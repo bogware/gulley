@@ -1,0 +1,45 @@
+# Local dev dependencies for Gulley.
+# Mirrors the production role-split: one Postgres + three Redis instances
+# (cache / counters / vector) so eviction-policy assumptions match prod.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gulley
+      POSTGRES_PASSWORD: gulley
+      POSTGRES_DB: gulley
+    ports:
+      - '5432:5432'
+    volumes:
+      - gulley_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U gulley -d gulley']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis-cache:
+    image: redis:7-alpine
+    command: ['redis-server', '--maxmemory', '256mb', '--maxmemory-policy', 'allkeys-lru']
+    ports:
+      - '6379:6379'
+
+  redis-counters:
+    image: redis:7-alpine
+    # Counters (rate-limit + budget) must never be evicted.
+    command: ['redis-server', '--maxmemory-policy', 'noeviction', '--appendonly', 'yes']
+    ports:
+      - '6380:6379'
+    volumes:
+      - gulley_redis_counters:/data
+
+  redis-vector:
+    image: redis:7-alpine
+    # Semantic-cache vector index; must not be evicted out from under recall.
+    command: ['redis-server', '--maxmemory-policy', 'noeviction']
+    ports:
+      - '6381:6379'
+
+volumes:
+  gulley_pg:
+  gulley_redis_counters:

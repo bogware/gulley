@@ -1,0 +1,24 @@
+# Azure DevOps pipeline — kept at parity with .github/workflows/ci.yml by
+# delegating all logic to the shared ci/ scripts.
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - '*'
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - task: NodeTool@0
+    inputs:
+      versionSpec: '22.x'
+    displayName: Install Node.js
+  - script: bash ci/install.sh
+    displayName: Install
+  - script: bash ci/verify.sh
+    displayName: Verify

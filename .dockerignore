@@ -1,0 +1,14 @@
+**/node_modules
+**/dist
+**/.next
+**/.turbo
+**/coverage
+**/*.log
+.git
+.github
+.azuredevops
+docs
+infra
+**/.env
+**/.env.*
+!**/.env.example

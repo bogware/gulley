@@ -1,0 +1,10 @@
+node_modules
+dist
+.next
+.turbo
+coverage
+pnpm-lock.yaml
+**/.terraform
+*.tfstate
+CHANGELOG.md
+packages/storage/migrations
