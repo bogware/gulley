@@ -1,6 +1,12 @@
 import type { Readable } from 'node:stream';
-import { request } from 'undici';
+import { getGlobalDispatcher, request } from 'undici';
 import type { ForwardRequest, ForwardResponse, ProviderAdapter } from './types';
+
+/** Drain undici's keep-alive connection pool. Call on graceful shutdown (or at
+ *  the end of a short-lived script) so the event loop can exit cleanly. */
+export async function closeUpstreamPool(): Promise<void> {
+  await getGlobalDispatcher().close();
+}
 
 const HOP_BY_HOP = new Set([
   'connection',

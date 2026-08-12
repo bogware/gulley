@@ -39,12 +39,19 @@ export const CACHE_MULTIPLIERS = {
 } as const;
 
 /**
- * Bedrock exposes Claude via region-prefixed inference-profile IDs
- * (`us.anthropic.claude-...`). Strip provider/region prefixes so the same
- * pricing table serves native Anthropic and Bedrock routes.
+ * Normalize a provider model id to a pricing-table key:
+ *   - strip Bedrock region prefixes (`us.` / `eu.` / `apac.` / `global.`)
+ *   - strip the `anthropic.` provider prefix
+ *   - strip a trailing `-YYYYMMDD` date snapshot (the Messages API reports the
+ *     dated id, e.g. `claude-haiku-4-5-20251001`, while pricing is keyed by the
+ *     alias `claude-haiku-4-5`). The 8-digit guard leaves minor versions like
+ *     `claude-opus-4-8` untouched.
  */
 export function normalizeModelId(model: string): string {
-  return model.replace(/^(us|eu|apac|global)\./, '').replace(/^anthropic\./, '');
+  return model
+    .replace(/^(us|eu|apac|global)\./, '')
+    .replace(/^anthropic\./, '')
+    .replace(/-\d{8}$/, '');
 }
 
 export function lookupRate(model: string): ModelRate | undefined {

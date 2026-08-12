@@ -2,9 +2,22 @@ import { describe, expect, it } from 'vitest';
 import { computeAnthropicCost, lookupRate, normalizeModelId, toMicroUsd } from './index';
 
 describe('pricing', () => {
-  it('normalizes Bedrock inference-profile ids to the base model id', () => {
+  it('normalizes Bedrock prefixes and dated snapshots to the base model id', () => {
     expect(normalizeModelId('us.anthropic.claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
     expect(normalizeModelId('claude-opus-5')).toBe('claude-opus-5');
+    // The Messages API reports dated ids; pricing is keyed by the alias.
+    expect(normalizeModelId('claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5');
+    // A minor version like -4-8 must NOT be mistaken for a date suffix.
+    expect(normalizeModelId('claude-opus-4-8')).toBe('claude-opus-4-8');
+  });
+
+  it('prices a dated model id via alias normalization', () => {
+    const c = computeAnthropicCost('claude-haiku-4-5-20251001', {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+    });
+    expect(c.priced).toBe(true);
+    expect(c.totalUsd).toBeCloseTo(6, 6); // $1 in + $5 out
   });
 
   it('prices known models and skips unknown ones', () => {

@@ -6,12 +6,16 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "tsx src/main.ts",
+    "seed": "tsx src/seed.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@gulley/auth": "workspace:*",
     "@gulley/core": "workspace:*",
+    "@gulley/storage": "workspace:*",
+    "drizzle-orm": "^0.38.2",
     "fastify": "^5.2.0",
     "zod": "^3.24.1"
   },
