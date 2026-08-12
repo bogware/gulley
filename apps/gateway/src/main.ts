@@ -1,8 +1,20 @@
 import { loadConfig } from './config';
+import { createProductionContext } from './context';
+import type { GatewayContext } from './routes/messages';
 import { buildServer } from './server';
 
 const config = loadConfig();
-const app = buildServer(config);
+
+let context: GatewayContext | undefined;
+try {
+  context = createProductionContext(config);
+} catch (err) {
+  // Boot health-only so the container stays inspectable while config is finished.
+  // The messages route is simply not registered until the context is complete.
+  console.warn(`[gateway] proxy disabled — ${(err as Error).message}`);
+}
+
+const app = buildServer(config, context);
 
 async function start(): Promise<void> {
   try {
@@ -16,8 +28,6 @@ async function start(): Promise<void> {
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
     app.log.info({ signal }, 'shutting down');
-    // Fast, clean drain so ECS deploys / AZ events don't sever streams.
-    // Real connection-aware draining arrives with the streaming pipeline.
     void app.close().then(() => process.exit(0));
   });
 }

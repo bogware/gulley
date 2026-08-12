@@ -5,6 +5,16 @@ const Env = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   GATEWAY_HOST: z.string().default('0.0.0.0'),
   GATEWAY_PORT: z.coerce.number().int().positive().default(8080),
+
+  // Virtual-key pepper (KMS-held in prod). Optional so the server boots for
+  // health checks; the messages route requires it via the production context.
+  GULLEY_KEY_PEPPER: z.string().min(1).optional(),
+
+  // Upstream Anthropic credential held centrally by the gateway (v1).
+  ANTHROPIC_UPSTREAM_API_KEY: z.string().min(1).optional(),
+  ANTHROPIC_BASE_URL: z.string().url().default('https://api.anthropic.com'),
+
+  DATABASE_URL: z.string().url().optional(),
 });
 
 export type Config = z.infer<typeof Env>;

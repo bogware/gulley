@@ -57,9 +57,24 @@ importers:
 
   apps/gateway:
     dependencies:
+      '@gulley/auth':
+        specifier: workspace:*
+        version: link:../../packages/auth
       '@gulley/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@gulley/cost':
+        specifier: workspace:*
+        version: link:../../packages/cost
+      '@gulley/pipeline':
+        specifier: workspace:*
+        version: link:../../packages/pipeline
+      '@gulley/providers':
+        specifier: workspace:*
+        version: link:../../packages/providers
+      '@gulley/storage':
+        specifier: workspace:*
+        version: link:../../packages/storage
       fastify:
         specifier: ^5.2.0
         version: 5.11.3
@@ -113,6 +128,19 @@ importers:
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
+
+  packages/auth:
+    dependencies:
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
       vitest:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.20.1)
@@ -133,11 +161,74 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.20.1)
 
-  packages/storage:
+  packages/cost:
     dependencies:
       '@gulley/core':
         specifier: workspace:*
         version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/pipeline:
+    dependencies:
+      '@gulley/cost':
+        specifier: workspace:*
+        version: link:../cost
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/providers:
+    dependencies:
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
+      '@gulley/cost':
+        specifier: workspace:*
+        version: link:../cost
+      undici:
+        specifier: ^6.21.0
+        version: 6.28.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/storage:
+    dependencies:
+      '@gulley/auth':
+        specifier: workspace:*
+        version: link:../auth
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
+      '@gulley/cost':
+        specifier: workspace:*
+        version: link:../cost
+      '@gulley/pipeline':
+        specifier: workspace:*
+        version: link:../pipeline
       drizzle-orm:
         specifier: ^0.38.2
         version: 0.38.4(@types/react@19.2.18)(postgres@3.4.9)(react@19.2.8)
@@ -2382,6 +2473,10 @@ packages:
   undici-types@6.21.0:
     resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
 
+  undici@6.28.0:
+    resolution: {integrity: sha512-LIY910g9TI13YS95lrMFrs8Rm/u/irgHeTWoKCoteeJ04CUJ92eEfj0rVn+7VKMPBpUPiUoBKfhNyLI23EE/KA==}
+    engines: {node: '>=18.17'}
+
   update-browserslist-db@1.3.1:
     resolution: {integrity: sha512-ZZ61DsRsOnakl74HAmp3oSN4aXUmEWXf+i/yv0h7tIBfICc3VdrFErQKUUKPgu3AMsTUMbcongALEN4l6GSUrQ==}
     hasBin: true
@@ -4338,6 +4433,8 @@ snapshots:
   typescript@5.9.3: {}
 
   undici-types@6.21.0: {}
+
+  undici@6.28.0: {}
 
   update-browserslist-db@1.3.1(browserslist@4.28.8):
     dependencies:

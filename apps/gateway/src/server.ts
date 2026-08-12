@@ -1,14 +1,13 @@
 import { GULLEY_VERSION } from '@gulley/core';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config';
+import { type GatewayContext, registerMessagesRoute } from './routes/messages';
 
-export function buildServer(config: Config): FastifyInstance {
+export function buildServer(config: Config, context?: GatewayContext): FastifyInstance {
   const app = Fastify({
     trustProxy: true,
     logger: {
       level: config.LOG_LEVEL,
-      // Credential hygiene is always-on: strip auth material before anything is
-      // logged, independent of the (separate) no-content-logging toggle.
       redact: {
         paths: [
           'req.headers.authorization',
@@ -21,18 +20,17 @@ export function buildServer(config: Config): FastifyInstance {
     },
   });
 
-  app.get('/health', async () => ({
-    status: 'ok',
-    service: 'gateway',
-    version: GULLEY_VERSION,
-  }));
+  // The proxy forwards raw bytes upstream, so capture the body verbatim rather
+  // than letting Fastify parse it into an object.
+  app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (_req, body, done) => {
+    done(null, body);
+  });
 
-  // Readiness is a stub until real dependency checks land (Redis/PG reachable,
-  // tokenizer/NER/embedding models warm). It must never report ready early —
-  // ALB should not route to a task whose heavy deps aren't loaded.
-  app.get('/ready', async () => ({ status: 'ready' }));
-
+  app.get('/health', async () => ({ status: 'ok', service: 'gateway', version: GULLEY_VERSION }));
+  app.get('/ready', async () => ({ status: context ? 'ready' : 'degraded' }));
   app.get('/', async () => ({ name: 'gulley-gateway', version: GULLEY_VERSION }));
+
+  if (context) registerMessagesRoute(app, context);
 
   return app;
 }

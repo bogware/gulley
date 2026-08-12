@@ -8,6 +8,13 @@
       "when": 1786574814761,
       "tag": "0000_worried_network",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786576130937,
+      "tag": "0001_cooing_namora",
+      "breakpoints": true
     }
   ]
 }

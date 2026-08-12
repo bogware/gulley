@@ -3,6 +3,7 @@ import {
   bigint,
   boolean,
   index,
+  integer,
   jsonb,
   pgTable,
   text,
@@ -91,4 +92,56 @@ export const auditLog = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('audit_log_seq_idx').on(t.seq)],
+);
+
+// Durable spend ledger — the source of truth for cost. Redis budget counters
+// are a rebuildable projection of this table (never the reverse).
+export const spendLedger = pgTable(
+  'spend_ledger',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    requestId: text('request_id').notNull(),
+    principalId: text('principal_id').notNull(),
+    orgId: uuid('org_id'),
+    workspaceId: uuid('workspace_id'),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    status: text('status').notNull(),
+    inputTokens: bigint('input_tokens', { mode: 'number' }).notNull().default(0),
+    outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
+    costMicroUsd: bigint('cost_micro_usd', { mode: 'number' }).notNull().default(0),
+    priced: boolean('priced').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('spend_ledger_workspace_idx').on(t.workspaceId),
+    index('spend_ledger_created_idx').on(t.createdAt),
+  ],
+);
+
+// Per-request operational log. High write volume — a later milestone
+// time-partitions this and drops old partitions rather than DELETE-ing.
+export const requestLog = pgTable(
+  'request_log',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    requestId: text('request_id').notNull(),
+    principalId: text('principal_id').notNull(),
+    workspaceId: uuid('workspace_id'),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    route: text('route').notNull(),
+    statusCode: integer('status_code').notNull(),
+    status: text('status').notNull(),
+    streamed: boolean('streamed').notNull().default(false),
+    inputTokens: bigint('input_tokens', { mode: 'number' }).notNull().default(0),
+    outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
+    costMicroUsd: bigint('cost_micro_usd', { mode: 'number' }).notNull().default(0),
+    latencyMs: integer('latency_ms').notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('request_log_workspace_idx').on(t.workspaceId),
+    index('request_log_created_idx').on(t.createdAt),
+  ],
 );

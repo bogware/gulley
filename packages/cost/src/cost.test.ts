@@ -1,0 +1,66 @@
+import { describe, expect, it } from 'vitest';
+import { computeAnthropicCost, lookupRate, normalizeModelId, toMicroUsd } from './index';
+
+describe('pricing', () => {
+  it('normalizes Bedrock inference-profile ids to the base model id', () => {
+    expect(normalizeModelId('us.anthropic.claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
+    expect(normalizeModelId('claude-opus-5')).toBe('claude-opus-5');
+  });
+
+  it('prices known models and skips unknown ones', () => {
+    expect(lookupRate('claude-opus-5')).toEqual({ input: 5, output: 25 });
+    expect(lookupRate('gpt-4')).toBeUndefined();
+  });
+});
+
+describe('computeAnthropicCost', () => {
+  it('meters from the raw usage object with cache-inclusive input', () => {
+    // 1M uncached input, 1M output on Opus-5 => $5 + $25 = $30.
+    const c = computeAnthropicCost('claude-opus-5', {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+    });
+    expect(c.priced).toBe(true);
+    expect(c.totalUsd).toBeCloseTo(30, 6);
+    expect(c.totalInputTokens).toBe(1_000_000);
+  });
+
+  it('applies cache read/write multipliers on the input rate', () => {
+    // Sonnet-5 input $3/MTok. read x0.1 => $0.30; write5m x1.25 => $3.75 per MTok.
+    const c = computeAnthropicCost('claude-sonnet-5', {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_input_tokens: 1_000_000,
+      cache_creation_input_tokens: 1_000_000,
+    });
+    expect(c.cacheReadUsd).toBeCloseTo(0.3, 6);
+    expect(c.cacheWriteUsd).toBeCloseTo(3.75, 6);
+    expect(c.totalInputTokens).toBe(2_000_000);
+  });
+
+  it('honors the per-TTL cache-creation breakdown when present', () => {
+    // Opus-5 input $5. 1M @1h x2.0 => $10.
+    const c = computeAnthropicCost('claude-opus-5', {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 1_000_000,
+      cache_creation: { ephemeral_1h_input_tokens: 1_000_000 },
+    });
+    expect(c.cacheWriteUsd).toBeCloseTo(10, 6);
+  });
+
+  it('still meters tokens for an unpriced model', () => {
+    const c = computeAnthropicCost('some-future-model', {
+      input_tokens: 100,
+      output_tokens: 50,
+    });
+    expect(c.priced).toBe(false);
+    expect(c.totalUsd).toBe(0);
+    expect(c.outputTokens).toBe(50);
+  });
+
+  it('converts USD to micro-dollars for the ledger', () => {
+    expect(toMicroUsd(30)).toBe(30_000_000);
+    expect(toMicroUsd(0.0000005)).toBe(1);
+  });
+});
