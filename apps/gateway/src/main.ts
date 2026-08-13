@@ -1,3 +1,4 @@
+import { closeUpstreamPool } from '@gulley/providers';
 import { loadConfig } from './config';
 import { createProductionContext } from './context';
 import type { GatewayContext } from './routes/messages';
@@ -25,11 +26,33 @@ async function start(): Promise<void> {
   }
 }
 
+// Bounded graceful drain: stop accepting, let in-flight streams finish, close
+// the upstream pool. A backstop under Fargate's 120s stopTimeout guarantees we
+// exit before SIGKILL; streams cut at the backstop reconnect via Last-Event-ID.
+const SHUTDOWN_GRACE_MS = Number(process.env['SHUTDOWN_GRACE_MS']) || 110_000;
+let shuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  app.log.info({ signal, graceMs: SHUTDOWN_GRACE_MS }, 'draining');
+  const backstop = setTimeout(() => {
+    app.log.warn('drain grace elapsed, forcing exit');
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS);
+  backstop.unref();
+  try {
+    await app.close();
+    await closeUpstreamPool();
+  } catch (err) {
+    app.log.error({ err }, 'shutdown error');
+  }
+  clearTimeout(backstop);
+  process.exit(0);
+}
+
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(signal, () => {
-    app.log.info({ signal }, 'shutting down');
-    void app.close().then(() => process.exit(0));
-  });
+  process.on(signal, () => void shutdown(signal));
 }
 
 void start();

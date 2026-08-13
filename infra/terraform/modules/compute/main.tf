@@ -100,14 +100,15 @@ resource "aws_lb_listener_rule" "control" {
 
 locals {
   gateway_container = [{
-    name         = "gateway"
-    image        = var.image
-    essential    = true
-    command      = ["pnpm", "--filter", "@gulley/gateway", "start"]
-    portMappings = [{ containerPort = var.gateway_port, protocol = "tcp" }]
-    environment  = [for k, v in var.gateway_env : { name = k, value = v }]
-    secrets      = [for k, v in var.gateway_secrets : { name = k, valueFrom = v }]
-    stopTimeout  = 120
+    name            = "gateway"
+    image           = var.image
+    essential       = true
+    command         = ["node", "--import", "tsx", "apps/gateway/src/main.ts"]
+    linuxParameters = { initProcessEnabled = true }
+    portMappings    = [{ containerPort = var.gateway_port, protocol = "tcp" }]
+    environment     = [for k, v in var.gateway_env : { name = k, value = v }]
+    secrets         = [for k, v in var.gateway_secrets : { name = k, valueFrom = v }]
+    stopTimeout     = 120
     healthCheck = {
       command     = ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:${var.gateway_port}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval    = 30
@@ -126,14 +127,15 @@ locals {
   }]
 
   control_container = [{
-    name         = "control-api"
-    image        = var.image
-    essential    = true
-    command      = ["pnpm", "--filter", "@gulley/control-api", "start"]
-    portMappings = [{ containerPort = var.control_port, protocol = "tcp" }]
-    environment  = [for k, v in var.control_env : { name = k, value = v }]
-    secrets      = [for k, v in var.control_secrets : { name = k, valueFrom = v }]
-    stopTimeout  = 120
+    name            = "control-api"
+    image           = var.image
+    essential       = true
+    command         = ["node", "--import", "tsx", "apps/control-api/src/main.ts"]
+    linuxParameters = { initProcessEnabled = true }
+    portMappings    = [{ containerPort = var.control_port, protocol = "tcp" }]
+    environment     = [for k, v in var.control_env : { name = k, value = v }]
+    secrets         = [for k, v in var.control_secrets : { name = k, valueFrom = v }]
+    stopTimeout     = 120
     logConfiguration = {
       logDriver = "awslogs"
       options = {

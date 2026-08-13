@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1
+# Control-plane image. Node is PID 1 (SIGTERM reaches the drain handler); a
+# tsup bundle + distroless base is a documented further-hardening step.
+# Build for the ECS task platform: --platform linux/arm64.
 FROM node:22-slim AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
 RUN corepack enable
@@ -20,4 +23,4 @@ EXPOSE 8081
 USER node
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s CMD \
   node -e "fetch('http://127.0.0.1:'+(process.env.CONTROL_API_PORT||8081)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["pnpm", "--filter", "@gulley/control-api", "start"]
+CMD ["node", "--import", "tsx", "apps/control-api/src/main.ts"]

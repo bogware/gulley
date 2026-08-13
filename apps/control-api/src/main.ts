@@ -13,11 +13,26 @@ async function start(): Promise<void> {
   }
 }
 
+const SHUTDOWN_GRACE_MS = Number(process.env['SHUTDOWN_GRACE_MS']) || 110_000;
+let shuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  app.log.info({ signal }, 'draining');
+  const backstop = setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS);
+  backstop.unref();
+  try {
+    await app.close();
+  } catch (err) {
+    app.log.error({ err }, 'shutdown error');
+  }
+  clearTimeout(backstop);
+  process.exit(0);
+}
+
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(signal, () => {
-    app.log.info({ signal }, 'shutting down');
-    void app.close().then(() => process.exit(0));
-  });
+  process.on(signal, () => void shutdown(signal));
 }
 
 void start();
