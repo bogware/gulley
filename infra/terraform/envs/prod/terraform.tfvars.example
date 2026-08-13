@@ -1,0 +1,8 @@
+aws_region     = "us-east-1"
+image_tag      = "latest"
+domain_name    = "gulley.example.com"
+hosted_zone_id = "Z0123456789ABCDEFGHIJ"
+
+# Optional cross-account Bedrock role:
+# bedrock_assume_role_arn = "arn:aws:iam::111122223333:role/gulley-bedrock"
+# bedrock_external_id     = "gulley-dev-xxxx"
