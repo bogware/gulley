@@ -23,6 +23,11 @@ const Env = z.object({
   AZURE_UPSTREAM_API_KEY: z.string().min(1).optional(),
 
   DATABASE_URL: z.string().url().optional(),
+  // Redis counters (budget reserve/commit). Absent = budgets disabled.
+  REDIS_COUNTERS_URL: z.string().url().optional(),
+  // OpenTelemetry OTLP/HTTP export. Absent = telemetry disabled.
+  OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
+  OTEL_SERVICE_NAME: z.string().default('gulley-gateway'),
 });
 
 export type Config = z.infer<typeof Env>;

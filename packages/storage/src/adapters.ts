@@ -12,7 +12,7 @@ import {
 } from '@gulley/pipeline';
 import { desc, eq, sql } from 'drizzle-orm';
 import type { Database } from './db';
-import { auditLog, requestLog, spendLedger, virtualKey, workspace } from './schema';
+import { auditLog, budget, requestLog, spendLedger, virtualKey, workspace } from './schema';
 
 /** Postgres-backed virtual-key lookup. Route-policy columns (allowed
  *  providers/models) arrive in a later milestone; v1 keys allow all. */
@@ -145,4 +145,23 @@ export class PostgresAuditSink implements AuditSink {
       return { ...event, seq, prevHash, rowHash, createdAt };
     });
   }
+}
+
+/** Reads per-workspace budget caps for the RedisBudgetStore. Structurally
+ *  matches @gulley/budget's CapResolver without importing it. */
+export function createBudgetCapResolver(
+  db: Database,
+): (workspaceId: string) => Promise<{ capMicroUsd: number; periodSeconds?: number } | null> {
+  return async (workspaceId) => {
+    const rows = await db
+      .select({ cap: budget.capMicroUsd, period: budget.periodSeconds })
+      .from(budget)
+      .where(eq(budget.workspaceId, workspaceId))
+      .limit(1);
+    const b = rows[0];
+    if (!b) return null;
+    return b.period != null
+      ? { capMicroUsd: b.cap, periodSeconds: b.period }
+      : { capMicroUsd: b.cap };
+  };
 }

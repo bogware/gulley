@@ -145,3 +145,18 @@ export const requestLog = pgTable(
     index('request_log_created_idx').on(t.createdAt),
   ],
 );
+
+// Per-workspace spend cap (micro-USD). period_seconds null = lifetime cap.
+export const budget = pgTable(
+  'budget',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    capMicroUsd: bigint('cap_micro_usd', { mode: 'number' }).notNull(),
+    periodSeconds: integer('period_seconds'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('budget_workspace_idx').on(t.workspaceId)],
+);

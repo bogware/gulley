@@ -15,6 +15,13 @@
       "when": 1786576130937,
       "tag": "0001_cooing_namora",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786588409820,
+      "tag": "0002_dazzling_rawhide_kid",
+      "breakpoints": true
     }
   ]
 }

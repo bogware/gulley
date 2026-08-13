@@ -2,8 +2,10 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
+import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { AnthropicAdapter, AnthropicUsageExtractor } from '@gulley/providers';
 import { CircuitBreaker, type RouteTarget } from '@gulley/routing';
+import { initTelemetry } from '@gulley/telemetry';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
 import type { GatewayContext } from './routes/messages';
@@ -59,7 +61,10 @@ function testConfig() {
   return loadConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv);
 }
 
-function buildContext(store: InMemoryKeyStore): {
+function buildContext(
+  store: InMemoryKeyStore,
+  budgets: BudgetStore = new InMemoryBudgetStore(new Map()),
+): {
   ctx: GatewayContext;
   ledger: InMemoryLedger;
   requestLog: InMemoryRequestLog;
@@ -94,6 +99,8 @@ function buildContext(store: InMemoryKeyStore): {
       requestLog,
       audit,
       breaker,
+      budgets,
+      telemetry: initTelemetry({}),
     },
     ledger,
     requestLog,
@@ -228,6 +235,8 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       requestLog,
       audit,
       breaker,
+      budgets: new InMemoryBudgetStore(new Map()),
+      telemetry: initTelemetry({}),
     };
     const app = buildServer(testConfig(), ctx);
     const base = await app.listen({ port: 0, host: '127.0.0.1' });
@@ -249,6 +258,55 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(ledger.entries[0]?.status).toBe('ok');
     expect(ledger.entries[0]?.cost.outputTokens).toBe(42);
 
+    await app.close();
+  });
+
+  it('rejects a request whose worst-case reservation exceeds the workspace budget', async () => {
+    const { store, token } = seededStore();
+    // Tiny cap: sonnet-4-6 with max_tokens=1000 reserves well over 500 microUSD.
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 500 }]]));
+    const { ctx, requestLog } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    expect(res.status).toBe(402);
+    const json = (await res.json()) as { error: { type: string } };
+    expect(json.error.type).toBe('budget_exceeded');
+    expect(requestLog.entries).toHaveLength(0); // never called upstream
+
+    await app.close();
+  });
+
+  it('allows a request that fits within the workspace budget', async () => {
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+    const { ctx } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    expect(res.status).toBe(200);
     await app.close();
   });
 });

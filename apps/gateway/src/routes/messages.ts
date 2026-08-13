@@ -4,6 +4,7 @@ import {
   scopeAllowsModel,
   scopeAllowsProvider,
 } from '@gulley/auth';
+import { type BudgetStore, estimateWorstCaseMicroUsd } from '@gulley/budget';
 import { computeCost, toMicroUsd } from '@gulley/cost';
 import { isErr } from '@gulley/core';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
@@ -15,7 +16,10 @@ import {
   type RoutingStrategy,
   selectCandidates,
 } from '@gulley/routing';
+import type { Telemetry } from '@gulley/telemetry';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+
+const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
 /** A client-facing surface backed by a routing strategy (single / load-balance
  *  / fallback across upstream targets). */
@@ -33,6 +37,8 @@ export interface GatewayContext {
   requestLog: RequestLogSink;
   audit: AuditSink;
   breaker: CircuitBreaker;
+  budgets: BudgetStore;
+  telemetry: Telemetry;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -101,6 +107,59 @@ async function handleProxy(
       .code(403)
       .send({ type: 'error', error: { type: 'permission_error', message: 'not permitted' } });
     return;
+  }
+
+  // --- budget: reserve worst-case at admission (hard cap, TOCTOU-safe) ---
+  const maxOutput =
+    numField(parsed['max_tokens']) ??
+    numField(parsed['max_output_tokens']) ??
+    DEFAULT_MAX_OUTPUT_TOKENS;
+  const worstProvider = candidates[0]?.provider ?? 'unknown';
+  const worstCase = estimateWorstCaseMicroUsd(
+    worstProvider,
+    requestedModel,
+    body.length,
+    maxOutput,
+  );
+  let reserved = false;
+  if (worstCase > 0) {
+    const decision = await ctx.budgets.reserve(principal.scope.workspaceId, requestId, worstCase);
+    if (decision && !decision.allowed) {
+      request.log.info(
+        { cap: decision.capMicroUsd, used: decision.usedMicroUsd },
+        'budget exceeded',
+      );
+      await ctx.audit.append({
+        orgId: principal.scope.orgId,
+        actor: principal.id,
+        action: 'budget.rejected',
+        target: worstProvider,
+        payload: {
+          model: requestedModel,
+          capMicroUsd: decision.capMicroUsd,
+          usedMicroUsd: decision.usedMicroUsd,
+          worstCaseMicroUsd: worstCase,
+        },
+      });
+      ctx.telemetry.recordRequest({
+        provider: worstProvider,
+        requestModel: requestedModel,
+        responseModel: requestedModel,
+        route: candidates[0]?.upstreamPath ?? '',
+        statusCode: 402,
+        status: 'error',
+        inputTokens: 0,
+        outputTokens: 0,
+        costMicroUsd: 0,
+        streamed: false,
+        startedAtMs: started,
+      });
+      await reply
+        .code(402)
+        .send({ type: 'error', error: { type: 'budget_exceeded', message: 'budget exceeded' } });
+      return;
+    }
+    reserved = decision !== null && decision.allowed;
   }
 
   const controller = new AbortController();
@@ -212,9 +271,28 @@ async function handleProxy(
           costMicroUsd,
         },
       });
+      // Commit actual spend, refunding the reservation's worst-case remainder.
+      if (reserved) {
+        await ctx.budgets.commit(principal.scope.workspaceId, requestId, costMicroUsd);
+      }
     } catch (err) {
       request.log.error({ err }, 'metering/audit teardown failed');
     }
+
+    ctx.telemetry.recordRequest({
+      provider,
+      requestModel: requestedModel,
+      responseModel: meteredModel,
+      route: served?.upstreamPath ?? route.clientPaths[0] ?? '',
+      statusCode,
+      status,
+      inputTokens: cost.totalInputTokens,
+      outputTokens: cost.outputTokens,
+      costMicroUsd,
+      streamed,
+      stopReason: n.stopReason,
+      startedAtMs: started,
+    });
   };
 
   // Every candidate failed to produce a response (all connection errors).
@@ -284,6 +362,10 @@ async function handleProxy(
     if (!reply.raw.writableEnded) reply.raw.end();
     void teardown();
   });
+}
+
+function numField(v: unknown): number | undefined {
+  return typeof v === 'number' ? v : undefined;
 }
 
 function headerValue(request: FastifyRequest, name: string): string | undefined {

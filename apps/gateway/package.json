@@ -12,18 +12,22 @@
     "live:bedrock": "tsx src/live-check.ts --provider bedrock",
     "live:azure": "tsx src/live-check.ts --provider azure",
     "live:translate": "tsx src/live-check.ts --provider translate",
+    "budget:check": "tsx src/budget-check.ts",
+    "otel:check": "tsx src/otel-check.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
     "@gulley/auth": "workspace:*",
+    "@gulley/budget": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
     "@gulley/pipeline": "workspace:*",
     "@gulley/providers": "workspace:*",
     "@gulley/routing": "workspace:*",
     "@gulley/storage": "workspace:*",
+    "@gulley/telemetry": "workspace:*",
     "fastify": "^5.2.0",
     "zod": "^3.24.1"
   },

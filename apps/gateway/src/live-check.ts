@@ -24,7 +24,9 @@ import {
   type UpstreamCredential,
   type UsageExtractor,
 } from '@gulley/providers';
+import { InMemoryBudgetStore } from '@gulley/budget';
 import { CircuitBreaker, type RouteTarget, type RoutingStrategy } from '@gulley/routing';
+import { initTelemetry } from '@gulley/telemetry';
 import { loadConfig } from './config';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 import { buildServer } from './server';
@@ -245,6 +247,8 @@ async function main(): Promise<void> {
     requestLog,
     audit,
     breaker: new CircuitBreaker(),
+    budgets: new InMemoryBudgetStore(new Map()),
+    telemetry: initTelemetry({}),
   };
 
   const app = buildServer(loadConfig({ LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv), ctx);

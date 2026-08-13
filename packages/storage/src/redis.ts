@@ -17,12 +17,14 @@ export type RedisClients = Record<RedisRole, Redis>;
  * silently under-charges; evicting vectors silently degrades recall).
  * See docs/ARCHITECTURE.md §13.
  */
+export function createRedisClient(url: string): Redis {
+  return new Redis(url, { lazyConnect: true, maxRetriesPerRequest: 2, enableAutoPipelining: true });
+}
+
 export function createRedisClients(urls: RedisUrls): RedisClients {
-  const make = (url: string): Redis =>
-    new Redis(url, { lazyConnect: true, maxRetriesPerRequest: 2, enableAutoPipelining: true });
   return {
-    cache: make(urls.cache),
-    counters: make(urls.counters),
-    vector: make(urls.vector),
+    cache: createRedisClient(urls.cache),
+    counters: createRedisClient(urls.counters),
+    vector: createRedisClient(urls.vector),
   };
 }

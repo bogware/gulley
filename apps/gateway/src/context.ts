@@ -7,14 +7,18 @@ import {
   OpenAIUsageExtractor,
   type UpstreamCredential,
 } from '@gulley/providers';
+import { InMemoryBudgetStore, RedisBudgetStore } from '@gulley/budget';
 import { CircuitBreaker } from '@gulley/routing';
 import {
+  createBudgetCapResolver,
   createDatabase,
+  createRedisClient,
   PostgresAuditSink,
   PostgresKeyStore,
   PostgresLedger,
   PostgresRequestLog,
 } from '@gulley/storage';
+import { initTelemetry } from '@gulley/telemetry';
 import type { Config } from './config';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 
@@ -152,6 +156,18 @@ export function createProductionContext(config: Config): GatewayContext {
   }
 
   const db = createDatabase(config.DATABASE_URL);
+  // Budgets need Redis counters; without them, enforcement is simply disabled.
+  const budgets = config.REDIS_COUNTERS_URL
+    ? new RedisBudgetStore(
+        createRedisClient(config.REDIS_COUNTERS_URL),
+        createBudgetCapResolver(db),
+      )
+    : new InMemoryBudgetStore(new Map());
+  const telemetry = initTelemetry({
+    endpoint: config.OTEL_EXPORTER_OTLP_ENDPOINT,
+    serviceName: config.OTEL_SERVICE_NAME,
+  });
+
   return {
     routes,
     keyStore: new PostgresKeyStore(db),
@@ -160,5 +176,7 @@ export function createProductionContext(config: Config): GatewayContext {
     requestLog: new PostgresRequestLog(db),
     audit: new PostgresAuditSink(db),
     breaker: new CircuitBreaker(),
+    budgets,
+    telemetry,
   };
 }
