@@ -1,0 +1,43 @@
+name: Dependency bump (manual)
+
+# Deliberately manual — NO `schedule:` trigger. Dependency updates are grouped
+# into a single reviewed PR, per policy (see CLAUDE.md / ARCHITECTURE).
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'pnpm update filter (e.g. "--latest" or a package name)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Update dependencies
+        run: |
+          corepack enable
+          pnpm update -r ${{ inputs.scope }}
+          pnpm install --lockfile-only
+      - name: Verify
+        run: |
+          bash ci/install.sh
+          bash ci/verify.sh
+      - name: Open a single grouped PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: deps/manual-bump
+          title: 'chore(deps): manual grouped dependency bump'
+          commit-message: 'chore(deps): manual grouped dependency bump'
+          body: |
+            Manual, grouped dependency update (triggered via workflow_dispatch).
+            CI (`verify` + `terraform`) must pass before merge.
+          delete-branch: true

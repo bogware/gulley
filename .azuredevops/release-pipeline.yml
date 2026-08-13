@@ -1,0 +1,57 @@
+# Azure DevOps release pipeline — at parity with .github/workflows/release.yml.
+# Manual/tag only (no scheduled trigger). Builds + pushes the image via the shared
+# ci/build-image.sh and runs a prod terraform plan. AWS auth comes from an AWS
+# service connection (OIDC); ECR_REPOSITORY / AWS_REGION are pipeline variables.
+trigger: none
+
+pr: none
+
+parameters:
+  - name: imageTag
+    type: string
+    default: latest
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: gulley-release # AWS_REGION, ECR_REPOSITORY (+ AWS creds via service connection)
+
+stages:
+  - stage: image
+    displayName: Build + push image
+    jobs:
+      - job: build
+        steps:
+          - task: AWSShellScript@1
+            displayName: Build + push (SBOM + provenance) and scan
+            inputs:
+              awsCredentials: gulley-aws
+              regionName: $(AWS_REGION)
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                export IMAGE_TAG='${{ parameters.imageTag }}'
+                bash ci/build-image.sh
+                curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ECR_REPOSITORY:$IMAGE_TAG"
+
+  - stage: plan
+    displayName: Terraform plan (prod)
+    dependsOn: image
+    jobs:
+      - job: plan
+        steps:
+          - task: AWSShellScript@1
+            displayName: terraform plan
+            inputs:
+              awsCredentials: gulley-aws
+              regionName: $(AWS_REGION)
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                curl -fsSL "https://releases.hashicorp.com/terraform/1.15.8/terraform_1.15.8_linux_amd64.zip" -o /tmp/tf.zip
+                sudo unzip -o /tmp/tf.zip -d /usr/local/bin
+                cd infra/terraform/envs/prod
+                terraform init -backend-config=backend.hcl -input=false
+                terraform plan -input=false -var "image_tag=${{ parameters.imageTag }}"

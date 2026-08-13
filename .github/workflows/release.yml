@@ -1,0 +1,60 @@
+name: Release
+
+# Manual or tag-driven only — never scheduled.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to build and push
+        required: true
+        default: latest
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write # OIDC federation to AWS (no long-lived keys)
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build + push image (SBOM + provenance)
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag || github.ref_name }}
+        run: bash ci/build-image.sh
+      - name: Scan image (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ inputs.image_tag || github.ref_name }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+  plan:
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+      - name: Terraform plan (prod)
+        working-directory: infra/terraform/envs/prod
+        run: |
+          terraform init -backend-config=backend.hcl -input=false
+          terraform plan -input=false -var "image_tag=${{ inputs.image_tag || github.ref_name }}"

@@ -13,12 +13,25 @@ pr:
 pool:
   vmImage: ubuntu-latest
 
-steps:
-  - task: NodeTool@0
-    inputs:
-      versionSpec: '22.x'
-    displayName: Install Node.js
-  - script: bash ci/install.sh
-    displayName: Install
-  - script: bash ci/verify.sh
+jobs:
+  - job: verify
     displayName: Verify
+    steps:
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '22.x'
+        displayName: Install Node.js
+      - script: bash ci/install.sh
+        displayName: Install
+      - script: bash ci/verify.sh
+        displayName: Verify (format/lint/types/tests/build)
+
+  - job: terraform
+    displayName: Terraform
+    steps:
+      - script: |
+          set -euo pipefail
+          curl -fsSL "https://releases.hashicorp.com/terraform/1.15.8/terraform_1.15.8_linux_amd64.zip" -o /tmp/tf.zip
+          sudo unzip -o /tmp/tf.zip -d /usr/local/bin
+          bash ci/tf-check.sh
+        displayName: Terraform fmt + validate (dev + prod)

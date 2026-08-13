@@ -21,4 +21,16 @@ jobs:
       - name: Install
         run: bash ci/install.sh
       - name: Verify
+        # format / lint / typecheck / test (incl. the M1-M5 credential-leak,
+        # ReDoS, and guard fuzz tests) / build.
         run: bash ci/verify.sh
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+      - name: Terraform fmt + validate (dev + prod)
+        run: bash ci/tf-check.sh
