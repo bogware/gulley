@@ -59,6 +59,8 @@ export class PassthroughAdapter implements ProviderAdapter {
     }
     if (req.credential.scheme === 'x-api-key') {
       headers['x-api-key'] = req.credential.value;
+    } else if (req.credential.scheme === 'api-key') {
+      headers['api-key'] = req.credential.value;
     } else {
       headers['authorization'] = `Bearer ${req.credential.value}`;
     }
@@ -94,5 +96,17 @@ export class AnthropicAdapter extends PassthroughAdapter {
 export class OpenAIAdapter extends PassthroughAdapter {
   constructor(opts: { baseUrl?: string } = {}) {
     super({ name: 'openai', baseUrl: opts.baseUrl ?? 'https://api.openai.com' });
+  }
+}
+
+/**
+ * Azure AI Foundry / Azure OpenAI. `baseUrl` is the resource endpoint
+ * (`https://<res>.openai.azure.com`); routes forward to the OpenAI-compatible
+ * `/openai/v1/...` surface with the deployment name as the `model`. Auth is the
+ * `api-key` header, or an Entra bearer token (credential scheme decides).
+ */
+export class AzureAdapter extends PassthroughAdapter {
+  constructor(opts: { baseUrl: string }) {
+    super({ name: 'azure', baseUrl: opts.baseUrl });
   }
 }

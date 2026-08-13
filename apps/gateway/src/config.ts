@@ -18,6 +18,9 @@ const Env = z.object({
   OPENAI_BASE_URL: z.string().url().default('https://api.openai.com'),
   BEDROCK_UPSTREAM_API_KEY: z.string().min(1).optional(),
   BEDROCK_REGION: z.string().default('us-east-1'),
+  // Azure AI Foundry / Azure OpenAI: resource endpoint + api-key (Entra later).
+  AZURE_ENDPOINT: z.string().url().optional(),
+  AZURE_UPSTREAM_API_KEY: z.string().min(1).optional(),
 
   DATABASE_URL: z.string().url().optional(),
 });

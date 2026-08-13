@@ -10,6 +10,7 @@
     "live:anthropic": "tsx src/live-check.ts --provider anthropic",
     "live:openai": "tsx src/live-check.ts --provider openai",
     "live:bedrock": "tsx src/live-check.ts --provider bedrock",
+    "live:azure": "tsx src/live-check.ts --provider azure",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"

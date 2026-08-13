@@ -1,6 +1,7 @@
 import {
   AnthropicAdapter,
   AnthropicUsageExtractor,
+  AzureAdapter,
   BedrockAdapter,
   OpenAIAdapter,
   OpenAIUsageExtractor,
@@ -72,6 +73,30 @@ export function buildRoutes(config: Config): ProviderRoute[] {
       credential: { scheme: 'bearer', value: config.BEDROCK_UPSTREAM_API_KEY },
       createExtractor: () => new AnthropicUsageExtractor(),
       alwaysStream: true,
+    });
+  }
+
+  if (config.AZURE_ENDPOINT && config.AZURE_UPSTREAM_API_KEY) {
+    const adapter = new AzureAdapter({ baseUrl: config.AZURE_ENDPOINT });
+    const credential: UpstreamCredential = {
+      scheme: 'api-key',
+      value: config.AZURE_UPSTREAM_API_KEY,
+    };
+    routes.push({
+      provider: 'azure',
+      clientPaths: ['/azure/v1/chat/completions', '/azure/openai/v1/chat/completions'],
+      upstreamPath: '/openai/v1/chat/completions',
+      adapter,
+      credential,
+      createExtractor: () => new OpenAIUsageExtractor(),
+    });
+    routes.push({
+      provider: 'azure',
+      clientPaths: ['/azure/v1/responses', '/azure/openai/v1/responses'],
+      upstreamPath: '/openai/v1/responses',
+      adapter,
+      credential,
+      createExtractor: () => new OpenAIUsageExtractor(),
     });
   }
 

@@ -14,6 +14,7 @@ import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/p
 import {
   AnthropicAdapter,
   AnthropicUsageExtractor,
+  AzureAdapter,
   BedrockAdapter,
   closeUpstreamPool,
   OpenAIAdapter,
@@ -38,6 +39,8 @@ interface Target {
   provider: string;
   keyVars: string[];
   path: string;
+  /** Upstream path if different from the client path (Azure remaps to /openai/v1). */
+  upstreamPath?: string;
   adapter: ProviderAdapter;
   extractor: () => UsageExtractor;
   credential: (key: string) => UpstreamCredential;
@@ -69,6 +72,40 @@ function resolveTarget(): Target {
           }
         : {
             model: model ?? 'gpt-4o-mini',
+            stream: true,
+            stream_options: { include_usage: true },
+            max_tokens: 16,
+            messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+          },
+    };
+  }
+
+  if (provider === 'azure') {
+    const endpoint = process.env['GULLEY_LIVE_AZURE_ENDPOINT'] ?? process.env['AZURE_ENDPOINT'];
+    if (!endpoint)
+      throw new Error('Set GULLEY_LIVE_AZURE_ENDPOINT (the Azure resource endpoint URL)');
+    const responses = flag('surface', 'chat') === 'responses';
+    const deployment = model ?? 'gpt-4o-mini';
+    return {
+      provider: 'azure',
+      keyVars: ['GULLEY_LIVE_AZURE_KEY', 'AZURE_API_KEY', 'AZURE_UPSTREAM_API_KEY'],
+      path: responses ? '/azure/v1/responses' : '/azure/v1/chat/completions',
+      upstreamPath: responses ? '/openai/v1/responses' : '/openai/v1/chat/completions',
+      adapter: new AzureAdapter({ baseUrl: endpoint }),
+      extractor: () => new OpenAIUsageExtractor(),
+      // A JWT (Entra token) uses bearer; otherwise the resource api-key.
+      credential: (k) =>
+        k.startsWith('eyJ') ? { scheme: 'bearer', value: k } : { scheme: 'api-key', value: k },
+      clientHeaders: (t) => ({ authorization: `Bearer ${t}` }),
+      body: responses
+        ? {
+            model: deployment,
+            stream: true,
+            input: 'Reply with exactly: OK',
+            max_output_tokens: 16,
+          }
+        : {
+            model: deployment,
             stream: true,
             stream_options: { include_usage: true },
             max_tokens: 16,
@@ -154,7 +191,7 @@ async function main(): Promise<void> {
   const route: ProviderRoute = {
     provider: t.provider,
     clientPaths: [t.path],
-    upstreamPath: t.path,
+    upstreamPath: t.upstreamPath ?? t.path,
     adapter: t.adapter,
     credential: t.credential(key.value),
     createExtractor: t.extractor,

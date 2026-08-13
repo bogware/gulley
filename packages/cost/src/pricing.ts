@@ -107,4 +107,10 @@ export const PROVIDER_PRICING: Readonly<Record<string, ProviderPricing>> = {
     },
     normalize: normalizeBedrockModel,
   },
+  azure: {
+    // Azure OpenAI bills at OpenAI rates (deployment name is the model).
+    rates: OPENAI_PRICING,
+    cache: { read: 0.5, write5m: 1.0, write1h: 1.0 },
+    normalize: normalizeOpenAIModel,
+  },
 };

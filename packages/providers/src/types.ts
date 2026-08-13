@@ -4,8 +4,9 @@ import type { SSEEvent } from './sse';
 
 export interface UpstreamCredential {
   /** How the credential is attached upstream: Anthropic uses `x-api-key`;
-   *  OpenAI/Bedrock use `Authorization: Bearer`. */
-  scheme: 'x-api-key' | 'bearer';
+   *  OpenAI/Bedrock use `Authorization: Bearer`; Azure uses the `api-key` header
+   *  (or `bearer` for Entra ID tokens). */
+  scheme: 'x-api-key' | 'bearer' | 'api-key';
   value: string;
 }
 
