@@ -1,12 +1,22 @@
 import {
   type KeyStore,
+  type Principal,
   resolveVirtualKey,
   scopeAllowsModel,
   scopeAllowsProvider,
 } from '@gulley/auth';
 import { type BudgetStore, estimateWorstCaseMicroUsd } from '@gulley/budget';
+import type { CacheableRequest, CacheEngine, CacheLookup } from '@gulley/cache';
 import { computeCost, toMicroUsd } from '@gulley/cost';
 import { isErr } from '@gulley/core';
+import {
+  filterByPolicy,
+  type GuardrailEngine,
+  type OutputInspection,
+  StreamingReplacer,
+  StreamingScanner,
+  type TokenVault,
+} from '@gulley/guardrails';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import { SSEParser, type UsageExtractor } from '@gulley/providers';
 import {
@@ -18,6 +28,7 @@ import {
 } from '@gulley/routing';
 import type { Telemetry } from '@gulley/telemetry';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { StringDecoder } from 'node:string_decoder';
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
@@ -27,6 +38,10 @@ export interface ProviderRoute {
   clientPaths: string[];
   createExtractor: () => UsageExtractor;
   strategy: RoutingStrategy;
+  /** Per-route guardrail engine; falls back to the context's global engine. */
+  guardrails?: GuardrailEngine;
+  /** Set false to exclude this route from caching even when a cache is wired. */
+  cacheable?: boolean;
 }
 
 export interface GatewayContext {
@@ -39,9 +54,17 @@ export interface GatewayContext {
   breaker: CircuitBreaker;
   budgets: BudgetStore;
   telemetry: Telemetry;
+  /** Global guardrail engine (audit-only by default). */
+  guardrails?: GuardrailEngine;
+  /** Two-tier response cache; absent = caching disabled. */
+  cache?: CacheEngine;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
+/** Responses over this size are streamed through but never cached. */
+const CACHE_BODY_CAP = 2 * 1024 * 1024;
+/** Findings at or above this confidence make a response too sensitive to cache. */
+const CACHE_SENSITIVE_CONFIDENCE = 0.8;
 
 const DROP_RESPONSE_HEADERS = new Set([
   'connection',
@@ -67,7 +90,7 @@ async function handleProxy(
 ): Promise<void> {
   const started = Date.now();
   const requestId = request.id;
-  const body = (request.body as Buffer | undefined) ?? Buffer.alloc(0);
+  let body = (request.body as Buffer | undefined) ?? Buffer.alloc(0);
 
   let parsed: Record<string, unknown> = {};
   try {
@@ -108,19 +131,98 @@ async function handleProxy(
       .send({ type: 'error', error: { type: 'permission_error', message: 'not permitted' } });
     return;
   }
+  const provider0 = candidates[0]?.provider ?? 'unknown';
+
+  // --- guardrails (input): audit by default; block / mask / redact per policy ---
+  const engine = route.guardrails ?? ctx.guardrails;
+  let inputFindings = 0;
+  let guardrailAction: string | undefined;
+  let vault: TokenVault | undefined;
+  let inputMasked = false;
+  if (engine) {
+    const gr = await engine.inspectInput(body.toString('utf8'));
+    inputFindings = gr.summary.total;
+    if (gr.blocked) {
+      await ctx.audit.append({
+        orgId: principal.scope.orgId,
+        actor: principal.id,
+        action: 'guardrail.blocked',
+        target: provider0,
+        payload: {
+          direction: 'input',
+          reason: gr.blockedReason,
+          categories: gr.summary.categories,
+        },
+      });
+      ctx.telemetry.recordRequest({
+        provider: provider0,
+        requestModel: requestedModel,
+        responseModel: requestedModel,
+        route: candidates[0]?.upstreamPath ?? '',
+        statusCode: 403,
+        status: 'error',
+        inputTokens: 0,
+        outputTokens: 0,
+        costMicroUsd: 0,
+        streamed: false,
+        startedAtMs: started,
+        guardrailInputFindings: inputFindings,
+        guardrailAction: 'block',
+      });
+      await reply.code(403).send({
+        type: 'error',
+        error: { type: 'guardrail_blocked', message: gr.blockedReason ?? 'blocked by guardrail' },
+      });
+      return;
+    }
+    if (gr.transformedText !== undefined) {
+      body = Buffer.from(gr.transformedText, 'utf8');
+      inputMasked = true;
+      guardrailAction = gr.vault ? 'mask' : 'redact';
+      vault = gr.vault;
+    }
+  }
+
+  // --- cache lookup (before budget: a hit consumes no budget and no upstream) ---
+  const cacheOn =
+    ctx.cache !== undefined &&
+    route.cacheable !== false &&
+    !inputMasked &&
+    !cacheControlHas(request, 'no-cache');
+  let cacheReq: CacheableRequest | undefined;
+  let cacheLookup: CacheLookup | undefined;
+  if (cacheOn && ctx.cache) {
+    cacheReq = {
+      scope: principal.scope.workspaceId,
+      provider: provider0,
+      model: requestedModel,
+      path: route.clientPaths[0] ?? '',
+      body,
+      variant: headerValue(request, 'anthropic-beta'),
+    };
+    cacheLookup = await ctx.cache.lookup(cacheReq);
+    if (cacheLookup.response) {
+      await serveFromCache(
+        ctx,
+        route,
+        reply,
+        request,
+        principal,
+        provider0,
+        requestedModel,
+        cacheLookup,
+        started,
+      );
+      return;
+    }
+  }
 
   // --- budget: reserve worst-case at admission (hard cap, TOCTOU-safe) ---
   const maxOutput =
     numField(parsed['max_tokens']) ??
     numField(parsed['max_output_tokens']) ??
     DEFAULT_MAX_OUTPUT_TOKENS;
-  const worstProvider = candidates[0]?.provider ?? 'unknown';
-  const worstCase = estimateWorstCaseMicroUsd(
-    worstProvider,
-    requestedModel,
-    body.length,
-    maxOutput,
-  );
+  const worstCase = estimateWorstCaseMicroUsd(provider0, requestedModel, body.length, maxOutput);
   let reserved = false;
   if (worstCase > 0) {
     const decision = await ctx.budgets.reserve(principal.scope.workspaceId, requestId, worstCase);
@@ -133,7 +235,7 @@ async function handleProxy(
         orgId: principal.scope.orgId,
         actor: principal.id,
         action: 'budget.rejected',
-        target: worstProvider,
+        target: provider0,
         payload: {
           model: requestedModel,
           capMicroUsd: decision.capMicroUsd,
@@ -142,7 +244,7 @@ async function handleProxy(
         },
       });
       ctx.telemetry.recordRequest({
-        provider: worstProvider,
+        provider: provider0,
         requestModel: requestedModel,
         responseModel: requestedModel,
         route: candidates[0]?.upstreamPath ?? '',
@@ -153,6 +255,7 @@ async function handleProxy(
         costMicroUsd: 0,
         streamed: false,
         startedAtMs: started,
+        guardrailInputFindings: engine ? inputFindings : undefined,
       });
       await reply
         .code(402)
@@ -200,12 +303,10 @@ async function handleProxy(
   }
 
   const streamed = served?.alwaysStream === true || parsed['stream'] === true;
-  const provider = served?.provider ?? candidates[0]?.provider ?? 'unknown';
+  const provider = served?.provider ?? provider0;
 
   const parserSse = new SSEParser();
   const usage = route.createExtractor();
-  const jsonChunks: Buffer[] = [];
-  let jsonBytes = 0;
   let statusCode = upstream?.statusCode ?? 502;
   let status: RequestStatus = controller.signal.aborted
     ? 'aborted'
@@ -213,6 +314,26 @@ async function handleProxy(
       ? 'ok'
       : 'error';
   let settled = false;
+
+  // Output guardrails: a windowed audit scanner (never mutates) + an optional
+  // detokenizer that restores masked values in the client-bound stream. Output
+  // block/redact enforcement requires buffering, so it applies to non-streamed
+  // responses only; streamed output guardrails are audit.
+  const outScanner = engine ? new StreamingScanner(engine.combinedDetector()) : undefined;
+  const detok = vault ? new StreamingReplacer(vault.entries()) : undefined;
+  const decoder = outScanner || detok ? new StringDecoder('utf8') : undefined;
+  const outputEnforcing = engine !== undefined && engine.outputPolicy.action !== 'audit';
+  const bufferOutput = outputEnforcing && !streamed && statusCode < 400;
+
+  // Capture the full response when we need it whole: non-streamed metering,
+  // buffered enforcement, or a cacheable miss we intend to store.
+  const storeCache =
+    cacheOn && cacheLookup?.status === 'miss' && !outputEnforcing && statusCode < 400;
+  const captureFull = !streamed || bufferOutput || storeCache;
+  const fullChunks: Buffer[] = [];
+  let fullBytes = 0;
+  let captureOverflow = false;
+  let outputEnforced: OutputInspection | undefined;
 
   const teardown = async (): Promise<void> => {
     if (settled) return;
@@ -223,6 +344,15 @@ async function handleProxy(
     const cost = computeCost(provider, meteredModel, n);
     const costMicroUsd = toMicroUsd(cost.totalUsd);
     const createdAt = new Date();
+
+    // Output guardrail findings: from the buffered enforcement pass, or the
+    // streaming audit scanner, filtered to what the output policy cares about.
+    const outFindings = bufferOutput
+      ? (outputEnforced?.findings ?? [])
+      : outScanner && engine
+        ? filterByPolicy(outScanner.findings(), engine.outputPolicy)
+        : [];
+    const outputSensitive = outFindings.some((f) => f.confidence >= CACHE_SENSITIVE_CONFIDENCE);
 
     try {
       if (n.seen) {
@@ -269,11 +399,45 @@ async function handleProxy(
           inputTokens: cost.totalInputTokens,
           outputTokens: cost.outputTokens,
           costMicroUsd,
+          guardrailInputFindings: inputFindings,
+          guardrailOutputFindings: outFindings.length,
+          cache: cacheLookup?.status ?? 'bypass',
         },
       });
       // Commit actual spend, refunding the reservation's worst-case remainder.
       if (reserved) {
         await ctx.budgets.commit(principal.scope.workspaceId, requestId, costMicroUsd);
+      }
+      // Persist to cache — only clean, non-sensitive, non-truncated 2xx bodies.
+      if (
+        storeCache &&
+        ctx.cache &&
+        cacheReq &&
+        cacheLookup &&
+        status === 'ok' &&
+        statusCode < 400 &&
+        !captureOverflow &&
+        !outputSensitive &&
+        !cacheControlHas(request, 'no-store') &&
+        fullChunks.length > 0
+      ) {
+        const full = Buffer.concat(fullChunks);
+        if (full.length <= CACHE_BODY_CAP) {
+          await ctx.cache.store(
+            cacheReq,
+            {
+              statusCode,
+              headers: filterResponseHeaders(upstream?.headers ?? {}),
+              body: full,
+              streamed,
+              model: meteredModel,
+              inputTokens: cost.totalInputTokens,
+              outputTokens: cost.outputTokens,
+              createdAtMs: Date.now(),
+            },
+            cacheLookup,
+          );
+        }
       }
     } catch (err) {
       request.log.error({ err }, 'metering/audit teardown failed');
@@ -292,6 +456,10 @@ async function handleProxy(
       streamed,
       stopReason: n.stopReason,
       startedAtMs: started,
+      cacheStatus: cacheLookup?.status ?? 'bypass',
+      guardrailInputFindings: engine ? inputFindings : undefined,
+      guardrailOutputFindings: engine ? outFindings.length : undefined,
+      guardrailAction: guardrailAction ?? (outputEnforced?.blocked ? 'block' : undefined),
     });
   };
 
@@ -310,49 +478,109 @@ async function handleProxy(
 
   // Take over the raw socket: raw byte fidelity + guaranteed teardown.
   reply.hijack();
-  reply.raw.writeHead(statusCode, {
-    ...filterResponseHeaders(upstream.headers),
-    'x-gulley-request-id': requestId,
-    'x-gulley-target': served.name,
-  });
+  if (!bufferOutput) {
+    reply.raw.writeHead(statusCode, {
+      ...filterResponseHeaders(upstream.headers),
+      'x-gulley-request-id': requestId,
+      'x-gulley-target': served.name,
+      'x-gulley-cache': cacheLookup?.status ?? 'bypass',
+    });
+  }
 
+  const servedTarget = served;
+  const upstreamHeaders = upstream.headers;
   const upstreamBody = upstream.body;
+
   upstreamBody.on('data', (chunk: Buffer) => {
-    try {
-      if (!reply.raw.writableEnded) reply.raw.write(chunk);
-    } catch {
-      controller.abort();
-      return;
+    if (captureFull && !captureOverflow) {
+      if (fullBytes + chunk.length <= JSON_PARSE_CAP) {
+        fullChunks.push(chunk);
+        fullBytes += chunk.length;
+      } else {
+        captureOverflow = true;
+      }
     }
+
+    let text: string | undefined;
+    if (decoder) {
+      text = decoder.write(chunk);
+      if (outScanner && text) outScanner.push(text);
+    }
+
     if (streamed) {
       try {
-        usage.ingestSse(parserSse.push(chunk.toString('utf8')));
+        usage.ingestSse(parserSse.push(text ?? chunk.toString('utf8')));
       } catch {
         /* metering is best-effort */
       }
-    } else if (jsonBytes < JSON_PARSE_CAP) {
-      jsonChunks.push(chunk);
-      jsonBytes += chunk.length;
+    }
+
+    if (bufferOutput) return; // hold bytes; enforce + write once at end
+
+    let outBuf = chunk;
+    if (detok && text !== undefined) outBuf = Buffer.from(detok.push(text), 'utf8');
+    try {
+      if (!reply.raw.writableEnded) reply.raw.write(outBuf);
+    } catch {
+      controller.abort();
     }
   });
 
   upstreamBody.on('end', () => {
+    const tail = decoder ? decoder.end() : '';
+    if (tail && outScanner) outScanner.push(tail);
+
     if (streamed) {
       try {
+        if (tail) usage.ingestSse(parserSse.push(tail));
         usage.ingestSse(parserSse.push('\n\n'));
       } catch {
         /* best-effort */
       }
-    } else if (jsonBytes > 0 && jsonBytes < JSON_PARSE_CAP) {
+    } else if (fullBytes > 0 && !captureOverflow) {
       try {
-        usage.ingestJson(
-          JSON.parse(Buffer.concat(jsonChunks).toString('utf8')) as Record<string, unknown>,
-        );
+        usage.ingestJson(JSON.parse(Buffer.concat(fullChunks).toString('utf8')));
       } catch {
         /* unparseable body — still forwarded verbatim */
       }
     }
-    if (!reply.raw.writableEnded) reply.raw.end();
+
+    if (bufferOutput && engine) {
+      // Enforce the output policy on the whole (non-streamed) body, then write.
+      const text = Buffer.concat(fullChunks).toString('utf8');
+      const out = engine.inspectOutputText(text);
+      outputEnforced = out;
+      const bodyOut = out.blocked
+        ? Buffer.from(
+            JSON.stringify({
+              type: 'error',
+              error: { type: 'guardrail_blocked', message: 'response withheld by guardrail' },
+            }),
+          )
+        : Buffer.from(out.transformedText ?? text, 'utf8');
+      if (!reply.raw.writableEnded) {
+        reply.raw.writeHead(statusCode, {
+          ...filterResponseHeaders(upstreamHeaders),
+          'content-type': 'application/json',
+          'x-gulley-request-id': requestId,
+          'x-gulley-target': servedTarget.name,
+          'x-gulley-cache': 'bypass',
+          'x-gulley-guardrail': out.blocked
+            ? 'output-blocked'
+            : out.transformedText
+              ? 'output-redacted'
+              : 'audit',
+        });
+        reply.raw.write(bodyOut);
+        reply.raw.end();
+      }
+    } else {
+      if (detok) {
+        const rest = detok.flush();
+        if (rest && !reply.raw.writableEnded) reply.raw.write(Buffer.from(rest, 'utf8'));
+      }
+      if (!reply.raw.writableEnded) reply.raw.end();
+    }
     void teardown();
   });
 
@@ -361,6 +589,85 @@ async function handleProxy(
     request.log.error({ err }, 'upstream stream error');
     if (!reply.raw.writableEnded) reply.raw.end();
     void teardown();
+  });
+}
+
+/** Replay a cached response verbatim and record a $0 (no-upstream) request. */
+async function serveFromCache(
+  ctx: GatewayContext,
+  route: ProviderRoute,
+  reply: FastifyReply,
+  request: FastifyRequest,
+  principal: Principal,
+  provider: string,
+  requestModel: string,
+  lookup: CacheLookup,
+  started: number,
+): Promise<void> {
+  const cached = lookup.response;
+  if (!cached) return;
+  const requestId = request.id;
+
+  reply.hijack();
+  reply.raw.writeHead(cached.statusCode, {
+    ...filterResponseHeaders(cached.headers),
+    'x-gulley-request-id': requestId,
+    'x-gulley-target': `cache:${lookup.status}`,
+    'x-gulley-cache': lookup.status,
+    'cache-status': `Gulley; hit`,
+  });
+  if (!reply.raw.writableEnded) {
+    reply.raw.write(cached.body);
+    reply.raw.end();
+  }
+
+  const createdAt = new Date();
+  try {
+    await ctx.requestLog.write({
+      requestId,
+      principalId: principal.id,
+      workspaceId: principal.scope.workspaceId,
+      provider,
+      model: cached.model,
+      route: route.clientPaths[0] ?? '',
+      statusCode: cached.statusCode,
+      status: 'ok',
+      streamed: cached.streamed,
+      inputTokens: cached.inputTokens,
+      outputTokens: cached.outputTokens,
+      costMicroUsd: 0,
+      latencyMs: Date.now() - started,
+      createdAt,
+    });
+    await ctx.audit.append({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'proxy.cache_hit',
+      target: provider,
+      payload: {
+        provider,
+        model: cached.model,
+        cache: lookup.status,
+        statusCode: cached.statusCode,
+      },
+    });
+  } catch (err) {
+    request.log.error({ err }, 'cache-hit teardown failed');
+  }
+
+  ctx.telemetry.recordRequest({
+    provider,
+    requestModel,
+    responseModel: cached.model,
+    route: route.clientPaths[0] ?? '',
+    statusCode: cached.statusCode,
+    status: 'ok',
+    inputTokens: cached.inputTokens,
+    outputTokens: cached.outputTokens,
+    costMicroUsd: 0,
+    streamed: cached.streamed,
+    startedAtMs: started,
+    cacheStatus: lookup.status,
   });
 }
 
@@ -377,6 +684,11 @@ function bearerToken(request: FastifyRequest): string | undefined {
   const auth = headerValue(request, 'authorization');
   if (auth && auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
   return undefined;
+}
+
+function cacheControlHas(request: FastifyRequest, directive: string): boolean {
+  const cc = headerValue(request, 'cache-control');
+  return cc !== undefined && cc.toLowerCase().includes(directive);
 }
 
 function filterResponseHeaders(

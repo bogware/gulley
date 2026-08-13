@@ -10,6 +10,7 @@ import {
   timestamp,
   uniqueIndex,
   uuid,
+  vector,
 } from 'drizzle-orm/pg-core';
 
 // The org/workspace/project spine. Single-tenant today; these boundaries are
@@ -144,6 +145,50 @@ export const requestLog = pgTable(
     index('request_log_workspace_idx').on(t.workspaceId),
     index('request_log_created_idx').on(t.createdAt),
   ],
+);
+
+// Two-tier response cache. `cache_entry` is the exact tier — the full response
+// bytes, replayed verbatim on a key hit. Body is base64 text so binary SSE
+// survives the round-trip. Scope is carried for partition-scoped eviction.
+export const cacheEntry = pgTable(
+  'cache_entry',
+  {
+    key: text('key').primaryKey(),
+    scope: text('scope').notNull(),
+    provider: text('provider').notNull().default(''),
+    model: text('model').notNull(),
+    statusCode: integer('status_code').notNull(),
+    streamed: boolean('streamed').notNull().default(false),
+    headers: jsonb('headers')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    body: text('body').notNull(),
+    inputTokens: bigint('input_tokens', { mode: 'number' }).notNull().default(0),
+    outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('cache_entry_scope_idx').on(t.scope),
+    index('cache_entry_expires_idx').on(t.expiresAt),
+  ],
+);
+
+// Semantic tier: the embedding of a cached request. Primary key equals the
+// exact-cache key, so a nearest-neighbor match resolves straight to a
+// cache_entry. Requires pgvector — migration 0003 adds `CREATE EXTENSION vector`
+// and an HNSW cosine index (which drizzle-kit cannot emit on its own).
+export const semanticVector = pgTable(
+  'semantic_vector',
+  {
+    key: text('key')
+      .primaryKey()
+      .references(() => cacheEntry.key, { onDelete: 'cascade' }),
+    scope: text('scope').notNull(),
+    embedding: vector('embedding', { dimensions: 256 }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('semantic_vector_scope_idx').on(t.scope)],
 );
 
 // Per-workspace spend cap (micro-USD). period_seconds null = lifetime cap.

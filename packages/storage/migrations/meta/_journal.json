@@ -22,6 +22,13 @@
       "when": 1786588409820,
       "tag": "0002_dazzling_rawhide_kid",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786590274889,
+      "tag": "0003_cooing_scarlet_spider",
+      "breakpoints": true
     }
   ]
 }

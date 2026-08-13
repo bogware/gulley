@@ -72,12 +72,18 @@ importers:
       '@gulley/budget':
         specifier: workspace:*
         version: link:../../packages/budget
+      '@gulley/cache':
+        specifier: workspace:*
+        version: link:../../packages/cache
       '@gulley/core':
         specifier: workspace:*
         version: link:../../packages/core
       '@gulley/cost':
         specifier: workspace:*
         version: link:../../packages/cost
+      '@gulley/guardrails':
+        specifier: workspace:*
+        version: link:../../packages/guardrails
       '@gulley/pipeline':
         specifier: workspace:*
         version: link:../../packages/pipeline
@@ -179,6 +185,18 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.20.1)
 
+  packages/cache:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
   packages/core:
     dependencies:
       zod:
@@ -200,6 +218,18 @@ importers:
       '@gulley/core':
         specifier: workspace:*
         version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/guardrails:
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
@@ -235,6 +265,9 @@ importers:
       '@gulley/cost':
         specifier: workspace:*
         version: link:../cost
+      '@gulley/guardrails':
+        specifier: workspace:*
+        version: link:../guardrails
       undici:
         specifier: ^6.21.0
         version: 6.28.0
@@ -270,6 +303,9 @@ importers:
       '@gulley/auth':
         specifier: workspace:*
         version: link:../auth
+      '@gulley/cache':
+        specifier: workspace:*
+        version: link:../cache
       '@gulley/core':
         specifier: workspace:*
         version: link:../core

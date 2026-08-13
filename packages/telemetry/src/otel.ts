@@ -18,6 +18,13 @@ export interface RequestSpanData {
   stopReason?: string | null;
   /** Epoch ms when the request started, so the span reflects real latency. */
   startedAtMs: number;
+  /** Cache tier outcome: hit-exact | hit-semantic | miss | bypass. */
+  cacheStatus?: string;
+  /** Guardrail finding counts (structured — never the matched content). */
+  guardrailInputFindings?: number;
+  guardrailOutputFindings?: number;
+  /** The enforcing action taken, if any: block | mask | redact. */
+  guardrailAction?: string;
 }
 
 export interface Telemetry {
@@ -86,6 +93,14 @@ export function initTelemetry(opts: TelemetryOptions): Telemetry {
       if (data.stopReason) {
         span.setAttribute('gen_ai.response.finish_reasons', [data.stopReason]);
       }
+      if (data.cacheStatus) span.setAttribute('gulley.cache.status', data.cacheStatus);
+      if (data.guardrailInputFindings !== undefined) {
+        span.setAttribute('gulley.guardrail.input.findings', data.guardrailInputFindings);
+      }
+      if (data.guardrailOutputFindings !== undefined) {
+        span.setAttribute('gulley.guardrail.output.findings', data.guardrailOutputFindings);
+      }
+      if (data.guardrailAction) span.setAttribute('gulley.guardrail.action', data.guardrailAction);
       if (data.status !== 'ok') {
         span.setStatus({ code: SpanStatusCode.ERROR, message: data.status });
       }

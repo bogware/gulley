@@ -8,19 +8,93 @@ import {
   type UpstreamCredential,
 } from '@gulley/providers';
 import { InMemoryBudgetStore, RedisBudgetStore } from '@gulley/budget';
+import {
+  CacheEngine,
+  type EmbeddingProvider,
+  type ExactCacheStore,
+  InMemoryExactCache,
+  InMemoryVectorIndex,
+  OpenAIEmbeddingProvider,
+  type VectorIndex,
+} from '@gulley/cache';
+import { auditOnlyPolicies, GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { CircuitBreaker } from '@gulley/routing';
 import {
   createBudgetCapResolver,
   createDatabase,
   createRedisClient,
+  type Database,
   PostgresAuditSink,
+  PostgresExactCache,
   PostgresKeyStore,
   PostgresLedger,
   PostgresRequestLog,
+  PostgresVectorIndex,
+  RedisExactCache,
+  RedisVectorIndex,
 } from '@gulley/storage';
 import { initTelemetry } from '@gulley/telemetry';
 import type { Config } from './config';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
+
+/** Native guardrail engine (audit-only default). Per-route policy overrides live
+ *  on the route; this is the global default applied to every proxied request. */
+export function buildGuardrails(config: Config): GuardrailEngine | undefined {
+  if (!config.GUARDRAILS_ENABLED) return undefined;
+  return new GuardrailEngine(
+    [new NativeDetector({ entropy: config.GUARDRAILS_ENTROPY })],
+    auditOnlyPolicies(),
+  );
+}
+
+/** Assemble the two-tier cache from config: pluggable exact store + optional
+ *  semantic tier (embeddings + vector index). pgvector is the vector default. */
+export function buildCache(config: Config, db: Database): CacheEngine {
+  let exact: ExactCacheStore;
+  switch (config.CACHE_EXACT_BACKEND) {
+    case 'memory':
+      exact = new InMemoryExactCache();
+      break;
+    case 'redis':
+      if (!config.REDIS_CACHE_URL)
+        throw new Error('REDIS_CACHE_URL required for the redis exact cache');
+      exact = new RedisExactCache(createRedisClient(config.REDIS_CACHE_URL));
+      break;
+    default:
+      exact = new PostgresExactCache(db);
+  }
+
+  let semantic: { embed: EmbeddingProvider; index: VectorIndex; threshold: number } | undefined;
+  if (config.CACHE_SEMANTIC_ENABLED) {
+    if (!config.EMBEDDINGS_API_KEY)
+      throw new Error('EMBEDDINGS_API_KEY required for the semantic cache');
+    const embed = new OpenAIEmbeddingProvider({
+      apiKey: config.EMBEDDINGS_API_KEY,
+      model: config.EMBEDDINGS_MODEL,
+      dimensions: config.EMBEDDINGS_DIMENSIONS,
+      baseUrl: config.EMBEDDINGS_BASE_URL,
+    });
+    let index: VectorIndex;
+    switch (config.CACHE_VECTOR_BACKEND) {
+      case 'memory':
+        index = new InMemoryVectorIndex();
+        break;
+      case 'redis':
+        if (!config.REDIS_VECTOR_URL)
+          throw new Error('REDIS_VECTOR_URL required for the redis vector index');
+        index = new RedisVectorIndex(
+          createRedisClient(config.REDIS_VECTOR_URL),
+          config.EMBEDDINGS_DIMENSIONS,
+        );
+        break;
+      default:
+        index = new PostgresVectorIndex(db);
+    }
+    semantic = { embed, index, threshold: config.CACHE_SIMILARITY_THRESHOLD };
+  }
+
+  return new CacheEngine({ exact, semantic, ttlSeconds: config.CACHE_TTL_SECONDS });
+}
 
 function anthropicCredential(key: string): UpstreamCredential {
   // sk-ant-... API keys use x-api-key; OAuth / enterprise tokens use bearer.
@@ -178,5 +252,7 @@ export function createProductionContext(config: Config): GatewayContext {
     breaker: new CircuitBreaker(),
     budgets,
     telemetry,
+    guardrails: buildGuardrails(config),
+    cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,
   };
 }

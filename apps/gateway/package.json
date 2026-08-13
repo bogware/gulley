@@ -14,6 +14,9 @@
     "live:translate": "tsx src/live-check.ts --provider translate",
     "budget:check": "tsx src/budget-check.ts",
     "otel:check": "tsx src/otel-check.ts",
+    "cache:check": "tsx src/cache-check.ts",
+    "guardrail:check": "tsx src/guardrail-check.ts",
+    "bedrock-guardrail:check": "tsx src/bedrock-guardrail-check.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"
@@ -21,8 +24,10 @@
   "dependencies": {
     "@gulley/auth": "workspace:*",
     "@gulley/budget": "workspace:*",
+    "@gulley/cache": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
+    "@gulley/guardrails": "workspace:*",
     "@gulley/pipeline": "workspace:*",
     "@gulley/providers": "workspace:*",
     "@gulley/routing": "workspace:*",
