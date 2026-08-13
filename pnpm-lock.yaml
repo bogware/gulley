@@ -38,6 +38,15 @@ importers:
       '@gulley/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@gulley/egress':
+        specifier: workspace:*
+        version: link:../../packages/egress
+      '@gulley/pipeline':
+        specifier: workspace:*
+        version: link:../../packages/pipeline
+      '@gulley/rbac':
+        specifier: workspace:*
+        version: link:../../packages/rbac
       '@gulley/storage':
         specifier: workspace:*
         version: link:../../packages/storage
@@ -158,6 +167,9 @@ importers:
       '@gulley/core':
         specifier: workspace:*
         version: link:../core
+      '@gulley/rbac':
+        specifier: workspace:*
+        version: link:../rbac
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
@@ -229,6 +241,18 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.20.1)
 
+  packages/egress:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
   packages/guardrails:
     devDependencies:
       '@types/node':
@@ -243,6 +267,9 @@ importers:
 
   packages/pipeline:
     dependencies:
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
       '@gulley/cost':
         specifier: workspace:*
         version: link:../cost
@@ -271,6 +298,22 @@ importers:
       undici:
         specifier: ^6.21.0
         version: 6.28.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/rbac:
+    dependencies:
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

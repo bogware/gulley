@@ -1,0 +1,89 @@
+import { resolveAdmin } from '@gulley/auth';
+import type { AdminPrincipal, Permission, ScopeRef } from '@gulley/rbac';
+import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { ControlContext } from './context';
+
+export function bearerToken(request: FastifyRequest): string | undefined {
+  const raw = request.headers['authorization'];
+  const auth = Array.isArray(raw) ? raw[0] : raw;
+  if (auth && auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
+  return undefined;
+}
+
+type AdminHandler = (
+  request: FastifyRequest,
+  reply: FastifyReply,
+  admin: AdminPrincipal,
+) => Promise<unknown>;
+
+/** Wrap a handler so it only runs for a resolved admin identity; a generic 401
+ *  otherwise (the control surface never falls through to another auth mode). */
+export function adminRoute(ctx: ControlContext, handler: AdminHandler) {
+  return async (request: FastifyRequest, reply: FastifyReply): Promise<unknown> => {
+    const res = await resolveAdmin(bearerToken(request), ctx.resolverDeps);
+    if (!res.ok) {
+      return reply
+        .code(401)
+        .send({ error: { type: 'authentication_error', message: 'invalid credentials' } });
+    }
+    return handler(request, reply, res.value);
+  };
+}
+
+export interface AuditedWriteArgs<T> {
+  perm: Permission;
+  at: ScopeRef;
+  action: string;
+  target: string;
+  diff: Record<string, unknown>;
+  mutate: () => T | Promise<T>;
+}
+
+/** Permission-check (deny by default) → mutate → append a hash-chained audit
+ *  row. In-memory here; the Postgres path runs mutate + appendTx in one tx. */
+export async function auditedWrite<T>(
+  ctx: ControlContext,
+  admin: AdminPrincipal,
+  args: AuditedWriteArgs<T>,
+): Promise<{ ok: true; value: T } | { ok: false }> {
+  if (!(await ctx.access.can(admin, args.perm, args.at))) return { ok: false };
+  const value = await args.mutate();
+  await ctx.audit.append({
+    orgId: args.at.orgId ?? null,
+    actor: admin.subject,
+    action: args.action,
+    target: args.target,
+    payload: args.diff,
+  });
+  return { ok: true, value };
+}
+
+export function forbidden(reply: FastifyReply): FastifyReply {
+  return reply.code(403).send({ error: { type: 'permission_error', message: 'forbidden' } });
+}
+
+export function notFound(reply: FastifyReply, what: string): FastifyReply {
+  return reply.code(404).send({ error: { type: 'not_found', message: `${what} not found` } });
+}
+
+/** Resolve the scope of a workspace from the parent chain (never the request
+ *  body), so a caller cannot forge an orgId to escape RBAC. */
+export function scopeForWorkspace(ctx: ControlContext, workspaceId: string): ScopeRef | undefined {
+  const ws = ctx.workspaces.get(workspaceId);
+  if (!ws) return undefined;
+  return { orgId: ws.orgId, workspaceId: ws.id };
+}
+
+export function scopeForProvider(ctx: ControlContext, providerId: string): ScopeRef | undefined {
+  const provider = ctx.providers.get(providerId);
+  if (!provider) return undefined;
+  return scopeForWorkspace(ctx, provider.workspaceId);
+}
+
+export function body(request: FastifyRequest): Record<string, unknown> {
+  return (request.body ?? {}) as Record<string, unknown>;
+}
+
+export function str(v: unknown): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined;
+}

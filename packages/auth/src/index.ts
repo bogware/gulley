@@ -3,3 +3,5 @@ export * from './virtual-key';
 export * from './key-store';
 export * from './resolver';
 export * from './errors';
+export * from './admin-session';
+export * from './admin-resolver';

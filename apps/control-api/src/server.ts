@@ -1,8 +1,10 @@
 import { GULLEY_VERSION } from '@gulley/core';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config';
+import type { ControlContext } from './context';
+import { registerAdminRoutes } from './routes';
 
-export function buildServer(config: Config): FastifyInstance {
+export function buildServer(config: Config, ctx?: ControlContext): FastifyInstance {
   const app = Fastify({
     trustProxy: true,
     logger: {
@@ -24,10 +26,10 @@ export function buildServer(config: Config): FastifyInstance {
     service: 'control-api',
     version: GULLEY_VERSION,
   }));
-
-  app.get('/ready', async () => ({ status: 'ready' }));
-
+  app.get('/ready', async () => ({ status: ctx ? 'ready' : 'degraded' }));
   app.get('/', async () => ({ name: 'gulley-control-api', version: GULLEY_VERSION }));
+
+  if (ctx) registerAdminRoutes(app, ctx);
 
   return app;
 }

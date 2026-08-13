@@ -13,7 +13,8 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@gulley/core": "workspace:*"
+    "@gulley/core": "workspace:*",
+    "@gulley/rbac": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

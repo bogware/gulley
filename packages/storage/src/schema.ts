@@ -191,6 +191,163 @@ export const semanticVector = pgTable(
   (t) => [index('semantic_vector_scope_idx').on(t.scope)],
 );
 
+// --- M5.1 control-plane / RBAC ---------------------------------------------
+
+// Admin users (Entra oid, or a bootstrap subject). Distinct from data-plane keys.
+export const adminUser = pgTable(
+  'admin_user',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    subject: text('subject').notNull(),
+    displayName: text('display_name').notNull(),
+    email: text('email'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('admin_user_subject_idx').on(t.subject)],
+);
+
+// A role granted at a scope. org_id NULL + workspace_id NULL is a platform grant;
+// the in-memory '*' sentinel is never persisted here.
+export const membership = pgTable(
+  'membership',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => adminUser.id, { onDelete: 'cascade' }),
+    role: text('role').notNull(),
+    orgId: uuid('org_id').references(() => org.id, { onDelete: 'cascade' }),
+    workspaceId: uuid('workspace_id').references(() => workspace.id, { onDelete: 'cascade' }),
+  },
+  (t) => [index('membership_user_idx').on(t.userId)],
+);
+
+// Server-side admin sessions — the revocation record for a gses_ token.
+export const adminSession = pgTable(
+  'admin_session',
+  {
+    jti: uuid('jti').primaryKey(),
+    tokenHash: text('token_hash').notNull(),
+    subject: text('subject').notNull(),
+    revoked: boolean('revoked').notNull().default(false),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  },
+  (t) => [uniqueIndex('admin_session_hash_idx').on(t.tokenHash)],
+);
+
+export const provider = pgTable(
+  'provider',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    kind: text('kind').notNull(),
+    baseUrl: text('base_url'),
+    enabled: boolean('enabled').notNull().default(true),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('provider_workspace_idx').on(t.workspaceId)],
+);
+
+// A reference to a Secrets Manager entry — ARN + version, NEVER the value.
+export const providerCredential = pgTable(
+  'provider_credential',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    providerId: uuid('provider_id')
+      .notNull()
+      .references(() => provider.id, { onDelete: 'cascade' }),
+    secretArn: text('secret_arn').notNull(),
+    secretVersion: text('secret_version').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('provider_credential_provider_idx').on(t.providerId)],
+);
+
+// Workspace-scoped config collections (routes, policies, model aliases, rate
+// limits, guardrails). A jsonb `config` keeps the control plane schema-light;
+// GitOps (M5.3) serializes these generically.
+export const route = pgTable(
+  'route',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    config: jsonb('config')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('route_workspace_idx').on(t.workspaceId)],
+);
+
+export const routePolicy = pgTable(
+  'route_policy',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    config: jsonb('config')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('route_policy_workspace_idx').on(t.workspaceId)],
+);
+
+export const modelAlias = pgTable(
+  'model_alias',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    config: jsonb('config')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('model_alias_workspace_idx').on(t.workspaceId)],
+);
+
+export const rateLimit = pgTable(
+  'rate_limit',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    config: jsonb('config')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('rate_limit_workspace_idx').on(t.workspaceId)],
+);
+
+export const guardrail = pgTable(
+  'guardrail',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    config: jsonb('config')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('guardrail_workspace_idx').on(t.workspaceId)],
+);
+
 // Per-workspace spend cap (micro-USD). period_seconds null = lifetime cap.
 export const budget = pgTable(
   'budget',
