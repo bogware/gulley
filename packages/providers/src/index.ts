@@ -5,3 +5,4 @@ export * from './anthropic';
 export * from './extractors';
 export * from './bedrock-eventstream';
 export * from './bedrock';
+export * from './translate';

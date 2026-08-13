@@ -13,6 +13,7 @@ import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import {
   AnthropicAdapter,
+  AnthropicToOpenAIAdapter,
   AnthropicUsageExtractor,
   AzureAdapter,
   BedrockAdapter,
@@ -78,6 +79,29 @@ function resolveTarget(): Target {
             max_tokens: 16,
             messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
           },
+    };
+  }
+
+  if (provider === 'translate') {
+    // Client speaks Anthropic Messages; OpenAI serves it via translation.
+    return {
+      provider: 'openai',
+      keyVars: ['GULLEY_LIVE_OPENAI_KEY', 'OPENAI_API_KEY'],
+      path: '/v1/messages',
+      upstreamPath: '/v1/chat/completions',
+      adapter: new AnthropicToOpenAIAdapter({
+        inner: new OpenAIAdapter(),
+        targetModel: model ?? 'gpt-4o-mini',
+      }),
+      extractor: () => new AnthropicUsageExtractor(),
+      credential: (k) => ({ scheme: 'bearer', value: k }),
+      clientHeaders: (t) => ({ 'x-api-key': t }),
+      body: {
+        model: 'claude-haiku-4-5',
+        max_tokens: 16,
+        stream: true,
+        messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+      },
     };
   }
 
