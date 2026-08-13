@@ -43,6 +43,13 @@
       "when": 1786595483287,
       "tag": "0005_dazzling_obadiah_stane",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786596140096,
+      "tag": "0006_jittery_matthew_murdock",
+      "breakpoints": true
     }
   ]
 }

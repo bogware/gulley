@@ -9,12 +9,14 @@
     "seed": "tsx src/seed.ts",
     "rbac:check": "tsx src/rbac-check.ts",
     "oauth:check": "tsx src/oauth-check.ts",
+    "config:check": "tsx src/config-check.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
     "@gulley/auth": "workspace:*",
+    "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/egress": "workspace:*",
     "@gulley/oauth": "workspace:*",

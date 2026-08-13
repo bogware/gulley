@@ -4,6 +4,7 @@ import {
   InMemoryAdminSessionStore,
   InMemoryKeyStore,
 } from '@gulley/auth';
+import { type ConfigVersionStore, InMemoryConfigVersionStore } from '@gulley/config';
 import { type AuditSink, GuardedAuditSink, InMemoryAuditSink } from '@gulley/pipeline';
 import { type AccessControl, InMemoryAccessControl } from '@gulley/rbac';
 import type { CollectionKind } from './domain';
@@ -32,6 +33,7 @@ export interface ControlContext {
   audit: AuditSink;
   access: AccessControl;
   sessionStore: AdminSessionStore;
+  configVersions: ConfigVersionStore;
   resolverDeps: AdminResolverDeps;
   /** Verify the underlying audit chain (the sink is guarded, so expose it). */
   verifyAudit: () => { verified: boolean; count: number };
@@ -73,6 +75,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     audit,
     access: new InMemoryAccessControl(),
     sessionStore,
+    configVersions: new InMemoryConfigVersionStore(),
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,
       bootstrapTokenSha256: opts.bootstrapTokenSha256,

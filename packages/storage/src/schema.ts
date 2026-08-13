@@ -434,3 +434,23 @@ export const authCode = pgTable('auth_code', {
   workspaceId: uuid('workspace_id').notNull(),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
 });
+
+// --- M5.3 config / GitOps --------------------------------------------------
+
+// Append-only version log. content_hash is NON-unique so a revert (re-applying
+// earlier content) is allowed. Immutability is enforced in migration 0006.
+export const configVersion = pgTable(
+  'config_version',
+  {
+    version: integer('version').primaryKey(),
+    contentHash: text('content_hash').notNull(),
+    yaml: text('yaml').notNull(),
+    actor: text('actor').notNull(),
+    summary: jsonb('summary')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    auditSeq: bigint('audit_seq', { mode: 'number' }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('config_version_hash_idx').on(t.contentHash)],
+);
