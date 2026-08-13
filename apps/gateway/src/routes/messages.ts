@@ -1,35 +1,42 @@
-import { isErr } from '@gulley/core';
 import {
   type KeyStore,
   resolveVirtualKey,
   scopeAllowsModel,
   scopeAllowsProvider,
 } from '@gulley/auth';
-import { computeAnthropicCost, toMicroUsd } from '@gulley/cost';
+import { computeCost, toMicroUsd } from '@gulley/cost';
+import { isErr } from '@gulley/core';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import {
-  AnthropicUsageAccumulator,
   type ProviderAdapter,
   SSEParser,
   type UpstreamCredential,
+  type UsageExtractor,
 } from '@gulley/providers';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
-export interface GatewayContext {
+/** One provider surface: which client paths it serves, where it forwards, and
+ *  how to authenticate + meter it. */
+export interface ProviderRoute {
+  provider: string;
+  clientPaths: string[];
+  upstreamPath: string;
   adapter: ProviderAdapter;
+  credential: UpstreamCredential;
+  createExtractor: () => UsageExtractor;
+}
+
+export interface GatewayContext {
+  routes: ProviderRoute[];
   keyStore: KeyStore;
   pepper: string;
-  credential: UpstreamCredential;
   ledger: Ledger;
   requestLog: RequestLogSink;
   audit: AuditSink;
 }
 
-const PROVIDER = 'anthropic';
-const ROUTE = '/v1/messages';
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
 
-// Response headers we never pass through — the gateway re-frames the response.
 const DROP_RESPONSE_HEADERS = new Set([
   'connection',
   'keep-alive',
@@ -38,17 +45,17 @@ const DROP_RESPONSE_HEADERS = new Set([
   'content-encoding',
 ]);
 
-export function registerMessagesRoute(app: FastifyInstance, ctx: GatewayContext): void {
-  const handler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
-    handleMessages(ctx, req, reply);
-  // Anthropic-first: base URL at the root serves /v1/messages (drop-in Claude
-  // Code); the /anthropic-namespaced path is the explicit per-provider surface.
-  app.post(ROUTE, handler);
-  app.post('/anthropic/v1/messages', handler);
+export function registerRoutes(app: FastifyInstance, ctx: GatewayContext): void {
+  for (const route of ctx.routes) {
+    const handler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
+      handleProxy(ctx, route, req, reply);
+    for (const path of route.clientPaths) app.post(path, handler);
+  }
 }
 
-async function handleMessages(
+async function handleProxy(
   ctx: GatewayContext,
+  route: ProviderRoute,
   request: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> {
@@ -60,7 +67,7 @@ async function handleMessages(
   try {
     parsed = JSON.parse(body.toString('utf8') || '{}') as Record<string, unknown>;
   } catch {
-    /* leave {} — a malformed body still gets forwarded verbatim */
+    /* malformed body still gets forwarded verbatim */
   }
   const requestedModel = typeof parsed['model'] === 'string' ? parsed['model'] : 'unknown';
   const streamed = parsed['stream'] === true;
@@ -82,7 +89,7 @@ async function handleMessages(
 
   // --- authz: uniform scope check ---
   if (
-    !scopeAllowsProvider(principal.scope, PROVIDER) ||
+    !scopeAllowsProvider(principal.scope, route.provider) ||
     !scopeAllowsModel(principal.scope, requestedModel)
   ) {
     await reply
@@ -93,7 +100,7 @@ async function handleMessages(
 
   const controller = new AbortController();
   const parser = new SSEParser();
-  const usage = new AnthropicUsageAccumulator();
+  const usage = route.createExtractor();
   const jsonChunks: Buffer[] = [];
   let jsonBytes = 0;
 
@@ -105,20 +112,20 @@ async function handleMessages(
     if (settled) return;
     settled = true;
 
-    const u = usage.get();
-    const meteredModel = u.model ?? requestedModel;
-    const cost = computeAnthropicCost(meteredModel, u);
+    const n = usage.normalized();
+    const meteredModel = n.model ?? requestedModel;
+    const cost = computeCost(route.provider, meteredModel, n);
     const costMicroUsd = toMicroUsd(cost.totalUsd);
     const createdAt = new Date();
 
     try {
-      if (usage.hasUsage()) {
+      if (n.seen) {
         await ctx.ledger.record({
           requestId,
           principalId: principal.id,
           orgId: principal.scope.orgId,
           workspaceId: principal.scope.workspaceId,
-          provider: PROVIDER,
+          provider: route.provider,
           model: meteredModel,
           cost,
           costMicroUsd,
@@ -130,9 +137,9 @@ async function handleMessages(
         requestId,
         principalId: principal.id,
         workspaceId: principal.scope.workspaceId,
-        provider: PROVIDER,
+        provider: route.provider,
         model: meteredModel,
-        route: ROUTE,
+        route: route.upstreamPath,
         statusCode,
         status,
         streamed,
@@ -145,10 +152,11 @@ async function handleMessages(
       await ctx.audit.append({
         orgId: principal.scope.orgId,
         actor: principal.id,
-        action: 'proxy.messages',
-        target: PROVIDER,
+        action: 'proxy.request',
+        target: route.provider,
         payload: {
           model: meteredModel,
+          route: route.upstreamPath,
           status,
           statusCode,
           streamed,
@@ -158,7 +166,6 @@ async function handleMessages(
         },
       });
     } catch (err) {
-      // Teardown must never throw into the request lifecycle.
       request.log.error({ err }, 'metering/audit teardown failed');
     }
   };
@@ -173,10 +180,11 @@ async function handleMessages(
 
   let upstream;
   try {
-    upstream = await ctx.adapter.forward({
+    upstream = await route.adapter.forward({
+      path: route.upstreamPath,
       body,
       headers: request.headers,
-      credential: ctx.credential,
+      credential: route.credential,
       signal: controller.signal,
     });
   } catch (err) {
@@ -211,7 +219,7 @@ async function handleMessages(
     }
     if (streamed) {
       try {
-        usage.ingest(parser.push(chunk.toString('utf8')));
+        usage.ingestSse(parser.push(chunk.toString('utf8')));
       } catch {
         /* metering is best-effort and must never disturb the client stream */
       }
@@ -223,11 +231,10 @@ async function handleMessages(
 
   upstream.body.on('end', () => {
     if (streamed) {
-      // Flush any final event that arrived without its terminating blank line.
       try {
-        usage.ingest(parser.push('\n\n'));
+        usage.ingestSse(parser.push('\n\n')); // flush a final event missing its blank line
       } catch {
-        /* metering is best-effort */
+        /* best-effort */
       }
     } else if (jsonBytes > 0 && jsonBytes < JSON_PARSE_CAP) {
       try {

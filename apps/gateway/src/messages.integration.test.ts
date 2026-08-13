@@ -2,7 +2,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
-import { AnthropicAdapter } from '@gulley/providers';
+import { AnthropicAdapter, AnthropicUsageExtractor } from '@gulley/providers';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
 import type { GatewayContext } from './routes/messages';
@@ -69,10 +69,18 @@ function buildContext(store: InMemoryKeyStore): {
   const audit = new InMemoryAuditSink();
   return {
     ctx: {
-      adapter: new AnthropicAdapter({ baseUrl: upstreamUrl }),
+      routes: [
+        {
+          provider: 'anthropic',
+          clientPaths: ['/v1/messages', '/anthropic/v1/messages'],
+          upstreamPath: '/v1/messages',
+          adapter: new AnthropicAdapter({ baseUrl: upstreamUrl }),
+          credential: { scheme: 'x-api-key', value: UPSTREAM_KEY },
+          createExtractor: () => new AnthropicUsageExtractor(),
+        },
+      ],
       keyStore: store,
       pepper: PEPPER,
-      credential: { kind: 'api-key', value: UPSTREAM_KEY },
       ledger,
       requestLog,
       audit,
@@ -147,7 +155,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(requestLog.entries[0]?.statusCode).toBe(200);
 
     expect(audit.rows).toHaveLength(1);
-    expect(audit.rows[0]?.action).toBe('proxy.messages');
+    expect(audit.rows[0]?.action).toBe('proxy.request');
     expect(audit.verify()).toBe(true);
 
     await app.close();

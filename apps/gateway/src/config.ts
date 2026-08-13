@@ -7,12 +7,15 @@ const Env = z.object({
   GATEWAY_PORT: z.coerce.number().int().positive().default(8080),
 
   // Virtual-key pepper (KMS-held in prod). Optional so the server boots for
-  // health checks; the messages route requires it via the production context.
+  // health checks; the proxy routes require it via the production context.
   GULLEY_KEY_PEPPER: z.string().min(1).optional(),
 
-  // Upstream Anthropic credential held centrally by the gateway (v1).
+  // Upstream provider credentials held centrally by the gateway (v1). A provider
+  // route is registered only when its key is present.
   ANTHROPIC_UPSTREAM_API_KEY: z.string().min(1).optional(),
   ANTHROPIC_BASE_URL: z.string().url().default('https://api.anthropic.com'),
+  OPENAI_UPSTREAM_API_KEY: z.string().min(1).optional(),
+  OPENAI_BASE_URL: z.string().url().default('https://api.openai.com'),
 
   DATABASE_URL: z.string().url().optional(),
 });

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { computeAnthropicCost, lookupRate, normalizeModelId, toMicroUsd } from './index';
+import {
+  computeAnthropicCost,
+  computeCost,
+  lookupRate,
+  normalizeModelId,
+  toMicroUsd,
+} from './index';
 
 describe('pricing', () => {
   it('normalizes Bedrock prefixes and dated snapshots to the base model id', () => {
@@ -75,5 +81,51 @@ describe('computeAnthropicCost', () => {
   it('converts USD to micro-dollars for the ledger', () => {
     expect(toMicroUsd(30)).toBe(30_000_000);
     expect(toMicroUsd(0.0000005)).toBe(1);
+  });
+});
+
+describe('computeCost (provider-generic)', () => {
+  it('prices OpenAI usage with the cached-input discount and no cache-write charge', () => {
+    // gpt-4o-mini: $0.15 in / $0.60 out; cached read at 0.5x.
+    const c = computeCost('openai', 'gpt-4o-mini', {
+      inputTokens: 1_000_000,
+      cacheReadTokens: 1_000_000,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      outputTokens: 1_000_000,
+      seen: true,
+    });
+    expect(c.priced).toBe(true);
+    expect(c.inputUsd).toBeCloseTo(0.15, 6);
+    expect(c.cacheReadUsd).toBeCloseTo(0.075, 6);
+    expect(c.cacheWriteUsd).toBe(0);
+    expect(c.outputUsd).toBeCloseTo(0.6, 6);
+    expect(c.totalInputTokens).toBe(2_000_000);
+  });
+
+  it('normalizes OpenAI dated snapshots to the alias', () => {
+    const c = computeCost('openai', 'gpt-4o-mini-2024-07-18', {
+      inputTokens: 1_000_000,
+      cacheReadTokens: 0,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      outputTokens: 0,
+      seen: true,
+    });
+    expect(c.priced).toBe(true);
+    expect(c.inputUsd).toBeCloseTo(0.15, 6);
+  });
+
+  it('meters tokens for an unknown provider', () => {
+    const c = computeCost('mystery', 'x', {
+      inputTokens: 10,
+      cacheReadTokens: 0,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      outputTokens: 5,
+      seen: true,
+    });
+    expect(c.priced).toBe(false);
+    expect(c.outputTokens).toBe(5);
   });
 });

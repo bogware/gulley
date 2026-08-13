@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "tsx src/main.ts",
-    "live:anthropic": "tsx src/live-check.ts",
+    "live": "tsx src/live-check.ts",
+    "live:anthropic": "tsx src/live-check.ts --provider anthropic",
+    "live:openai": "tsx src/live-check.ts --provider openai",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"

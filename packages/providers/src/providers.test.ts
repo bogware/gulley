@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { computeAnthropicCost } from '@gulley/cost';
+import { computeAnthropicCost, computeCost } from '@gulley/cost';
 import { AnthropicUsageAccumulator } from './anthropic-usage';
+import { OpenAIUsageExtractor } from './extractors';
 import { SSEParser } from './sse';
 
 const GOLDEN_SSE = [
@@ -81,5 +82,50 @@ describe('AnthropicUsageAccumulator', () => {
     });
     expect(acc.get().output_tokens).toBe(7);
     expect(acc.get().model).toBe('claude-opus-5');
+  });
+});
+
+const OPENAI_CHAT_SSE = [
+  'data: {"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}',
+  '',
+  'data: {"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+  '',
+  'data: {"model":"gpt-4o-mini-2024-07-18","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":8}}}',
+  '',
+  'data: [DONE]',
+  '',
+  '',
+].join('\n');
+
+const OPENAI_RESPONSES_SSE = [
+  'event: response.completed',
+  'data: {"type":"response.completed","response":{"model":"gpt-4.1-mini","status":"completed","usage":{"input_tokens":30,"output_tokens":7,"input_tokens_details":{"cached_tokens":10}}}}',
+  '',
+  '',
+].join('\n');
+
+describe('OpenAIUsageExtractor', () => {
+  it('extracts chat-completions usage (prompt includes cached) and prices it', () => {
+    const ex = new OpenAIUsageExtractor();
+    ex.ingestSse(new SSEParser().push(OPENAI_CHAT_SSE));
+    const u = ex.normalized();
+    expect(u.seen).toBe(true);
+    expect(u.inputTokens).toBe(12); // 20 prompt - 8 cached
+    expect(u.cacheReadTokens).toBe(8);
+    expect(u.outputTokens).toBe(5);
+    expect(u.stopReason).toBe('stop');
+
+    const cost = computeCost('openai', u.model ?? '', u);
+    expect(cost.priced).toBe(true); // dated snapshot normalized to gpt-4o-mini
+  });
+
+  it('extracts Responses API usage from response.completed', () => {
+    const ex = new OpenAIUsageExtractor();
+    ex.ingestSse(new SSEParser().push(OPENAI_RESPONSES_SSE));
+    const u = ex.normalized();
+    expect(u.inputTokens).toBe(20); // 30 input - 10 cached
+    expect(u.cacheReadTokens).toBe(10);
+    expect(u.outputTokens).toBe(7);
+    expect(u.model).toBe('gpt-4.1-mini');
   });
 });

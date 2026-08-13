@@ -2,12 +2,6 @@ import type { Readable } from 'node:stream';
 import { getGlobalDispatcher, request } from 'undici';
 import type { ForwardRequest, ForwardResponse, ProviderAdapter } from './types';
 
-/** Drain undici's keep-alive connection pool. Call on graceful shutdown (or at
- *  the end of a short-lived script) so the event loop can exit cleanly. */
-export async function closeUpstreamPool(): Promise<void> {
-  await getGlobalDispatcher().close();
-}
-
 const HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
@@ -20,20 +14,36 @@ const HOP_BY_HOP = new Set([
 ]);
 
 // Client auth + framing headers we never forward. The gateway attaches the
-// upstream credential itself, so the client's virtual key never reaches Anthropic.
+// upstream credential itself, so the client's virtual key never reaches upstream.
 const STRIP = new Set(['authorization', 'x-api-key', 'host', 'content-length', 'accept-encoding']);
 
-export interface AnthropicAdapterOptions {
-  /** Upstream base URL; overridden in tests to point at a mock. */
-  baseUrl?: string;
+/** Drain undici's keep-alive connection pool. Call on graceful shutdown (or at
+ *  the end of a short-lived script) so the event loop can exit cleanly. */
+export async function closeUpstreamPool(): Promise<void> {
+  await getGlobalDispatcher().close();
 }
 
-export class AnthropicAdapter implements ProviderAdapter {
-  readonly name = 'anthropic';
-  private readonly baseUrl: string;
+export interface PassthroughAdapterOptions {
+  name: string;
+  baseUrl: string;
+  /** Provider defaults applied when the client didn't send them (e.g. Anthropic's version). */
+  defaultHeaders?: Record<string, string>;
+}
 
-  constructor(opts: AnthropicAdapterOptions = {}) {
-    this.baseUrl = (opts.baseUrl ?? 'https://api.anthropic.com').replace(/\/$/, '');
+/**
+ * Generic streaming passthrough. Forwards the client body verbatim to
+ * `${baseUrl}${path}`, stripping client auth and injecting the gateway's
+ * upstream credential. SSE-safe timeouts (no body timeout; bounded headers).
+ */
+export class PassthroughAdapter implements ProviderAdapter {
+  readonly name: string;
+  private readonly baseUrl: string;
+  private readonly defaultHeaders: Record<string, string>;
+
+  constructor(opts: PassthroughAdapterOptions) {
+    this.name = opts.name;
+    this.baseUrl = opts.baseUrl.replace(/\/$/, '');
+    this.defaultHeaders = opts.defaultHeaders ?? {};
   }
 
   async forward(req: ForwardRequest): Promise<ForwardResponse> {
@@ -44,21 +54,21 @@ export class AnthropicAdapter implements ProviderAdapter {
       if (STRIP.has(key) || HOP_BY_HOP.has(key)) continue;
       headers[key] = Array.isArray(v) ? v.join(', ') : v;
     }
-
-    if (req.credential.kind === 'api-key') {
+    for (const [k, v] of Object.entries(this.defaultHeaders)) {
+      if (!(k in headers)) headers[k] = v;
+    }
+    if (req.credential.scheme === 'x-api-key') {
       headers['x-api-key'] = req.credential.value;
     } else {
       headers['authorization'] = `Bearer ${req.credential.value}`;
     }
-    headers['anthropic-version'] = headers['anthropic-version'] ?? '2023-06-01';
     headers['content-type'] = headers['content-type'] ?? 'application/json';
 
-    const res = await request(`${this.baseUrl}/v1/messages`, {
+    const res = await request(`${this.baseUrl}${req.path}`, {
       method: 'POST',
       headers,
       body: req.body,
       signal: req.signal,
-      // Long, gappy SSE streams: never time out the body; bound only the headers.
       bodyTimeout: 0,
       headersTimeout: 60_000,
     });
@@ -68,5 +78,21 @@ export class AnthropicAdapter implements ProviderAdapter {
       headers: res.headers,
       body: res.body as unknown as Readable,
     };
+  }
+}
+
+export class AnthropicAdapter extends PassthroughAdapter {
+  constructor(opts: { baseUrl?: string } = {}) {
+    super({
+      name: 'anthropic',
+      baseUrl: opts.baseUrl ?? 'https://api.anthropic.com',
+      defaultHeaders: { 'anthropic-version': '2023-06-01' },
+    });
+  }
+}
+
+export class OpenAIAdapter extends PassthroughAdapter {
+  constructor(opts: { baseUrl?: string } = {}) {
+    super({ name: 'openai', baseUrl: opts.baseUrl ?? 'https://api.openai.com' });
   }
 }
