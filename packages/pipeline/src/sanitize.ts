@@ -69,10 +69,20 @@ export function assertNoInlineSecret(value: unknown, path = '$'): void {
     return;
   }
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (SECRET_KEY_RE.test(k) && !isValidSecretRef(v)) {
-      if (typeof v === 'string' && v !== REDACTED) {
-        throw new InlineSecretError(`${path}.${k}`, 'secret-named field holds an inline value');
-      }
+    // A secret-named field must be a SecretRef (or null / the redacted marker) —
+    // an inline STRING *or* a value wrapped in an object/array is rejected, so a
+    // secret can't hide under { apiKey: { current: '...' } } / { password: [...] }.
+    if (
+      SECRET_KEY_RE.test(k) &&
+      !isValidSecretRef(v) &&
+      v !== null &&
+      v !== undefined &&
+      v !== REDACTED
+    ) {
+      throw new InlineSecretError(
+        `${path}.${k}`,
+        'secret-named field must be a SecretRef, not an inline value',
+      );
     }
     assertNoInlineSecret(v, `${path}.${k}`);
   }
@@ -88,7 +98,9 @@ export function redactValue(value: unknown): unknown {
     if (isValidSecretRef(value)) return value;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = SECRET_KEY_RE.test(k) && typeof v !== 'object' ? REDACTED : redactValue(v);
+      // Redact a secret-named field's ENTIRE value (scalar, object, or array)
+      // unless it is a valid SecretRef — closes the non-scalar bypass.
+      out[k] = SECRET_KEY_RE.test(k) && !isValidSecretRef(v) ? REDACTED : redactValue(v);
     }
     return out;
   }

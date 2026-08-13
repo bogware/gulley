@@ -35,6 +35,15 @@ export interface TokenResponse {
   refresh_token: string;
 }
 
+/** Authorizes the consenting admin against the client's tenancy. Returns false
+ *  to deny (deny-by-default). Wired by the control-api consent routes so a viewer
+ *  / out-of-tenant admin cannot broker a data-plane token. */
+export type ConsentGuard = (tenancy: {
+  clientId: string;
+  orgId: string;
+  workspaceId: string;
+}) => Promise<boolean>;
+
 export interface BrokerConfig {
   pepper: string;
   accessTtlMs: number;
@@ -153,11 +162,27 @@ export class BrokerService {
   async deviceApprove(
     userCode: string,
     identity: { subject: string; displayName: string },
+    guard?: ConsentGuard,
   ): Promise<Result<void, OAuthError>> {
     const d = await this.deps.devices.getByUserCode(userCode);
     if (!d) return e('invalid_request');
     if (this.now() >= d.expiresAt) return e('expired_token');
     if (d.status !== 'pending') return e('invalid_request');
+    // Deny-by-default: the consenting admin must be authorized for the client's
+    // tenancy before a data-plane grant can be brokered.
+    if (guard) {
+      const client = await this.deps.clients.get(d.clientId);
+      if (!client) return e('invalid_client');
+      if (
+        !(await guard({
+          clientId: client.clientId,
+          orgId: client.orgId,
+          workspaceId: client.workspaceId,
+        }))
+      ) {
+        return e('access_denied');
+      }
+    }
     await this.deps.devices.update(d.deviceCode, {
       status: 'approved',
       principalId: identity.subject,
@@ -201,14 +226,17 @@ export class BrokerService {
 
   // --- authorization code + PKCE (S256 only) ---
 
-  async authorize(params: {
-    clientId: string;
-    redirectUri: string;
-    state: string;
-    codeChallenge: string;
-    codeChallengeMethod: string;
-    identity: { subject: string; displayName: string };
-  }): Promise<Result<{ code: string; state: string }, OAuthError>> {
+  async authorize(
+    params: {
+      clientId: string;
+      redirectUri: string;
+      state: string;
+      codeChallenge: string;
+      codeChallengeMethod: string;
+      identity: { subject: string; displayName: string };
+    },
+    guard?: ConsentGuard,
+  ): Promise<Result<{ code: string; state: string }, OAuthError>> {
     const client = await this.deps.clients.get(params.clientId);
     if (!client || !client.enabled || !client.grantTypes.includes('authorization_code')) {
       return e('invalid_client');
@@ -216,6 +244,16 @@ export class BrokerService {
     if (params.codeChallengeMethod !== 'S256') return e('invalid_request'); // reject 'plain'
     if (!validateLoopbackRedirect(params.redirectUri, client.redirectAllowlist)) {
       return e('invalid_request');
+    }
+    if (
+      guard &&
+      !(await guard({
+        clientId: client.clientId,
+        orgId: client.orgId,
+        workspaceId: client.workspaceId,
+      }))
+    ) {
+      return e('access_denied');
     }
     const code = randomBytes(24).toString('base64url');
     await this.deps.codes.create({

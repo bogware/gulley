@@ -11,6 +11,7 @@ function applyErrorStatus(kind: string): number {
       return 403;
     case 'stale':
       return 409;
+    case 'validation':
     case 'inline_secret':
     case 'egress':
       return 422;

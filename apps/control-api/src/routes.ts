@@ -21,6 +21,7 @@ import {
   scopeForProvider,
   scopeForWorkspace,
   str,
+  visibleWorkspaceIds,
 } from './admin';
 import type { ControlContext } from './context';
 import type { CollectionKind } from './domain';
@@ -130,9 +131,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   // --- workspaces ---
   app.get(
     '/workspaces',
-    adminRoute(ctx, async (_req, reply, admin) =>
-      reply.send({ workspaces: ctx.workspaces.list(coveredOrgIds(admin)) }),
-    ),
+    adminRoute(ctx, async (_req, reply, admin) => {
+      const visible = visibleWorkspaceIds(ctx, admin);
+      return reply.send({ workspaces: ctx.workspaces.list('*').filter((w) => visible.has(w.id)) });
+    }),
   );
   app.post(
     '/workspaces',
@@ -158,10 +160,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   app.get(
     '/providers',
     adminRoute(ctx, async (_req, reply, admin) => {
-      const covered = coveredOrgIds(admin);
-      const wsIds = covered === '*' ? null : new Set(ctx.workspaces.list(covered).map((w) => w.id));
-      const providers = ctx.providers.all().filter((p) => !wsIds || wsIds.has(p.workspaceId));
-      return reply.send({ providers });
+      const visible = visibleWorkspaceIds(ctx, admin);
+      return reply.send({
+        providers: ctx.providers.all().filter((p) => visible.has(p.workspaceId)),
+      });
     }),
   );
   app.post(
@@ -332,12 +334,8 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     app.get(
       `/${c.path}`,
       adminRoute(ctx, async (_req, reply, admin) => {
-        const covered = coveredOrgIds(admin);
-        const wsIds =
-          covered === '*' ? null : new Set(ctx.workspaces.list(covered).map((w) => w.id));
-        const entities = ctx.collections[c.kind]
-          .all()
-          .filter((e) => !wsIds || wsIds.has(e.workspaceId));
+        const visible = visibleWorkspaceIds(ctx, admin);
+        const entities = ctx.collections[c.kind].all().filter((e) => visible.has(e.workspaceId));
         return reply.send({ entities });
       }),
     );

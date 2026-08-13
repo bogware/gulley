@@ -45,7 +45,10 @@ export async function resolveVirtualKey(
   if (stored.disabled) return err({ reason: 'disabled' });
   if (stored.expiresAt && stored.expiresAt.getTime() <= now) return err({ reason: 'expired' });
 
-  void deps.keyStore.touchLastUsed(stored.id);
+  // Best-effort last-used bookkeeping — MUST NOT reject unhandled: a transient
+  // DB error here would otherwise become an unhandledRejection and, under Node's
+  // default policy, terminate the process (severing every in-flight stream).
+  void deps.keyStore.touchLastUsed(stored.id).catch(() => {});
 
   return ok({
     kind: 'virtual-key',

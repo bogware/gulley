@@ -27,7 +27,13 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     service: 'control-api',
     version: GULLEY_VERSION,
   }));
-  app.get('/ready', async () => ({ status: ctx ? 'ready' : 'degraded' }));
+  app.get('/ready', async (_req, reply) => {
+    if (!ctx) {
+      reply.code(503);
+      return { status: 'degraded' };
+    }
+    return { status: 'ready' };
+  });
   app.get('/', async () => ({ name: 'gulley-control-api', version: GULLEY_VERSION }));
 
   if (ctx) {

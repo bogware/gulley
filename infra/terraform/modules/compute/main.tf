@@ -29,7 +29,7 @@ resource "aws_lb_target_group" "gateway" {
   deregistration_delay = 180 # let in-flight streams drain before dropping the target
 
   health_check {
-    path                = "/health"
+    path                = "/ready" # 503 until a working context is wired
     healthy_threshold   = 2
     unhealthy_threshold = 3
     timeout             = 5
@@ -48,7 +48,7 @@ resource "aws_lb_target_group" "control" {
   deregistration_delay = 60
 
   health_check {
-    path    = "/health"
+    path    = "/ready"
     matcher = "200"
   }
   tags = var.tags
@@ -81,17 +81,30 @@ resource "aws_lb_listener" "https" {
   }
 }
 
-# Control-plane surfaces route to the control-api service by path.
+# Control-plane surfaces route to the control-api service by path. The control-api
+# registers routes at several root prefixes, so they are grouped into rules of up
+# to 5 path patterns each (the ALB per-condition limit). Everything else falls
+# through to the default action (the gateway data plane).
+locals {
+  control_path_groups = [
+    ["/admin/*", "/oauth/*", "/config/*", "/audit/*", "/memberships*"],
+    ["/orgs*", "/workspaces*", "/projects*", "/providers*", "/keys*"],
+    ["/routes*", "/policies*", "/budgets*", "/rate-limits*", "/guardrails*"],
+    ["/model-aliases*"],
+  ]
+}
+
 resource "aws_lb_listener_rule" "control" {
+  count        = length(local.control_path_groups)
   listener_arn = aws_lb_listener.https.arn
-  priority     = 10
+  priority     = 10 + count.index
   action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.control.arn
   }
   condition {
     path_pattern {
-      values = ["/admin/*", "/oauth/*", "/config/*"]
+      values = local.control_path_groups[count.index]
     }
   }
 }

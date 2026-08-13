@@ -1,4 +1,5 @@
 data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
 
 locals {
   # Split KMS keys per secret class (blast-radius isolation, ARCH §12).
@@ -20,6 +21,40 @@ resource "aws_kms_alias" "this" {
   for_each      = toset(local.key_classes)
   name          = "alias/${var.name}-${each.value}"
   target_key_id = aws_kms_key.this[each.value].key_id
+}
+
+# The audit-export key also encrypts the CloudWatch log group; a CMK-encrypted
+# log group requires the Logs service principal to be granted in the KEY policy
+# (an IAM policy alone is insufficient), else `apply` fails creating the group.
+data "aws_iam_policy_document" "audit_key" {
+  statement {
+    sid       = "RootAdmin"
+    actions   = ["kms:*"]
+    resources = ["*"]
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+  }
+  statement {
+    sid       = "CloudWatchLogs"
+    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"]
+    resources = ["*"]
+    principals {
+      type        = "Service"
+      identifiers = ["logs.${data.aws_region.current.name}.amazonaws.com"]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "kms:EncryptionContext:aws:logs:arn"
+      values   = ["arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/gulley/*"]
+    }
+  }
+}
+
+resource "aws_kms_key_policy" "audit_export" {
+  key_id = aws_kms_key.this["audit-export"].id
+  policy = data.aws_iam_policy_document.audit_key.json
 }
 
 # Secrets are provisioned empty; values are written out-of-band (never in TF state).

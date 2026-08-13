@@ -119,6 +119,23 @@ describe('CacheEngine semantic tier', () => {
     expect(hit.response?.body.toString()).toBe('Paris');
   });
 
+  it('never serves a semantic hit across different models', async () => {
+    const engine = make(0.9);
+    const a = req(
+      'ws1',
+      { messages: [{ role: 'user', content: 'Capital of France' }] },
+      { model: 'model-a' },
+    );
+    await engine.store(a, resp('Paris'), await engine.lookup(a));
+    // Same (near-identical) prompt but a DIFFERENT model -> different partition.
+    const b = req(
+      'ws1',
+      { messages: [{ role: 'user', content: 'capital of france?' }] },
+      { model: 'model-b' },
+    );
+    expect((await engine.lookup(b)).status).toBe('miss');
+  });
+
   it('misses a dissimilar request and never crosses scopes', async () => {
     const engine = make(0.9);
     const a = req('ws1', { messages: [{ role: 'user', content: 'Capital of France' }] });

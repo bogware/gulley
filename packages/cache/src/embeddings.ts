@@ -8,6 +8,9 @@ export interface OpenAIEmbeddingOptions {
    *  cheap to index, still strong for cache similarity. */
   dimensions?: number;
   baseUrl?: string;
+  /** Request timeout (ms). The cache is best-effort; a slow embeddings endpoint
+   *  must not stall the request. Default 4000. */
+  timeoutMs?: number;
 }
 
 /** Embeddings via the OpenAI (or OpenAI-compatible) `/v1/embeddings` endpoint.
@@ -18,12 +21,14 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly baseUrl: string;
+  private readonly timeoutMs: number;
 
   constructor(opts: OpenAIEmbeddingOptions) {
     this.apiKey = opts.apiKey;
     this.model = opts.model ?? 'text-embedding-3-small';
     this.dimensions = opts.dimensions ?? 256;
     this.baseUrl = (opts.baseUrl ?? 'https://api.openai.com').replace(/\/$/, '');
+    this.timeoutMs = opts.timeoutMs ?? 4000;
   }
 
   async embed(text: string): Promise<number[]> {
@@ -34,6 +39,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
         authorization: `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({ model: this.model, input: text, dimensions: this.dimensions }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!res.ok) {
       throw new Error(`embeddings request failed: ${res.status} ${await res.text()}`);

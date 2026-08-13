@@ -10,8 +10,11 @@ describe('estimateWorstCaseMicroUsd', () => {
     expect(estimateWorstCaseMicroUsd('openai', 'gpt-4o-mini', 300, 1000)).toBe(615);
   });
 
-  it('returns 0 for an unpriced model (nothing to enforce)', () => {
-    expect(estimateWorstCaseMicroUsd('openai', 'unknown-model', 300, 1000)).toBe(0);
+  it('reserves a conservative non-zero floor for an unpriced model (no cap bypass)', () => {
+    // Unknown pricing must NOT price to 0 (that would let a budget be bypassed by
+    // requesting any unpriced model, e.g. an arbitrary Azure deployment name).
+    // floor = 100*15/1e6 + 1000*75/1e6 = 0.0765 USD => 76500 microUSD.
+    expect(estimateWorstCaseMicroUsd('azure', 'prod-custom-deployment', 300, 1000)).toBe(76500);
   });
 });
 

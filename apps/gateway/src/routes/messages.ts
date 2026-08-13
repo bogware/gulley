@@ -61,6 +61,10 @@ export interface GatewayContext {
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
+/** Abort a proxied stream after this long with no upstream activity — provider
+ *  adapters disable undici's bodyTimeout for long SSE, so this is the only guard
+ *  against a half-open upstream that would otherwise pin a budget reservation. */
+const STREAM_INACTIVITY_MS = Number(process.env['STREAM_INACTIVITY_MS']) || 120_000;
 /** Responses over this size are streamed through but never cached. */
 const CACHE_BODY_CAP = 2 * 1024 * 1024;
 /** Findings at or above this confidence make a response too sensitive to cache. */
@@ -200,8 +204,15 @@ async function handleProxy(
       body,
       variant: headerValue(request, 'anthropic-beta'),
     };
-    cacheLookup = await ctx.cache.lookup(cacheReq);
-    if (cacheLookup.response) {
+    try {
+      cacheLookup = await ctx.cache.lookup(cacheReq);
+    } catch (err) {
+      // The cache is best-effort: an embeddings/vector outage must degrade to a
+      // plain proxy, never fail the request.
+      request.log.warn({ err }, 'cache lookup failed — bypassing');
+      cacheLookup = undefined;
+    }
+    if (cacheLookup?.response) {
       await serveFromCache(
         ctx,
         route,
@@ -292,8 +303,13 @@ async function handleProxy(
       }
       upstream = resp;
       served = target;
+      // The breaker should track UPSTREAM faults, not client mistakes: a terminal
+      // 4xx (400/401/403/404/422) is the caller's error and must not trip the
+      // breaker for every other tenant sharing this target.
       if (resp.statusCode < 400) ctx.breaker.recordSuccess(target.name);
-      else ctx.breaker.recordFailure(target.name);
+      else if (isFailoverStatus(route.strategy, resp.statusCode)) {
+        ctx.breaker.recordFailure(target.name);
+      }
       break;
     } catch (err) {
       ctx.breaker.recordFailure(target.name);
@@ -354,6 +370,17 @@ async function handleProxy(
         : [];
     const outputSensitive = outFindings.some((f) => f.confidence >= CACHE_SENSITIVE_CONFIDENCE);
 
+    // Release the reservation FIRST and independently of the best-effort durable
+    // sinks below — a failed ledger/requestLog/audit write must never leak the
+    // reservation (which would accumulate and DoS the workspace budget).
+    if (reserved) {
+      try {
+        await ctx.budgets.commit(principal.scope.workspaceId, requestId, costMicroUsd);
+      } catch (err) {
+        request.log.error({ err }, 'budget commit failed');
+      }
+    }
+
     try {
       if (n.seen) {
         await ctx.ledger.record({
@@ -404,10 +431,6 @@ async function handleProxy(
           cache: cacheLookup?.status ?? 'bypass',
         },
       });
-      // Commit actual spend, refunding the reservation's worst-case remainder.
-      if (reserved) {
-        await ctx.budgets.commit(principal.scope.workspaceId, requestId, costMicroUsd);
-      }
       // Persist to cache — only clean, non-sensitive, non-truncated 2xx bodies.
       if (
         storeCache &&
@@ -491,7 +514,26 @@ async function handleProxy(
   const upstreamHeaders = upstream.headers;
   const upstreamBody = upstream.body;
 
+  // Inactivity watchdog: a stalled upstream (half-open TCP / provider hang) emits
+  // neither 'end' nor 'error', so without this teardown never runs and the
+  // reservation leaks. Aborting drives the 'error' path → teardown → release.
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const resetWatchdog = (): void => {
+    if (watchdog) clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      request.log.warn('upstream stream idle — aborting');
+      controller.abort();
+    }, STREAM_INACTIVITY_MS);
+    watchdog.unref();
+  };
+  const clearWatchdog = (): void => {
+    if (watchdog) clearTimeout(watchdog);
+    watchdog = undefined;
+  };
+  resetWatchdog();
+
   upstreamBody.on('data', (chunk: Buffer) => {
+    resetWatchdog();
     if (captureFull && !captureOverflow) {
       if (fullBytes + chunk.length <= JSON_PARSE_CAP) {
         fullChunks.push(chunk);
@@ -520,13 +562,23 @@ async function handleProxy(
     let outBuf = chunk;
     if (detok && text !== undefined) outBuf = Buffer.from(detok.push(text), 'utf8');
     try {
-      if (!reply.raw.writableEnded) reply.raw.write(outBuf);
+      if (!reply.raw.writableEnded) {
+        // Honor backpressure: if the client-bound socket buffer is full, pause
+        // the upstream until it drains. Without this a slow reader makes the
+        // (bodyTimeout-disabled) upstream fill memory unbounded — an OOM vector.
+        const flushed = reply.raw.write(outBuf);
+        if (!flushed) {
+          upstreamBody.pause();
+          reply.raw.once('drain', () => upstreamBody.resume());
+        }
+      }
     } catch {
       controller.abort();
     }
   });
 
   upstreamBody.on('end', () => {
+    clearWatchdog();
     const tail = decoder ? decoder.end() : '';
     if (tail && outScanner) outScanner.push(tail);
 
@@ -585,6 +637,7 @@ async function handleProxy(
   });
 
   upstreamBody.on('error', (err: Error) => {
+    clearWatchdog();
     status = controller.signal.aborted ? 'aborted' : 'error';
     request.log.error({ err }, 'upstream stream error');
     if (!reply.raw.writableEnded) reply.raw.end();

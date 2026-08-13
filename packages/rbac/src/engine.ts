@@ -27,6 +27,14 @@ export function maxRankAt(p: AdminPrincipal, at: ScopeRef): number {
   return max;
 }
 
+/** Does the principal cover this specific workspace? An org-wide membership
+ *  covers every workspace in its org; a workspace-scoped membership covers only
+ *  its own. List/export handlers must filter by this (not by org alone) so a
+ *  workspace-scoped principal never sees sibling-workspace config. */
+export function coversWorkspace(p: AdminPrincipal, orgId: string, workspaceId: string): boolean {
+  return p.memberships.some((m) => covers(m, { orgId, workspaceId }));
+}
+
 /** Org ids the principal can see, or '*' for platform-wide. An empty array means
  *  "see nothing" — list endpoints must filter to this, never fall back to all. */
 export function coveredOrgIds(p: AdminPrincipal): readonly string[] | '*' {

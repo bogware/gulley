@@ -49,8 +49,16 @@ export function isBlockedIp(host: string): boolean {
   if (h.includes(':')) {
     if (h === '::1' || h === '::') return true;
     if (h.startsWith('fe80') || h.startsWith('fc') || h.startsWith('fd')) return true;
+    // IPv4-mapped IPv6, dotted form (::ffff:169.254.169.254).
     const mapped = /::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(h);
     if (mapped?.[1]) return isBlockedIp(mapped[1]);
+    // IPv4-mapped IPv6, HEX form — the form the WHATWG URL parser actually emits
+    // (new URL('https://[::ffff:169.254.169.254]/').hostname === '[::ffff:a9fe:a9fe]').
+    const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+    if (hex?.[1] && hex[2]) {
+      const n = ((parseInt(hex[1], 16) << 16) | parseInt(hex[2], 16)) >>> 0;
+      return isBlockedIp([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.'));
+    }
     return false;
   }
   const ip = ipv4ToInt(h);

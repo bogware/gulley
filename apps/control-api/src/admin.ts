@@ -1,7 +1,18 @@
 import { resolveAdmin } from '@gulley/auth';
-import type { AdminPrincipal, Permission, ScopeRef } from '@gulley/rbac';
+import { type AdminPrincipal, coversWorkspace, type Permission, type ScopeRef } from '@gulley/rbac';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { ControlContext } from './context';
+
+/** Workspace ids the principal is actually allowed to see (org-wide membership →
+ *  all workspaces in that org; workspace-scoped → only that workspace). */
+export function visibleWorkspaceIds(ctx: ControlContext, admin: AdminPrincipal): Set<string> {
+  return new Set(
+    ctx.workspaces
+      .list('*')
+      .filter((w) => coversWorkspace(admin, w.orgId, w.id))
+      .map((w) => w.id),
+  );
+}
 
 export function bearerToken(request: FastifyRequest): string | undefined {
   const raw = request.headers['authorization'];

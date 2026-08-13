@@ -85,7 +85,10 @@ export class ControlConfigStore implements ConfigStore {
 
   async authorize(desired: ConfigDocument, cx: ReconcileContext): Promise<boolean> {
     const current = this.ctx.orgs.list('*');
-    const idByName = new Map(current.map((o) => [o.name, o.id]));
+    // First-match by name, matching reconcile()'s `.find(...)`, so a duplicate
+    // org name can't authorize one org while reconcile mutates another.
+    const idByName = new Map<string, string>();
+    for (const o of current) if (!idByName.has(o.name)) idByName.set(o.name, o.id);
     const affected = new Set<string>([
       ...desired.orgs.map((o) => o.name),
       ...current.filter((o) => !desired.orgs.some((d) => d.name === o.name)).map((o) => o.name),

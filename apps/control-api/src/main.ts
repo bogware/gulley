@@ -13,6 +13,10 @@ async function start(): Promise<void> {
   }
 }
 
+process.on('unhandledRejection', (reason) => {
+  app.log.error({ reason }, 'unhandledRejection');
+});
+
 const SHUTDOWN_GRACE_MS = Number(process.env['SHUTDOWN_GRACE_MS']) || 110_000;
 let shuttingDown = false;
 

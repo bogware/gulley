@@ -26,6 +26,12 @@ async function start(): Promise<void> {
   }
 }
 
+// Safety net: a stray rejection (e.g. best-effort bookkeeping) must never
+// terminate the process and cut in-flight streams.
+process.on('unhandledRejection', (reason) => {
+  app.log.error({ reason }, 'unhandledRejection');
+});
+
 // Bounded graceful drain: stop accepting, let in-flight streams finish, close
 // the upstream pool. A backstop under Fargate's 120s stopTimeout guarantees we
 // exit before SIGKILL; streams cut at the backstop reconnect via Last-Event-ID.

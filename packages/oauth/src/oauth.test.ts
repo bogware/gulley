@@ -77,6 +77,25 @@ describe('device flow + tenancy', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.error).toBe('authorization_pending');
   });
+
+  it('consent is denied when the authorization guard rejects the tenancy', async () => {
+    const { broker } = makeBroker();
+    const da = await broker.deviceAuthorization('claude-code');
+    if (!da.ok) throw new Error('device auth');
+    const denied = await broker.deviceApprove(
+      da.value.user_code,
+      { subject: 'u', displayName: 'U' },
+      async () => false,
+    );
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) expect(denied.error.error).toBe('access_denied');
+    const allowed = await broker.deviceApprove(
+      da.value.user_code,
+      { subject: 'u', displayName: 'U' },
+      async () => true,
+    );
+    expect(allowed.ok).toBe(true);
+  });
 });
 
 describe('refresh rotation + reuse detection', () => {

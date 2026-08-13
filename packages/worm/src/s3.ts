@@ -12,9 +12,13 @@ interface S3Body {
   transformToString(): Promise<string>;
 }
 interface S3Api {
-  send: (
-    cmd: unknown,
-  ) => Promise<{ VersionId?: string; Body?: S3Body; Contents?: Array<{ Key?: string }> }>;
+  send: (cmd: unknown) => Promise<{
+    VersionId?: string;
+    Body?: S3Body;
+    Contents?: Array<{ Key?: string }>;
+    IsTruncated?: boolean;
+    NextContinuationToken?: string;
+  }>;
   PutObjectCommand: new (input: unknown) => unknown;
   GetObjectCommand: new (input: unknown) => unknown;
   ListObjectsV2Command: new (input: unknown) => unknown;
@@ -75,13 +79,24 @@ export class S3AuditMirror implements AuditMirror {
 
   async list(): Promise<MirrorObjectRef[]> {
     const s3 = await this.s3();
-    const res = await s3.send(
-      new s3.ListObjectsV2Command({ Bucket: this.opts.bucket, Prefix: this.prefix }),
-    );
-    return (res.Contents ?? [])
-      .map((c) => c.Key)
-      .filter((k): k is string => typeof k === 'string')
-      .map((key) => ({ key }));
+    const refs: MirrorObjectRef[] = [];
+    // ListObjectsV2 caps at 1000 keys — page until IsTruncated is false so the
+    // chain verifier sees EVERY batch, not just the oldest 1000.
+    let token: string | undefined;
+    do {
+      const res = await s3.send(
+        new s3.ListObjectsV2Command({
+          Bucket: this.opts.bucket,
+          Prefix: this.prefix,
+          ContinuationToken: token,
+        }),
+      );
+      for (const c of res.Contents ?? []) {
+        if (typeof c.Key === 'string') refs.push({ key: c.Key });
+      }
+      token = res.IsTruncated ? res.NextContinuationToken : undefined;
+    } while (token);
+    return refs;
   }
 
   async get(ref: MirrorObjectRef): Promise<MirrorBatch> {

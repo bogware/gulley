@@ -28,6 +28,14 @@ describe('assertNoInlineSecret', () => {
     );
   });
 
+  it('throws on a secret-named field wrapping the value in an object or array', () => {
+    expect(() => assertNoInlineSecret({ apiKey: { current: 'plaintext-key-value' } })).toThrow(
+      InlineSecretError,
+    );
+    expect(() => assertNoInlineSecret({ password: ['hunter2'] })).toThrow(InlineSecretError);
+    expect(() => assertNoInlineSecret({ refresh_token: 42 })).toThrow(InlineSecretError);
+  });
+
   it('throws when a SecretRef smuggles a value into secretArn', () => {
     expect(() =>
       assertNoInlineSecret({
@@ -59,6 +67,12 @@ describe('redactAuditRow + GuardedAuditSink', () => {
     expect(out['apiKey']).toBe('[REDACTED]');
     expect(out['model']).toBe('haiku');
     expect(out['ref']).toMatchObject({ secretArn: ARN });
+  });
+
+  it('redacts a secret-named field even when the value is nested', () => {
+    const out = redactAuditRow({ apiKey: { current: 'opaque-not-a-known-format' }, ok: 'x' });
+    expect(out['apiKey']).toBe('[REDACTED]');
+    expect(out['ok']).toBe('x');
   });
 
   it('the guarded sink redacts, counts a violation, and keeps the chain intact', async () => {

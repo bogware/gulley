@@ -3,13 +3,14 @@ import { assertEgressAllowed } from '@gulley/egress';
 import { assertNoInlineSecret, type AuditSink, InlineSecretError } from '@gulley/pipeline';
 import type { AccessControl, AdminPrincipal } from '@gulley/rbac';
 import { contentHash, diffDocuments, type DiffSummary } from './canonical';
-import type { ConfigDocument } from './document';
+import { type ConfigDocument, validateConfigDocument } from './document';
 import type { ConfigStore, ConfigVersionStore } from './store';
 import { toYaml } from './yaml';
 
 export type ApplyError =
   | { kind: 'forbidden' }
   | { kind: 'stale'; current: number }
+  | { kind: 'validation'; detail: string }
   | { kind: 'inline_secret'; detail: string }
   | { kind: 'egress'; detail: string }
   | { kind: 'internal'; detail: string };
@@ -67,6 +68,11 @@ export async function applyConfig(
   admin: AdminPrincipal,
   deps: ApplyDeps,
 ): Promise<Result<ApplyOutcome, ApplyError>> {
+  // Deep-validate BEFORE reserving a version, so a malformed doc can't half-apply
+  // (mutate stores + advance the version counter) and then 500 in reconcile.
+  const invalid = validateConfigDocument(desired);
+  if (invalid) return err({ kind: 'validation', detail: invalid });
+
   try {
     assertNoInlineSecret(desired);
   } catch (e) {
@@ -88,27 +94,33 @@ export async function applyConfig(
     return err({ kind: 'stale', current: await deps.versions.currentVersion() });
   }
 
-  const applied = await deps.store.reconcile(desired, { admin, access: deps.access });
-  const newDoc = await deps.store.exportDocument('*');
-  const hash = contentHash(newDoc);
-  const auditRow = await deps.audit.append({
-    orgId: null,
-    actor: admin.subject,
-    action: 'config.apply',
-    target: `v${reserved}`,
-    payload: { version: reserved, contentHash: hash, summary: applied.summary },
-  });
-  await deps.versions.append({
-    version: reserved,
-    contentHash: hash,
-    yaml: toYaml(newDoc),
-    actor: admin.subject,
-    summary: applied.summary,
-    auditSeq: auditRow.seq,
-    createdAt: new Date(deps.now?.() ?? Date.now()).toISOString(),
-  });
-
-  return ok({ version: reserved, contentHash: hash, summary: applied.summary });
+  // Reconcile + audit + version-record. On Postgres these run in ONE transaction
+  // so a mid-way failure rolls all back together (that's the durable-atomicity
+  // seam); here we at least surface a clean error instead of an uncaught 500.
+  try {
+    const applied = await deps.store.reconcile(desired, { admin, access: deps.access });
+    const newDoc = await deps.store.exportDocument('*');
+    const hash = contentHash(newDoc);
+    const auditRow = await deps.audit.append({
+      orgId: null,
+      actor: admin.subject,
+      action: 'config.apply',
+      target: `v${reserved}`,
+      payload: { version: reserved, contentHash: hash, summary: applied.summary },
+    });
+    await deps.versions.append({
+      version: reserved,
+      contentHash: hash,
+      yaml: toYaml(newDoc),
+      actor: admin.subject,
+      summary: applied.summary,
+      auditSeq: auditRow.seq,
+      createdAt: new Date(deps.now?.() ?? Date.now()).toISOString(),
+    });
+    return ok({ version: reserved, contentHash: hash, summary: applied.summary });
+  } catch (err2) {
+    return err({ kind: 'internal', detail: (err2 as Error).message });
+  }
 }
 
 export interface DriftReport {

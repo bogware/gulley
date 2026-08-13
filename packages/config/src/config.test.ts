@@ -94,6 +94,20 @@ describe('applyConfig', () => {
     }
   });
 
+  it('rejects a malformed document before reserving a version', async () => {
+    const versions = new InMemoryConfigVersionStore();
+    const d = deps(new TestStore(), versions);
+    // Workspace missing the six entity collections — would crash reconcile.
+    const bad = {
+      apiVersion: 'gulley/v1',
+      orgs: [{ name: 'Acme', workspaces: [{ name: 'Default', providers: [] }] }],
+    } as unknown as ConfigDocument;
+    const r = await applyConfig(bad, 0, OWNER, d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.kind).toBe('validation');
+    expect(await versions.currentVersion()).toBe(0); // no version consumed
+  });
+
   it('rejects a stale baseVersion (409)', async () => {
     const store = new TestStore();
     const d = deps(store);

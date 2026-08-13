@@ -15,6 +15,9 @@ describe('isBlockedIp', () => {
       'fe80::1',
       'fd00::1',
       '::ffff:169.254.169.254',
+      '::ffff:a9fe:a9fe', // hex-form IPv4-mapped IMDS — what new URL() actually emits
+      '::ffff:7f00:1', // hex-form 127.0.0.1
+      '[::ffff:a9fe:a9fe]',
     ]) {
       expect(isBlockedIp(ip), ip).toBe(true);
     }

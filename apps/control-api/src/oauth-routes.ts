@@ -28,10 +28,11 @@ export function registerOAuthRoutes(
     adminRoute(ctx, async (request, reply, admin) => {
       const userCode = str(body(request)['user_code']);
       if (!userCode) return oerr(reply, 400, 'invalid_request');
-      const r = await broker.deviceApprove(userCode, {
-        subject: admin.subject,
-        displayName: admin.displayName,
-      });
+      const r = await broker.deviceApprove(
+        userCode,
+        { subject: admin.subject, displayName: admin.displayName },
+        (t) => ctx.access.can(admin, 'key:create', { orgId: t.orgId, workspaceId: t.workspaceId }),
+      );
       return r.ok ? reply.send({ approved: true }) : reply.code(400).send(r.error);
     }),
   );
@@ -79,14 +80,17 @@ export function registerOAuthRoutes(
       const method = str(q['code_challenge_method']) ?? '';
       const state = str(q['state']) ?? '';
       if (!clientId || !redirectUri || !codeChallenge) return oerr(reply, 400, 'invalid_request');
-      const r = await broker.authorize({
-        clientId,
-        redirectUri,
-        state,
-        codeChallenge,
-        codeChallengeMethod: method,
-        identity: { subject: admin.subject, displayName: admin.displayName },
-      });
+      const r = await broker.authorize(
+        {
+          clientId,
+          redirectUri,
+          state,
+          codeChallenge,
+          codeChallengeMethod: method,
+          identity: { subject: admin.subject, displayName: admin.displayName },
+        },
+        (t) => ctx.access.can(admin, 'key:create', { orgId: t.orgId, workspaceId: t.workspaceId }),
+      );
       return r.ok ? reply.send(r.value) : reply.code(400).send(r.error);
     }),
   );

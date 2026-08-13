@@ -29,11 +29,17 @@ export function buildServer(config: Config, context?: GatewayContext): FastifyIn
 
   const providers =
     context?.routes.flatMap((r) => allTargets(r.strategy).map((t) => t.provider)) ?? [];
+  // /health = process liveness (always 200). /ready = 503 until a working
+  // context is wired, so ALB/ECS pull a task that booted without providers/DB
+  // out of service and the deployment circuit-breaker rolls it back.
   app.get('/health', async () => ({ status: 'ok', service: 'gateway', version: GULLEY_VERSION }));
-  app.get('/ready', async () => ({
-    status: context ? 'ready' : 'degraded',
-    providers: [...new Set(providers)],
-  }));
+  app.get('/ready', async (_req, reply) => {
+    if (!context) {
+      reply.code(503);
+      return { status: 'degraded' };
+    }
+    return { status: 'ready', providers: [...new Set(providers)] };
+  });
   app.get('/', async () => ({ name: 'gulley-gateway', version: GULLEY_VERSION }));
 
   if (context) registerRoutes(app, context);

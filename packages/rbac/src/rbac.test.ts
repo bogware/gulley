@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { InMemoryAccessControl } from './access-control';
-import { can, covers, coveredOrgIds, maxRankAt } from './engine';
+import { can, covers, coveredOrgIds, coversWorkspace, maxRankAt } from './engine';
 import { PERMISSIONS_BY_ROLE } from './permissions';
 import type { AdminPrincipal } from './principal';
 import { roleRank } from './principal';
@@ -74,6 +74,14 @@ describe('maxRankAt / coveredOrgIds', () => {
   it('coveredOrgIds returns the set, or * for a bootstrap principal', () => {
     expect(coveredOrgIds(principal([{ role: 'viewer', orgId: 'o1' }]))).toEqual(['o1']);
     expect(coveredOrgIds(principal([{ role: 'owner', orgId: '*' }]))).toBe('*');
+  });
+
+  it('coversWorkspace is workspace-precise for a workspace-scoped member', () => {
+    const p = principal([{ role: 'viewer', orgId: 'o1', workspaceId: 'w1' }]);
+    expect(coversWorkspace(p, 'o1', 'w1')).toBe(true);
+    expect(coversWorkspace(p, 'o1', 'w2')).toBe(false); // sibling workspace hidden
+    const orgWide = principal([{ role: 'viewer', orgId: 'o1' }]);
+    expect(coversWorkspace(orgWide, 'o1', 'w2')).toBe(true); // org-wide sees all
   });
 });
 

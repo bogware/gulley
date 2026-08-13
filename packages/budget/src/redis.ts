@@ -6,7 +6,10 @@ export interface EvalRedis {
   eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>;
 }
 
-// Atomic reserve: reject if reserved+committed+worst would breach the cap.
+// Atomic reserve. Each reservation field holds "amount:expiryMs"; before checking
+// the cap we SWEEP fields whose expiry has passed (a request that crashed between
+// reserve and commit would otherwise strand its worst-case forever), rebuild the
+// authoritative __total from the live fields, then reserve if it still fits.
 const RESERVE_LUA = `
 local reservedKey = KEYS[1]
 local committedKey = KEYS[2]
@@ -14,29 +17,63 @@ local cap = tonumber(ARGV[1])
 local worst = tonumber(ARGV[2])
 local field = ARGV[3]
 local ttl = tonumber(ARGV[4])
-local reserved = tonumber(redis.call('HGET', reservedKey, '__total') or '0')
+local now = tonumber(ARGV[5])
+local maxLifetime = tonumber(ARGV[6])
+local all = redis.call('HGETALL', reservedKey)
+local reserved = 0
+for i = 1, #all, 2 do
+  local k = all[i]
+  local v = all[i + 1]
+  if k ~= '__total' then
+    local sep = string.find(v, ':')
+    if sep then
+      local amt = tonumber(string.sub(v, 1, sep - 1))
+      local exp = tonumber(string.sub(v, sep + 1))
+      if exp and exp <= now then
+        redis.call('HDEL', reservedKey, k)
+      else
+        reserved = reserved + amt
+      end
+    else
+      redis.call('HDEL', reservedKey, k)
+    end
+  end
+end
 local committed = tonumber(redis.call('GET', committedKey) or '0')
 if reserved + committed + worst > cap then
+  redis.call('HSET', reservedKey, '__total', reserved)
   return {0, reserved + committed}
 end
-redis.call('HSET', reservedKey, field, worst)
-redis.call('HINCRBY', reservedKey, '__total', worst)
+redis.call('HSET', reservedKey, field, worst .. ':' .. (now + maxLifetime))
+redis.call('HSET', reservedKey, '__total', reserved + worst)
 if ttl > 0 then redis.call('EXPIRE', reservedKey, ttl) end
 return {1, reserved + committed + worst}
 `;
 
-// Atomic commit: release the reservation, add the actual spend (refund = diff).
+// Atomic commit: release the reservation, add the actual spend. The committed
+// counter's TTL is set only when the key is first created, so the budget period
+// is a fixed window from first spend — not an idle-timeout that never rolls over
+// under continuous traffic.
 const COMMIT_LUA = `
 local reservedKey = KEYS[1]
 local committedKey = KEYS[2]
 local field = ARGV[1]
 local actual = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
-local worst = tonumber(redis.call('HGET', reservedKey, field) or '0')
+local raw = redis.call('HGET', reservedKey, field)
+local worst = 0
+if raw then
+  local sep = string.find(raw, ':')
+  if sep then worst = tonumber(string.sub(raw, 1, sep - 1)) else worst = tonumber(raw) or 0 end
+end
 redis.call('HDEL', reservedKey, field)
 redis.call('HINCRBY', reservedKey, '__total', -worst)
+local existed = redis.call('EXISTS', committedKey)
 redis.call('INCRBY', committedKey, actual)
-if ttl > 0 then redis.call('EXPIRE', committedKey, ttl); redis.call('EXPIRE', reservedKey, ttl) end
+if ttl > 0 then
+  if existed == 0 then redis.call('EXPIRE', committedKey, ttl) end
+  redis.call('EXPIRE', reservedKey, ttl)
+end
 return redis.call('GET', committedKey)
 `;
 
@@ -44,6 +81,8 @@ export class RedisBudgetStore implements BudgetStore {
   constructor(
     private readonly redis: EvalRedis,
     private readonly capFor: CapResolver,
+    /** Max lifetime of a reservation before it is swept as orphaned (ms). */
+    private readonly maxReservationLifetimeMs = 600_000,
   ) {}
 
   private keys(workspaceId: string): [string, string] {
@@ -69,6 +108,8 @@ export class RedisBudgetStore implements BudgetStore {
       String(worstCaseMicroUsd),
       requestId,
       String(ttl),
+      String(Date.now()),
+      String(this.maxReservationLifetimeMs),
     )) as [number, number];
     return { allowed: res[0] === 1, capMicroUsd: budget.capMicroUsd, usedMicroUsd: res[1] };
   }
