@@ -41,6 +41,9 @@ importers:
       '@gulley/egress':
         specifier: workspace:*
         version: link:../../packages/egress
+      '@gulley/oauth':
+        specifier: workspace:*
+        version: link:../../packages/oauth
       '@gulley/pipeline':
         specifier: workspace:*
         version: link:../../packages/pipeline
@@ -254,6 +257,28 @@ importers:
         version: 2.1.9(@types/node@22.20.1)
 
   packages/guardrails:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/oauth:
+    dependencies:
+      '@gulley/auth':
+        specifier: workspace:*
+        version: link:../auth
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
+      '@gulley/egress':
+        specifier: workspace:*
+        version: link:../egress
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

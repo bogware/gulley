@@ -362,3 +362,75 @@ export const budget = pgTable(
   },
   (t) => [uniqueIndex('budget_workspace_idx').on(t.workspaceId)],
 );
+
+// --- M5.2 OAuth broker -----------------------------------------------------
+
+export const oauthClient = pgTable('oauth_client', {
+  clientId: text('client_id').primaryKey(),
+  name: text('name').notNull(),
+  orgId: uuid('org_id')
+    .notNull()
+    .references(() => org.id, { onDelete: 'cascade' }),
+  workspaceId: uuid('workspace_id')
+    .notNull()
+    .references(() => workspace.id, { onDelete: 'cascade' }),
+  grantTypes: jsonb('grant_types')
+    .notNull()
+    .default(sql`'[]'::jsonb`),
+  redirectAllowlist: jsonb('redirect_allowlist')
+    .notNull()
+    .default(sql`'[]'::jsonb`),
+  enabled: boolean('enabled').notNull().default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+// One row per token family. Rotation advances refresh_generation; the previous
+// refresh hash is retained so single-step reuse is distinguishable from forgery.
+export const oauthGrant = pgTable(
+  'oauth_grant',
+  {
+    handle: text('handle').primaryKey(),
+    clientId: text('client_id').notNull(),
+    principalId: text('principal_id').notNull(),
+    displayName: text('display_name').notNull(),
+    orgId: uuid('org_id').notNull(),
+    workspaceId: uuid('workspace_id').notNull(),
+    status: text('status').notNull(),
+    accessTokenHash: text('access_token_hash'),
+    accessTokenExpiresAt: timestamp('access_token_expires_at', { withTimezone: true }),
+    refreshTokenHash: text('refresh_token_hash'),
+    prevRefreshTokenHash: text('prev_refresh_token_hash'),
+    refreshGeneration: integer('refresh_generation').notNull().default(0),
+    absoluteExpiresAt: timestamp('absolute_expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('oauth_grant_client_idx').on(t.clientId)],
+);
+
+export const deviceCode = pgTable(
+  'device_code',
+  {
+    deviceCode: text('device_code').primaryKey(),
+    userCode: text('user_code').notNull(),
+    clientId: text('client_id').notNull(),
+    status: text('status').notNull(),
+    principalId: text('principal_id'),
+    displayName: text('display_name'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    lastPolledAt: bigint('last_polled_at', { mode: 'number' }).notNull().default(0),
+    intervalMs: integer('interval_ms').notNull().default(5000),
+  },
+  (t) => [uniqueIndex('device_code_user_idx').on(t.userCode)],
+);
+
+export const authCode = pgTable('auth_code', {
+  code: text('code').primaryKey(),
+  clientId: text('client_id').notNull(),
+  redirectUri: text('redirect_uri').notNull(),
+  codeChallenge: text('code_challenge').notNull(),
+  principalId: text('principal_id').notNull(),
+  displayName: text('display_name').notNull(),
+  orgId: uuid('org_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+});

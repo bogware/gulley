@@ -8,6 +8,7 @@
     "start": "tsx src/main.ts",
     "seed": "tsx src/seed.ts",
     "rbac:check": "tsx src/rbac-check.ts",
+    "oauth:check": "tsx src/oauth-check.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"
@@ -16,6 +17,7 @@
     "@gulley/auth": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/egress": "workspace:*",
+    "@gulley/oauth": "workspace:*",
     "@gulley/pipeline": "workspace:*",
     "@gulley/rbac": "workspace:*",
     "@gulley/storage": "workspace:*",
