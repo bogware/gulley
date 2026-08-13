@@ -21,6 +21,7 @@
     "@gulley/cost": "workspace:*",
     "@gulley/pipeline": "workspace:*",
     "@gulley/providers": "workspace:*",
+    "@gulley/routing": "workspace:*",
     "@gulley/storage": "workspace:*",
     "fastify": "^5.2.0",
     "zod": "^3.24.1"

@@ -23,6 +23,7 @@ import {
   type UpstreamCredential,
   type UsageExtractor,
 } from '@gulley/providers';
+import { CircuitBreaker, type RouteTarget, type RoutingStrategy } from '@gulley/routing';
 import { loadConfig } from './config';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 import { buildServer } from './server';
@@ -188,15 +189,30 @@ async function main(): Promise<void> {
   const ledger = new InMemoryLedger();
   const requestLog = new InMemoryRequestLog();
   const audit = new InMemoryAuditSink();
-  const route: ProviderRoute = {
+  const target: RouteTarget = {
+    name: t.provider,
     provider: t.provider,
-    clientPaths: [t.path],
-    upstreamPath: t.upstreamPath ?? t.path,
     adapter: t.adapter,
     credential: t.credential(key.value),
-    createExtractor: t.extractor,
+    upstreamPath: t.upstreamPath ?? t.path,
     alwaysStream: t.alwaysStream,
   };
+  // --scenario failover prepends an unreachable target to prove pre-first-byte failover.
+  const strategy: RoutingStrategy =
+    flag('scenario', '') === 'failover'
+      ? {
+          mode: 'fallback',
+          targets: [
+            {
+              ...target,
+              name: 'unreachable',
+              adapter: new OpenAIAdapter({ baseUrl: 'http://127.0.0.1:1' }),
+            },
+            target,
+          ],
+        }
+      : { mode: 'single', target };
+  const route: ProviderRoute = { clientPaths: [t.path], createExtractor: t.extractor, strategy };
   const ctx: GatewayContext = {
     routes: [route],
     keyStore: store,
@@ -204,6 +220,7 @@ async function main(): Promise<void> {
     ledger,
     requestLog,
     audit,
+    breaker: new CircuitBreaker(),
   };
 
   const app = buildServer(loadConfig({ LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv), ctx);
@@ -217,6 +234,7 @@ async function main(): Promise<void> {
     });
     const text = await res.text();
     process.stdout.write(`\nHTTP ${res.status} (${res.headers.get('content-type') ?? '?'})\n`);
+    process.stdout.write(`served target: ${res.headers.get('x-gulley-target') ?? '?'}\n`);
 
     if (res.status !== 200) {
       process.stdout.write(`Error body:\n${text.slice(0, 600)}\n`);

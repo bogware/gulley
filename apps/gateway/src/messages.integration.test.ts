@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { AnthropicAdapter, AnthropicUsageExtractor } from '@gulley/providers';
+import { CircuitBreaker, type RouteTarget } from '@gulley/routing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
 import type { GatewayContext } from './routes/messages';
@@ -63,20 +64,28 @@ function buildContext(store: InMemoryKeyStore): {
   ledger: InMemoryLedger;
   requestLog: InMemoryRequestLog;
   audit: InMemoryAuditSink;
+  breaker: CircuitBreaker;
 } {
   const ledger = new InMemoryLedger();
   const requestLog = new InMemoryRequestLog();
   const audit = new InMemoryAuditSink();
+  const breaker = new CircuitBreaker();
   return {
     ctx: {
       routes: [
         {
-          provider: 'anthropic',
           clientPaths: ['/v1/messages', '/anthropic/v1/messages'],
-          upstreamPath: '/v1/messages',
-          adapter: new AnthropicAdapter({ baseUrl: upstreamUrl }),
-          credential: { scheme: 'x-api-key', value: UPSTREAM_KEY },
           createExtractor: () => new AnthropicUsageExtractor(),
+          strategy: {
+            mode: 'single',
+            target: {
+              name: 'anthropic',
+              provider: 'anthropic',
+              adapter: new AnthropicAdapter({ baseUrl: upstreamUrl }),
+              credential: { scheme: 'x-api-key', value: UPSTREAM_KEY },
+              upstreamPath: '/v1/messages',
+            },
+          },
         },
       ],
       keyStore: store,
@@ -84,10 +93,22 @@ function buildContext(store: InMemoryKeyStore): {
       ledger,
       requestLog,
       audit,
+      breaker,
     },
     ledger,
     requestLog,
     audit,
+    breaker,
+  };
+}
+
+function anthropicTarget(name: string, baseUrl: string): RouteTarget {
+  return {
+    name,
+    provider: 'anthropic',
+    adapter: new AnthropicAdapter({ baseUrl }),
+    credential: { scheme: 'x-api-key', value: UPSTREAM_KEY },
+    upstreamPath: '/v1/messages',
   };
 }
 
@@ -177,6 +198,56 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     const json = (await res.json()) as { error: { type: string } };
     expect(json.error.type).toBe('authentication_error');
     expect(requestLog.entries).toHaveLength(0);
+
+    await app.close();
+  });
+
+  it('fails over pre-first-byte from an unreachable target to a healthy one', async () => {
+    const { store, token } = seededStore();
+    const ledger = new InMemoryLedger();
+    const requestLog = new InMemoryRequestLog();
+    const audit = new InMemoryAuditSink();
+    const breaker = new CircuitBreaker();
+    const ctx: GatewayContext = {
+      routes: [
+        {
+          clientPaths: ['/v1/messages'],
+          createExtractor: () => new AnthropicUsageExtractor(),
+          strategy: {
+            mode: 'fallback',
+            targets: [
+              anthropicTarget('bad', 'http://127.0.0.1:1'), // connection refused
+              anthropicTarget('good', upstreamUrl),
+            ],
+          },
+        },
+      ],
+      keyStore: store,
+      pepper: PEPPER,
+      ledger,
+      requestLog,
+      audit,
+      breaker,
+    };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-target')).toBe('good'); // served by the fallback
+    expect(text).toContain('message_start');
+    expect(ledger.entries[0]?.status).toBe('ok');
+    expect(ledger.entries[0]?.cost.outputTokens).toBe(42);
 
     await app.close();
   });

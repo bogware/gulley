@@ -7,6 +7,7 @@ import {
   OpenAIUsageExtractor,
   type UpstreamCredential,
 } from '@gulley/providers';
+import { CircuitBreaker } from '@gulley/routing';
 import {
   createDatabase,
   PostgresAuditSink,
@@ -24,19 +25,25 @@ function anthropicCredential(key: string): UpstreamCredential {
     : { scheme: 'bearer', value: key };
 }
 
-/** Assemble provider routes from config. A provider is registered only when its
- *  upstream key is present, so partial configurations work. */
+/** Assemble provider routes (each a single-target strategy in v1) from config.
+ *  A provider is registered only when its upstream key is present. */
 export function buildRoutes(config: Config): ProviderRoute[] {
   const routes: ProviderRoute[] = [];
 
   if (config.ANTHROPIC_UPSTREAM_API_KEY) {
     routes.push({
-      provider: 'anthropic',
       clientPaths: ['/v1/messages', '/anthropic/v1/messages'],
-      upstreamPath: '/v1/messages',
-      adapter: new AnthropicAdapter({ baseUrl: config.ANTHROPIC_BASE_URL }),
-      credential: anthropicCredential(config.ANTHROPIC_UPSTREAM_API_KEY),
       createExtractor: () => new AnthropicUsageExtractor(),
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'anthropic',
+          provider: 'anthropic',
+          adapter: new AnthropicAdapter({ baseUrl: config.ANTHROPIC_BASE_URL }),
+          credential: anthropicCredential(config.ANTHROPIC_UPSTREAM_API_KEY),
+          upstreamPath: '/v1/messages',
+        },
+      },
     });
   }
 
@@ -47,32 +54,50 @@ export function buildRoutes(config: Config): ProviderRoute[] {
       value: config.OPENAI_UPSTREAM_API_KEY,
     };
     routes.push({
-      provider: 'openai',
       clientPaths: ['/v1/chat/completions', '/openai/v1/chat/completions'],
-      upstreamPath: '/v1/chat/completions',
-      adapter,
-      credential,
       createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'openai',
+          provider: 'openai',
+          adapter,
+          credential,
+          upstreamPath: '/v1/chat/completions',
+        },
+      },
     });
     routes.push({
-      provider: 'openai',
       clientPaths: ['/v1/responses', '/openai/v1/responses'],
-      upstreamPath: '/v1/responses',
-      adapter,
-      credential,
       createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'openai',
+          provider: 'openai',
+          adapter,
+          credential,
+          upstreamPath: '/v1/responses',
+        },
+      },
     });
   }
 
   if (config.BEDROCK_UPSTREAM_API_KEY) {
     routes.push({
-      provider: 'bedrock',
       clientPaths: ['/bedrock/v1/messages'],
-      upstreamPath: '/v1/messages',
-      adapter: new BedrockAdapter({ region: config.BEDROCK_REGION }),
-      credential: { scheme: 'bearer', value: config.BEDROCK_UPSTREAM_API_KEY },
       createExtractor: () => new AnthropicUsageExtractor(),
-      alwaysStream: true,
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'bedrock',
+          provider: 'bedrock',
+          adapter: new BedrockAdapter({ region: config.BEDROCK_REGION }),
+          credential: { scheme: 'bearer', value: config.BEDROCK_UPSTREAM_API_KEY },
+          upstreamPath: '/v1/messages',
+          alwaysStream: true,
+        },
+      },
     });
   }
 
@@ -83,20 +108,32 @@ export function buildRoutes(config: Config): ProviderRoute[] {
       value: config.AZURE_UPSTREAM_API_KEY,
     };
     routes.push({
-      provider: 'azure',
       clientPaths: ['/azure/v1/chat/completions', '/azure/openai/v1/chat/completions'],
-      upstreamPath: '/openai/v1/chat/completions',
-      adapter,
-      credential,
       createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'azure',
+          provider: 'azure',
+          adapter,
+          credential,
+          upstreamPath: '/openai/v1/chat/completions',
+        },
+      },
     });
     routes.push({
-      provider: 'azure',
       clientPaths: ['/azure/v1/responses', '/azure/openai/v1/responses'],
-      upstreamPath: '/openai/v1/responses',
-      adapter,
-      credential,
       createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'azure',
+          provider: 'azure',
+          adapter,
+          credential,
+          upstreamPath: '/openai/v1/responses',
+        },
+      },
     });
   }
 
@@ -122,5 +159,6 @@ export function createProductionContext(config: Config): GatewayContext {
     ledger: new PostgresLedger(db),
     requestLog: new PostgresRequestLog(db),
     audit: new PostgresAuditSink(db),
+    breaker: new CircuitBreaker(),
   };
 }

@@ -7,26 +7,22 @@ import {
 import { computeCost, toMicroUsd } from '@gulley/cost';
 import { isErr } from '@gulley/core';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
+import { SSEParser, type UsageExtractor } from '@gulley/providers';
 import {
-  type ProviderAdapter,
-  SSEParser,
-  type UpstreamCredential,
-  type UsageExtractor,
-} from '@gulley/providers';
+  type CircuitBreaker,
+  isFailoverStatus,
+  type RouteTarget,
+  type RoutingStrategy,
+  selectCandidates,
+} from '@gulley/routing';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
-/** One provider surface: which client paths it serves, where it forwards, and
- *  how to authenticate + meter it. */
+/** A client-facing surface backed by a routing strategy (single / load-balance
+ *  / fallback across upstream targets). */
 export interface ProviderRoute {
-  provider: string;
   clientPaths: string[];
-  upstreamPath: string;
-  adapter: ProviderAdapter;
-  credential: UpstreamCredential;
   createExtractor: () => UsageExtractor;
-  /** Force the streaming response path regardless of the client's `stream`
-   *  flag (e.g. Bedrock's invoke-with-response-stream always streams). */
-  alwaysStream?: boolean;
+  strategy: RoutingStrategy;
 }
 
 export interface GatewayContext {
@@ -36,6 +32,7 @@ export interface GatewayContext {
   ledger: Ledger;
   requestLog: RequestLogSink;
   audit: AuditSink;
+  breaker: CircuitBreaker;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -73,7 +70,6 @@ async function handleProxy(
     /* malformed body still gets forwarded verbatim */
   }
   const requestedModel = typeof parsed['model'] === 'string' ? parsed['model'] : 'unknown';
-  const streamed = route.alwaysStream === true || parsed['stream'] === true;
 
   // --- authn: virtual-key mode, deterministic + fail-closed ---
   const auth = await resolveVirtualKey(
@@ -90,11 +86,17 @@ async function handleProxy(
   }
   const principal = auth.value;
 
-  // --- authz: uniform scope check ---
-  if (
-    !scopeAllowsProvider(principal.scope, route.provider) ||
-    !scopeAllowsModel(principal.scope, requestedModel)
-  ) {
+  // --- authz: model + provider scope (candidates filtered to allowed providers) ---
+  if (!scopeAllowsModel(principal.scope, requestedModel)) {
+    await reply
+      .code(403)
+      .send({ type: 'error', error: { type: 'permission_error', message: 'model not permitted' } });
+    return;
+  }
+  const candidates = selectCandidates(route.strategy, ctx.breaker).filter((t) =>
+    scopeAllowsProvider(principal.scope, t.provider),
+  );
+  if (candidates.length === 0) {
     await reply
       .code(403)
       .send({ type: 'error', error: { type: 'permission_error', message: 'not permitted' } });
@@ -102,13 +104,55 @@ async function handleProxy(
   }
 
   const controller = new AbortController();
-  const parser = new SSEParser();
+  reply.raw.on('close', () => {
+    if (!reply.raw.writableEnded && !controller.signal.aborted) controller.abort();
+  });
+
+  // --- pre-first-byte failover: try candidates until one serves a response ---
+  let upstream: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
+  let served: RouteTarget | undefined;
+  for (let i = 0; i < candidates.length; i++) {
+    const target = candidates[i] as RouteTarget;
+    const isLast = i === candidates.length - 1;
+    try {
+      const resp = await target.adapter.forward({
+        path: target.upstreamPath,
+        body,
+        headers: request.headers,
+        credential: target.credential,
+        signal: controller.signal,
+      });
+      if (!isLast && resp.statusCode >= 400 && isFailoverStatus(route.strategy, resp.statusCode)) {
+        ctx.breaker.recordFailure(target.name);
+        resp.body.resume(); // discard the failed body, then try the next target
+        request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
+        continue;
+      }
+      upstream = resp;
+      served = target;
+      if (resp.statusCode < 400) ctx.breaker.recordSuccess(target.name);
+      else ctx.breaker.recordFailure(target.name);
+      break;
+    } catch (err) {
+      ctx.breaker.recordFailure(target.name);
+      request.log.warn({ target: target.name, err }, 'target error');
+      if (controller.signal.aborted) break; // client gone — stop trying
+    }
+  }
+
+  const streamed = served?.alwaysStream === true || parsed['stream'] === true;
+  const provider = served?.provider ?? candidates[0]?.provider ?? 'unknown';
+
+  const parserSse = new SSEParser();
   const usage = route.createExtractor();
   const jsonChunks: Buffer[] = [];
   let jsonBytes = 0;
-
-  let statusCode = 502;
-  let status: RequestStatus = 'error';
+  let statusCode = upstream?.statusCode ?? 502;
+  let status: RequestStatus = controller.signal.aborted
+    ? 'aborted'
+    : statusCode < 400
+      ? 'ok'
+      : 'error';
   let settled = false;
 
   const teardown = async (): Promise<void> => {
@@ -117,7 +161,7 @@ async function handleProxy(
 
     const n = usage.normalized();
     const meteredModel = n.model ?? requestedModel;
-    const cost = computeCost(route.provider, meteredModel, n);
+    const cost = computeCost(provider, meteredModel, n);
     const costMicroUsd = toMicroUsd(cost.totalUsd);
     const createdAt = new Date();
 
@@ -128,7 +172,7 @@ async function handleProxy(
           principalId: principal.id,
           orgId: principal.scope.orgId,
           workspaceId: principal.scope.workspaceId,
-          provider: route.provider,
+          provider,
           model: meteredModel,
           cost,
           costMicroUsd,
@@ -140,9 +184,9 @@ async function handleProxy(
         requestId,
         principalId: principal.id,
         workspaceId: principal.scope.workspaceId,
-        provider: route.provider,
+        provider,
         model: meteredModel,
-        route: route.upstreamPath,
+        route: served?.upstreamPath ?? route.clientPaths[0] ?? '',
         statusCode,
         status,
         streamed,
@@ -156,10 +200,10 @@ async function handleProxy(
         orgId: principal.scope.orgId,
         actor: principal.id,
         action: 'proxy.request',
-        target: route.provider,
+        target: served?.name ?? provider,
         payload: {
+          provider,
           model: meteredModel,
-          route: route.upstreamPath,
           status,
           statusCode,
           streamed,
@@ -173,47 +217,29 @@ async function handleProxy(
     }
   };
 
-  // Client disconnect before completion → abort upstream, meter partial spend.
-  reply.raw.on('close', () => {
-    if (!settled) {
-      status = 'aborted';
-      controller.abort();
-    }
-  });
-
-  let upstream;
-  try {
-    upstream = await route.adapter.forward({
-      path: route.upstreamPath,
-      body,
-      headers: request.headers,
-      credential: route.credential,
-      signal: controller.signal,
-    });
-  } catch (err) {
+  // Every candidate failed to produce a response (all connection errors).
+  if (!upstream || !served) {
     status = controller.signal.aborted ? 'aborted' : 'error';
-    request.log.error({ err }, 'upstream request failed');
+    statusCode = 502;
     await teardown();
     if (!reply.sent) {
       await reply
         .code(502)
-        .send({ type: 'error', error: { type: 'api_error', message: 'upstream request failed' } });
+        .send({ type: 'error', error: { type: 'api_error', message: 'no upstream available' } });
     }
     return;
   }
 
-  statusCode = upstream.statusCode;
-  status = upstream.statusCode < 400 ? 'ok' : 'error';
-
-  // Take over the raw socket: raw byte fidelity + guaranteed teardown (a
-  // hijacked reply bypasses Fastify onSend/onResponse hooks by design).
+  // Take over the raw socket: raw byte fidelity + guaranteed teardown.
   reply.hijack();
-  reply.raw.writeHead(upstream.statusCode, {
+  reply.raw.writeHead(statusCode, {
     ...filterResponseHeaders(upstream.headers),
     'x-gulley-request-id': requestId,
+    'x-gulley-target': served.name,
   });
 
-  upstream.body.on('data', (chunk: Buffer) => {
+  const upstreamBody = upstream.body;
+  upstreamBody.on('data', (chunk: Buffer) => {
     try {
       if (!reply.raw.writableEnded) reply.raw.write(chunk);
     } catch {
@@ -222,9 +248,9 @@ async function handleProxy(
     }
     if (streamed) {
       try {
-        usage.ingestSse(parser.push(chunk.toString('utf8')));
+        usage.ingestSse(parserSse.push(chunk.toString('utf8')));
       } catch {
-        /* metering is best-effort and must never disturb the client stream */
+        /* metering is best-effort */
       }
     } else if (jsonBytes < JSON_PARSE_CAP) {
       jsonChunks.push(chunk);
@@ -232,10 +258,10 @@ async function handleProxy(
     }
   });
 
-  upstream.body.on('end', () => {
+  upstreamBody.on('end', () => {
     if (streamed) {
       try {
-        usage.ingestSse(parser.push('\n\n')); // flush a final event missing its blank line
+        usage.ingestSse(parserSse.push('\n\n'));
       } catch {
         /* best-effort */
       }
@@ -245,14 +271,14 @@ async function handleProxy(
           JSON.parse(Buffer.concat(jsonChunks).toString('utf8')) as Record<string, unknown>,
         );
       } catch {
-        /* unparseable body — still forwarded verbatim above */
+        /* unparseable body — still forwarded verbatim */
       }
     }
     if (!reply.raw.writableEnded) reply.raw.end();
     void teardown();
   });
 
-  upstream.body.on('error', (err: Error) => {
+  upstreamBody.on('error', (err: Error) => {
     status = controller.signal.aborted ? 'aborted' : 'error';
     request.log.error({ err }, 'upstream stream error');
     if (!reply.raw.writableEnded) reply.raw.end();

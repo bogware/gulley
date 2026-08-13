@@ -81,6 +81,9 @@ importers:
       '@gulley/providers':
         specifier: workspace:*
         version: link:../../packages/providers
+      '@gulley/routing':
+        specifier: workspace:*
+        version: link:../../packages/routing
       '@gulley/storage':
         specifier: workspace:*
         version: link:../../packages/storage
@@ -213,6 +216,22 @@ importers:
       undici:
         specifier: ^6.21.0
         version: 6.28.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/routing:
+    dependencies:
+      '@gulley/providers':
+        specifier: workspace:*
+        version: link:../providers
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

@@ -1,4 +1,5 @@
 import { GULLEY_VERSION } from '@gulley/core';
+import { allTargets } from '@gulley/routing';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { type GatewayContext, registerRoutes } from './routes/messages';
@@ -26,7 +27,8 @@ export function buildServer(config: Config, context?: GatewayContext): FastifyIn
     done(null, body);
   });
 
-  const providers = context?.routes.map((r) => r.provider) ?? [];
+  const providers =
+    context?.routes.flatMap((r) => allTargets(r.strategy).map((t) => t.provider)) ?? [];
   app.get('/health', async () => ({ status: 'ok', service: 'gateway', version: GULLEY_VERSION }));
   app.get('/ready', async () => ({
     status: context ? 'ready' : 'degraded',
