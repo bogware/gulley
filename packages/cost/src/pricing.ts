@@ -23,6 +23,10 @@ export const ANTHROPIC_PRICING: Readonly<Record<string, ModelRate>> = {
   'claude-sonnet-4-6': { input: 3, output: 15 },
   'claude-haiku-4-5': { input: 1, output: 5 },
   'claude-fable-5': { input: 10, output: 50 },
+  // Older Claude generations still served on Bedrock:
+  'claude-3-5-sonnet': { input: 3, output: 15 },
+  'claude-3-5-haiku': { input: 0.8, output: 4 },
+  'claude-3-haiku': { input: 0.25, output: 1.25 },
 };
 
 // --- OpenAI (verify against current pricing; seeded with well-known rates) ---
@@ -55,6 +59,16 @@ function normalizeOpenAIModel(model: string): string {
   return model.replace(/-\d{4}-\d{2}-\d{2}$/, '');
 }
 
+/** Bedrock ids look like `us.anthropic.claude-3-5-haiku-20241022-v1:0`; strip
+ *  the region/provider prefix, the `-vN:M` suffix, and the date snapshot. */
+function normalizeBedrockModel(model: string): string {
+  return model
+    .replace(/^(us|eu|apac|global)\./, '')
+    .replace(/^anthropic\./, '')
+    .replace(/-v\d+:\d+$/, '')
+    .replace(/-\d{8}$/, '');
+}
+
 export function lookupRate(model: string): ModelRate | undefined {
   return ANTHROPIC_PRICING[normalizeModelId(model)];
 }
@@ -81,5 +95,16 @@ export const PROVIDER_PRICING: Readonly<Record<string, ProviderPricing>> = {
     rates: OPENAI_PRICING,
     cache: { read: 0.5, write5m: 1.0, write1h: 1.0 },
     normalize: normalizeOpenAIModel,
+  },
+  bedrock: {
+    // Claude on Bedrock — reuse the Anthropic rate table as a seed (Bedrock
+    // partner pricing is close but not identical; verify for billing use).
+    rates: ANTHROPIC_PRICING,
+    cache: {
+      read: CACHE_MULTIPLIERS.read,
+      write5m: CACHE_MULTIPLIERS.write5m,
+      write1h: CACHE_MULTIPLIERS.write1h,
+    },
+    normalize: normalizeBedrockModel,
   },
 };

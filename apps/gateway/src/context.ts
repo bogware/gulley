@@ -1,6 +1,7 @@
 import {
   AnthropicAdapter,
   AnthropicUsageExtractor,
+  BedrockAdapter,
   OpenAIAdapter,
   OpenAIUsageExtractor,
   type UpstreamCredential,
@@ -59,6 +60,18 @@ export function buildRoutes(config: Config): ProviderRoute[] {
       adapter,
       credential,
       createExtractor: () => new OpenAIUsageExtractor(),
+    });
+  }
+
+  if (config.BEDROCK_UPSTREAM_API_KEY) {
+    routes.push({
+      provider: 'bedrock',
+      clientPaths: ['/bedrock/v1/messages'],
+      upstreamPath: '/v1/messages',
+      adapter: new BedrockAdapter({ region: config.BEDROCK_REGION }),
+      credential: { scheme: 'bearer', value: config.BEDROCK_UPSTREAM_API_KEY },
+      createExtractor: () => new AnthropicUsageExtractor(),
+      alwaysStream: true,
     });
   }
 

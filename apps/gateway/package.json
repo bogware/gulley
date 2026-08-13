@@ -9,6 +9,7 @@
     "live": "tsx src/live-check.ts",
     "live:anthropic": "tsx src/live-check.ts --provider anthropic",
     "live:openai": "tsx src/live-check.ts --provider openai",
+    "live:bedrock": "tsx src/live-check.ts --provider bedrock",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"

@@ -16,6 +16,8 @@ const Env = z.object({
   ANTHROPIC_BASE_URL: z.string().url().default('https://api.anthropic.com'),
   OPENAI_UPSTREAM_API_KEY: z.string().min(1).optional(),
   OPENAI_BASE_URL: z.string().url().default('https://api.openai.com'),
+  BEDROCK_UPSTREAM_API_KEY: z.string().min(1).optional(),
+  BEDROCK_REGION: z.string().default('us-east-1'),
 
   DATABASE_URL: z.string().url().optional(),
 });

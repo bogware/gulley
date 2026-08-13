@@ -14,6 +14,7 @@ import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/p
 import {
   AnthropicAdapter,
   AnthropicUsageExtractor,
+  BedrockAdapter,
   closeUpstreamPool,
   OpenAIAdapter,
   OpenAIUsageExtractor,
@@ -42,6 +43,7 @@ interface Target {
   credential: (key: string) => UpstreamCredential;
   clientHeaders: (token: string) => Record<string, string>;
   body: unknown;
+  alwaysStream?: boolean;
 }
 
 function resolveTarget(): Target {
@@ -72,6 +74,25 @@ function resolveTarget(): Target {
             max_tokens: 16,
             messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
           },
+    };
+  }
+
+  if (provider === 'bedrock') {
+    const region = process.env['GULLEY_LIVE_REGION'] ?? process.env['AWS_REGION'] ?? 'us-east-1';
+    return {
+      provider: 'bedrock',
+      keyVars: ['GULLEY_LIVE_BEDROCK_KEY', 'BEDROCK_API_KEY'],
+      path: '/bedrock/v1/messages',
+      adapter: new BedrockAdapter({ region }),
+      extractor: () => new AnthropicUsageExtractor(),
+      credential: (k) => ({ scheme: 'bearer', value: k }),
+      clientHeaders: (t) => ({ 'x-api-key': t }),
+      alwaysStream: true,
+      body: {
+        model: model ?? 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+      },
     };
   }
 
@@ -137,6 +158,7 @@ async function main(): Promise<void> {
     adapter: t.adapter,
     credential: t.credential(key.value),
     createExtractor: t.extractor,
+    alwaysStream: t.alwaysStream,
   };
   const ctx: GatewayContext = {
     routes: [route],

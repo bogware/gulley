@@ -24,6 +24,9 @@ export interface ProviderRoute {
   adapter: ProviderAdapter;
   credential: UpstreamCredential;
   createExtractor: () => UsageExtractor;
+  /** Force the streaming response path regardless of the client's `stream`
+   *  flag (e.g. Bedrock's invoke-with-response-stream always streams). */
+  alwaysStream?: boolean;
 }
 
 export interface GatewayContext {
@@ -70,7 +73,7 @@ async function handleProxy(
     /* malformed body still gets forwarded verbatim */
   }
   const requestedModel = typeof parsed['model'] === 'string' ? parsed['model'] : 'unknown';
-  const streamed = parsed['stream'] === true;
+  const streamed = route.alwaysStream === true || parsed['stream'] === true;
 
   // --- authn: virtual-key mode, deterministic + fail-closed ---
   const auth = await resolveVirtualKey(
