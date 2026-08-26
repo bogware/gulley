@@ -24,7 +24,7 @@ stages:
       - job: build
         steps:
           - task: AWSShellScript@1
-            displayName: Build + push (SBOM + provenance) and scan
+            displayName: Build + push (SBOM + provenance + cosign) and scan
             inputs:
               awsCredentials: gulley-aws
               regionName: $(AWS_REGION)
@@ -32,6 +32,11 @@ stages:
               inlineScript: |
                 set -euo pipefail
                 export IMAGE_TAG='${{ parameters.imageTag }}'
+                # cosign for keyless signing (build-image.sh signs the digest).
+                # Keyless in Azure DevOps needs the pipeline OIDC to be enabled;
+                # set SKIP_SIGN=1 to build without signing.
+                curl -fsSL "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64" -o /usr/local/bin/cosign
+                chmod +x /usr/local/bin/cosign
                 bash ci/build-image.sh
                 curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
                 trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ECR_REPOSITORY:$IMAGE_TAG"
