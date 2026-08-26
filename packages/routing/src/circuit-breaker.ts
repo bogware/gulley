@@ -12,6 +12,14 @@ export interface CircuitBreakerOptions {
   minSamples?: number;
   /** EWMA smoothing factor (0..1); higher = more reactive. */
   alpha?: number;
+  /** EWMA latency (ms) at/above which a target is passively ejected as a slow
+   *  outlier — even with zero errors. Undefined = latency ejection disabled. */
+  latencyThresholdMs?: number;
+  /** Minimum latency observations before the latency rule can trip. */
+  minLatencySamples?: number;
+  /** Base duration a latency-ejected target stays out (backoff-scaled on repeats,
+   *  capped by `maxCooldownMs`). Defaults to `cooldownMs`. */
+  latencyEjectionMs?: number;
   now?: () => number;
 }
 
@@ -20,6 +28,9 @@ interface CircuitState {
   /** EWMA of the error indicator (0 = healthy, 1 = all failing). */
   ewmaError: number;
   samples: number;
+  /** EWMA of observed upstream latency (ms); 0 until the first sample. */
+  ewmaLatency: number;
+  latencySamples: number;
   /** Successive ejections, for multiplicative backoff; reset on recovery. */
   ejections: number;
   openUntil: number;
@@ -33,6 +44,11 @@ interface CircuitState {
  * duration is the base cooldown scaled by multiplicative backoff on repeated
  * ejections (capped), and never shorter than an upstream-supplied `Retry-After`.
  * A half-open success clears the failure state and resets the backoff.
+ *
+ * Passive outlier detection (opt-in): when `latencyThresholdMs` is set, a target
+ * whose EWMA latency crosses it is ejected as a slow outlier even if it never
+ * errors, and un-ejected by time (a half-open probe re-measures it — fast clears
+ * it, slow re-ejects). This is independent of the error/failure rules above.
  */
 export class CircuitBreaker {
   private readonly state = new Map<string, CircuitState>();
@@ -42,6 +58,9 @@ export class CircuitBreaker {
   private readonly errorRateThreshold: number;
   private readonly minSamples: number;
   private readonly alpha: number;
+  private readonly latencyThresholdMs: number | undefined;
+  private readonly minLatencySamples: number;
+  private readonly latencyEjectionMs: number;
   private readonly now: () => number;
 
   constructor(opts: CircuitBreakerOptions = {}) {
@@ -51,6 +70,9 @@ export class CircuitBreaker {
     this.errorRateThreshold = opts.errorRateThreshold ?? 0.5;
     this.minSamples = opts.minSamples ?? 20;
     this.alpha = opts.alpha ?? 0.2;
+    this.latencyThresholdMs = opts.latencyThresholdMs;
+    this.minLatencySamples = opts.minLatencySamples ?? 20;
+    this.latencyEjectionMs = opts.latencyEjectionMs ?? this.cooldownMs;
     this.now = opts.now ?? ((): number => Date.now());
   }
 
@@ -64,10 +86,23 @@ export class CircuitBreaker {
     return this.state.get(key)?.ewmaError ?? 0;
   }
 
+  /** EWMA upstream latency (ms) for observability / least-load selection. */
+  latencyMs(key: string): number {
+    return this.state.get(key)?.ewmaLatency ?? 0;
+  }
+
   private get(key: string): CircuitState {
     let s = this.state.get(key);
     if (!s) {
-      s = { consecutiveFailures: 0, ewmaError: 0, samples: 0, ejections: 0, openUntil: 0 };
+      s = {
+        consecutiveFailures: 0,
+        ewmaError: 0,
+        samples: 0,
+        ewmaLatency: 0,
+        latencySamples: 0,
+        ejections: 0,
+        openUntil: 0,
+      };
       this.state.set(key, s);
     }
     return s;
@@ -97,6 +132,26 @@ export class CircuitBreaker {
       s.ejections += 1;
       const backoff = Math.min(this.cooldownMs * 2 ** (s.ejections - 1), this.maxCooldownMs);
       s.openUntil = this.now() + Math.max(backoff, retryAfterMs ?? 0);
+    }
+  }
+
+  /** Record an observed upstream latency (ms). Feeds the EWMA used for passive
+   *  outlier ejection (when `latencyThresholdMs` is set) and observability. */
+  recordLatency(key: string, ms: number): void {
+    const s = this.get(key);
+    s.ewmaLatency =
+      s.latencySamples === 0 ? ms : s.ewmaLatency * (1 - this.alpha) + this.alpha * ms;
+    s.latencySamples += 1;
+
+    if (
+      this.latencyThresholdMs !== undefined &&
+      s.latencySamples >= this.minLatencySamples &&
+      s.ewmaLatency >= this.latencyThresholdMs &&
+      s.openUntil <= this.now() // don't extend an already-open circuit
+    ) {
+      s.ejections += 1;
+      const backoff = Math.min(this.latencyEjectionMs * 2 ** (s.ejections - 1), this.maxCooldownMs);
+      s.openUntil = this.now() + backoff;
     }
   }
 }

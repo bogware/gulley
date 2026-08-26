@@ -126,6 +126,13 @@ const Env = z.object({
   RETRY_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(1),
   RETRY_BACKOFF_MS: z.coerce.number().int().positive().default(250),
 
+  // Passive outlier detection: eject a target whose EWMA time-to-response-headers
+  // crosses this many ms (even with zero errors), re-probed after the ejection
+  // window. Unset = disabled (error/failure rules still apply).
+  BREAKER_LATENCY_THRESHOLD_MS: z.coerce.number().int().positive().optional(),
+  BREAKER_LATENCY_MIN_SAMPLES: z.coerce.number().int().positive().default(20),
+  BREAKER_LATENCY_EJECTION_MS: z.coerce.number().int().positive().default(30_000),
+
   // Load balancing across a loadbalance strategy's targets. When affinity is off
   // (default) the primary pick uses power-of-two-choices least-load over in-flight
   // counts. Setting LB_SESSION_AFFINITY_HEADER pins a session (that header's

@@ -545,7 +545,11 @@ export function createProductionContext(config: Config): GatewayContext {
     requestLog,
     flushLogs: () => requestLog.close(),
     audit: new PostgresAuditSink(db),
-    breaker: new CircuitBreaker(),
+    breaker: new CircuitBreaker({
+      latencyThresholdMs: config.BREAKER_LATENCY_THRESHOLD_MS,
+      minLatencySamples: config.BREAKER_LATENCY_MIN_SAMPLES,
+      latencyEjectionMs: config.BREAKER_LATENCY_EJECTION_MS,
+    }),
     budgets,
     telemetry,
     guardrails: buildGuardrails(config),

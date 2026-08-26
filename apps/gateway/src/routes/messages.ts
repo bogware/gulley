@@ -537,6 +537,7 @@ async function handleProxy(
     const isLast = i === candidates.length - 1;
     let resp: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
     let retryAfterMs: number | undefined;
+    let forwardStart = 0;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (controller.signal.aborted) break;
@@ -546,6 +547,7 @@ async function handleProxy(
         if (controller.signal.aborted) break;
       }
       try {
+        forwardStart = Date.now();
         const r = await target.adapter.forward({
           path: target.upstreamPath,
           body,
@@ -593,6 +595,9 @@ async function handleProxy(
     }
     upstream = resp;
     served = target;
+    // Feed time-to-response-headers to the breaker's latency EWMA (drives passive
+    // slow-outlier ejection when configured; measured independent of stream body).
+    ctx.breaker.recordLatency(target.name, Date.now() - forwardStart);
     // Mark this target in-flight for power-of-two-choices least-load; released
     // in teardown (guarded so a double teardown can't double-decrement).
     if (ctx.scoreboard) {

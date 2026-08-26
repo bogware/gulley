@@ -46,6 +46,37 @@ describe('CircuitBreaker (graded)', () => {
     expect(b.isOpen('t')).toBe(false);
   });
 
+  it('passively ejects a slow (but not erroring) outlier and self-heals on a fast probe', () => {
+    const c = clock();
+    const b = new CircuitBreaker({
+      latencyThresholdMs: 500,
+      minLatencySamples: 3,
+      latencyEjectionMs: 1000,
+      alpha: 1, // EWMA tracks the latest sample exactly, for a deterministic test
+      now: c.now,
+    });
+    // Below the sample floor: measured but never ejected.
+    b.recordLatency('slow', 900);
+    b.recordLatency('slow', 900);
+    expect(b.isOpen('slow')).toBe(false);
+    b.recordLatency('slow', 900); // 3rd sample, EWMA 900 ≥ 500 → ejected
+    expect(b.isOpen('slow')).toBe(true);
+    expect(b.latencyMs('slow')).toBe(900);
+
+    c.advance(1001); // ejection window elapses → half-open
+    expect(b.isOpen('slow')).toBe(false);
+    b.recordLatency('slow', 100); // fast probe pulls EWMA under the threshold
+    expect(b.isOpen('slow')).toBe(false); // stays healthy
+  });
+
+  it('does not eject on latency when the threshold is unset (opt-in)', () => {
+    const c = clock();
+    const b = new CircuitBreaker({ minLatencySamples: 1, alpha: 1, now: c.now });
+    for (let i = 0; i < 5; i++) b.recordLatency('t', 10_000);
+    expect(b.isOpen('t')).toBe(false); // latency ejection disabled by default
+    expect(b.latencyMs('t')).toBe(10_000); // still tracked for observability
+  });
+
   it('ejects on a high EWMA error rate with no consecutive streak', () => {
     const c = clock();
     const b = new CircuitBreaker({
