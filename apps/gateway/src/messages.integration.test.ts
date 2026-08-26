@@ -856,6 +856,52 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await new Promise<void>((r) => leaky.close(() => r()));
   });
 
+  it('withholds a buffered response that overflows the enforcement buffer (fail-closed)', async () => {
+    const big = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      // A non-streamed body far larger than the tiny buffer limit below, carrying
+      // a secret the output guardrail would have caught had it fit.
+      res.end(JSON.stringify({ content: 'AKIAIOSFODNN7EXAMPLE ' + 'x'.repeat(2000) }));
+    });
+    await new Promise<void>((r) => big.listen(0, '127.0.0.1', r));
+    const bigUrl = `http://127.0.0.1:${(big.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.responseBufferLimit = 50; // force overflow
+    ctx.bufferFailClosed = true;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('big', bigUrl) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action: 'block' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.headers.get('x-gulley-guardrail')).toBe('output-blocked-overflow');
+    expect(text).not.toContain('AKIA'); // the over-cap body never reaches the client
+    expect(text).toContain('too large to enforce');
+
+    await app.close();
+    await new Promise<void>((r) => big.close(() => r()));
+  });
+
   it('applies CEL request/response transformation', async () => {
     const { store, token } = seededStore();
     const { ctx } = buildContext(store);

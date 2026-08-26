@@ -175,6 +175,17 @@ const Env = z.object({
   TRACE_PROPAGATION: envBool(false),
   TRACE_SAMPLE_RATIO: z.coerce.number().min(0).max(1).default(1),
 
+  // Response buffering cap for non-streamed metering / buffered output enforcement.
+  // When a buffered-enforcement body exceeds this, the guardrail can't see the
+  // whole response: BUFFER_FAIL_CLOSED (default) WITHHOLDS it; fail-open forwards
+  // the truncated body flagged as unenforced.
+  RESPONSE_BUFFER_LIMIT_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(8 * 1024 * 1024),
+  BUFFER_FAIL_CLOSED: envBool(true),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),

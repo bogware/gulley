@@ -119,6 +119,11 @@ export interface GatewayContext {
   accessLog?: AccessLogFieldEngine;
   /** W3C trace-context propagation; absent = disabled. */
   tracePropagation?: { sampleRatio: number };
+  /** Max bytes buffered for non-streamed metering / output enforcement. */
+  responseBufferLimit?: number;
+  /** When a buffered-enforcement body exceeds the limit, withhold (true) rather
+   *  than forward it unenforced+truncated (false). Default true. */
+  bufferFailClosed?: boolean;
   /** Request header whose value pins a session to one target (HRW affinity);
    *  falls back to the principal id. Absent = no affinity (P2C / weighted). */
   sessionAffinityHeader?: string;
@@ -710,6 +715,8 @@ async function handleProxy(
   const storeCache =
     cacheOn && cacheLookup?.status === 'miss' && !outputEnforcing && statusCode < 400;
   const captureFull = !streamed || bufferOutput || storeCache;
+  const bufferLimit = ctx.responseBufferLimit ?? JSON_PARSE_CAP;
+  const bufferFailClosed = ctx.bufferFailClosed !== false;
   const fullChunks: Buffer[] = [];
   let fullBytes = 0;
   let captureOverflow = false;
@@ -977,7 +984,7 @@ async function handleProxy(
   upstreamBody.on('data', (chunk: Buffer) => {
     resetWatchdog();
     if (captureFull && !captureOverflow) {
-      if (fullBytes + chunk.length <= JSON_PARSE_CAP) {
+      if (fullBytes + chunk.length <= bufferLimit) {
         fullChunks.push(chunk);
         fullBytes += chunk.length;
       } else {
@@ -1054,7 +1061,42 @@ async function handleProxy(
       }
     }
 
-    if (bufferOutput && engine && holdStreamed) {
+    if (bufferOutput && engine && captureOverflow) {
+      // The response outgrew the buffer limit, so the guardrail could not inspect
+      // the whole body (and the raw bytes were not streamed through). Fail closed:
+      // withhold rather than forward a truncated, unenforced response.
+      const sse = holdStreamed;
+      outputEnforced = {
+        findings: [],
+        summary: { total: 0, categories: {}, maxConfidence: 0 },
+        blocked: bufferFailClosed,
+      };
+      const bodyOut = bufferFailClosed
+        ? sse
+          ? providerErrorFrame(provider, 'response too large to enforce guardrail')
+          : Buffer.from(
+              JSON.stringify({
+                type: 'error',
+                error: { type: 'guardrail_blocked', message: 'response too large to enforce' },
+              }),
+            )
+        : Buffer.concat(fullChunks); // fail-open: forward the truncated prefix
+      if (!reply.raw.writableEnded) {
+        reply.raw.writeHead(statusCode, {
+          ...filterResponseHeaders(upstreamHeaders),
+          ...rlHeaders,
+          'content-type': sse ? 'text/event-stream' : 'application/json',
+          'x-gulley-request-id': requestId,
+          'x-gulley-target': servedTarget.name,
+          'x-gulley-cache': 'bypass',
+          'x-gulley-guardrail': bufferFailClosed
+            ? 'output-blocked-overflow'
+            : 'overflow-unenforced',
+        });
+        reply.raw.write(bodyOut);
+        reply.raw.end();
+      }
+    } else if (bufferOutput && engine && holdStreamed) {
       // Streamed hold-then-flush: enforce on the whole SSE body. Because we can't
       // re-encode a redaction into SSE frames, any enforcing verdict (block OR
       // would-redact) WITHHOLDS the response (a terminal error frame); otherwise

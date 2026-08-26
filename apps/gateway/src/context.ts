@@ -600,6 +600,8 @@ export function createProductionContext(config: Config): GatewayContext {
     tracePropagation: config.TRACE_PROPAGATION
       ? { sampleRatio: config.TRACE_SAMPLE_RATIO }
       : undefined,
+    responseBufferLimit: config.RESPONSE_BUFFER_LIMIT_BYTES,
+    bufferFailClosed: config.BUFFER_FAIL_CLOSED,
   };
 }
 
