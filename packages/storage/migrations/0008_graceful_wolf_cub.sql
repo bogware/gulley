@@ -1,0 +1,1 @@
+ALTER TABLE "budget" ADD COLUMN "name" text DEFAULT 'default' NOT NULL;

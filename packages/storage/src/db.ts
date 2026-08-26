@@ -11,6 +11,17 @@ export function createDatabase(url: string, max = 10) {
   return drizzle(client, { schema });
 }
 
+/** Like `createDatabase`, but also returns a `close()` that ends the underlying
+ *  pool — for a long-lived component (e.g. the config-reload watcher) that owns
+ *  its own connection and must release it on shutdown. */
+export function createClosableDatabase(
+  url: string,
+  max = 10,
+): { db: Database; close: () => Promise<void> } {
+  const client = postgres(url, { max });
+  return { db: drizzle(client, { schema }), close: () => client.end({ timeout: 5 }) };
+}
+
 export type ListenConnection = ReturnType<typeof postgres>;
 
 /**

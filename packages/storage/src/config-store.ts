@@ -130,16 +130,24 @@ export class PostgresConfigBackend implements ConfigBackend {
         set: { secretArn: ref.secretArn, secretVersion: ref.secretVersion },
       });
   }
+  async deleteCredential(providerId: string): Promise<void> {
+    await this.db.delete(providerCredential).where(eq(providerCredential.providerId, providerId));
+  }
 
   async listEntities(kind: ConfigCollectionKind, workspaceId: string): Promise<BackendEntity[]> {
     if (kind === 'budget') {
       const rows = await this.db
-        .select({ id: budget.id, cap: budget.capMicroUsd, period: budget.periodSeconds })
+        .select({
+          id: budget.id,
+          name: budget.name,
+          cap: budget.capMicroUsd,
+          period: budget.periodSeconds,
+        })
         .from(budget)
         .where(eq(budget.workspaceId, workspaceId));
       return rows.map((r) => ({
         id: r.id,
-        name: 'default',
+        name: r.name,
         config:
           r.period == null
             ? { capMicroUsd: r.cap }
@@ -164,11 +172,24 @@ export class PostgresConfigBackend implements ConfigBackend {
     config: Record<string, unknown>,
   ): Promise<void> {
     if (kind === 'budget') {
-      await this.db.insert(budget).values({
-        workspaceId,
-        capMicroUsd: Number(config['capMicroUsd'] ?? 0),
-        periodSeconds: config['periodSeconds'] == null ? null : Number(config['periodSeconds']),
-      });
+      // Budget is singular per workspace — upsert so a (structurally-valid but
+      // unusual) second budget in the doc overwrites rather than crashing the tx.
+      await this.db
+        .insert(budget)
+        .values({
+          workspaceId,
+          name,
+          capMicroUsd: Number(config['capMicroUsd'] ?? 0),
+          periodSeconds: config['periodSeconds'] == null ? null : Number(config['periodSeconds']),
+        })
+        .onConflictDoUpdate({
+          target: budget.workspaceId,
+          set: {
+            name,
+            capMicroUsd: Number(config['capMicroUsd'] ?? 0),
+            periodSeconds: config['periodSeconds'] == null ? null : Number(config['periodSeconds']),
+          },
+        });
       return;
     }
     await this.db.insert(jsonbTable(kind)).values({ workspaceId, name, config });
@@ -186,6 +207,8 @@ export class PostgresConfigBackend implements ConfigBackend {
           periodSeconds: config['periodSeconds'] == null ? null : Number(config['periodSeconds']),
         })
         .where(eq(budget.id, id));
+      // Note: name is not updated here — reconcile only calls updateEntity when
+      // the config CHANGED for the same name, so the name is already correct.
       return;
     }
     const t = jsonbTable(kind);
@@ -259,39 +282,27 @@ export class PostgresConfigVersionStore implements ConfigVersionStore {
   }
 
   async tryReserve(expected: number): Promise<number | null> {
-    const next = expected + 1;
-    const rows = await this.db.execute(sql`
-      insert into config_version (version, content_hash, yaml, actor, summary, audit_seq)
-      select ${next}, '', '', '', '{}'::jsonb, 0
-      where coalesce((select max(version) from config_version), 0) = ${expected}
-      on conflict (version) do nothing
-      returning version
-    `);
-    // postgres.js returns an array-like of rows.
-    const count = Array.isArray(rows) ? rows.length : ((rows as { length?: number }).length ?? 0);
-    return count > 0 ? next : null;
+    // Pure read — NEVER a placeholder row (which would leak on a failed apply and
+    // surface as a blank "current" version). `append` is the atomic gate: the
+    // config_version PK on `version` means a concurrent apply at the same base
+    // loses on its INSERT (a 500, not corruption). Note: reconcile + append are
+    // not one transaction (apply.ts orchestrates separate deps), so a rare
+    // same-base race can leave the loser's reconcile applied without a version
+    // row — the audit chain + content hash still catch it.
+    const current = await this.currentVersion();
+    return current === expected ? expected + 1 : null;
   }
 
   async append(rec: ConfigVersionRecord): Promise<void> {
-    await this.db
-      .insert(configVersion)
-      .values({
-        version: rec.version,
-        contentHash: rec.contentHash,
-        yaml: rec.yaml,
-        actor: rec.actor,
-        summary: rec.summary,
-        auditSeq: rec.auditSeq,
-      })
-      .onConflictDoUpdate({
-        target: configVersion.version,
-        set: {
-          contentHash: rec.contentHash,
-          yaml: rec.yaml,
-          actor: rec.actor,
-          summary: rec.summary,
-          auditSeq: rec.auditSeq,
-        },
-      });
+    // Plain insert: the version PK is the concurrency gate — a duplicate version
+    // (lost race) throws rather than silently overwriting the winner's record.
+    await this.db.insert(configVersion).values({
+      version: rec.version,
+      contentHash: rec.contentHash,
+      yaml: rec.yaml,
+      actor: rec.actor,
+      summary: rec.summary,
+      auditSeq: rec.auditSeq,
+    });
   }
 }

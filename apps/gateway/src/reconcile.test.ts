@@ -75,6 +75,22 @@ describe('GatewayReconciler', () => {
     expect(breaker.errorRate('anthropic')).toBeGreaterThan(0);
   });
 
+  it('reports success/failure so the watcher advances the cursor only on success', async () => {
+    const { holder } = holderWithState();
+    const ok = new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      new MapSecretResolver(new Map([[ARN, 'k']])),
+    );
+    expect(await ok.reconcile()).toBe(true);
+    const bad = new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      new MapSecretResolver(new Map()), // resolve throws
+    );
+    expect(await bad.reconcile()).toBe(false);
+  });
+
   it('KEEPS the current config when a secret cannot be resolved (fail-safe)', async () => {
     const { holder } = holderWithState();
     // Seed a working config first.

@@ -79,6 +79,24 @@ describe('reconcileWithBackend + exportWithBackend', () => {
     expect(await backend.getCredential('id_3')).toBeNull();
   });
 
+  it('clears a kept provider credential when the desired doc omits it', async () => {
+    const store = new BackendConfigStore(new InMemoryConfigBackend());
+    await store.reconcile(doc(), { admin, access: allow });
+    expect(
+      (await store.exportDocument('*')).orgs[0]?.workspaces[0]?.providers[0]?.credential,
+    ).toBeDefined();
+    // Re-apply the same provider (kept by kind) with no credential → the old ARN is cleared.
+    await store.reconcile(
+      doc({
+        providers: [{ kind: 'anthropic', baseUrl: 'https://api.anthropic.com', enabled: true }],
+      }),
+      { admin, access: allow },
+    );
+    expect(
+      (await store.exportDocument('*')).orgs[0]?.workspaces[0]?.providers[0]?.credential,
+    ).toBeUndefined();
+  });
+
   it('does not create duplicate orgs/workspaces across repeated applies', async () => {
     const backend = new InMemoryConfigBackend();
     const store = new BackendConfigStore(backend);

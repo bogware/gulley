@@ -65,6 +65,7 @@ export interface ConfigBackend {
   deleteProvider(id: string): Promise<void>;
   getCredential(providerId: string): Promise<SecretRef | null>;
   setCredential(providerId: string, ref: SecretRef): Promise<void>;
+  deleteCredential(providerId: string): Promise<void>;
 
   listEntities(kind: ConfigCollectionKind, workspaceId: string): Promise<BackendEntity[]>;
   createEntity(
@@ -184,7 +185,10 @@ export async function reconcileWithBackend(
           baseUrl: dp.baseUrl ?? null,
           enabled: dp.enabled,
         });
+        // Reconcile the credential too: set it, or CLEAR a stale one when the
+        // desired provider omits it (a kept provider must not retain an old ARN).
         if (dp.credential) await backend.setCredential(p.id, dp.credential);
+        else await backend.deleteCredential(p.id);
       }
 
       // Entity collections: delete-by-absence, create-new, update-on-change.
@@ -283,6 +287,9 @@ export class InMemoryConfigBackend implements ConfigBackend {
   }
   async setCredential(providerId: string, ref: SecretRef): Promise<void> {
     this.credentials.set(providerId, ref);
+  }
+  async deleteCredential(providerId: string): Promise<void> {
+    this.credentials.delete(providerId);
   }
   async listEntities(kind: ConfigCollectionKind, workspaceId: string): Promise<BackendEntity[]> {
     return [...this.coll(kind).values()]

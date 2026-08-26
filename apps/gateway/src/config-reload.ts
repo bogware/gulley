@@ -1,5 +1,5 @@
 import {
-  createDatabase,
+  createClosableDatabase,
   createListenConnection,
   newOriginId,
   PostgresConfigBus,
@@ -26,7 +26,7 @@ export function buildConfigWatcher(
 ): ConfigWatcher | undefined {
   if (config.CONFIG_SOURCE !== 'db' || !config.DATABASE_URL) return undefined;
 
-  const db = createDatabase(config.DATABASE_URL);
+  const { db, close } = createClosableDatabase(config.DATABASE_URL);
   const store = new PostgresConfigStore(db);
   const versions = new PostgresConfigVersionStore(db);
   const resolver = buildSecretResolver(config);
@@ -40,6 +40,8 @@ export function buildConfigWatcher(
     // Fires on every (re)connect — resync to catch anything missed while down.
     void ref.watcher?.resync();
   });
-  ref.watcher = new ConfigWatcher(subscriber, reconciler, versions, newOriginId());
+  // On stop, close the store's query pool too (the subscriber closes its own
+  // listen connection) so neither is leaked.
+  ref.watcher = new ConfigWatcher(subscriber, reconciler, versions, newOriginId(), close);
   return ref.watcher;
 }

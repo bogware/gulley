@@ -57,10 +57,14 @@ export class SignalGate {
   }
   /** True if this signal is new and foreign — and, if so, advances the cursor. */
   accept(sig: ConfigSignal): boolean {
-    if (sig.origin === this.ownOrigin) return false;
-    if (sig.v <= this.applied) return false;
+    if (!this.shouldAccept(sig)) return false;
     this.applied = sig.v;
     return true;
+  }
+  /** Peek: true if the signal is new and foreign, WITHOUT advancing the cursor —
+   *  so a caller can advance only after it has successfully acted on the signal. */
+  shouldAccept(sig: ConfigSignal): boolean {
+    return sig.origin !== this.ownOrigin && sig.v > this.applied;
   }
   /** Advance the cursor from a durable read (e.g. reconnect catch-up). */
   observe(version: number): void {

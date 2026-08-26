@@ -57,6 +57,13 @@
       "when": 1787710081275,
       "tag": "0007_windy_lionheart",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1787770271171,
+      "tag": "0008_graceful_wolf_cub",
+      "breakpoints": true
     }
   ]
 }

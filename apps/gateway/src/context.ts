@@ -440,7 +440,11 @@ export function createProductionContext(config: Config): GatewayContext {
     });
   }
 
-  if (routes.length === 0) {
+  // In DB config mode the route table is loaded from Postgres by the reload
+  // watcher AFTER boot, so an empty env route set is expected — the gateway boots
+  // with a working context (and holder) and reconciles to the DB config. Only the
+  // env-only mode requires at least one provider key at boot.
+  if (routes.length === 0 && config.CONFIG_SOURCE !== 'db') {
     throw new Error(
       'no providers configured — set ANTHROPIC_UPSTREAM_API_KEY / OPENAI_UPSTREAM_API_KEY or CUSTOM_PROVIDERS',
     );

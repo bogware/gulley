@@ -99,9 +99,12 @@ export async function applyConfig(
     return err({ kind: 'stale', current: await deps.versions.currentVersion() });
   }
 
-  // Reconcile + audit + version-record. On Postgres these run in ONE transaction
-  // so a mid-way failure rolls all back together (that's the durable-atomicity
-  // seam); here we at least surface a clean error instead of an uncaught 500.
+  // Reconcile → export → audit → version-record. These are separate deps, so on
+  // Postgres the reconcile is atomic within ITS transaction and the version row
+  // is a separate append; a mid-way failure surfaces a clean error (no blank
+  // version row is written — tryReserve is a pure read). A rare concurrent apply
+  // at the same base version loses on the version PK. Full cross-step atomicity
+  // (reconcile + version row in one tx) remains a future hardening.
   try {
     const applied = await deps.store.reconcile(desired, { admin, access: deps.access });
     const newDoc = await deps.store.exportDocument('*');

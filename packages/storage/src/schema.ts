@@ -360,6 +360,9 @@ export const budget = pgTable(
     workspaceId: uuid('workspace_id')
       .notNull()
       .references(() => workspace.id, { onDelete: 'cascade' }),
+    // Config-document entity name (singular per workspace; 'default' by convention).
+    // Carried so a GitOps round-trip preserves the authored name.
+    name: text('name').notNull().default('default'),
     capMicroUsd: bigint('cap_micro_usd', { mode: 'number' }).notNull(),
     periodSeconds: integer('period_seconds'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

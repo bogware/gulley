@@ -37,11 +37,15 @@ export function buildServer(config: Config, context?: GatewayContext): GatewaySe
   // recomputes providers from the (swappable) holder so a reconcile is reflected.
   app.get('/health', async () => ({ status: 'ok', service: 'gateway', version: GULLEY_VERSION }));
   app.get('/ready', async (_req, reply) => {
-    if (!holder) {
+    const providers = holder?.providers() ?? [];
+    // Degraded until there is at least one route: no context, OR a DB-config
+    // gateway whose reconcile hasn't loaded routes yet — so the LB pulls the task
+    // and only routes traffic once the route table is populated.
+    if (!holder || providers.length === 0) {
       reply.code(503);
-      return { status: 'degraded' };
+      return { status: 'degraded', providers };
     }
-    return { status: 'ready', providers: holder.providers() };
+    return { status: 'ready', providers };
   });
   app.get('/', async () => ({ name: 'gulley-gateway', version: GULLEY_VERSION }));
 

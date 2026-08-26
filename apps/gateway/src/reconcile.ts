@@ -28,21 +28,31 @@ export class GatewayReconciler {
     private readonly log?: ReconcileLog,
   ) {}
 
-  /** Trigger a reconcile; serialized behind any in-flight one. */
-  reconcile(): Promise<void> {
-    this.chain = this.chain.catch(() => undefined).then(() => this.run());
-    return this.chain;
+  /** Trigger a reconcile; serialized behind any in-flight one. Resolves to true
+   *  if the swap succeeded, false if it failed (old config kept). */
+  reconcile(): Promise<boolean> {
+    const next = this.chain.then(
+      () => this.run(),
+      () => this.run(),
+    );
+    this.chain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
-  private async run(): Promise<void> {
+  private async run(): Promise<boolean> {
     try {
       const doc = await this.store.exportDocument('*');
       const routes = await buildRoutesFromDocument(doc, this.resolver);
       this.holder.swapRoutes(routes);
       this.log?.info(`config reconciled: ${routes.length} routes active`);
+      return true;
     } catch (err) {
       // Old routes stay intact — never a partial or credential-less swap.
       this.log?.error(err, 'config reconcile failed; keeping current config');
+      return false;
     }
   }
 }
@@ -56,31 +66,58 @@ export class GatewayReconciler {
  */
 export class ConfigWatcher {
   private readonly gate: SignalGate;
+  private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private stopped = false;
 
   constructor(
     private readonly subscriber: ConfigSubscriber,
     private readonly reconciler: GatewayReconciler,
     private readonly versions: ConfigVersionStore,
     originId: string,
+    /** Extra cleanup on stop (e.g. close the store's DB pool). */
+    private readonly cleanup?: () => Promise<void>,
+    private readonly retryMs = 5_000,
   ) {
     this.gate = new SignalGate(originId);
   }
 
   async start(): Promise<void> {
     this.subscriber.onSignal((sig) => {
-      if (this.gate.accept(sig)) void this.reconciler.reconcile();
+      // Peek (don't advance) so a FAILED reconcile doesn't wedge the cursor and
+      // drop this version forever — advance only after a successful swap.
+      if (this.gate.shouldAccept(sig)) void this.handle(sig.v);
     });
     await this.subscriber.start();
     await this.resync();
   }
 
-  /** Read the durable version + reconcile from the latest document. */
+  private async handle(version: number): Promise<void> {
+    const ok = await this.reconciler.reconcile();
+    if (ok) this.gate.observe(version);
+    else this.scheduleRetry(); // transient failure — retry so we don't stay stale
+  }
+
+  private scheduleRetry(): void {
+    if (this.stopped || this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      void this.resync();
+    }, this.retryMs);
+    this.retryTimer.unref?.();
+  }
+
+  /** Reconcile from the latest document; advance the cursor only on success. */
   async resync(): Promise<void> {
-    this.gate.observe(await this.versions.currentVersion());
-    await this.reconciler.reconcile();
+    const version = await this.versions.currentVersion();
+    const ok = await this.reconciler.reconcile();
+    if (ok) this.gate.observe(version);
+    else this.scheduleRetry();
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
     await this.subscriber.close();
+    await this.cleanup?.();
   }
 }
