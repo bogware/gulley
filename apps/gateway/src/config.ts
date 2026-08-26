@@ -97,6 +97,11 @@ const Env = z.object({
   CUSTOM_PROVIDERS: z.string().optional(),
 
   DATABASE_URL: z.string().url().optional(),
+  // Secret resolution for the DB config path (provider ARNs → values at reload).
+  // SECRETS_LOCAL_MAP (JSON {arn:value}) selects the in-process resolver for
+  // dev/tests; otherwise AWS Secrets Manager (SECRETS_REGION optional).
+  SECRETS_LOCAL_MAP: z.string().optional(),
+  SECRETS_REGION: z.string().optional(),
   // Redis counters (budget reserve/commit). Absent = budgets disabled.
   REDIS_COUNTERS_URL: z.string().url().optional(),
   // Redis for the exact cache / Redis Stack vector index (when selected).

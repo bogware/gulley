@@ -23,11 +23,13 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.1118.0",
     "@gulley/auth": "workspace:*",
     "@gulley/budget": "workspace:*",
     "@gulley/cache": "workspace:*",
     "@gulley/catalog": "workspace:*",
     "@gulley/cel": "workspace:*",
+    "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
     "@gulley/egress": "workspace:*",
