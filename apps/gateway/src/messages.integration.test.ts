@@ -876,7 +876,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     const bigUrl = `http://127.0.0.1:${(big.address() as AddressInfo).port}`;
 
     const { store, token } = seededStore();
-    const { ctx } = buildContext(store);
+    const { ctx, ledger } = buildContext(store);
     ctx.responseBufferLimit = 50; // force overflow
     ctx.bufferFailClosed = true;
     ctx.routes = [
@@ -906,6 +906,11 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(res.headers.get('x-gulley-guardrail')).toBe('output-blocked-overflow');
     expect(text).not.toContain('AKIA'); // the over-cap body never reaches the client
     expect(text).toContain('too large to enforce');
+    // Metering couldn't parse the over-cap body, but the provider billed it — the
+    // worst-case reservation is charged (a ledger row with a non-zero cost), so a
+    // withheld over-cap response can't be used to evade the budget.
+    expect(ledger.entries).toHaveLength(1);
+    expect(ledger.entries[0]?.costMicroUsd ?? 0).toBeGreaterThan(0);
 
     await app.close();
     await new Promise<void>((r) => big.close(() => r()));

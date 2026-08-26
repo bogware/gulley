@@ -193,15 +193,22 @@ function handleDebugTrace(ctx: GatewayContext, request: FastifyRequest, reply: F
     'cache-control': 'no-cache',
     connection: 'keep-alive',
   });
-  const write = (e: unknown): void => {
-    if (!reply.raw.writableEnded) reply.raw.write(`data: ${JSON.stringify(e)}\n\n`);
+  // Respect socket backpressure: a slow consumer that stops draining would
+  // otherwise buffer every event unbounded (OOM). The tracer is lossy by design,
+  // so we DROP events while the socket is backed up and resume on 'drain'.
+  let backpressured = false;
+  reply.raw.on('drain', () => {
+    backpressured = false;
+  });
+  const writeRaw = (chunk: string): void => {
+    if (reply.raw.writableEnded || backpressured) return;
+    if (!reply.raw.write(chunk)) backpressured = true;
   };
+  const write = (e: unknown): void => writeRaw(`data: ${JSON.stringify(e)}\n\n`);
   for (const e of tracer.recent()) write(e); // replay the ring
   const unsubscribe = tracer.subscribe(write); // then stream live
   // Heartbeat so an idle stream + dead peer is detected and cleaned up.
-  const heartbeat = setInterval(() => {
-    if (!reply.raw.writableEnded) reply.raw.write(': ping\n\n');
-  }, 15_000);
+  const heartbeat = setInterval(() => writeRaw(': ping\n\n'), 15_000);
   const cleanup = (): void => {
     clearInterval(heartbeat);
     unsubscribe();
@@ -803,7 +810,12 @@ async function handleProxy(
     const n = usage.normalized();
     const meteredModel = n.model ?? requestedModel;
     const cost = computeCost(provider, meteredModel, n, ctx.rateResolver);
-    const costMicroUsd = toMicroUsd(cost.totalUsd);
+    // A buffered-enforcement body that overflowed the cap can't be metered (the
+    // usage was never parsed), but the provider still generated and billed it.
+    // Charge the worst-case reservation rather than $0, so a withheld over-cap
+    // response can't be used to drive real provider spend past the budget.
+    const meteringFailed = captureOverflow && bufferOutput && !n.seen;
+    const costMicroUsd = meteringFailed ? worstCase : toMicroUsd(cost.totalUsd);
     const createdAt = new Date();
 
     // Output guardrail findings: from the buffered enforcement pass, or the
@@ -838,7 +850,7 @@ async function handleProxy(
     }
 
     try {
-      if (n.seen) {
+      if (n.seen || meteringFailed) {
         await ctx.ledger.record({
           requestId,
           principalId: principal.id,
@@ -1337,14 +1349,23 @@ async function serveFromCache(
   const requestId = request.id;
 
   reply.hijack();
-  reply.raw.writeHead(cached.statusCode, {
-    ...filterResponseHeaders(cached.headers),
-    ...rlHeaders,
-    'x-gulley-request-id': requestId,
-    'x-gulley-target': `cache:${lookup.status}`,
-    'x-gulley-cache': lookup.status,
-    'cache-status': `Gulley; hit`,
-  });
+  // Apply the static response header modifier here too — the cache-hit path is a
+  // fifth hijacked writeHead site, and skipping it would let a cached header the
+  // operator meant to strip (or a header they meant to add, e.g. HSTS) diverge
+  // from the miss path. (CEL response transforms don't run on cache hits by
+  // design — the CEL activation is request-specific and hits skip that stage.)
+  const cacheHeaders = applyHeaderRules(
+    {
+      ...filterResponseHeaders(cached.headers),
+      ...rlHeaders,
+      'x-gulley-request-id': requestId,
+      'x-gulley-target': `cache:${lookup.status}`,
+      'x-gulley-cache': lookup.status,
+      'cache-status': `Gulley; hit`,
+    },
+    ctx.headerModifier?.response,
+  );
+  reply.raw.writeHead(cached.statusCode, cacheHeaders);
   if (!reply.raw.writableEnded) {
     reply.raw.write(cached.body);
     reply.raw.end();

@@ -38,8 +38,8 @@ So M13 is three layers, each independently shippable and verifiable.
   a serializable guard / advisory lock) to keep the optimistic-concurrency "exactly
   one concurrent apply wins" contract the tests assert.
 - Wire both into `apps/control-api/src/context.ts` (replacing `InMemoryConfigVersionStore`
-  + the in-memory stores) so `POST /config/apply` persists to the tables the gateway
-  reads, then fires the (already-wired) `onApplied` bus emit.
+  - the in-memory stores) so `POST /config/apply` persists to the tables the gateway
+    reads, then fires the (already-wired) `onApplied` bus emit.
 
 **Verify:** apply → rows persisted + version bumped; two concurrent applies → one
 409 stale; a revert reuses a prior hash under a new version.
