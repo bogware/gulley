@@ -75,6 +75,7 @@ async function shutdown(signal: string): Promise<void> {
     await configWatcher?.stop(); // stop reloads before draining so none races the close
     await app.close();
     await context?.flushLogs?.(); // drain buffered request logs before exit
+    await context?.accessLogSink?.shutdown(); // flush the OTLP access-log batch
     await metricsServer?.close();
     await closeUpstreamPool();
   } catch (err) {

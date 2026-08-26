@@ -87,6 +87,7 @@ import {
 import {
   type AccessLogConfig,
   AccessLogFieldEngine,
+  initAccessLogExporter,
   initTelemetry,
   type Telemetry,
 } from '@gulley/telemetry';
@@ -607,6 +608,12 @@ export function createProductionContext(config: Config): GatewayContext {
     scoreboard: config.LB_LEAST_LOAD ? new LoadScoreboard() : undefined,
     sessionAffinityHeader: config.LB_SESSION_AFFINITY_HEADER,
     accessLog: buildAccessLog(config.ACCESS_LOG_FIELDS),
+    accessLogSink: config.ACCESS_LOG_OTLP
+      ? initAccessLogExporter({
+          endpoint: config.OTEL_EXPORTER_OTLP_ENDPOINT,
+          serviceName: config.OTEL_SERVICE_NAME,
+        })
+      : undefined,
     tracePropagation: config.TRACE_PROPAGATION
       ? { sampleRatio: config.TRACE_SAMPLE_RATIO }
       : undefined,

@@ -1,0 +1,75 @@
+# Gulley gateway SLO recording + alerting rules (Prometheus).
+# SLO: 99.5% availability, p99 end-to-end latency < 10s, over a 30-day window.
+# Multi-window multi-burn-rate alerting per the Google SRE workbook.
+#
+# Load with `rule_files: [gulley-slo-alerts.yml]` in prometheus.yml. The metric
+# names + labels match @gulley/metrics (gulley_requests_total{provider,model,
+# status,status_code,streamed}, gulley_request_duration_seconds_bucket).
+groups:
+  - name: gulley-gateway-slo-recording
+    interval: 30s
+    rules:
+      # `status="error"` is a gateway/upstream failure — 4xx client errors are
+      # status="ok" with a 4xx status_code, so they don't burn the availability SLO.
+      - record: gulley:error_ratio:rate5m
+        expr: |
+          sum(rate(gulley_requests_total{status="error"}[5m]))
+          / clamp_min(sum(rate(gulley_requests_total[5m])), 1e-9)
+      - record: gulley:error_ratio:rate30m
+        expr: |
+          sum(rate(gulley_requests_total{status="error"}[30m]))
+          / clamp_min(sum(rate(gulley_requests_total[30m])), 1e-9)
+      - record: gulley:error_ratio:rate1h
+        expr: |
+          sum(rate(gulley_requests_total{status="error"}[1h]))
+          / clamp_min(sum(rate(gulley_requests_total[1h])), 1e-9)
+      - record: gulley:error_ratio:rate6h
+        expr: |
+          sum(rate(gulley_requests_total{status="error"}[6h]))
+          / clamp_min(sum(rate(gulley_requests_total[6h])), 1e-9)
+      - record: gulley:latency_p99:5m
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(gulley_request_duration_seconds_bucket[5m])))
+
+  - name: gulley-gateway-slo-alerts
+    rules:
+      # Fast burn: 14.4x budget rate confirmed on both 5m and 1h windows → page.
+      - alert: GulleyErrorBudgetBurnFast
+        expr: |
+          gulley:error_ratio:rate5m > (14.4 * 0.005)
+          and gulley:error_ratio:rate1h > (14.4 * 0.005)
+        for: 2m
+        labels: { severity: page, service: gulley-gateway }
+        annotations:
+          summary: 'Gulley error budget burning fast (>14.4x)'
+          description: '5m error ratio {{ $value | humanizePercentage }} — ~2% of the 30d budget/hour.'
+      # Slow burn: 6x budget rate on 30m + 6h windows → ticket.
+      - alert: GulleyErrorBudgetBurnSlow
+        expr: |
+          gulley:error_ratio:rate30m > (6 * 0.005)
+          and gulley:error_ratio:rate6h > (6 * 0.005)
+        for: 15m
+        labels: { severity: ticket, service: gulley-gateway }
+        annotations:
+          summary: 'Gulley error budget burning slowly (>6x)'
+          description: '6h error ratio {{ $value | humanizePercentage }} — steady budget erosion.'
+      - alert: GulleyLatencySLOBreach
+        expr: gulley:latency_p99:5m > 10
+        for: 10m
+        labels: { severity: warning, service: gulley-gateway }
+        annotations:
+          summary: 'Gulley p99 latency above the 10s SLO'
+          description: 'p99 end-to-end {{ $value }}s over 5m.'
+      # Capacity / correctness signals.
+      - alert: GulleyBudgetRejectionsSpiking
+        expr: sum(rate(gulley_requests_total{status_code="402"}[5m])) > 1
+        for: 5m
+        labels: { severity: warning, service: gulley-gateway }
+        annotations:
+          summary: 'Workspaces hitting budget caps (402s)'
+      - alert: GulleyFailoversElevated
+        expr: sum(rate(gulley_failovers_total[5m])) > 0.5
+        for: 10m
+        labels: { severity: warning, service: gulley-gateway }
+        annotations:
+          summary: 'Elevated pre-first-byte failovers — an upstream is unhealthy'

@@ -43,6 +43,7 @@ import {
 } from '@gulley/routing';
 import {
   type AccessLogFieldEngine,
+  type AccessLogSink,
   nextTraceContext,
   type Telemetry,
   type TraceContext,
@@ -120,6 +121,8 @@ export interface GatewayContext {
   outlier?: OutlierDetector;
   /** Operator-configurable access-log field engine; absent = no access log. */
   accessLog?: AccessLogFieldEngine;
+  /** OTLP logs sink for the access-log record; absent = stdout only. */
+  accessLogSink?: AccessLogSink;
   /** W3C trace-context propagation; absent = disabled. */
   tracePropagation?: { sampleRatio: number };
   /** Max bytes buffered for non-streamed metering / output enforcement. */
@@ -719,6 +722,8 @@ async function handleProxy(
   let upstream: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
   let served: RouteTarget | undefined;
   let scoreboardHeld = false;
+  let dispatchMs: number | undefined; // when we dispatched to the serving target
+  let firstByteMs: number | undefined; // when its response headers arrived
   for (let i = 0; i < candidates.length; i++) {
     const target = candidates[i] as RouteTarget;
     const isLast = i === candidates.length - 1;
@@ -782,6 +787,8 @@ async function handleProxy(
     }
     upstream = resp;
     served = target;
+    dispatchMs = forwardStart;
+    firstByteMs = Date.now();
     // Feed time-to-response-headers (peer-relative) to the passive outlier
     // detector — measured independent of stream-body duration, judged against the
     // candidate pool. Only served (pre-first-byte) responses count.
@@ -961,7 +968,10 @@ async function handleProxy(
           guardrailOutputFindings: outFindings.length,
           ...(trace ? { traceId: trace.traceId } : {}),
         });
-        if (record) request.log.info({ access: record }, 'access');
+        if (record) {
+          request.log.info({ access: record }, 'access');
+          ctx.accessLogSink?.emit(record); // also ship to the OTLP logs backend
+        }
       }
       await ctx.audit.append({
         orgId: principal.scope.orgId,
@@ -1035,6 +1045,14 @@ async function handleProxy(
       guardrailOutputFindings: engine ? outFindings.length : undefined,
       guardrailAction: guardrailAction ?? (outputEnforced?.blocked ? 'block' : undefined),
       traceId: trace?.traceId,
+      stages:
+        dispatchMs !== undefined && firstByteMs !== undefined
+          ? [
+              { name: 'admission', startMs: started, endMs: dispatchMs },
+              { name: 'upstream.ttfb', startMs: dispatchMs, endMs: firstByteMs },
+              { name: 'stream', startMs: firstByteMs, endMs: Date.now() },
+            ]
+          : undefined,
     });
 
     // Feed the live request tracer (credential-free summary; per-replica, lossy).

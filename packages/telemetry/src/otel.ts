@@ -1,4 +1,4 @@
-import { SpanKind, SpanStatusCode, trace, type Tracer } from '@opentelemetry/api';
+import { context, SpanKind, SpanStatusCode, trace, type Tracer } from '@opentelemetry/api';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
@@ -27,6 +27,9 @@ export interface RequestSpanData {
   guardrailAction?: string;
   /** W3C trace id (32-hex) this request belongs to, for cross-system correlation. */
   traceId?: string;
+  /** Per-stage timings (epoch ms), materialized as child spans under the request
+   *  span — recorded off the hot path (cheap marks), never per-chunk. */
+  stages?: Array<{ name: string; startMs: number; endMs: number }>;
 }
 
 export interface Telemetry {
@@ -106,6 +109,16 @@ export function initTelemetry(opts: TelemetryOptions): Telemetry {
       if (data.traceId) span.setAttribute('gulley.trace_id', data.traceId);
       if (data.status !== 'ok') {
         span.setStatus({ code: SpanStatusCode.ERROR, message: data.status });
+      }
+      // Materialize per-stage child spans under the request span (buffered marks,
+      // never per-chunk) so a trace shows where the latency actually went.
+      if (data.stages && data.stages.length > 0) {
+        const parentCtx = trace.setSpan(context.active(), span);
+        for (const s of data.stages) {
+          if (s.endMs >= s.startMs) {
+            tracer.startSpan(s.name, { startTime: s.startMs }, parentCtx).end(s.endMs);
+          }
+        }
       }
       span.end();
     },

@@ -1,0 +1,148 @@
+{
+  "title": "Gulley Gateway — RED + Cost",
+  "uid": "gulley-gateway-red",
+  "schemaVersion": 39,
+  "editable": true,
+  "tags": ["gulley", "gateway"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "provider",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(gulley_requests_total, provider)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "panels": [
+    {
+      "title": "Request rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (provider) (rate(gulley_requests_total{provider=~\"$provider\"}[5m]))",
+          "legendFormat": "{{provider}}"
+        }
+      ]
+    },
+    {
+      "title": "Error ratio (SLO 99.5%)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.005 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(gulley_requests_total{status=\"error\",provider=~\"$provider\"}[5m])) / clamp_min(sum(rate(gulley_requests_total{provider=~\"$provider\"}[5m])), 1e-9)",
+          "legendFormat": "error ratio"
+        }
+      ]
+    },
+    {
+      "title": "Latency p50 / p95 / p99 (s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(gulley_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gulley_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gulley_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "title": "Cost rate (USD/hr)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+      "targets": [
+        {
+          "expr": "sum by (provider) (rate(gulley_cost_micro_usd_total{provider=~\"$provider\"}[5m])) * 3600 / 1e6",
+          "legendFormat": "{{provider}}"
+        }
+      ]
+    },
+    {
+      "title": "Cache hit ratio",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "targets": [
+        {
+          "expr": "sum(rate(gulley_cache_events_total{status=~\"hit-.*\"}[5m])) / clamp_min(sum(rate(gulley_cache_events_total[5m])), 1e-9)",
+          "legendFormat": "hit ratio"
+        }
+      ]
+    },
+    {
+      "title": "Tokens/s (input vs output)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (type) (rate(gulley_tokens_total{provider=~\"$provider\"}[5m]))",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "title": "Guardrail enforcement (actions/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (action) (rate(gulley_guardrail_actions_total[5m]))",
+          "legendFormat": "{{action}}"
+        }
+      ]
+    },
+    {
+      "title": "Pre-first-byte failovers (per target)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (target) (rate(gulley_failovers_total[5m]))",
+          "legendFormat": "{{target}}"
+        }
+      ]
+    }
+  ]
+}

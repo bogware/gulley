@@ -177,6 +177,9 @@ const Env = z.object({
   // per-request record (CEL-valued fields, remove/filter/flatten). JSON:
   // {"add":{"cost_usd":"costMicroUsd/1000000.0"},"remove":["route"],"filter":"statusCode>=400"}
   ACCESS_LOG_FIELDS: z.string().optional(),
+  // Also ship each access-log record to the OTLP logs backend (/v1/logs on the
+  // OTEL endpoint), not just stdout. Requires OTEL_EXPORTER_OTLP_ENDPOINT.
+  ACCESS_LOG_OTLP: envBool(false),
 
   // Distributed tracing — continue a client's W3C traceparent (or start one) and
   // inject it into the upstream request, stamping the trace id on the span +
