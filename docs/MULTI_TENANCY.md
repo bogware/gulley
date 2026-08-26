@@ -40,13 +40,25 @@ gateway's default (env/route) credential when a tenant has none — so single-te
 deployments are unchanged. Tests cover the mechanism with an in-memory
 `MapTenantCredentialResolver`; the DB resolver is exercised live.
 
+## Per-tenant routing (M14 D)
+
+Beyond credentials, a workspace may **reroute a client path to its own
+strategy/provider**: tenant A's `/v1/messages` can serve Anthropic while tenant
+B's serves a self-hosted model. A `TenantRouteResolver` (in-process
+`MapTenantRouteResolver`; back a DB-driven one with an in-memory snapshot like the
+config reconciler) is consulted after authn — so the workspace is known — and its
+override wins over the shared route and the model router. It is resolved against
+the matched route's **full client-path alias set** (a route is indexed under every
+one of its `clientPaths`), so an override keyed under one alias applies to all of
+them — a client can't hit a sibling alias to slip its tenant routing pin. When the override
+changes provider family it carries its own `createExtractor`, so metering still
+reads that provider's usage. Absent an override, the shared route serves the
+request unchanged.
+
 ## What a fuller multi-tenant mode would still add
 
-- Per-tenant **provider ROUTING** (not just credentials): a tenant could route the
-  same client path to a different provider/model. The route table is currently
-  shared; tenant credentials are the first, highest-value step.
 - Hard **noisy-neighbor** controls: per-tenant concurrency caps and priority
-  (the breaker/outlier/scoreboard are per-target, not per-tenant).
+  (the breaker/outlier/scoreboard/adaptive-limiter are per-target, not per-tenant).
 - Per-tenant **data residency** / at-rest key separation, and per-tenant OTLP /
   log routing.
 

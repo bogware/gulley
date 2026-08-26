@@ -9,6 +9,7 @@ import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { RequestMirror } from '@gulley/http-edge';
 import { RequestTracer } from './tracer';
 import { MapTenantCredentialResolver } from './tenant';
+import { MapTenantRouteResolver } from './tenant-routes';
 import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
@@ -598,6 +599,94 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     await app.close();
     await new Promise<void>((r) => secondary.close(() => r()));
+  });
+
+  it('routes a client path per-tenant: workspace B overrides the shared strategy', async () => {
+    const store = new InMemoryKeyStore();
+    const genA = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_a',
+      keyPrefix: genA.keyPrefix,
+      keyHash: genA.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_a',
+      displayName: 'A',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: '*',
+      allowedModels: '*',
+    });
+    const genB = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_b',
+      keyPrefix: genB.keyPrefix,
+      keyHash: genB.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_b',
+      displayName: 'B',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: '*',
+      allowedModels: '*',
+    });
+
+    const { ctx } = buildContext(store); // base route target = 'anthropic'
+    ctx.tenantRoutes = new MapTenantRouteResolver(
+      new Map([
+        [
+          'ws_b',
+          new Map([
+            [
+              '/v1/messages',
+              {
+                strategy: {
+                  mode: 'single' as const,
+                  target: anthropicTarget('tenant-b-target', upstreamUrl),
+                },
+              },
+            ],
+          ]),
+        ],
+      ]),
+    );
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const reqBody = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const resA = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': genA.token },
+      body: reqBody,
+    });
+    await resA.text();
+    const resB = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': genB.token },
+      body: reqBody,
+    });
+    await resB.text();
+    // Sibling alias of the SAME route (indexed under both '/v1/messages' and
+    // '/anthropic/v1/messages'): the override — keyed only under '/v1/messages' —
+    // must still apply, so a client can't escape its tenant pin via the alias.
+    const resBAlias = await fetch(`${base}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': genB.token },
+      body: reqBody,
+    });
+    await resBAlias.text();
+
+    expect(resA.headers.get('x-gulley-target')).toBe('anthropic'); // shared route
+    expect(resB.headers.get('x-gulley-target')).toBe('tenant-b-target'); // per-tenant override
+    expect(resBAlias.headers.get('x-gulley-target')).toBe('tenant-b-target'); // alias honored
+
+    await app.close();
   });
 
   it('rejects a request whose worst-case reservation exceeds the workspace budget', async () => {

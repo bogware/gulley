@@ -137,12 +137,25 @@ teardown, budget committed once. Then the adversarial hot-path review pass.
   and image blocks are refused (`canTranslateAnthropicToGemini`) rather than
   silently dropped — the extension point for a fuller native surface.
 
-## D — Per-tenant routing (planned)
+## D — Per-tenant routing (delivered)
 
-Let a tenant route the same client path to a different provider/model; additive on
-the org→workspace spine, no tenant-boundary schema migration.
+A workspace may reroute a client path to its own strategy/provider
+(`apps/gateway/src/tenant-routes.ts`: `TenantRouteResolver` +
+`MapTenantRouteResolver`). Consulted in `handleProxy` right after authn (workspace
+known) and before candidate selection; the override wins over the shared route and
+the model router, and carries its own `createExtractor` when it changes provider
+family so metering stays correct. Off unless `ctx.tenantRoutes` is wired — single-
+tenant deployments are unchanged. See `docs/MULTI_TENANCY.md`.
 
-## E — Release & supply-chain hardening (planned)
+## E — Release & supply-chain hardening (delivered)
 
-SBOM + image signing (cosign / SLSA provenance) on the release pipeline; a
-documented DR/restore drill for the Postgres source of truth.
+- **Image signing.** `ci/build-image.sh` now keyless-signs the pushed image
+  **digest** with cosign (identity = the CI's OIDC token, Rekor-logged), on top of
+  the SBOM + SLSA provenance attestations and Trivy scan it already produced. Both
+  release pipelines install cosign; `SKIP_SIGN=1` covers a local build.
+  `docs/SUPPLY_CHAIN.md` gives the `cosign verify` recipe (pin the identity to this
+  repo's release workflow) for a deploy/admission gate.
+- **DR/restore drill.** `docs/DR_RESTORE.md` documents Postgres as the source of
+  truth, the rebuildable Redis projections, the restore order (restore → verify the
+  audit hash-chain against the S3 WORM mirror → rebuild counters → confirm config →
+  lift readiness), a quarterly drill checklist, and RTO/RPO targets.

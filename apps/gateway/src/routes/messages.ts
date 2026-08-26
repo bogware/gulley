@@ -25,6 +25,7 @@ import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
 import type { RequestTracer } from '../tracer';
 import type { TenantCredentialResolver } from '../tenant';
+import type { TenantRouteResolver } from '../tenant-routes';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
@@ -95,6 +96,8 @@ export interface GatewayContext {
   /** Default request-hedging delay (ms) applied to multi-target routes; a route's
    *  own `hedgeDelayMs` overrides it. Absent/0 = hedging off. */
   hedgeDelayMs?: number;
+  /** Per-tenant routing overrides (workspace may reroute a client path). */
+  tenantRoutes?: TenantRouteResolver;
   budgets: BudgetStore;
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */
@@ -336,6 +339,7 @@ async function handleProxy(
   // route shaping. Both rewrite the outbound body BEFORE authz/guardrails/cache
   // so scope checks, the cache key, and detection all see the effective request.
   let strategy = route.strategy;
+  let createExtractor = route.createExtractor;
   if (parseOk) {
     if (ctx.modelRouter) {
       const m = ctx.modelRouter.resolve(requestedModel);
@@ -397,6 +401,21 @@ async function handleProxy(
       return;
     }
     principal = auth.value;
+  }
+
+  // --- per-tenant routing override (most specific: wins over the shared route
+  // and the model router) ---
+  // A workspace may reroute this client path to its own strategy/provider. Applied
+  // after authn (workspace is now known) and before candidate selection. An
+  // override that changes provider family carries its own extractor so metering
+  // stays correct. Resolve by the route's FULL alias set (route.clientPaths), not
+  // the concrete request path — a route is indexed under every alias, so an
+  // override keyed under one alias must apply to all of them (else a client could
+  // hit a sibling alias to escape the override — a residency/isolation bypass).
+  const tenantRoute = ctx.tenantRoutes?.resolve(principal.scope.workspaceId, route.clientPaths);
+  if (tenantRoute) {
+    strategy = tenantRoute.strategy;
+    if (tenantRoute.createExtractor) createExtractor = tenantRoute.createExtractor;
   }
 
   // --- authz: model + provider scope (candidates filtered to allowed providers) ---
@@ -1034,7 +1053,7 @@ async function handleProxy(
   const provider = served?.provider ?? provider0;
 
   const parserSse = new SSEParser();
-  const usage = route.createExtractor();
+  const usage = createExtractor();
   let statusCode = upstream?.statusCode ?? 502;
   let status: RequestStatus = controller.signal.aborted
     ? 'aborted'
