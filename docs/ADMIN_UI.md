@@ -1,7 +1,13 @@
 # Gulley Admin Console — Build Plan
 
 The control-plane UI (`apps/web`), built on the control-api endpoints that already
-exist. This document is the plan; the data layer is scaffolded (`apps/web/lib/`).
+exist.
+
+> **Status: ✅ DELIVERED** (2026-08-26). All pages below are built and the app
+> builds clean (`next build`, 13 routes). Auth is the pasted-token flow; the
+> **OIDC session gate is the one remaining piece (M11)** — until then, connect
+> with a bootstrap admin token. `pnpm --filter @gulley/web dev` serves it;
+> `/control/*` proxies to the control-api (`CONTROL_API_URL`, default :8081).
 
 ## Stack
 
