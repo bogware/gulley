@@ -5,6 +5,7 @@ import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { CelAuthorizer, CelTransformer } from '@gulley/cel';
+import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
@@ -803,6 +804,55 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(bad.status).toBe(401);
 
     await app.close();
+  });
+
+  it('hold-then-flush withholds a streamed response that violates the output policy', async () => {
+    const leaky = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        'event: content_block_delta\ndata: {"delta":{"text":"here is a key AKIAIOSFODNN7EXAMPLE"}}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"output_tokens":5}}\n\n',
+      );
+    });
+    await new Promise<void>((r) => leaky.listen(0, '127.0.0.1', r));
+    const leakyUrl = `http://127.0.0.1:${(leaky.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    const engine = new GuardrailEngine([new NativeDetector({})], {
+      input: { action: 'audit' },
+      output: { action: 'block' },
+    });
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('leaky', leakyUrl) },
+        guardrails: engine,
+        holdStreamedOutput: true,
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-guardrail')).toBe('output-blocked');
+    expect(text).not.toContain('AKIA'); // secret withheld, not streamed to the client
+    expect(text).toContain('event: error');
+
+    await app.close();
+    await new Promise<void>((r) => leaky.close(() => r()));
   });
 
   it('applies CEL request/response transformation', async () => {

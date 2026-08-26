@@ -54,6 +54,9 @@ export interface ProviderRoute {
   cacheable?: boolean;
   /** Request shaping (defaults/overrides/system enrichment) applied before forward. */
   shaping?: RequestShaping;
+  /** Opt in to hold-then-flush enforcement of the OUTPUT policy on streamed
+   *  responses (buffers the stream, then blocks/withholds). Trades streaming. */
+  holdStreamedOutput?: boolean;
 }
 
 export interface GatewayContext {
@@ -592,7 +595,12 @@ async function handleProxy(
   const detok = vault ? new StreamingReplacer(vault.entries()) : undefined;
   const decoder = outScanner || detok ? new StringDecoder('utf8') : undefined;
   const outputEnforcing = engine !== undefined && engine.outputPolicy.action !== 'audit';
-  const bufferOutput = outputEnforcing && !streamed && statusCode < 400;
+  // Opt-in hold-then-flush: buffer a streamed response so the output policy can
+  // truly enforce (block/withhold) on the whole body — trading streaming for
+  // enforcement on the routes that ask for it.
+  const holdStreamed =
+    streamed && outputEnforcing && route.holdStreamedOutput === true && statusCode < 400;
+  const bufferOutput = (outputEnforcing && !streamed && statusCode < 400) || holdStreamed;
 
   // Capture the full response when we need it whole: non-streamed metering,
   // buffered enforcement, or a cacheable miss we intend to store.
@@ -893,7 +901,34 @@ async function handleProxy(
       }
     }
 
-    if (bufferOutput && engine) {
+    if (bufferOutput && engine && holdStreamed) {
+      // Streamed hold-then-flush: enforce on the whole SSE body. Because we can't
+      // re-encode a redaction into SSE frames, any enforcing verdict (block OR
+      // would-redact) WITHHOLDS the response (a terminal error frame); otherwise
+      // flush the buffered SSE, detokenized.
+      const text = Buffer.concat(fullChunks).toString('utf8');
+      const out = engine.inspectOutputText(text);
+      outputEnforced = out;
+      const withhold = out.blocked || out.transformedText !== undefined;
+      const bodyOut = withhold
+        ? providerErrorFrame(provider, 'response withheld by guardrail')
+        : detok
+          ? detok.push(text) + detok.flush()
+          : text;
+      if (!reply.raw.writableEnded) {
+        reply.raw.writeHead(statusCode, {
+          ...filterResponseHeaders(upstreamHeaders),
+          ...rlHeaders,
+          'content-type': 'text/event-stream',
+          'x-gulley-request-id': requestId,
+          'x-gulley-target': servedTarget.name,
+          'x-gulley-cache': 'bypass',
+          'x-gulley-guardrail': withhold ? 'output-blocked' : 'audit',
+        });
+        reply.raw.write(bodyOut);
+        reply.raw.end();
+      }
+    } else if (bufferOutput && engine) {
       // Enforce the output policy on the whole (non-streamed) body, then write.
       const text = Buffer.concat(fullChunks).toString('utf8');
       const out = engine.inspectOutputText(text);
