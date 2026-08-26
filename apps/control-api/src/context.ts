@@ -5,6 +5,7 @@ import {
   InMemoryKeyStore,
 } from '@gulley/auth';
 import { type ConfigVersionStore, InMemoryConfigVersionStore } from '@gulley/config';
+import { type ConfigNotifier, newOriginId } from '@gulley/storage';
 import type { OidcProvider } from '@gulley/oidc';
 import type { OidcRoleRule } from './oidc-gate';
 import {
@@ -51,6 +52,12 @@ export interface ControlContext {
   outboundAllowlist: ReadonlySet<string>;
   /** OIDC session gate config; absent = OIDC login disabled (token-paste only). */
   oidc?: OidcSessionConfig;
+  /** Broadcasts a post-commit config signal to gateway replicas; absent = no
+   *  hot-reload propagation (single-process / v1 default). */
+  notifier?: ConfigNotifier;
+  /** This process's origin id, stamped on emitted signals so a subscriber that
+   *  is also a publisher can ignore its own writes. */
+  originId: string;
 }
 
 export interface OidcSessionConfig {
@@ -77,6 +84,8 @@ export interface InMemoryContextOptions {
   /** Inject a pre-seeded query backend (tests); defaults to a fresh in-memory log. */
   requestLogQuery?: RequestLogQuery;
   oidc?: OidcSessionConfig;
+  /** Config-change broadcaster (composite PG+Redis bus in prod); absent = none. */
+  notifier?: ConfigNotifier;
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -116,5 +125,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     verifyAudit: () => ({ verified: inner.verify(), count: inner.rows.length }),
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
     oidc: opts.oidc,
+    notifier: opts.notifier,
+    originId: newOriginId(),
   };
 }

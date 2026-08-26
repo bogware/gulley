@@ -66,6 +66,15 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
         audit: ctx.audit,
         access: ctx.access,
         egressAllowlist: ctx.outboundAllowlist,
+        onApplied: ctx.notifier
+          ? (e) =>
+              ctx.notifier?.emit({
+                v: e.version,
+                hash: e.contentHash,
+                origin: ctx.originId,
+                ts: Date.now(),
+              })
+          : undefined,
       });
       if (r.ok) {
         return reply.send({

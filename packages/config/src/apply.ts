@@ -28,6 +28,11 @@ export interface ApplyDeps {
   access: AccessControl;
   egressAllowlist?: ReadonlySet<string>;
   now?: () => number;
+  /** Post-commit broadcast hook: fired AFTER a version is durably appended, so
+   *  the change can be signalled to gateway replicas. Best-effort — a throw is
+   *  swallowed (the durable write already succeeded). Kept as a bare callback so
+   *  @gulley/config stays free of storage/transport dependencies. */
+  onApplied?: (event: { version: number; contentHash: string }) => Promise<void> | void;
 }
 
 function checkEgress(doc: ConfigDocument, allowlist?: ReadonlySet<string>): string | null {
@@ -117,6 +122,15 @@ export async function applyConfig(
       auditSeq: auditRow.seq,
       createdAt: new Date(deps.now?.() ?? Date.now()).toISOString(),
     });
+    // Broadcast AFTER the durable commit (never before) so a subscriber can never
+    // react to a half-applied version. Best-effort: the write already succeeded.
+    if (deps.onApplied) {
+      try {
+        await deps.onApplied({ version: reserved, contentHash: hash });
+      } catch {
+        /* best-effort broadcast; correctness comes from the durable version */
+      }
+    }
     return ok({ version: reserved, contentHash: hash, summary: applied.summary });
   } catch (err2) {
     return err({ kind: 'internal', detail: (err2 as Error).message });
