@@ -109,6 +109,13 @@ const Env = z.object({
   RETRY_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(1),
   RETRY_BACKOFF_MS: z.coerce.number().int().positive().default(250),
 
+  // Load balancing across a loadbalance strategy's targets. When affinity is off
+  // (default) the primary pick uses power-of-two-choices least-load over in-flight
+  // counts. Setting LB_SESSION_AFFINITY_HEADER pins a session (that header's
+  // value, else the principal id) to one target via rendezvous hashing (HRW).
+  LB_LEAST_LOAD: envBool(true),
+  LB_SESSION_AFFINITY_HEADER: z.string().optional(),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),

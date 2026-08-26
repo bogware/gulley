@@ -51,6 +51,7 @@ import {
 } from '@gulley/ratelimit';
 import {
   CircuitBreaker,
+  LoadScoreboard,
   type ModelRouteRule,
   ModelRouter,
   type RouteTarget,
@@ -539,5 +540,7 @@ export function createProductionContext(config: Config): GatewayContext {
     authorizer,
     transformer,
     jwtAuth,
+    scoreboard: config.LB_LEAST_LOAD ? new LoadScoreboard() : undefined,
+    sessionAffinityHeader: config.LB_SESSION_AFFINITY_HEADER,
   };
 }

@@ -885,6 +885,54 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     await app.close();
   });
+
+  it('session affinity pins a session to the same loadbalance target across requests', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    // Two targets to the SAME upstream (so both serve), distinguished only by
+    // name; HRW must resolve one deterministically per session id.
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: {
+          mode: 'loadbalance',
+          targets: [anthropicTarget('ta', upstreamUrl), anthropicTarget('tb', upstreamUrl)],
+        },
+      },
+    ];
+    ctx.sessionAffinityHeader = 'x-session-id';
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const call = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': token,
+          'x-session-id': 'affinity-user-9',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+
+    const first = await call();
+    await first.text();
+    const pinned = first.headers.get('x-gulley-target');
+    expect(pinned).toMatch(/^t[ab]$/);
+
+    for (let i = 0; i < 3; i++) {
+      const r = await call();
+      await r.text();
+      expect(r.headers.get('x-gulley-target')).toBe(pinned); // sticky
+    }
+
+    await app.close();
+  });
 });
 
 function single(v: string | string[] | undefined): string | undefined {

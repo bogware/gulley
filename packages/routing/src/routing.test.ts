@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { CircuitBreaker } from './circuit-breaker';
-import { isFailoverStatus, orderByWeight, selectCandidates } from './select';
+import {
+  hrwOrder,
+  isFailoverStatus,
+  LoadScoreboard,
+  orderByWeight,
+  p2cOrder,
+  selectCandidates,
+} from './select';
 import type { RouteTarget, RoutingStrategy } from './types';
 
 const fakeAdapter: RouteTarget['adapter'] = {
@@ -91,5 +98,57 @@ describe('orderByWeight', () => {
     expect(orderByWeight(targets, () => 0.99)[0]?.name).toBe('b');
     // Every target still appears in the failover order.
     expect(orderByWeight(targets, () => 0.99).length).toBe(2);
+  });
+});
+
+describe('hrwOrder (session affinity)', () => {
+  it('is deterministic per session key and covers every target', () => {
+    const targets = [target('a'), target('b'), target('c')];
+    const first = hrwOrder(targets, 'sess-42').map((t) => t.name);
+    const again = hrwOrder(targets, 'sess-42').map((t) => t.name);
+    expect(again).toEqual(first); // sticky: same key → same order
+    expect([...first].sort()).toEqual(['a', 'b', 'c']); // no target dropped
+  });
+
+  it('spreads different session keys across targets', () => {
+    const targets = [target('a'), target('b'), target('c')];
+    const primaries = new Set(
+      Array.from({ length: 60 }, (_, i) => hrwOrder(targets, `k${i}`)[0]?.name),
+    );
+    expect(primaries.size).toBeGreaterThan(1); // not all keys land on one target
+  });
+
+  it('selectCandidates loadbalance sticks a session', () => {
+    const s: RoutingStrategy = { mode: 'loadbalance', targets: [target('a'), target('b')] };
+    const cb = new CircuitBreaker();
+    const a = selectCandidates(s, cb, { sessionKey: 'u1' }).map((t) => t.name);
+    const b = selectCandidates(s, cb, { sessionKey: 'u1' }).map((t) => t.name);
+    expect(a).toEqual(b);
+  });
+});
+
+describe('p2cOrder (least-load)', () => {
+  it('prefers the less-loaded of the two sampled targets', () => {
+    const sb = new LoadScoreboard();
+    const targets = [target('a'), target('b')];
+    sb.begin('a'); // a is busier than b
+    // rand sequence 0,0.9 samples a then b → picks the least-loaded (b).
+    const seq = [0, 0.9];
+    let i = 0;
+    const order = p2cOrder(targets, sb, () => seq[i++ % seq.length] as number);
+    expect(order[0]?.name).toBe('b');
+    expect(order.length).toBe(2);
+  });
+
+  it('scoreboard begin/end tracks in-flight counts', () => {
+    const sb = new LoadScoreboard();
+    sb.begin('a');
+    sb.begin('a');
+    expect(sb.load('a')).toBe(2);
+    sb.end('a');
+    expect(sb.load('a')).toBe(1);
+    sb.end('a');
+    sb.end('a'); // never goes negative
+    expect(sb.load('a')).toBe(0);
   });
 });

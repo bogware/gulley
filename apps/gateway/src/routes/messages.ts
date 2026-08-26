@@ -27,6 +27,7 @@ import {
   type CircuitBreaker,
   hasShaping,
   isFailoverStatus,
+  type LoadScoreboard,
   type ModelRouter,
   type RequestShaping,
   type RouteTarget,
@@ -95,6 +96,11 @@ export interface GatewayContext {
   transformer?: CelTransformer;
   /** Inbound JWT/JWKS auth mode; absent = virtual keys only. */
   jwtAuth?: JwtAuthConfig;
+  /** In-flight load scoreboard for power-of-two-choices least-load balancing. */
+  scoreboard?: LoadScoreboard;
+  /** Request header whose value pins a session to one target (HRW affinity);
+   *  falls back to the principal id. Absent = no affinity (P2C / weighted). */
+  sessionAffinityHeader?: string;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -234,9 +240,13 @@ async function handleProxy(
       .send({ type: 'error', error: { type: 'permission_error', message: 'model not permitted' } });
     return;
   }
-  const candidates = selectCandidates(strategy, ctx.breaker).filter((t) =>
-    scopeAllowsProvider(principal.scope, t.provider),
-  );
+  const sessionKey = ctx.sessionAffinityHeader
+    ? (headerValue(request, ctx.sessionAffinityHeader) ?? principal.id)
+    : undefined;
+  const candidates = selectCandidates(strategy, ctx.breaker, {
+    sessionKey,
+    scoreboard: ctx.scoreboard,
+  }).filter((t) => scopeAllowsProvider(principal.scope, t.provider));
   if (candidates.length === 0) {
     await reply
       .code(403)
@@ -503,6 +513,7 @@ async function handleProxy(
   const retryBackoffMs = ctx.retryBackoffMs ?? 250;
   let upstream: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
   let served: RouteTarget | undefined;
+  let scoreboardHeld = false;
   for (let i = 0; i < candidates.length; i++) {
     const target = candidates[i] as RouteTarget;
     const isLast = i === candidates.length - 1;
@@ -564,6 +575,12 @@ async function handleProxy(
     }
     upstream = resp;
     served = target;
+    // Mark this target in-flight for power-of-two-choices least-load; released
+    // in teardown (guarded so a double teardown can't double-decrement).
+    if (ctx.scoreboard) {
+      ctx.scoreboard.begin(target.name);
+      scoreboardHeld = true;
+    }
     // The breaker should track UPSTREAM faults, not client mistakes: a terminal
     // 4xx (400/401/403/404/422) is the caller's error and must not trip the
     // breaker for every other tenant sharing this target.
@@ -615,6 +632,10 @@ async function handleProxy(
   const teardown = async (): Promise<void> => {
     if (settled) return;
     settled = true;
+    if (scoreboardHeld && served) {
+      scoreboardHeld = false;
+      ctx.scoreboard?.end(served.name);
+    }
 
     const n = usage.normalized();
     const meteredModel = n.model ?? requestedModel;
