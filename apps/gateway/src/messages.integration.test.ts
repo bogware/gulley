@@ -39,7 +39,13 @@ const GOLDEN_SSE = [
 
 let upstream: http.Server;
 let upstreamUrl: string;
-let received: { apiKey?: string; auth?: string; traceparent?: string; body: string } = { body: '' };
+let received: {
+  apiKey?: string;
+  auth?: string;
+  traceparent?: string;
+  tenant?: string;
+  body: string;
+} = { body: '' };
 
 beforeAll(async () => {
   upstream = http.createServer((req, res) => {
@@ -48,6 +54,7 @@ beforeAll(async () => {
     received.apiKey = single(req.headers['x-api-key']);
     received.auth = single(req.headers['authorization']);
     received.traceparent = single(req.headers['traceparent']);
+    received.tenant = single(req.headers['x-tenant']);
     req.on('data', (c: Buffer) => {
       body += c.toString('utf8');
     });
@@ -929,6 +936,33 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('x-policy')).toBe('applied-ws_1'); // response header injected
     expect(received.body).toContain('"max_tokens":128'); // request body field injected upstream
+
+    await app.close();
+  });
+
+  it('applies the static header modifier (request injected upstream, response to client)', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.headerModifier = {
+      request: { set: { 'x-tenant': 'acme' } },
+      response: { set: { 'x-gateway': 'gulley' } },
+    };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    expect(received.tenant).toBe('acme'); // request header reached upstream
+    expect(res.headers.get('x-gateway')).toBe('gulley'); // response header reached the client
 
     await app.close();
   });

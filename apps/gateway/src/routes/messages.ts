@@ -20,6 +20,7 @@ import {
   type TokenVault,
 } from '@gulley/guardrails';
 import type { CelAuthorizer, CelTransformer, ExternalAuthorizer, HeaderChanges } from '@gulley/cel';
+import { applyHeaderRules, type HeaderModifierConfig } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
@@ -127,6 +128,9 @@ export interface GatewayContext {
   /** Request header whose value pins a session to one target (HRW affinity);
    *  falls back to the principal id. Absent = no affinity (P2C / weighted). */
   sessionAffinityHeader?: string;
+  /** Static request/response header set/remove applied to every proxied request
+   *  (the non-CEL sibling of the transformer). */
+  headerModifier?: HeaderModifierConfig;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -374,9 +378,11 @@ async function handleProxy(
   // --- CEL transformation: mutate request headers/body (before guardrails/cache) ---
   let forwardHeaders: Record<string, string | string[] | undefined> = request.headers;
   let respHeaderChanges: HeaderChanges | undefined;
-  if (trace) {
+  if (trace || ctx.headerModifier?.request) {
     forwardHeaders = { ...request.headers };
-    forwardHeaders['traceparent'] = trace.traceparent;
+    if (trace) forwardHeaders['traceparent'] = trace.traceparent;
+    // Static request header rules (CEL can still override below).
+    applyHeaderRules(forwardHeaders, ctx.headerModifier?.request);
   }
   if (transformActive && ctx.transformer && activation) {
     const reqCh = ctx.transformer.requestHeaderChanges(activation);
@@ -392,6 +398,18 @@ async function handleProxy(
     }
     respHeaderChanges = ctx.transformer.responseHeaderChanges(activation);
   }
+
+  // Apply static + CEL response-header changes to every response writeHead site
+  // (the hijacked paths bypass Fastify onSend, and the buffered/hold-then-flush
+  // paths previously missed the CEL response transform — this closes that gap).
+  const finalizeResp = <T extends Record<string, string | string[]>>(h: T): T => {
+    applyHeaderRules(h, ctx.headerModifier?.response);
+    if (respHeaderChanges) {
+      for (const [k, v] of Object.entries(respHeaderChanges.set)) h[k as keyof T] = v as T[keyof T];
+      for (const k of respHeaderChanges.remove) delete h[k];
+    }
+    return h;
+  };
 
   // --- rate limit: RPM/TPM admission control (before guardrails/cache/budget) ---
   // Requests are charged now (known at admission); token spend is trued up in the
@@ -953,11 +971,7 @@ async function handleProxy(
       'x-gulley-target': served.name,
       'x-gulley-cache': cacheLookup?.status ?? 'bypass',
     };
-    if (respHeaderChanges) {
-      for (const [k, v] of Object.entries(respHeaderChanges.set)) responseHeaders[k] = v;
-      for (const k of respHeaderChanges.remove) delete responseHeaders[k];
-    }
-    reply.raw.writeHead(statusCode, responseHeaders);
+    reply.raw.writeHead(statusCode, finalizeResp(responseHeaders));
   }
 
   const servedTarget = served;
@@ -1082,17 +1096,20 @@ async function handleProxy(
             )
         : Buffer.concat(fullChunks); // fail-open: forward the truncated prefix
       if (!reply.raw.writableEnded) {
-        reply.raw.writeHead(statusCode, {
-          ...filterResponseHeaders(upstreamHeaders),
-          ...rlHeaders,
-          'content-type': sse ? 'text/event-stream' : 'application/json',
-          'x-gulley-request-id': requestId,
-          'x-gulley-target': servedTarget.name,
-          'x-gulley-cache': 'bypass',
-          'x-gulley-guardrail': bufferFailClosed
-            ? 'output-blocked-overflow'
-            : 'overflow-unenforced',
-        });
+        reply.raw.writeHead(
+          statusCode,
+          finalizeResp({
+            ...filterResponseHeaders(upstreamHeaders),
+            ...rlHeaders,
+            'content-type': sse ? 'text/event-stream' : 'application/json',
+            'x-gulley-request-id': requestId,
+            'x-gulley-target': servedTarget.name,
+            'x-gulley-cache': 'bypass',
+            'x-gulley-guardrail': bufferFailClosed
+              ? 'output-blocked-overflow'
+              : 'overflow-unenforced',
+          }),
+        );
         reply.raw.write(bodyOut);
         reply.raw.end();
       }
@@ -1111,15 +1128,18 @@ async function handleProxy(
           ? detok.push(text) + detok.flush()
           : text;
       if (!reply.raw.writableEnded) {
-        reply.raw.writeHead(statusCode, {
-          ...filterResponseHeaders(upstreamHeaders),
-          ...rlHeaders,
-          'content-type': 'text/event-stream',
-          'x-gulley-request-id': requestId,
-          'x-gulley-target': servedTarget.name,
-          'x-gulley-cache': 'bypass',
-          'x-gulley-guardrail': withhold ? 'output-blocked' : 'audit',
-        });
+        reply.raw.writeHead(
+          statusCode,
+          finalizeResp({
+            ...filterResponseHeaders(upstreamHeaders),
+            ...rlHeaders,
+            'content-type': 'text/event-stream',
+            'x-gulley-request-id': requestId,
+            'x-gulley-target': servedTarget.name,
+            'x-gulley-cache': 'bypass',
+            'x-gulley-guardrail': withhold ? 'output-blocked' : 'audit',
+          }),
+        );
         reply.raw.write(bodyOut);
         reply.raw.end();
       }
@@ -1137,19 +1157,22 @@ async function handleProxy(
           )
         : Buffer.from(out.transformedText ?? text, 'utf8');
       if (!reply.raw.writableEnded) {
-        reply.raw.writeHead(statusCode, {
-          ...filterResponseHeaders(upstreamHeaders),
-          ...rlHeaders,
-          'content-type': 'application/json',
-          'x-gulley-request-id': requestId,
-          'x-gulley-target': servedTarget.name,
-          'x-gulley-cache': 'bypass',
-          'x-gulley-guardrail': out.blocked
-            ? 'output-blocked'
-            : out.transformedText
-              ? 'output-redacted'
-              : 'audit',
-        });
+        reply.raw.writeHead(
+          statusCode,
+          finalizeResp({
+            ...filterResponseHeaders(upstreamHeaders),
+            ...rlHeaders,
+            'content-type': 'application/json',
+            'x-gulley-request-id': requestId,
+            'x-gulley-target': servedTarget.name,
+            'x-gulley-cache': 'bypass',
+            'x-gulley-guardrail': out.blocked
+              ? 'output-blocked'
+              : out.transformedText
+                ? 'output-redacted'
+                : 'audit',
+          }),
+        );
         reply.raw.write(bodyOut);
         reply.raw.end();
       }

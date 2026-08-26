@@ -129,6 +129,9 @@ importers:
       '@gulley/guardrails':
         specifier: workspace:*
         version: link:../../packages/guardrails
+      '@gulley/http-edge':
+        specifier: workspace:*
+        version: link:../../packages/http-edge
       '@gulley/metrics':
         specifier: workspace:*
         version: link:../../packages/metrics

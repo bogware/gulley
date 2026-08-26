@@ -30,6 +30,7 @@ import {
   ExternalAuthorizer,
 } from '@gulley/cel';
 import { assertEgressAllowed } from '@gulley/egress';
+import type { HeaderModifierConfig } from '@gulley/http-edge';
 import type { RateResolver } from '@gulley/cost';
 import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulley/auth';
 import { OidcProvider } from '@gulley/oidc';
@@ -602,6 +603,9 @@ export function createProductionContext(config: Config): GatewayContext {
       : undefined,
     responseBufferLimit: config.RESPONSE_BUFFER_LIMIT_BYTES,
     bufferFailClosed: config.BUFFER_FAIL_CLOSED,
+    headerModifier: config.HEADER_MODIFIER
+      ? (JSON.parse(config.HEADER_MODIFIER) as HeaderModifierConfig)
+      : undefined,
   };
 }
 

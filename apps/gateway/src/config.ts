@@ -186,6 +186,11 @@ const Env = z.object({
     .default(8 * 1024 * 1024),
   BUFFER_FAIL_CLOSED: envBool(true),
 
+  // Static request/response header set/remove applied to every proxied request
+  // (the non-CEL sibling of CEL_TRANSFORM). JSON:
+  // {"request":{"set":{"x-tenant":"acme"}},"response":{"remove":["x-internal"]}}
+  HEADER_MODIFIER: z.string().optional(),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),
