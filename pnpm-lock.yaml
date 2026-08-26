@@ -343,6 +343,10 @@ importers:
         version: 2.1.9(@types/node@22.20.1)
 
   packages/guardrails:
+    dependencies:
+      '@gulley/egress':
+        specifier: workspace:*
+        version: link:../egress
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

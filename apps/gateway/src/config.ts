@@ -67,6 +67,11 @@ const Env = z.object({
   // per-route in code. Detection runs on request and response text.
   GUARDRAILS_ENABLED: envBool(true),
   GUARDRAILS_ENTROPY: envBool(true),
+  // Optional bring-your-own-DLP webhook guardrail (runs on request input). A
+  // block/mask verdict is authoritative even under the audit-only default.
+  GUARDRAILS_WEBHOOK_URL: z.string().url().optional(),
+  GUARDRAILS_WEBHOOK_FAIL_CLOSED: envBool(false),
+  GUARDRAILS_WEBHOOK_ALLOW_INTERNAL: envBool(false),
 
   // Same-target retry (pre-first-byte, body already buffered): bounded attempts
   // on transient errors before failing over to the next candidate. Default 1 =

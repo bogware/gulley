@@ -22,7 +22,12 @@ import {
 } from '@gulley/cache';
 import { loadCatalogFromFile } from '@gulley/catalog';
 import type { RateResolver } from '@gulley/cost';
-import { auditOnlyPolicies, GuardrailEngine, NativeDetector } from '@gulley/guardrails';
+import {
+  auditOnlyPolicies,
+  GuardrailEngine,
+  NativeDetector,
+  WebhookGuardrailPlugin,
+} from '@gulley/guardrails';
 import { GatewayMetrics } from '@gulley/metrics';
 import { BatchingRequestLog } from '@gulley/pipeline';
 import {
@@ -61,9 +66,17 @@ import type { GatewayContext, ProviderRoute } from './routes/messages';
  *  on the route; this is the global default applied to every proxied request. */
 export function buildGuardrails(config: Config): GuardrailEngine | undefined {
   if (!config.GUARDRAILS_ENABLED) return undefined;
+  const plugin = config.GUARDRAILS_WEBHOOK_URL
+    ? new WebhookGuardrailPlugin({
+        url: config.GUARDRAILS_WEBHOOK_URL,
+        failMode: config.GUARDRAILS_WEBHOOK_FAIL_CLOSED ? 'closed' : 'open',
+        allowInternal: config.GUARDRAILS_WEBHOOK_ALLOW_INTERNAL,
+      })
+    : undefined;
   return new GuardrailEngine(
     [new NativeDetector({ entropy: config.GUARDRAILS_ENTROPY })],
     auditOnlyPolicies(),
+    plugin,
   );
 }
 
