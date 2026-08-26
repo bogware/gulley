@@ -76,13 +76,15 @@ _Still open in M8: Vertex + Copilot native adapters, provider prompt-cache break
 
 **Done when:** Bedrock runs under an IAM role via SigV4 with STS session-tagged cost rows; a GCP/Azure token flows through the single-flight cache; a backend with a private CA + mTLS connects; the DNS cache honors TTLs and feeds the egress guard.
 
-## M10 — CEL policy engine, authorization & transformation (P1)
+## M10 — CEL policy engine, authorization & transformation (P1) — ✅ DELIVERED
 
-- **`packages/cel`** — compiled `Program` + typed `Executor` (compile-once), **static attribute inference → lazy body buffering/snapshot**, permissive/strict compile, an LLM-aware attribute surface + snapshot context, an expression stdlib (string/math/encoding, CIDR/IP, `jsonField`, sampling), user-defined functions + evaluation tracing.
-- **Authorization** — Allow/Deny/Require rule sets (`apps/gateway` authz + `packages/rbac`).
-- **Transformation** — request/response header/body/metadata transformation with a scratchpad, driven by CEL; bounded body attributes + header/query/secret accessors.
+**Delivered & verified (full CI gate green):**
 
-**Done when:** an operator writes a CEL authz rule and a header/body transform that only buffers the body when the expression references it; the fast path is untouched for policies that don't.
+- **`@gulley/cel` engine — ✅** a sandboxed, side-effect-free CEL subset: lexer + Pratt parser (literals, member/index, unary/binary/ternary, lists/maps, `in`, function + method calls, `has()`, and comprehension macros `all`/`exists`/`exists_one`/`filter`/`map`); an evaluator with CEL value semantics, short-circuit `&&`/`||`, string methods, an expression stdlib (`size`/`type`/`matches`/`jsonField`/`base64`/`lowerAscii`/`ip()`/`cidr().containsIP()`), user-defined functions, a step cap, and an optional eval trace. **`compile()` does static attribute inference** (roots + second-level paths like `request.body` / `principal.scope`) so a policy that never reads the body keeps the raw-pipe fast path; strict mode rejects undeclared root variables. 18 tests.
+- **Authorization — ✅** `CelAuthorizer` (deny-first + allow-list; an erroring rule is a non-match, so an allow-list fails closed) wired into `handleProxy` via `CEL_AUTHZ` (strict-compiled) — a deny → 403 + audit + telemetry before rate limit. LLM-aware activation: `request.{method,path,model,provider,stream,source_ip,headers,body}`, `principal.{id,orgId,workspaceId}`. 5 + 1 tests.
+- **Transformation — ✅** `CelTransformer` (set/remove request & response headers, set request-body fields; each value a CEL expression; fail-open per mutation; `needsBody` inference) wired via `CEL_TRANSFORM` — request mutations applied before guardrails/cache (detection + cache key + budget see the effective request), response header mutations on the streamed writeHead. 4 + 1 tests.
+
+**Done when:** ✅ an operator writes a CEL authz rule and a header/body transform; the fast path is untouched for policies that don't reference the body (via `needsBody`/`reads`). _Follow-up: a transform scratchpad (computed `vars`) and response-body transform on buffered responses._
 
 ## M11 — Resilience, inbound auth & guardrail depth (P1/P2)
 
