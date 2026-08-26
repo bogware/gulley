@@ -17,18 +17,26 @@ import {
   StreamingScanner,
   type TokenVault,
 } from '@gulley/guardrails';
+import type { GatewayMetrics } from '@gulley/metrics';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import { SSEParser, type UsageExtractor } from '@gulley/providers';
+import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
 import {
   type CircuitBreaker,
+  hasShaping,
   isFailoverStatus,
+  type ModelRouter,
+  type RequestShaping,
   type RouteTarget,
   type RoutingStrategy,
   selectCandidates,
+  shapeRequestBody,
 } from '@gulley/routing';
 import type { Telemetry } from '@gulley/telemetry';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { Readable, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
+import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
@@ -42,6 +50,8 @@ export interface ProviderRoute {
   guardrails?: GuardrailEngine;
   /** Set false to exclude this route from caching even when a cache is wired. */
   cacheable?: boolean;
+  /** Request shaping (defaults/overrides/system enrichment) applied before forward. */
+  shaping?: RequestShaping;
 }
 
 export interface GatewayContext {
@@ -58,6 +68,16 @@ export interface GatewayContext {
   guardrails?: GuardrailEngine;
   /** Two-tier response cache; absent = caching disabled. */
   cache?: CacheEngine;
+  /** RPM/TPM rate limiter; absent = no rate limiting. */
+  rateLimiter?: RateLimiter;
+  /** Prometheus instruments; absent = metrics disabled. */
+  metrics?: GatewayMetrics;
+  /** Flush any buffered request logs (called on the SIGTERM drain). */
+  flushLogs?: () => Promise<void>;
+  /** Model-based routing / aliasing; absent = route by path only. */
+  modelRouter?: ModelRouter;
+  /** Static model catalog surfaced by GET /v1/models (merged with router models). */
+  models?: string[];
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -84,6 +104,36 @@ export function registerRoutes(app: FastifyInstance, ctx: GatewayContext): void 
       handleProxy(ctx, route, req, reply);
     for (const path of route.clientPaths) app.post(path, handler);
   }
+  // Model discovery (OpenAI-shaped list), filtered to the caller's allowed models.
+  const modelsHandler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
+    handleModels(ctx, req, reply);
+  for (const path of ['/v1/models', '/openai/v1/models']) app.get(path, modelsHandler);
+}
+
+/** GET /v1/models — the models this principal may use, as an OpenAI model list. */
+async function handleModels(
+  ctx: GatewayContext,
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<void> {
+  const auth = await resolveVirtualKey(
+    { apiKey: headerValue(request, 'x-api-key'), bearer: bearerToken(request) },
+    { keyStore: ctx.keyStore, pepper: ctx.pepper },
+  );
+  if (isErr(auth)) {
+    await reply.code(401).send({
+      type: 'error',
+      error: { type: 'authentication_error', message: 'invalid credentials' },
+    });
+    return;
+  }
+  const principal = auth.value;
+  const ids = new Set<string>([...(ctx.models ?? []), ...(ctx.modelRouter?.knownModels() ?? [])]);
+  const data = [...ids]
+    .filter((id) => scopeAllowsModel(principal.scope, id))
+    .sort()
+    .map((id) => ({ id, object: 'model', owned_by: 'gulley' }));
+  await reply.send({ object: 'list', data });
 }
 
 async function handleProxy(
@@ -97,12 +147,37 @@ async function handleProxy(
   let body = (request.body as Buffer | undefined) ?? Buffer.alloc(0);
 
   let parsed: Record<string, unknown> = {};
+  let parseOk = true;
   try {
     parsed = JSON.parse(body.toString('utf8') || '{}') as Record<string, unknown>;
   } catch {
-    /* malformed body still gets forwarded verbatim */
+    parseOk = false; /* malformed body still gets forwarded verbatim */
   }
-  const requestedModel = typeof parsed['model'] === 'string' ? parsed['model'] : 'unknown';
+  let requestedModel = typeof parsed['model'] === 'string' ? parsed['model'] : 'unknown';
+
+  // --- model routing + request shaping (only when the body parsed cleanly) ---
+  // Resolve the requested model through the router (alias/pin the upstream model,
+  // and optionally override the strategy for a "virtual model"), then apply any
+  // route shaping. Both rewrite the outbound body BEFORE authz/guardrails/cache
+  // so scope checks, the cache key, and detection all see the effective request.
+  let strategy = route.strategy;
+  if (parseOk) {
+    if (ctx.modelRouter) {
+      const m = ctx.modelRouter.resolve(requestedModel);
+      if (m) {
+        if (m.strategy) strategy = m.strategy;
+        if (m.resolved !== requestedModel) {
+          requestedModel = m.resolved;
+          parsed['model'] = m.resolved;
+          body = Buffer.from(JSON.stringify(parsed), 'utf8');
+        }
+      }
+    }
+    if (route.shaping && hasShaping(route.shaping)) {
+      parsed = shapeRequestBody(parsed, route.shaping);
+      body = Buffer.from(JSON.stringify(parsed), 'utf8');
+    }
+  }
 
   // --- authn: virtual-key mode, deterministic + fail-closed ---
   const auth = await resolveVirtualKey(
@@ -126,7 +201,7 @@ async function handleProxy(
       .send({ type: 'error', error: { type: 'permission_error', message: 'model not permitted' } });
     return;
   }
-  const candidates = selectCandidates(route.strategy, ctx.breaker).filter((t) =>
+  const candidates = selectCandidates(strategy, ctx.breaker).filter((t) =>
     scopeAllowsProvider(principal.scope, t.provider),
   );
   if (candidates.length === 0) {
@@ -136,6 +211,53 @@ async function handleProxy(
     return;
   }
   const provider0 = candidates[0]?.provider ?? 'unknown';
+
+  // --- rate limit: RPM/TPM admission control (before guardrails/cache/budget) ---
+  // Requests are charged now (known at admission); token spend is trued up in the
+  // teardown / cache-hit path once the response is metered. Rejections carry the
+  // standard x-ratelimit-* + retry-after headers.
+  let rlRules: RateLimit[] = [];
+  let rlHeaders: Record<string, string> = {};
+  if (ctx.rateLimiter) {
+    const { outcome, rules } = await ctx.rateLimiter.check(principal.scope.workspaceId, requestId);
+    rlRules = rules;
+    rlHeaders = rateLimitHeaders(outcome);
+    if (!outcome.allowed) {
+      await ctx.audit.append({
+        orgId: principal.scope.orgId,
+        actor: principal.id,
+        action: 'ratelimit.rejected',
+        target: provider0,
+        payload: {
+          model: requestedModel,
+          rule: outcome.limiting?.rule.id,
+          unit: outcome.limiting?.rule.unit,
+          limit: outcome.limiting?.rule.limit,
+        },
+      });
+      ctx.telemetry.recordRequest({
+        provider: provider0,
+        requestModel: requestedModel,
+        responseModel: requestedModel,
+        route: candidates[0]?.upstreamPath ?? '',
+        statusCode: 429,
+        status: 'error',
+        inputTokens: 0,
+        outputTokens: 0,
+        costMicroUsd: 0,
+        streamed: false,
+        startedAtMs: started,
+      });
+      await reply
+        .code(429)
+        .headers(rlHeaders)
+        .send({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: 'rate limit exceeded' },
+        });
+      return;
+    }
+  }
 
   // --- guardrails (input): audit by default; block / mask / redact per policy ---
   const engine = route.guardrails ?? ctx.guardrails;
@@ -223,6 +345,8 @@ async function handleProxy(
         requestedModel,
         cacheLookup,
         started,
+        rlRules,
+        rlHeaders,
       );
       return;
     }
@@ -295,8 +419,9 @@ async function handleProxy(
         credential: target.credential,
         signal: controller.signal,
       });
-      if (!isLast && resp.statusCode >= 400 && isFailoverStatus(route.strategy, resp.statusCode)) {
+      if (!isLast && resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
         ctx.breaker.recordFailure(target.name);
+        ctx.metrics?.recordFailover(target.name);
         resp.body.resume(); // discard the failed body, then try the next target
         request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
         continue;
@@ -307,7 +432,7 @@ async function handleProxy(
       // 4xx (400/401/403/404/422) is the caller's error and must not trip the
       // breaker for every other tenant sharing this target.
       if (resp.statusCode < 400) ctx.breaker.recordSuccess(target.name);
-      else if (isFailoverStatus(route.strategy, resp.statusCode)) {
+      else if (isFailoverStatus(strategy, resp.statusCode)) {
         ctx.breaker.recordFailure(target.name);
       }
       break;
@@ -381,6 +506,17 @@ async function handleProxy(
       }
     }
 
+    // True up the token-rate windows with actual usage (best-effort; the limiter
+    // swallows its own errors so a lost true-up under-counts but never blocks).
+    if (ctx.rateLimiter && rlRules.length > 0) {
+      await ctx.rateLimiter.commit(
+        principal.scope.workspaceId,
+        rlRules,
+        requestId,
+        cost.totalInputTokens + cost.outputTokens,
+      );
+    }
+
     try {
       if (n.seen) {
         await ctx.ledger.record({
@@ -411,6 +547,12 @@ async function handleProxy(
         costMicroUsd,
         latencyMs: Date.now() - started,
         createdAt,
+        attributes: {
+          cache: cacheLookup?.status ?? 'bypass',
+          target: served?.name ?? provider,
+          ...(guardrailAction ? { guardrailAction } : {}),
+          ...(outFindings.length > 0 ? { guardrailOutputFindings: outFindings.length } : {}),
+        },
       });
       await ctx.audit.append({
         orgId: principal.scope.orgId,
@@ -499,11 +641,33 @@ async function handleProxy(
     return;
   }
 
+  // Decompress a content-encoded upstream so guardrails, usage extraction, and the
+  // cache all see real bytes (not gzip), and the client receives plain bytes with
+  // the encoding header dropped (filterResponseHeaders strips it). An encoding we
+  // can't decode is passed through raw with its header preserved so the client can.
+  const rawEncoding = String(upstream.headers['content-encoding'] ?? '')
+    .toLowerCase()
+    .trim();
+  const decompressor =
+    rawEncoding && rawEncoding !== 'identity' ? decompressorFor(rawEncoding) : undefined;
+  let upstreamBody: Readable = upstream.body;
+  if (decompressor) {
+    const source = upstream.body;
+    // pipe() doesn't forward source errors — bridge them so a broken upstream
+    // tears the decompressor (and thus the response) down instead of hanging.
+    source.on('error', (e: Error) => decompressor.destroy(e));
+    upstreamBody = source.pipe(decompressor);
+  }
+  const passthroughEncoding =
+    rawEncoding && rawEncoding !== 'identity' && !decompressor ? rawEncoding : undefined;
+
   // Take over the raw socket: raw byte fidelity + guaranteed teardown.
   reply.hijack();
   if (!bufferOutput) {
     reply.raw.writeHead(statusCode, {
       ...filterResponseHeaders(upstream.headers),
+      ...rlHeaders,
+      ...(passthroughEncoding ? { 'content-encoding': passthroughEncoding } : {}),
       'x-gulley-request-id': requestId,
       'x-gulley-target': served.name,
       'x-gulley-cache': cacheLookup?.status ?? 'bypass',
@@ -512,7 +676,6 @@ async function handleProxy(
 
   const servedTarget = served;
   const upstreamHeaders = upstream.headers;
-  const upstreamBody = upstream.body;
 
   // Inactivity watchdog: a stalled upstream (half-open TCP / provider hang) emits
   // neither 'end' nor 'error', so without this teardown never runs and the
@@ -613,6 +776,7 @@ async function handleProxy(
       if (!reply.raw.writableEnded) {
         reply.raw.writeHead(statusCode, {
           ...filterResponseHeaders(upstreamHeaders),
+          ...rlHeaders,
           'content-type': 'application/json',
           'x-gulley-request-id': requestId,
           'x-gulley-target': servedTarget.name,
@@ -640,9 +804,48 @@ async function handleProxy(
     clearWatchdog();
     status = controller.signal.aborted ? 'aborted' : 'error';
     request.log.error({ err }, 'upstream stream error');
-    if (!reply.raw.writableEnded) reply.raw.end();
+    if (!reply.raw.writableEnded) {
+      // A raw pipe that just ends mid-stream leaves the client with a truncated,
+      // unparseable response. If we're streaming and the client is still here,
+      // emit a clean provider-shaped terminal error event before closing.
+      if (streamed && !controller.signal.aborted) {
+        try {
+          reply.raw.write(providerErrorFrame(provider, 'upstream stream error'));
+        } catch {
+          /* client already gone */
+        }
+      }
+      reply.raw.end();
+    }
     void teardown();
   });
+}
+
+/** A terminal SSE error event in the served provider's streaming dialect, so a
+ *  mid-stream failure surfaces to the client as a parseable error rather than a
+ *  dropped connection. Anthropic-canonical by default; OpenAI/Azure use the
+ *  `data: {error}` shape their SDKs expect. */
+function providerErrorFrame(provider: string, message: string): string {
+  if (provider === 'openai' || provider === 'azure') {
+    return `data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`;
+  }
+  return `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message } })}\n\n`;
+}
+
+/** A decompression transform for a Content-Encoding, or undefined for an encoding
+ *  we don't handle (caller then passes the bytes through raw). */
+function decompressorFor(encoding: string): Transform | undefined {
+  switch (encoding) {
+    case 'gzip':
+    case 'x-gzip':
+      return createGunzip();
+    case 'deflate':
+      return createInflate();
+    case 'br':
+      return createBrotliDecompress();
+    default:
+      return undefined;
+  }
 }
 
 /** Replay a cached response verbatim and record a $0 (no-upstream) request. */
@@ -656,6 +859,8 @@ async function serveFromCache(
   requestModel: string,
   lookup: CacheLookup,
   started: number,
+  rlRules: RateLimit[],
+  rlHeaders: Record<string, string>,
 ): Promise<void> {
   const cached = lookup.response;
   if (!cached) return;
@@ -664,6 +869,7 @@ async function serveFromCache(
   reply.hijack();
   reply.raw.writeHead(cached.statusCode, {
     ...filterResponseHeaders(cached.headers),
+    ...rlHeaders,
     'x-gulley-request-id': requestId,
     'x-gulley-target': `cache:${lookup.status}`,
     'x-gulley-cache': lookup.status,
@@ -672,6 +878,16 @@ async function serveFromCache(
   if (!reply.raw.writableEnded) {
     reply.raw.write(cached.body);
     reply.raw.end();
+  }
+
+  // A cache hit is still a request for rate-limit purposes; true up its tokens.
+  if (ctx.rateLimiter && rlRules.length > 0) {
+    await ctx.rateLimiter.commit(
+      principal.scope.workspaceId,
+      rlRules,
+      requestId,
+      cached.inputTokens + cached.outputTokens,
+    );
   }
 
   const createdAt = new Date();
@@ -691,6 +907,7 @@ async function serveFromCache(
       costMicroUsd: 0,
       latencyMs: Date.now() - started,
       createdAt,
+      attributes: { cache: lookup.status, target: `cache:${lookup.status}` },
     });
     await ctx.audit.append({
       orgId: principal.scope.orgId,

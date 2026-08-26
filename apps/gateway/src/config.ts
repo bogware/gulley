@@ -41,11 +41,29 @@ const Env = z.object({
   OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
   OTEL_SERVICE_NAME: z.string().default('gulley-gateway'),
 
+  // Prometheus /metrics on a SEPARATE management listener (not the data port),
+  // so scrape traffic never mixes with client traffic.
+  METRICS_ENABLED: envBool(true),
+  METRICS_PORT: z.coerce.number().int().positive().default(9090),
+  METRICS_HOST: z.string().default('0.0.0.0'),
+
   // Guardrails — native PII/secret detection. Audit-only by default (records
   // findings + telemetry, never mutates payloads); block/mask/redact are set
   // per-route in code. Detection runs on request and response text.
   GUARDRAILS_ENABLED: envBool(true),
   GUARDRAILS_ENTROPY: envBool(true),
+
+  // Request-log batching — buffer operational log writes off the hot-path
+  // teardown and flush in bulk. The durable spend ledger stays synchronous.
+  LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),
+  LOG_BATCH_INTERVAL_MS: z.coerce.number().int().positive().default(1000),
+
+  // Rate limiting — RPM/TPM fixed windows resolved per workspace from the
+  // rate_limit table (no rows = no limiting). Global counters use the same Redis
+  // counters cluster as budgets; without it, limits are per-replica (in-memory).
+  // fail_open admits requests when the limiter backend errors (availability).
+  RATELIMIT_ENABLED: envBool(true),
+  RATELIMIT_FAIL_OPEN: envBool(true),
 
   // Two-tier response cache. Off by default; opt in per deployment.
   CACHE_ENABLED: envBool(false),

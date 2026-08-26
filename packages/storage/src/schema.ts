@@ -139,11 +139,15 @@ export const requestLog = pgTable(
     outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
     costMicroUsd: bigint('cost_micro_usd', { mode: 'number' }).notNull().default(0),
     latencyMs: integer('latency_ms').notNull().default(0),
+    // Open, low-cardinality facet bag (cache status, guardrail action, tags…).
+    attributes: jsonb('attributes'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     index('request_log_workspace_idx').on(t.workspaceId),
     index('request_log_created_idx').on(t.createdAt),
+    // Keyset pagination + workspace-scoped browse: (workspace, created desc, id).
+    index('request_log_ws_created_idx').on(t.workspaceId, t.createdAt),
   ],
 );
 

@@ -1,5 +1,5 @@
 {
-  "name": "@gulley/providers",
+  "name": "@gulley/ratelimit",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -12,13 +12,7 @@
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"
   },
-  "dependencies": {
-    "@gulley/core": "workspace:*",
-    "@gulley/cost": "workspace:*",
-    "@gulley/egress": "workspace:*",
-    "@gulley/guardrails": "workspace:*",
-    "undici": "^6.21.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",

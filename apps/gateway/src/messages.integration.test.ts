@@ -1,10 +1,12 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import zlib from 'node:zlib';
 import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { AnthropicAdapter, AnthropicUsageExtractor } from '@gulley/providers';
-import { CircuitBreaker, type RouteTarget } from '@gulley/routing';
+import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
+import { CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
 import { initTelemetry } from '@gulley/telemetry';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
@@ -64,6 +66,7 @@ function testConfig() {
 function buildContext(
   store: InMemoryKeyStore,
   budgets: BudgetStore = new InMemoryBudgetStore(new Map()),
+  rateLimiter?: RateLimiter,
 ): {
   ctx: GatewayContext;
   ledger: InMemoryLedger;
@@ -77,6 +80,7 @@ function buildContext(
   const breaker = new CircuitBreaker();
   return {
     ctx: {
+      rateLimiter,
       routes: [
         {
           clientPaths: ['/v1/messages', '/anthropic/v1/messages'],
@@ -307,6 +311,203 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     });
 
     expect(res.status).toBe(200);
+    await app.close();
+  });
+
+  it('enforces an RPM limit: 429 with x-ratelimit headers, no upstream call', async () => {
+    const { store, token } = seededStore();
+    const limiter = new RateLimiter({
+      store: new InMemoryRateLimitStore(),
+      resolve: () => [{ id: 'rpm', limit: 1, windowSeconds: 60, unit: 'requests' }],
+    });
+    const { ctx, requestLog } = buildContext(store, undefined, limiter);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const headers = { 'content-type': 'application/json', 'x-api-key': token };
+
+    const first = await fetch(`${base}/v1/messages`, { method: 'POST', headers, body });
+    await first.text();
+    expect(first.status).toBe(200);
+    expect(first.headers.get('x-ratelimit-limit')).toBe('1');
+    expect(first.headers.get('x-ratelimit-remaining')).toBe('0');
+
+    const second = await fetch(`${base}/v1/messages`, { method: 'POST', headers, body });
+    const json = (await second.json()) as { error: { type: string } };
+    expect(second.status).toBe(429);
+    expect(json.error.type).toBe('rate_limit_error');
+    expect(second.headers.get('retry-after')).toBeTruthy();
+    expect(second.headers.get('x-ratelimit-remaining')).toBe('0');
+
+    // Only the first (admitted) request reached upstream and was logged.
+    expect(requestLog.entries).toHaveLength(1);
+
+    await app.close();
+  });
+
+  it('injects a terminal error frame when the upstream stream breaks mid-flight', async () => {
+    const broken = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":5,"output_tokens":1}}}\n\n',
+      );
+      setTimeout(() => res.destroy(), 20); // sever the connection mid-stream
+    });
+    await new Promise<void>((r) => broken.listen(0, '127.0.0.1', r));
+    const brokenUrl = `http://127.0.0.1:${(broken.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('broken', brokenUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).toContain('message_start'); // partial content still delivered
+    expect(text).toContain('event: error'); // clean terminal frame appended
+    expect(text).toContain('"type":"api_error"');
+
+    await app.close();
+    await new Promise<void>((r) => broken.close(() => r()));
+  });
+
+  it('decompresses a gzip-encoded upstream before metering and forwarding', async () => {
+    const gz = zlib.gzipSync(Buffer.from(GOLDEN_SSE, 'utf8'));
+    const gzServer = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
+      res.end(gz);
+    });
+    await new Promise<void>((r) => gzServer.listen(0, '127.0.0.1', r));
+    const gzUrl = `http://127.0.0.1:${(gzServer.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('gz', gzUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    // Client receives decoded SSE, with the content-encoding header stripped.
+    expect(res.headers.get('content-encoding')).toBeNull();
+    expect(text).toContain('message_start');
+    expect(text).toContain('"stop_reason":"end_turn"');
+    // Usage was metered from the DECODED stream, not gzip bytes.
+    expect(ledger.entries[0]?.cost.outputTokens).toBe(42);
+
+    await app.close();
+    await new Promise<void>((r) => gzServer.close(() => r()));
+  });
+
+  it('aliases a requested model to a pinned upstream model', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.modelRouter = new ModelRouter([{ pattern: 'smart', target: 'claude-sonnet-4-6' }]);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'smart',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    // Upstream received the pinned model, not the client's alias.
+    expect(received.body).toContain('"model":"claude-sonnet-4-6"');
+    expect(received.body).not.toContain('smart');
+
+    await app.close();
+  });
+
+  it('applies request shaping defaults before forwarding', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes[0]!.shaping = { defaults: { max_tokens: 256 }, overrides: { top_p: 0.1 } };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        top_p: 0.9,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    expect(received.body).toContain('"max_tokens":256'); // default (absent) applied
+    expect(received.body).toContain('"top_p":0.1'); // override wins over client 0.9
+
+    await app.close();
+  });
+
+  it('serves GET /v1/models filtered to the caller and 401 without a key', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.models = ['claude-sonnet-4-6', 'gpt-4o'];
+    ctx.modelRouter = new ModelRouter([{ pattern: 'smart', target: 'claude-sonnet-4-6' }]);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/models`, { headers: { 'x-api-key': token } });
+    const json = (await res.json()) as { object: string; data: Array<{ id: string }> };
+    expect(res.status).toBe(200);
+    expect(json.object).toBe('list');
+    const ids = json.data.map((d) => d.id);
+    expect(ids).toContain('claude-sonnet-4-6');
+    expect(ids).toContain('gpt-4o');
+    expect(ids).toContain('smart'); // known router alias
+
+    const bad = await fetch(`${base}/v1/models`);
+    expect(bad.status).toBe(401);
+
     await app.close();
   });
 });

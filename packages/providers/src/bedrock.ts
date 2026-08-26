@@ -1,3 +1,4 @@
+import { assertSafePathSegment } from '@gulley/egress';
 import type { Readable } from 'node:stream';
 import { request } from 'undici';
 import { bedrockToSse } from './bedrock-eventstream';
@@ -42,6 +43,9 @@ export class BedrockAdapter implements ProviderAdapter {
     delete rest['stream'];
     if (!('anthropic_version' in rest)) rest['anthropic_version'] = 'bedrock-2023-05-31';
 
+    // The model id becomes a URL path segment; validate it before encoding so a
+    // hostile id (path traversal / control chars) can't reshape the upstream URL.
+    if (model) assertSafePathSegment(model, 'model');
     const path = `/model/${encodeURIComponent(model)}/invoke-with-response-stream`;
     const res = await request(`${this.baseUrl}${path}`, {
       method: 'POST',

@@ -43,6 +43,46 @@ export function isIpLiteral(host: string): boolean {
   return ipv4ToInt(host) !== null || host.includes(':');
 }
 
+/** True if `s` contains any control char, space, or DEL (code point <= 0x20 or 0x7f). */
+function hasControlOrSpace(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c <= 0x20 || c === 0x7f) return true;
+  }
+  return false;
+}
+
+/**
+ * Validate a value destined to become ONE path segment of an upstream URL — e.g.
+ * a client-supplied model id spliced into a Bedrock/Vertex path. Rejects path
+ * separators, `..` traversal, and control/space characters, and re-checks the
+ * decoded form so a percent-encoded `..%2f` cannot smuggle a traversal past the
+ * caller's `encodeURIComponent`. Returns the value unchanged (the caller still
+ * encodes it on write). The "decode-then-validate, encode-on-write" discipline.
+ */
+export function assertSafePathSegment(value: string, label = 'path segment'): string {
+  if (!value || value.length > 256) {
+    throw new EgressError('invalid-url', `${label} is empty or too long`);
+  }
+  const unsafe = (s: string): boolean =>
+    hasControlOrSpace(s) || s.includes('/') || s.includes('\\') || s.includes('..');
+  if (unsafe(value)) {
+    throw new EgressError('invalid-url', `unsafe ${label}: ${JSON.stringify(value)}`);
+  }
+  if (value.includes('%')) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(value);
+    } catch {
+      throw new EgressError('invalid-url', `undecodable ${label}: ${JSON.stringify(value)}`);
+    }
+    if (unsafe(decoded)) {
+      throw new EgressError('invalid-url', `unsafe (encoded) ${label}: ${JSON.stringify(value)}`);
+    }
+  }
+  return value;
+}
+
 /** True for any internal / link-local / metadata / loopback address literal. */
 export function isBlockedIp(host: string): boolean {
   const h = host.toLowerCase().replace(/^\[|\]$/g, '');

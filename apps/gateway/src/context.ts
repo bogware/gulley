@@ -18,10 +18,19 @@ import {
   type VectorIndex,
 } from '@gulley/cache';
 import { auditOnlyPolicies, GuardrailEngine, NativeDetector } from '@gulley/guardrails';
+import { GatewayMetrics } from '@gulley/metrics';
+import { BatchingRequestLog } from '@gulley/pipeline';
+import {
+  InMemoryRateLimitStore,
+  RateLimiter,
+  type RateLimitStore,
+  RedisRateLimitStore,
+} from '@gulley/ratelimit';
 import { CircuitBreaker } from '@gulley/routing';
 import {
   createBudgetCapResolver,
   createDatabase,
+  createRateLimitResolver,
   createRedisClient,
   type Database,
   PostgresAuditSink,
@@ -33,7 +42,7 @@ import {
   RedisExactCache,
   RedisVectorIndex,
 } from '@gulley/storage';
-import { initTelemetry } from '@gulley/telemetry';
+import { initTelemetry, type Telemetry } from '@gulley/telemetry';
 import type { Config } from './config';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 
@@ -237,9 +246,44 @@ export function createProductionContext(config: Config): GatewayContext {
         createBudgetCapResolver(db),
       )
     : new InMemoryBudgetStore(new Map());
-  const telemetry = initTelemetry({
+  const otel = initTelemetry({
     endpoint: config.OTEL_EXPORTER_OTLP_ENDPOINT,
     serviceName: config.OTEL_SERVICE_NAME,
+  });
+
+  // Prometheus metrics tee off the single telemetry event, so one recordRequest
+  // call feeds both OTel spans and the /metrics counters/histograms.
+  const metrics = config.METRICS_ENABLED ? new GatewayMetrics() : undefined;
+  const telemetry: Telemetry = metrics
+    ? {
+        recordRequest: (d) => {
+          otel.recordRequest(d);
+          metrics.record(d);
+        },
+        forceFlush: () => otel.forceFlush(),
+        shutdown: () => otel.shutdown(),
+      }
+    : otel;
+
+  // Rate limiting shares the counters Redis with budgets (global, cross-replica);
+  // without it, limits fall back to per-replica in-memory counters.
+  let rateLimiter: RateLimiter | undefined;
+  if (config.RATELIMIT_ENABLED) {
+    const store: RateLimitStore = config.REDIS_COUNTERS_URL
+      ? new RedisRateLimitStore(createRedisClient(config.REDIS_COUNTERS_URL))
+      : new InMemoryRateLimitStore();
+    rateLimiter = new RateLimiter({
+      store,
+      resolve: createRateLimitResolver(db),
+      failOpen: config.RATELIMIT_FAIL_OPEN,
+    });
+  }
+
+  // Batch operational request-log writes off the hot-path teardown; the durable
+  // spend ledger stays synchronous. Flushed on the SIGTERM drain via flushLogs.
+  const requestLog = new BatchingRequestLog(new PostgresRequestLog(db), {
+    maxBatch: config.LOG_BATCH_MAX,
+    intervalMs: config.LOG_BATCH_INTERVAL_MS,
   });
 
   return {
@@ -247,12 +291,15 @@ export function createProductionContext(config: Config): GatewayContext {
     keyStore: new PostgresKeyStore(db),
     pepper: config.GULLEY_KEY_PEPPER,
     ledger: new PostgresLedger(db),
-    requestLog: new PostgresRequestLog(db),
+    requestLog,
+    flushLogs: () => requestLog.close(),
     audit: new PostgresAuditSink(db),
     breaker: new CircuitBreaker(),
     budgets,
     telemetry,
     guardrails: buildGuardrails(config),
     cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,
+    rateLimiter,
+    metrics,
   };
 }

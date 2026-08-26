@@ -5,7 +5,13 @@ import {
   InMemoryKeyStore,
 } from '@gulley/auth';
 import { type ConfigVersionStore, InMemoryConfigVersionStore } from '@gulley/config';
-import { type AuditSink, GuardedAuditSink, InMemoryAuditSink } from '@gulley/pipeline';
+import {
+  type AuditSink,
+  GuardedAuditSink,
+  InMemoryAuditSink,
+  InMemoryRequestLog,
+  type RequestLogQuery,
+} from '@gulley/pipeline';
 import { type AccessControl, InMemoryAccessControl } from '@gulley/rbac';
 import type { CollectionKind } from './domain';
 import { COLLECTION_KINDS } from './domain';
@@ -34,6 +40,8 @@ export interface ControlContext {
   access: AccessControl;
   sessionStore: AdminSessionStore;
   configVersions: ConfigVersionStore;
+  /** Read side of the request log: admin log browser + usage analytics. */
+  requestLogQuery: RequestLogQuery;
   resolverDeps: AdminResolverDeps;
   /** Verify the underlying audit chain (the sink is guarded, so expose it). */
   verifyAudit: () => { verified: boolean; count: number };
@@ -48,6 +56,8 @@ export interface InMemoryContextOptions {
   sessionSecrets: readonly string[];
   maxSessionTtlMs: number;
   outboundAllowlist?: ReadonlySet<string>;
+  /** Inject a pre-seeded query backend (tests); defaults to a fresh in-memory log. */
+  requestLogQuery?: RequestLogQuery;
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -76,6 +86,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     access: new InMemoryAccessControl(),
     sessionStore,
     configVersions: new InMemoryConfigVersionStore(),
+    requestLogQuery: opts.requestLogQuery ?? new InMemoryRequestLog(),
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,
       bootstrapTokenSha256: opts.bootstrapTokenSha256,

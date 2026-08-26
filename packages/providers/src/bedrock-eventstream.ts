@@ -14,6 +14,21 @@ export interface EventstreamFrame {
   payload: Buffer;
 }
 
+/** AWS caps a single eventstream message at 16 MiB. A frame declaring more than
+ *  that is corrupt or hostile — and without this bound the parser would buffer
+ *  toward that declared length unboundedly (`this.buf` never satisfies
+ *  `length < total`), an OOM/DoS vector on a malicious or truncated upstream. */
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+/** Minimum frame: 12-byte prelude (totalLen, headersLen, preludeCrc) + 4-byte CRC. */
+const MIN_FRAME_BYTES = 16;
+
+export class EventstreamError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EventstreamError';
+  }
+}
+
 export class EventstreamParser {
   private buf: Buffer = Buffer.alloc(0);
 
@@ -22,7 +37,12 @@ export class EventstreamParser {
     const out: EventstreamFrame[] = [];
     while (this.buf.length >= 4) {
       const total = this.buf.readUInt32BE(0);
-      if (total < 16 || this.buf.length < total) break;
+      // Validate the declared length BEFORE waiting for that many bytes, so a
+      // bogus multi-GB length is rejected immediately instead of buffering.
+      if (total < MIN_FRAME_BYTES || total > MAX_FRAME_BYTES) {
+        throw new EventstreamError(`invalid eventstream frame length: ${total}`);
+      }
+      if (this.buf.length < total) break; // legitimate partial frame — await more
       const frame = this.buf.subarray(0, total);
       this.buf = this.buf.subarray(total);
       out.push(parseFrame(frame));
@@ -35,6 +55,11 @@ function parseFrame(frame: Buffer): EventstreamFrame {
   const headersLen = frame.readUInt32BE(4);
   const headersStart = 12;
   const headersEnd = headersStart + headersLen;
+  // Headers must fit between the 12-byte prelude and the trailing 4-byte CRC;
+  // an out-of-range headersLen would otherwise make the payload slice negative.
+  if (headersLen > frame.length || headersEnd > frame.length - 4) {
+    throw new EventstreamError(`corrupt eventstream frame: headers length ${headersLen}`);
+  }
   return {
     headers: parseHeaders(frame.subarray(headersStart, headersEnd)),
     payload: frame.subarray(headersEnd, frame.length - 4),
@@ -103,8 +128,13 @@ export function bedrockToSse(upstream: Readable): Readable {
     let frames: EventstreamFrame[];
     try {
       frames = parser.push(chunk);
-    } catch {
-      return; // malformed frame — skip rather than corrupt the stream
+    } catch (err) {
+      // A bad frame length/bounds desynchronizes the byte stream — there is no
+      // safe resync point, and silently returning would spin on the same bytes
+      // (and keep buffering). Terminate both ends cleanly instead.
+      out.destroy(err as Error);
+      upstream.destroy();
+      return;
     }
     for (const f of frames) {
       const messageType = f.headers[':message-type'];

@@ -1,3 +1,4 @@
+import { type MetricsServerHandle, startMetricsServer } from '@gulley/metrics';
 import { closeUpstreamPool } from '@gulley/providers';
 import { loadConfig } from './config';
 import { createProductionContext } from './context';
@@ -5,6 +6,7 @@ import type { GatewayContext } from './routes/messages';
 import { buildServer } from './server';
 
 const config = loadConfig();
+let metricsServer: MetricsServerHandle | undefined;
 
 let context: GatewayContext | undefined;
 try {
@@ -20,6 +22,14 @@ const app = buildServer(config, context);
 async function start(): Promise<void> {
   try {
     await app.listen({ host: config.GATEWAY_HOST, port: config.GATEWAY_PORT });
+    if (context?.metrics) {
+      metricsServer = await startMetricsServer({
+        metrics: context.metrics,
+        port: config.METRICS_PORT,
+        host: config.METRICS_HOST,
+      });
+      app.log.info({ port: metricsServer.port }, 'metrics listener up on /metrics');
+    }
   } catch (error) {
     app.log.error(error);
     process.exit(1);
@@ -49,6 +59,8 @@ async function shutdown(signal: string): Promise<void> {
   backstop.unref();
   try {
     await app.close();
+    await context?.flushLogs?.(); // drain buffered request logs before exit
+    await metricsServer?.close();
     await closeUpstreamPool();
   } catch (err) {
     app.log.error({ err }, 'shutdown error');
