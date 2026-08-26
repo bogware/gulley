@@ -1,0 +1,2 @@
+event: response.completed
+data: {"type":"response.completed","response":{"model":"gpt-4.1-mini","status":"completed","usage":{"input_tokens":30,"output_tokens":7,"input_tokens_details":{"cached_tokens":10}}}}

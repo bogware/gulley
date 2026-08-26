@@ -18,6 +18,7 @@
     "cache:check": "tsx src/cache-check.ts",
     "guardrail:check": "tsx src/guardrail-check.ts",
     "bedrock-guardrail:check": "tsx src/bedrock-guardrail-check.ts",
+    "load:check": "tsx src/load-check.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"

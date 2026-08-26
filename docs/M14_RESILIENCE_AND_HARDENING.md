@@ -100,11 +100,21 @@ teardown, budget committed once. Then the adversarial hot-path review pass.
 
 ---
 
-## C — Conformance & load harness (planned)
+## C — Conformance & load harness (delivered)
 
-Golden black-box record/replay of real provider SSE fixtures asserting the
-pipeline invariants end-to-end, plus a k6/autocannon load profile asserting the
-SLOs the M13 dashboards visualize.
+- **Conformance (CI).** `apps/gateway/src/conformance.test.ts` replays captured
+  provider wire streams (`apps/gateway/src/conformance/fixtures/*.sse` — Anthropic
+  streaming, Anthropic extended-thinking signature, OpenAI chat, OpenAI Responses)
+  through the full assembled gateway and asserts, per fixture: (1) raw-byte
+  fidelity (client bytes === upstream bytes verbatim), (2) meter-from-raw-usage
+  (metered tokens === the provider's own usage), (3) single teardown (exactly one
+  ledger + request-log + audit row). Adding a provider quirk = a fixture + a row.
+- **Load (manual).** `pnpm --filter @gulley/gateway load:check`
+  (`apps/gateway/src/load-check.ts`) drives concurrent traffic through an
+  in-process gateway + fast fake upstream and asserts the SLOs (p99 < 10s, error
+  ratio < 0.005), exiting non-zero on a breach. `ops/load/gateway-load.js` is the
+  k6 profile for a deployed gateway, encoding the same thresholds. See
+  `ops/load/README.md`.
 
 ## B — Native Vertex + Copilot adapters (planned)
 

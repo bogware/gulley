@@ -1,0 +1,7 @@
+data: {"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}
+
+data: {"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"model":"gpt-4o-mini-2024-07-18","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":8}}}
+
+data: [DONE]
