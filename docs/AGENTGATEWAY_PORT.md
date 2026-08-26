@@ -94,7 +94,7 @@ _Still open in M8: Vertex + Copilot native adapters, provider prompt-cache break
 
 **Done when:** a flaky upstream is ejected and self-heals on its Retry-After; a transient error retries on the same target within the budget cap; a JWT/OIDC/Basic client authenticates; a webhook guardrail masks output; streamed output is truly blocked (not just audited) via hold-then-flush.
 
-**Status: substantially delivered** (JWT/OIDC inbound auth, managed guardrails, hold-then-flush, P2C + session affinity, graded breaker, retry-replay). Deferred: HTTP Basic, Model Armor, passive outlier ejection, PII depth.
+**Status: COMPLETE.** JWT/OIDC inbound auth, HTTP Basic (htpasswd), managed guardrails (OpenAI Moderation, Azure Content Safety, Bedrock, Model Armor), hold-then-flush, P2C + session affinity, graded breaker + passive outlier detection, retry-replay, PII depth. The tail slices were adversarially reviewed and seven confirmed defects fixed (see the fix commits).
 
 **Delivered:**
 
@@ -106,7 +106,11 @@ _Still open in M8: Vertex + Copilot native adapters, provider prompt-cache break
 - **Managed guardrail plugins — ✅ delivered.** `OpenAIModerationPlugin`, `AzureContentSafetyPlugin` (severity threshold), plus the earlier `WebhookGuardrailPlugin` and a Bedrock plugin, composed via `composePlugins`/`CompositeGuardrailPlugin` (short-circuit on block, chained masks). Fail-open by default, per-plugin fail-closed. 7 tests.
 - **Hold-then-flush streaming block — ✅ delivered.** A route may opt into `holdStreamedOutput`: the streamed SSE body is buffered, the output guardrail policy runs on the whole body, and any enforcing verdict (block, or a would-be redaction that can't be re-encoded into SSE frames) withholds the response with a terminal error frame; otherwise the buffered SSE is flushed (detokenized). Usage is still metered. 1 integration test.
 - **P2C least-load + session affinity (HRW) — ✅ delivered.** `@gulley/routing` gains a `LoadScoreboard` (in-flight counts) driving power-of-two-choices least-load selection for the `loadbalance` primary pick (default via `LB_LEAST_LOAD`), and weighted rendezvous hashing (`hrwOrder`) that pins a session to one target when `LB_SESSION_AFFINITY_HEADER` is set (header value, else principal id). Gateway begins on the served target and releases in teardown. 5 routing tests + 1 gateway integration test.
-- _Still open in M11 (deferred): HTTP Basic/htpasswd inbound auth; Google Model Armor plugin; passive outlier-detection ejection/uneviction; PII depth (libphonenumber, context-word boosting)._
+- **HTTP Basic (htpasswd) inbound auth — ✅ delivered.** `@gulley/auth` htpasswd verifier (bcrypt via bcryptjs, Apache `$apr1$` verified against openssl vectors, `{SHA}`/`{SSHA}`, plaintext; DES/unknown formats fail closed). Deterministic scheme selection ahead of JWT/virtual-key. Deny-by-default per-user scope, timing-equalized on the miss path.
+- **Google Model Armor — ✅ delivered.** `ModelArmorPlugin` (sanitizeUserPrompt/ModelResponse; block, or SDP-mask only when SDP is the sole matched filter). Runs on input AND (via `GuardrailEngine.inspectOutput`) the buffered output path.
+- **Passive outlier detection — ✅ delivered.** A dedicated peer-relative `OutlierDetector` (separate from the fault breaker): ejects a target whose TTFB EWMA is ≥ factor × the peer baseline, with correct timed self-heal; `selectCandidates` unions it with the breaker filter. `OUTLIER_*` config, off by default.
+- **PII depth — ✅ delivered.** NANP/E.164 phone validation, Canadian SIN (Luhn) + URL detectors, and context-word confidence boosting.
+- **Hardening from adversarial review — ✅** seven confirmed defects across the tail slices fixed (Basic-auth plaintext-fallthrough / allow-all default / timing oracle; Model Armor output-not-scanned / SDP-downgrades-block; outlier shared-backoff / broken-self-heal), each with regression tests.
 
 ## M12 — Observability engine, config hot-reload & HTTP edge (P2/P3)
 
