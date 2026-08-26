@@ -7,3 +7,6 @@ export * from './streaming';
 export * from './engine';
 export * from './plugin';
 export * from './webhook';
+export * from './moderation';
+export * from './azure-content-safety';
+export * from './composite';

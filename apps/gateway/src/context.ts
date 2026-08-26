@@ -3,6 +3,7 @@ import {
   AnthropicUsageExtractor,
   AzureAdapter,
   BedrockAdapter,
+  BedrockGuardrailPlugin,
   type CustomProviderConfig,
   OpenAIAdapter,
   OpenAIUsageExtractor,
@@ -32,8 +33,12 @@ import { OidcProvider } from '@gulley/oidc';
 import type { JwtAuthConfig } from './jwt-auth';
 import {
   auditOnlyPolicies,
+  AzureContentSafetyPlugin,
+  composePlugins,
   GuardrailEngine,
+  type GuardrailPlugin,
   NativeDetector,
+  OpenAIModerationPlugin,
   WebhookGuardrailPlugin,
 } from '@gulley/guardrails';
 import { GatewayMetrics } from '@gulley/metrics';
@@ -74,17 +79,51 @@ import type { GatewayContext, ProviderRoute } from './routes/messages';
  *  on the route; this is the global default applied to every proxied request. */
 export function buildGuardrails(config: Config): GuardrailEngine | undefined {
   if (!config.GUARDRAILS_ENABLED) return undefined;
-  const plugin = config.GUARDRAILS_WEBHOOK_URL
-    ? new WebhookGuardrailPlugin({
+
+  // Compose the configured external plugins (webhook DLP + managed services)
+  // behind the single plugin seam, layered after the native detectors.
+  const plugins: GuardrailPlugin[] = [];
+  if (config.GUARDRAILS_WEBHOOK_URL) {
+    plugins.push(
+      new WebhookGuardrailPlugin({
         url: config.GUARDRAILS_WEBHOOK_URL,
         failMode: config.GUARDRAILS_WEBHOOK_FAIL_CLOSED ? 'closed' : 'open',
         allowInternal: config.GUARDRAILS_WEBHOOK_ALLOW_INTERNAL,
-      })
-    : undefined;
+      }),
+    );
+  }
+  if (config.GUARDRAILS_MODERATION_API_KEY) {
+    plugins.push(
+      new OpenAIModerationPlugin({
+        apiKey: config.GUARDRAILS_MODERATION_API_KEY,
+        baseUrl: config.GUARDRAILS_MODERATION_BASE_URL,
+        model: config.GUARDRAILS_MODERATION_MODEL,
+      }),
+    );
+  }
+  if (config.GUARDRAILS_AZURE_CS_ENDPOINT && config.GUARDRAILS_AZURE_CS_KEY) {
+    plugins.push(
+      new AzureContentSafetyPlugin({
+        endpoint: config.GUARDRAILS_AZURE_CS_ENDPOINT,
+        apiKey: config.GUARDRAILS_AZURE_CS_KEY,
+        severityThreshold: config.GUARDRAILS_AZURE_CS_SEVERITY,
+      }),
+    );
+  }
+  if (config.GUARDRAILS_BEDROCK_GUARDRAIL_ID && config.GUARDRAILS_BEDROCK_API_KEY) {
+    plugins.push(
+      new BedrockGuardrailPlugin({
+        guardrailId: config.GUARDRAILS_BEDROCK_GUARDRAIL_ID,
+        apiKey: config.GUARDRAILS_BEDROCK_API_KEY,
+        region: config.GUARDRAILS_BEDROCK_REGION,
+      }),
+    );
+  }
+
   return new GuardrailEngine(
     [new NativeDetector({ entropy: config.GUARDRAILS_ENTROPY })],
     auditOnlyPolicies(),
-    plugin,
+    composePlugins(plugins),
   );
 }
 

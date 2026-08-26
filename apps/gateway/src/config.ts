@@ -92,6 +92,16 @@ const Env = z.object({
   GUARDRAILS_WEBHOOK_URL: z.string().url().optional(),
   GUARDRAILS_WEBHOOK_FAIL_CLOSED: envBool(false),
   GUARDRAILS_WEBHOOK_ALLOW_INTERNAL: envBool(false),
+  // Managed guardrail plugins (composed with the native detectors + webhook).
+  GUARDRAILS_MODERATION_API_KEY: z.string().optional(),
+  GUARDRAILS_MODERATION_BASE_URL: z.string().url().optional(),
+  GUARDRAILS_MODERATION_MODEL: z.string().optional(),
+  GUARDRAILS_AZURE_CS_ENDPOINT: z.string().url().optional(),
+  GUARDRAILS_AZURE_CS_KEY: z.string().optional(),
+  GUARDRAILS_AZURE_CS_SEVERITY: z.coerce.number().int().min(0).max(7).default(4),
+  GUARDRAILS_BEDROCK_GUARDRAIL_ID: z.string().optional(),
+  GUARDRAILS_BEDROCK_API_KEY: z.string().optional(),
+  GUARDRAILS_BEDROCK_REGION: z.string().optional(),
 
   // Same-target retry (pre-first-byte, body already buffered): bounded attempts
   // on transient errors before failing over to the next candidate. Default 1 =
