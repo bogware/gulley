@@ -17,6 +17,7 @@ import {
   StreamingScanner,
   type TokenVault,
 } from '@gulley/guardrails';
+import type { CelAuthorizer } from '@gulley/cel';
 import type { GatewayMetrics } from '@gulley/metrics';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
@@ -84,6 +85,8 @@ export interface GatewayContext {
   retryMaxAttempts?: number;
   /** Base exponential backoff between same-target retries (ms). */
   retryBackoffMs?: number;
+  /** CEL authorization rules; absent = scope-based authz only. */
+  authorizer?: CelAuthorizer;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -217,6 +220,40 @@ async function handleProxy(
     return;
   }
   const provider0 = candidates[0]?.provider ?? 'unknown';
+
+  // --- CEL authorization: operator-defined allow/deny rules over the request ---
+  if (ctx.authorizer) {
+    const decision = ctx.authorizer.authorize(
+      buildAuthzActivation(request, principal, requestedModel, provider0, parsed),
+    );
+    if (!decision.allowed) {
+      await ctx.audit.append({
+        orgId: principal.scope.orgId,
+        actor: principal.id,
+        action: 'authz.denied',
+        target: provider0,
+        payload: { model: requestedModel, reason: decision.reason },
+      });
+      ctx.telemetry.recordRequest({
+        provider: provider0,
+        requestModel: requestedModel,
+        responseModel: requestedModel,
+        route: candidates[0]?.upstreamPath ?? '',
+        statusCode: 403,
+        status: 'error',
+        inputTokens: 0,
+        outputTokens: 0,
+        costMicroUsd: 0,
+        streamed: false,
+        startedAtMs: started,
+      });
+      await reply.code(403).send({
+        type: 'error',
+        error: { type: 'permission_error', message: 'not permitted by policy' },
+      });
+      return;
+    }
+  }
 
   // --- rate limit: RPM/TPM admission control (before guardrails/cache/budget) ---
   // Requests are charged now (known at admission); token spend is trued up in the
@@ -1002,6 +1039,38 @@ async function serveFromCache(
     startedAtMs: started,
     cacheStatus: lookup.status,
   });
+}
+
+/** The LLM-aware attribute surface CEL policies evaluate against. */
+function buildAuthzActivation(
+  request: FastifyRequest,
+  principal: Principal,
+  model: string,
+  provider: string,
+  parsed: Record<string, unknown>,
+): Record<string, unknown> {
+  const headers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(request.headers)) {
+    if (v === undefined) continue;
+    headers[k.toLowerCase()] = Array.isArray(v) ? (v[0] ?? '') : v;
+  }
+  return {
+    request: {
+      method: request.method,
+      path: (request.url ?? '').split('?')[0],
+      model,
+      provider,
+      stream: parsed['stream'] === true,
+      source_ip: request.ip ?? '',
+      headers,
+      body: parsed,
+    },
+    principal: {
+      id: principal.id,
+      orgId: principal.scope.orgId,
+      workspaceId: principal.scope.workspaceId,
+    },
+  };
 }
 
 function numField(v: unknown): number | undefined {

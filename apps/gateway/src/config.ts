@@ -38,6 +38,11 @@ const Env = z.object({
   MODELS_CATALOG_FILE: z.string().optional(),
   MODELS_DEV_URL: z.string().url().default('https://models.dev/api.json'),
 
+  // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
+  // Deny-first, then allow-list; expressions run over { request, principal }.
+  // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]
+  CEL_AUTHZ: z.string().optional(),
+
   // Custom / OpenAI-compatible providers — a JSON array of entries, each either
   // { "preset": "ollama"|"groq"|…, "models": [...] } or a bespoke
   // { "provider": "x", "baseUrl": "http://…", "apiKey"?: "…", "models": [...] }.

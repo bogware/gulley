@@ -21,6 +21,7 @@ import {
   type VectorIndex,
 } from '@gulley/cache';
 import { loadCatalogFromFile } from '@gulley/catalog';
+import { type AuthzRuleConfig, CelAuthorizer } from '@gulley/cel';
 import type { RateResolver } from '@gulley/cost';
 import {
   auditOnlyPolicies,
@@ -379,6 +380,20 @@ export function createProductionContext(config: Config): GatewayContext {
     }
   }
 
+  // Optional CEL authorization rules (strict-compiled against the known surface).
+  let authorizer: CelAuthorizer | undefined;
+  if (config.CEL_AUTHZ) {
+    let rules: AuthzRuleConfig[];
+    try {
+      const parsed: unknown = JSON.parse(config.CEL_AUTHZ);
+      if (!Array.isArray(parsed)) throw new Error('not an array');
+      rules = parsed as AuthzRuleConfig[];
+    } catch {
+      throw new Error('CEL_AUTHZ must be a JSON array of { expr, effect, name? }');
+    }
+    authorizer = new CelAuthorizer(rules, { declaredVars: ['request', 'principal'] });
+  }
+
   const db = createDatabase(config.DATABASE_URL);
   // Budgets need Redis counters; without them, enforcement is simply disabled.
   const budgets = config.REDIS_COUNTERS_URL
@@ -447,5 +462,6 @@ export function createProductionContext(config: Config): GatewayContext {
     rateResolver,
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
     retryBackoffMs: config.RETRY_BACKOFF_MS,
+    authorizer,
   };
 }

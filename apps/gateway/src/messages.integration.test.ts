@@ -4,6 +4,7 @@ import zlib from 'node:zlib';
 import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
+import { CelAuthorizer } from '@gulley/cel';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
@@ -681,6 +682,42 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     await app.close();
     await new Promise<void>((r) => flaky.close(() => r()));
+  });
+
+  it('enforces a CEL authorization deny rule', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    ctx.authorizer = new CelAuthorizer(
+      [{ effect: 'deny', name: 'no-opus', expr: 'request.model.contains("opus")' }],
+      { declaredVars: ['request', 'principal'] },
+    );
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const headers = { 'content-type': 'application/json', 'x-api-key': token };
+
+    const denied = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: 'claude-opus-4-8', stream: true, messages: [] }),
+    });
+    expect(denied.status).toBe(403);
+    const json = (await denied.json()) as { error: { type: string } };
+    expect(json.error.type).toBe('permission_error');
+    expect(requestLog.entries).toHaveLength(0); // never reached upstream
+
+    const ok = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await ok.text();
+    expect(ok.status).toBe(200);
+
+    await app.close();
   });
 });
 

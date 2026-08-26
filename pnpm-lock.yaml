@@ -108,6 +108,9 @@ importers:
       '@gulley/catalog':
         specifier: workspace:*
         version: link:../../packages/catalog
+      '@gulley/cel':
+        specifier: workspace:*
+        version: link:../../packages/cel
       '@gulley/core':
         specifier: workspace:*
         version: link:../../packages/core

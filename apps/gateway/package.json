@@ -27,6 +27,7 @@
     "@gulley/budget": "workspace:*",
     "@gulley/cache": "workspace:*",
     "@gulley/catalog": "workspace:*",
+    "@gulley/cel": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
     "@gulley/guardrails": "workspace:*",
