@@ -85,6 +85,16 @@ export interface Provider {
   enabled: boolean;
 }
 
+export interface CollectionEntity {
+  id: string;
+  workspaceId: string;
+  name: string;
+  config: Record<string, unknown>;
+}
+
+/** The workspace-scoped config collections exposed by the control-api. */
+export type CollectionKind = 'budgets' | 'rate-limits' | 'guardrails' | 'routes' | 'policies';
+
 /** Micro-USD → a display string like "$1.2345". */
 export function formatUsd(microUsd: number): string {
   return `$${(microUsd / 1_000_000).toFixed(4)}`;

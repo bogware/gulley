@@ -1,4 +1,6 @@
 import type {
+  CollectionEntity,
+  CollectionKind,
   LogFilter,
   LogPage,
   Org,
@@ -57,16 +59,43 @@ export class GulleyAdminApi {
     return this.req<{ buckets: UsageBucket[] }>('GET', `/admin/analytics/usage${this.qs(query)}`);
   }
 
-  // --- config CRUD (existing control-api endpoints) ---
+  // --- orgs / workspaces ---
   orgs(): Promise<{ orgs: Org[] }> {
     return this.req<{ orgs: Org[] }>('GET', '/orgs');
+  }
+  createOrg(name: string): Promise<{ org: Org }> {
+    return this.req<{ org: Org }>('POST', '/orgs', { name });
   }
   workspaces(): Promise<{ workspaces: Workspace[] }> {
     return this.req<{ workspaces: Workspace[] }>('GET', '/workspaces');
   }
+  createWorkspace(orgId: string, name: string): Promise<{ workspace: Workspace }> {
+    return this.req<{ workspace: Workspace }>('POST', '/workspaces', { orgId, name });
+  }
+
+  // --- providers + credentials ---
   providers(): Promise<{ providers: Provider[] }> {
     return this.req<{ providers: Provider[] }>('GET', '/providers');
   }
+  createProvider(
+    workspaceId: string,
+    kind: string,
+    baseUrl?: string,
+  ): Promise<{ provider: Provider }> {
+    return this.req<{ provider: Provider }>('POST', '/providers', { workspaceId, kind, baseUrl });
+  }
+  setCredential(
+    providerId: string,
+    secretArn: string,
+    secretVersion: string,
+  ): Promise<{ credential: { id: string } }> {
+    return this.req('POST', `/providers/${encodeURIComponent(providerId)}/credential`, {
+      secretArn,
+      secretVersion,
+    });
+  }
+
+  // --- virtual keys ---
   createKey(
     workspaceId: string,
     name: string,
@@ -76,12 +105,31 @@ export class GulleyAdminApi {
   key(id: string): Promise<{ key: VirtualKeyView }> {
     return this.req<{ key: VirtualKeyView }>('GET', `/keys/${encodeURIComponent(id)}`);
   }
+
+  // --- workspace-scoped config collections (budgets / rate-limits / guardrails) ---
+  collection(kind: CollectionKind): Promise<{ entities: CollectionEntity[] }> {
+    return this.req<{ entities: CollectionEntity[] }>('GET', `/${kind}`);
+  }
+  createCollectionItem(
+    kind: CollectionKind,
+    workspaceId: string,
+    name: string,
+    config: Record<string, unknown>,
+  ): Promise<{ entity: CollectionEntity }> {
+    return this.req<{ entity: CollectionEntity }>('POST', `/${kind}`, {
+      workspaceId,
+      name,
+      config,
+    });
+  }
+
   verifyAudit(): Promise<{ verified: boolean; count: number }> {
     return this.req<{ verified: boolean; count: number }>('GET', '/audit/verify');
   }
 }
 
-/** Read the control-api base URL from the environment (client-safe). */
+/** The control-api base the browser calls. Defaults to the same-origin `/control`
+ *  proxy (see next.config.mjs rewrites); override for a direct/CORS setup. */
 export function controlApiUrl(): string {
-  return process.env['NEXT_PUBLIC_CONTROL_API_URL'] ?? 'http://localhost:8081';
+  return process.env['NEXT_PUBLIC_CONTROL_API_URL'] ?? '/control';
 }

@@ -1,102 +1,102 @@
-const SECTIONS: Array<{ title: string; desc: string; api: string; status: 'ready' | 'planned' }> = [
-  {
-    title: 'Dashboard',
-    desc: 'Spend + usage summary and recent requests at a glance.',
-    api: 'GET /admin/analytics/usage · GET /admin/logs',
-    status: 'ready',
-  },
-  {
-    title: 'Request logs',
-    desc: 'Browse, filter, and paginate every proxied request.',
-    api: 'GET /admin/logs · GET /admin/logs/:id',
-    status: 'ready',
-  },
-  {
-    title: 'Analytics',
-    desc: 'Time-bucketed spend and token usage, split by provider or model.',
-    api: 'GET /admin/analytics/usage',
-    status: 'ready',
-  },
-  {
-    title: 'Virtual keys',
-    desc: 'Mint, view, and revoke API keys scoped to a workspace.',
-    api: 'POST /keys · GET /keys/:id',
-    status: 'ready',
-  },
-  {
-    title: 'Providers',
-    desc: 'Configure upstream providers and their secret-ref credentials.',
-    api: 'GET/POST /providers',
-    status: 'ready',
-  },
-  {
-    title: 'Orgs & workspaces',
-    desc: 'The tenancy tree that scopes keys, budgets, and policies.',
-    api: 'GET/POST /orgs · /workspaces',
-    status: 'ready',
-  },
-  {
-    title: 'Routes & policies',
-    desc: 'Routing strategies, model aliases, and CEL authz/transform rules.',
-    api: 'GET/POST /routes · /model-aliases',
-    status: 'planned',
-  },
-  {
-    title: 'Budgets & rate limits',
-    desc: 'USD caps and RPM/TPM limits per workspace.',
-    api: 'GET/POST /budgets · /rate-limits',
-    status: 'ready',
-  },
-  {
-    title: 'Guardrails',
-    desc: 'Native PII/secret detection + webhook DLP policy.',
-    api: 'GET/POST /guardrails',
-    status: 'ready',
-  },
-  {
-    title: 'Audit',
-    desc: 'Verify the tamper-evident hash-chained audit log.',
-    api: 'GET /audit/verify',
-    status: 'ready',
-  },
-];
+'use client';
 
-export default function Home() {
+import { useMemo } from 'react';
+import {
+  EmptyState,
+  ErrorNote,
+  PageHeader,
+  Spinner,
+  StatTile,
+  StatusPill,
+  Table,
+  Td,
+  Th,
+} from '../components/ui';
+import { UsageChart } from '../components/usage-chart';
+import { formatNum, formatTime, formatTokens, formatUsd } from '../lib/format';
+import { useAdminQuery } from '../lib/hooks';
+
+export default function Dashboard() {
+  const range = useMemo(() => {
+    const to = new Date();
+    const from = new Date(to.getTime() - 24 * 60 * 60 * 1000);
+    return { from: from.toISOString(), to: to.toISOString() };
+  }, []);
+
+  const usage = useAdminQuery((api) => api.usage({ ...range, bucket: 'hour' }), []);
+  const logs = useAdminQuery((api) => api.logs({ limit: 10 }), []);
+
+  const buckets = usage.data?.buckets ?? [];
+  const totals = buckets.reduce(
+    (a, b) => ({
+      requests: a.requests + b.requests,
+      input: a.input + b.inputTokens,
+      output: a.output + b.outputTokens,
+      cost: a.cost + b.costMicroUsd,
+    }),
+    { requests: 0, input: 0, output: 0, cost: 0 },
+  );
+
   return (
-    <main className="mx-auto max-w-5xl px-6 py-16">
-      <header className="mb-10">
-        <h1 className="text-3xl font-semibold tracking-tight">Gulley</h1>
-        <p className="mt-1 text-neutral-500">Enterprise LLM gateway — control plane console.</p>
-      </header>
+    <div>
+      <PageHeader title="Dashboard" subtitle="Spend and usage over the last 24 hours." />
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {SECTIONS.map((s) => (
-          <div
-            key={s.title}
-            className="rounded-xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900"
-          >
-            <div className="flex items-center justify-between">
-              <h2 className="font-medium">{s.title}</h2>
-              <span
-                className={
-                  s.status === 'ready'
-                    ? 'rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
-                    : 'rounded-full bg-neutral-100 px-2 py-0.5 text-xs font-medium text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400'
-                }
-              >
-                {s.status === 'ready' ? 'API ready' : 'planned'}
-              </span>
-            </div>
-            <p className="mt-2 text-sm text-neutral-500">{s.desc}</p>
-            <code className="mt-3 block truncate font-mono text-xs text-neutral-400">{s.api}</code>
-          </div>
-        ))}
+      {usage.error ? <ErrorNote error={usage.error} /> : null}
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatTile label="Spend (24h)" value={formatUsd(totals.cost)} />
+        <StatTile label="Requests" value={formatNum(totals.requests)} />
+        <StatTile label="Input tokens" value={formatTokens(totals.input)} />
+        <StatTile label="Output tokens" value={formatTokens(totals.output)} />
       </div>
 
-      <footer className="mt-10 text-sm text-neutral-400">
-        Data layer scaffolded in <code className="font-mono">lib/api.ts</code>. See{' '}
-        <code className="font-mono">docs/ADMIN_UI.md</code> for the build plan.
-      </footer>
-    </main>
+      <div className="mt-6 rounded-xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+        <div className="mb-2 text-sm font-medium">Spend per hour</div>
+        {usage.loading ? <Spinner /> : <UsageChart buckets={buckets} metric="costMicroUsd" />}
+      </div>
+
+      <div className="mt-6">
+        <div className="mb-2 text-sm font-medium">Recent requests</div>
+        <div className="rounded-xl border border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900">
+          {logs.loading ? (
+            <Spinner />
+          ) : logs.error ? (
+            <ErrorNote error={logs.error} />
+          ) : (logs.data?.entries.length ?? 0) === 0 ? (
+            <EmptyState message="No requests yet." />
+          ) : (
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Time</Th>
+                  <Th>Provider</Th>
+                  <Th>Model</Th>
+                  <Th>Status</Th>
+                  <Th className="text-right">Tokens</Th>
+                  <Th className="text-right">Cost</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {logs.data?.entries.map((e) => (
+                  <tr key={e.id}>
+                    <Td className="whitespace-nowrap text-neutral-500">
+                      {formatTime(e.createdAt)}
+                    </Td>
+                    <Td>{e.provider}</Td>
+                    <Td className="font-mono text-xs">{e.model}</Td>
+                    <Td>
+                      <StatusPill status={e.status} code={e.statusCode} />
+                    </Td>
+                    <Td className="text-right tabular-nums">
+                      {formatTokens(e.inputTokens + e.outputTokens)}
+                    </Td>
+                    <Td className="text-right tabular-nums">{formatUsd(e.costMicroUsd)}</Td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
