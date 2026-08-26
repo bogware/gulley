@@ -25,6 +25,8 @@ export interface RequestSpanData {
   guardrailOutputFindings?: number;
   /** The enforcing action taken, if any: block | mask | redact. */
   guardrailAction?: string;
+  /** W3C trace id (32-hex) this request belongs to, for cross-system correlation. */
+  traceId?: string;
 }
 
 export interface Telemetry {
@@ -101,6 +103,7 @@ export function initTelemetry(opts: TelemetryOptions): Telemetry {
         span.setAttribute('gulley.guardrail.output.findings', data.guardrailOutputFindings);
       }
       if (data.guardrailAction) span.setAttribute('gulley.guardrail.action', data.guardrailAction);
+      if (data.traceId) span.setAttribute('gulley.trace_id', data.traceId);
       if (data.status !== 'ok') {
         span.setStatus({ code: SpanStatusCode.ERROR, message: data.status });
       }

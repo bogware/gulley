@@ -597,6 +597,9 @@ export function createProductionContext(config: Config): GatewayContext {
     scoreboard: config.LB_LEAST_LOAD ? new LoadScoreboard() : undefined,
     sessionAffinityHeader: config.LB_SESSION_AFFINITY_HEADER,
     accessLog: buildAccessLog(config.ACCESS_LOG_FIELDS),
+    tracePropagation: config.TRACE_PROPAGATION
+      ? { sampleRatio: config.TRACE_SAMPLE_RATIO }
+      : undefined,
   };
 }
 

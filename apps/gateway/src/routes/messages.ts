@@ -38,7 +38,12 @@ import {
   selectCandidates,
   shapeRequestBody,
 } from '@gulley/routing';
-import type { AccessLogFieldEngine, Telemetry } from '@gulley/telemetry';
+import {
+  type AccessLogFieldEngine,
+  nextTraceContext,
+  type Telemetry,
+  type TraceContext,
+} from '@gulley/telemetry';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Readable, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
@@ -112,6 +117,8 @@ export interface GatewayContext {
   outlier?: OutlierDetector;
   /** Operator-configurable access-log field engine; absent = no access log. */
   accessLog?: AccessLogFieldEngine;
+  /** W3C trace-context propagation; absent = disabled. */
+  tracePropagation?: { sampleRatio: number };
   /** Request header whose value pins a session to one target (HRW affinity);
    *  falls back to the principal id. Absent = no affinity (P2C / weighted). */
   sessionAffinityHeader?: string;
@@ -354,13 +361,22 @@ async function handleProxy(
     }
   }
 
+  // --- distributed-trace propagation: continue/start a W3C trace context ---
+  const trace: TraceContext | undefined = ctx.tracePropagation
+    ? nextTraceContext(headerValue(request, 'traceparent'), ctx.tracePropagation.sampleRatio)
+    : undefined;
+
   // --- CEL transformation: mutate request headers/body (before guardrails/cache) ---
   let forwardHeaders: Record<string, string | string[] | undefined> = request.headers;
   let respHeaderChanges: HeaderChanges | undefined;
+  if (trace) {
+    forwardHeaders = { ...request.headers };
+    forwardHeaders['traceparent'] = trace.traceparent;
+  }
   if (transformActive && ctx.transformer && activation) {
     const reqCh = ctx.transformer.requestHeaderChanges(activation);
     if (Object.keys(reqCh.set).length > 0 || reqCh.remove.length > 0) {
-      forwardHeaders = { ...request.headers };
+      forwardHeaders = { ...forwardHeaders }; // preserve any earlier injection (traceparent)
       for (const [k, v] of Object.entries(reqCh.set)) forwardHeaders[k] = v;
       for (const k of reqCh.remove) delete forwardHeaders[k];
     }
@@ -807,6 +823,7 @@ async function handleProxy(
           guardrailAction: guardrailAction ?? null,
           guardrailInputFindings: inputFindings,
           guardrailOutputFindings: outFindings.length,
+          ...(trace ? { traceId: trace.traceId } : {}),
         });
         if (record) request.log.info({ access: record }, 'access');
       }
@@ -881,6 +898,7 @@ async function handleProxy(
       guardrailInputFindings: engine ? inputFindings : undefined,
       guardrailOutputFindings: engine ? outFindings.length : undefined,
       guardrailAction: guardrailAction ?? (outputEnforced?.blocked ? 'block' : undefined),
+      traceId: trace?.traceId,
     });
   };
 

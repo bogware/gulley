@@ -39,7 +39,7 @@ const GOLDEN_SSE = [
 
 let upstream: http.Server;
 let upstreamUrl: string;
-let received: { apiKey?: string; auth?: string; body: string } = { body: '' };
+let received: { apiKey?: string; auth?: string; traceparent?: string; body: string } = { body: '' };
 
 beforeAll(async () => {
   upstream = http.createServer((req, res) => {
@@ -47,6 +47,7 @@ beforeAll(async () => {
     received = { apiKey: undefined, auth: undefined, body: '' };
     received.apiKey = single(req.headers['x-api-key']);
     received.auth = single(req.headers['authorization']);
+    received.traceparent = single(req.headers['traceparent']);
     req.on('data', (c: Buffer) => {
       body += c.toString('utf8');
     });
@@ -882,6 +883,32 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('x-policy')).toBe('applied-ws_1'); // response header injected
     expect(received.body).toContain('"max_tokens":128'); // request body field injected upstream
+
+    await app.close();
+  });
+
+  it('continues a client W3C trace and injects traceparent upstream', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.tracePropagation = { sampleRatio: 1 };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const inbound = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token, traceparent: inbound },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    // Same trace-id, a fresh span-id (the gateway's own span), sampled honored.
+    expect(received.traceparent).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-01$/);
+    expect(received.traceparent).not.toContain('00f067aa0ba902b7');
 
     await app.close();
   });

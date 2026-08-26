@@ -168,6 +168,13 @@ const Env = z.object({
   // {"add":{"cost_usd":"costMicroUsd/1000000.0"},"remove":["route"],"filter":"statusCode>=400"}
   ACCESS_LOG_FIELDS: z.string().optional(),
 
+  // Distributed tracing — continue a client's W3C traceparent (or start one) and
+  // inject it into the upstream request, stamping the trace id on the span +
+  // access log. Off by default; sample ratio applies only to freshly-started
+  // traces (an inbound sampled decision is always honored).
+  TRACE_PROPAGATION: envBool(false),
+  TRACE_SAMPLE_RATIO: z.coerce.number().min(0).max(1).default(1),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),
