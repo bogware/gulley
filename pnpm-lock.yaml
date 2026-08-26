@@ -595,6 +595,9 @@ importers:
 
   packages/telemetry:
     dependencies:
+      '@gulley/cel':
+        specifier: workspace:*
+        version: link:../cel
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.1

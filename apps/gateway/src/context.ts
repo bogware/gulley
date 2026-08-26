@@ -76,7 +76,12 @@ import {
   RedisExactCache,
   RedisVectorIndex,
 } from '@gulley/storage';
-import { initTelemetry, type Telemetry } from '@gulley/telemetry';
+import {
+  type AccessLogConfig,
+  AccessLogFieldEngine,
+  initTelemetry,
+  type Telemetry,
+} from '@gulley/telemetry';
 import type { Config } from './config';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 
@@ -573,6 +578,9 @@ export function createProductionContext(config: Config): GatewayContext {
     basicAuth,
     scoreboard: config.LB_LEAST_LOAD ? new LoadScoreboard() : undefined,
     sessionAffinityHeader: config.LB_SESSION_AFFINITY_HEADER,
+    accessLog: config.ACCESS_LOG_FIELDS
+      ? new AccessLogFieldEngine(JSON.parse(config.ACCESS_LOG_FIELDS) as AccessLogConfig)
+      : undefined,
   };
 }
 

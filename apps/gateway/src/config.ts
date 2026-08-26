@@ -149,6 +149,11 @@ const Env = z.object({
   LB_LEAST_LOAD: envBool(true),
   LB_SESSION_AFFINITY_HEADER: z.string().optional(),
 
+  // Access log — an operator-configurable field engine over a credential-free
+  // per-request record (CEL-valued fields, remove/filter/flatten). JSON:
+  // {"add":{"cost_usd":"costMicroUsd/1000000.0"},"remove":["route"],"filter":"statusCode>=400"}
+  ACCESS_LOG_FIELDS: z.string().optional(),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),

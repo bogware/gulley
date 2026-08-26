@@ -38,7 +38,7 @@ import {
   selectCandidates,
   shapeRequestBody,
 } from '@gulley/routing';
-import type { Telemetry } from '@gulley/telemetry';
+import type { AccessLogFieldEngine, Telemetry } from '@gulley/telemetry';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Readable, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
@@ -105,6 +105,8 @@ export interface GatewayContext {
   scoreboard?: LoadScoreboard;
   /** Passive latency-outlier detector (peer-relative slow-target ejection). */
   outlier?: OutlierDetector;
+  /** Operator-configurable access-log field engine; absent = no access log. */
+  accessLog?: AccessLogFieldEngine;
   /** Request header whose value pins a session to one target (HRW affinity);
    *  falls back to the principal id. Absent = no affinity (P2C / weighted). */
   sessionAffinityHeader?: string;
@@ -743,6 +745,35 @@ async function handleProxy(
           ...(outFindings.length > 0 ? { guardrailOutputFindings: outFindings.length } : {}),
         },
       });
+      // Operator-configurable access log (credential-free record → CEL field
+      // engine → structured log line). Fail-open; never carries headers/content.
+      if (ctx.accessLog) {
+        const record = ctx.accessLog.build({
+          requestId,
+          principal: {
+            id: principal.id,
+            orgId: principal.scope.orgId,
+            workspaceId: principal.scope.workspaceId,
+          },
+          provider,
+          target: served?.name ?? provider,
+          requestModel: requestedModel,
+          responseModel: meteredModel,
+          route: served?.upstreamPath ?? route.clientPaths[0] ?? '',
+          statusCode,
+          status,
+          streamed,
+          inputTokens: cost.totalInputTokens,
+          outputTokens: cost.outputTokens,
+          costMicroUsd,
+          latencyMs: Date.now() - started,
+          cache: cacheLookup?.status ?? 'bypass',
+          guardrailAction: guardrailAction ?? null,
+          guardrailInputFindings: inputFindings,
+          guardrailOutputFindings: outFindings.length,
+        });
+        if (record) request.log.info({ access: record }, 'access');
+      }
       await ctx.audit.append({
         orgId: principal.scope.orgId,
         actor: principal.id,
