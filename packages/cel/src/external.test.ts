@@ -83,6 +83,26 @@ describe('ExternalAuthorizer', () => {
     expect(calls).toBe(2);
   });
 
+  it('does NOT reuse a cached decision across differing payloads (default key = full payload)', async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return new Response(JSON.stringify({ allow: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const authz = new ExternalAuthorizer({ url: 'u', fetchImpl });
+    // Same principal+model+provider, but a different body ⇒ different key ⇒ the
+    // policy is consulted again (no coarse-key authorization bypass).
+    await authz.authorize({
+      request: { model: 'm', provider: 'p', body: { prompt: 'benign' } },
+      principal: { id: 'vk' },
+    });
+    await authz.authorize({
+      request: { model: 'm', provider: 'p', body: { prompt: 'exfiltrate' } },
+      principal: { id: 'vk' },
+    });
+    expect(calls).toBe(2);
+  });
+
   it('honors a custom CEL cache-key expression', async () => {
     let calls = 0;
     const fetchImpl = (async () => {

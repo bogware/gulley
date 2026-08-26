@@ -59,10 +59,7 @@ export class AccessLogFieldEngine {
       }
     }
 
-    const out: AccessRecord = {};
-    for (const [k, v] of Object.entries(record)) {
-      if (!this.removes.has(k)) out[k] = v;
-    }
+    let out: AccessRecord = { ...record };
     for (const f of this.adds) {
       try {
         out[f.name] = f.program.eval(record);
@@ -70,25 +67,35 @@ export class AccessLogFieldEngine {
         /* fail-open per field: leave it unset */
       }
     }
-    return this.doFlatten ? flatten(out) : out;
+    if (this.doFlatten) out = flatten(out);
+    // Remove LAST, so a name works whether or not flattening ran — e.g.
+    // remove:['principal'] drops the whole object, remove:['principal.orgId']
+    // drops just that flattened sub-field.
+    for (const k of this.removes) delete out[k];
+    return out;
   }
 }
 
-/** Flatten nested objects/arrays to dotted / bracketed scalar keys. */
+/** Flatten nested objects/arrays to dotted / bracketed scalar keys. A present but
+ *  EMPTY object/array is kept as-is (rather than vanishing), so a present field
+ *  never silently becomes absent. */
 export function flatten(obj: AccessRecord, prefix = ''): AccessRecord {
   const out: AccessRecord = {};
   for (const [k, v] of Object.entries(obj)) {
     const key = prefix ? `${prefix}.${k}` : k;
     if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
-      Object.assign(out, flatten(v as AccessRecord, key));
+      if (Object.keys(v).length === 0) out[key] = v;
+      else Object.assign(out, flatten(v as AccessRecord, key));
     } else if (Array.isArray(v)) {
-      v.forEach((item, i) => {
-        if (item !== null && typeof item === 'object') {
-          Object.assign(out, flatten(item as AccessRecord, `${key}.${i}`));
-        } else {
-          out[`${key}.${i}`] = item;
-        }
-      });
+      if (v.length === 0) out[key] = v;
+      else
+        v.forEach((item, i) => {
+          if (item !== null && typeof item === 'object') {
+            Object.assign(out, flatten(item as AccessRecord, `${key}.${i}`));
+          } else {
+            out[`${key}.${i}`] = item;
+          }
+        });
     } else {
       out[key] = v;
     }

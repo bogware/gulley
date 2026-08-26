@@ -1,5 +1,17 @@
+import { createHash } from 'node:crypto';
 import type { AuthzDecision } from './policy';
 import { compile, type Program } from './program';
+
+/** Deterministic JSON with sorted object keys, so two equal activations hash
+ *  identically regardless of key order. */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
+    .join(',')}}`;
+}
 
 /**
  * External authorization hook: delegates the allow/deny decision to an operator's
@@ -77,9 +89,12 @@ export class ExternalAuthorizer {
         /* fall through to the default key */
       }
     }
-    const req = (root['request'] ?? {}) as Record<string, unknown>;
-    const pr = (root['principal'] ?? {}) as Record<string, unknown>;
-    return `${String(pr['id'])}|${String(req['model'])}|${String(req['provider'])}`;
+    // Default: hash the EXACT payload sent to the policy service, so a cached
+    // decision is only ever reused for an identical request. Keying on a coarser
+    // subset (e.g. principal+model) would replay an ALLOW for a different request
+    // the policy would have denied. The caller controls hit rate by choosing what
+    // it puts in the activation (drop the body ⇒ coarse key ⇒ high hit rate).
+    return createHash('sha256').update(stableStringify(root)).digest('hex');
   }
 
   private async fetchDecision(root: Record<string, unknown>, key: string): Promise<AuthzDecision> {

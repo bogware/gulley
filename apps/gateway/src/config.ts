@@ -83,6 +83,10 @@ const Env = z.object({
   EXTERNAL_AUTHZ_TIMEOUT_MS: z.coerce.number().int().positive().default(1000),
   EXTERNAL_AUTHZ_FAIL_OPEN: envBool(false),
   EXTERNAL_AUTHZ_ALLOW_INTERNAL: envBool(false),
+  // Include the prompt body in what is sent to the policy service (default off —
+  // credential headers are NEVER sent). Opting in also makes the decision cache
+  // key body-specific, so a distinct prompt is a distinct cache entry.
+  EXTERNAL_AUTHZ_SEND_BODY: envBool(false),
 
   // Custom / OpenAI-compatible providers — a JSON array of entries, each either
   // { "preset": "ollama"|"groq"|…, "models": [...] } or a bespoke

@@ -16,6 +16,13 @@ describe('AccessLogFieldEngine', () => {
     expect(eng.build(base())).toMatchObject({ requestId: 'req_1', provider: 'anthropic' });
   });
 
+  it('throws at CONSTRUCTION on a malformed CEL expression', () => {
+    // The gateway wiring must catch this so a bad observability knob never downs
+    // the data plane (buildAccessLog in context.ts is fail-open around it).
+    expect(() => new AccessLogFieldEngine({ add: { bad: 'costMicroUsd / ' } })).toThrow();
+    expect(() => new AccessLogFieldEngine({ filter: 'statusCode >=' })).toThrow();
+  });
+
   it('removes fields and adds CEL-computed fields', () => {
     const eng = new AccessLogFieldEngine({
       remove: ['costMicroUsd', 'principal'],
@@ -55,6 +62,20 @@ describe('AccessLogFieldEngine', () => {
     expect(out).toMatchObject({ 'principal.id': 'vk_1', 'principal.orgId': 'org_1' });
     expect(out).not.toHaveProperty('principal');
   });
+
+  it('removes a nested field by its flattened name (remove runs after flatten)', () => {
+    const eng = new AccessLogFieldEngine({ flatten: true, remove: ['principal.orgId'] });
+    const out = eng.build(base());
+    expect(out).toHaveProperty('principal.id');
+    expect(out).not.toHaveProperty('principal.orgId'); // the nested sub-field is dropped
+  });
+
+  it('keeps a present-but-empty field under flatten (never silently absent)', () => {
+    const eng = new AccessLogFieldEngine({ flatten: true, add: { tags: '[]' } });
+    const out = eng.build(base());
+    expect(out).toHaveProperty('tags');
+    expect(out?.['tags']).toEqual([]);
+  });
 });
 
 describe('flatten', () => {
@@ -65,6 +86,14 @@ describe('flatten', () => {
       'b.d.e': 3,
       'list.0': 'x',
       'list.1.y': 4,
+    });
+  });
+
+  it('preserves empty objects and arrays instead of dropping them', () => {
+    expect(flatten({ a: 1, empty_obj: {}, empty_arr: [] })).toEqual({
+      a: 1,
+      empty_obj: {},
+      empty_arr: [],
     });
   });
 });

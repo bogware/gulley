@@ -71,11 +71,20 @@ export class SignalGate {
   }
 }
 
-/** Parse a signal off the wire; returns undefined for anything malformed. */
+/** Parse a signal off the wire; returns undefined for anything malformed. `v`
+ *  MUST be a safe, non-negative integer — a poison value (Infinity from an
+ *  overflowing literal, a huge non-safe integer, a negative/float) would pin the
+ *  SignalGate cursor and permanently wedge dedupe, so it is rejected here. */
 export function parseSignal(payload: string): ConfigSignal | undefined {
   try {
     const o = JSON.parse(payload) as Partial<ConfigSignal>;
-    if (typeof o.v === 'number' && typeof o.hash === 'string' && typeof o.origin === 'string') {
+    if (
+      typeof o.v === 'number' &&
+      Number.isSafeInteger(o.v) &&
+      o.v >= 0 &&
+      typeof o.hash === 'string' &&
+      typeof o.origin === 'string'
+    ) {
       return { v: o.v, hash: o.hash, origin: o.origin, ts: typeof o.ts === 'number' ? o.ts : 0 };
     }
   } catch {

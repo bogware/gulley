@@ -97,6 +97,9 @@ export interface GatewayContext {
   authorizer?: CelAuthorizer;
   /** External policy-service authorization hook (cached); absent = none. */
   externalAuthorizer?: ExternalAuthorizer;
+  /** Include the request body in the payload sent to the external policy service.
+   *  Default false — the prompt never leaves to a third party unless opted in. */
+  externalAuthzSendBody?: boolean;
   /** CEL request/response transformation; absent = no transform. */
   transformer?: CelTransformer;
   /** Inbound JWT/JWKS auth mode; absent = virtual keys only. */
@@ -326,9 +329,25 @@ async function handleProxy(
   }
 
   // --- External authorization hook: delegate to an operator policy service
-  // (cached + single-flight). Runs after the cheap local rules. ---
+  // (cached + single-flight). Runs after the cheap local rules. The activation
+  // is SANITIZED first: never ship the caller's credential headers, and omit the
+  // prompt body unless explicitly opted in — the policy endpoint is a third party
+  // whose logs must not become a credential/prompt exfiltration channel. ---
   if (ctx.externalAuthorizer && activation) {
-    const decision = await ctx.externalAuthorizer.authorize(activation);
+    const req = activation.request as Record<string, unknown>;
+    const safeRequest: Record<string, unknown> = {
+      method: req['method'],
+      path: req['path'],
+      model: req['model'],
+      provider: req['provider'],
+      stream: req['stream'],
+      source_ip: req['source_ip'],
+    };
+    if (ctx.externalAuthzSendBody) safeRequest['body'] = req['body'];
+    const decision = await ctx.externalAuthorizer.authorize({
+      request: safeRequest,
+      principal: activation.principal,
+    });
     if (!decision.allowed) {
       await denyByPolicy(decision.reason);
       return;

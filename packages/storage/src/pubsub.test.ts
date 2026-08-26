@@ -53,6 +53,19 @@ describe('parseSignal', () => {
     expect(parseSignal(JSON.stringify({ v: 'x', hash: 'h', origin: 'o' }))).toBeUndefined();
     expect(parseSignal(JSON.stringify({ hash: 'h', origin: 'o' }))).toBeUndefined();
   });
+
+  it('rejects a poison version that would wedge the dedupe cursor', () => {
+    // 1e400 overflows to Infinity in JSON.parse; a huge/neg/float v is also poison.
+    expect(parseSignal('{"v":1e400,"hash":"h","origin":"o"}')).toBeUndefined();
+    expect(parseSignal('{"v":9e99,"hash":"h","origin":"o"}')).toBeUndefined();
+    expect(parseSignal('{"v":-1,"hash":"h","origin":"o"}')).toBeUndefined();
+    expect(parseSignal('{"v":1.5,"hash":"h","origin":"o"}')).toBeUndefined();
+    // The gate is therefore never pinned by a poison signal.
+    const gate = new SignalGate('me');
+    const poison = parseSignal('{"v":1e400,"hash":"h","origin":"o"}');
+    expect(poison).toBeUndefined();
+    expect(gate.accept(sig({ v: 5 }))).toBe(true); // real signals still flow
+  });
 });
 
 describe('newOriginId', () => {

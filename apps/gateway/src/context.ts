@@ -590,15 +590,29 @@ export function createProductionContext(config: Config): GatewayContext {
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,
     externalAuthorizer,
+    externalAuthzSendBody: config.EXTERNAL_AUTHZ_SEND_BODY,
     transformer,
     jwtAuth,
     basicAuth,
     scoreboard: config.LB_LEAST_LOAD ? new LoadScoreboard() : undefined,
     sessionAffinityHeader: config.LB_SESSION_AFFINITY_HEADER,
-    accessLog: config.ACCESS_LOG_FIELDS
-      ? new AccessLogFieldEngine(JSON.parse(config.ACCESS_LOG_FIELDS) as AccessLogConfig)
-      : undefined,
+    accessLog: buildAccessLog(config.ACCESS_LOG_FIELDS),
   };
+}
+
+/** Build the access-log field engine, FAIL-OPEN: a bad JSON/CEL config disables
+ *  the access log (with a warning) rather than crashing the data plane — an
+ *  observability knob must never take down proxying. */
+export function buildAccessLog(raw: string | undefined): AccessLogFieldEngine | undefined {
+  if (!raw) return undefined;
+  try {
+    return new AccessLogFieldEngine(JSON.parse(raw) as AccessLogConfig);
+  } catch (err) {
+    console.warn(
+      `[gulley] ACCESS_LOG_FIELDS is invalid; access log disabled: ${(err as Error).message}`,
+    );
+    return undefined;
+  }
 }
 
 /** Build the inbound HTTP Basic auth config from an htpasswd source, or undefined
