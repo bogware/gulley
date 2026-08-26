@@ -14,7 +14,7 @@ describe('providers', () => {
     expect(() => ProviderKind.parse('nope')).toThrow();
   });
 
-  it('enumerates the three client auth modes', () => {
-    expect(AuthMode.options).toEqual(['oauth-broker', 'virtual-key', 'passthrough']);
+  it('enumerates the client auth modes', () => {
+    expect(AuthMode.options).toEqual(['oauth-broker', 'virtual-key', 'passthrough', 'basic']);
   });
 });

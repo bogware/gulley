@@ -29,7 +29,9 @@ import {
   CelTransformer,
 } from '@gulley/cel';
 import type { RateResolver } from '@gulley/cost';
+import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulley/auth';
 import { OidcProvider } from '@gulley/oidc';
+import { readFileSync } from 'node:fs';
 import type { JwtAuthConfig } from './jwt-auth';
 import {
   auditOnlyPolicies,
@@ -469,6 +471,8 @@ export function createProductionContext(config: Config): GatewayContext {
     };
   }
 
+  const basicAuth = buildBasicAuth(config);
+
   const db = createDatabase(config.DATABASE_URL);
   // Budgets need Redis counters; without them, enforcement is simply disabled.
   const budgets = config.REDIS_COUNTERS_URL
@@ -540,7 +544,37 @@ export function createProductionContext(config: Config): GatewayContext {
     authorizer,
     transformer,
     jwtAuth,
+    basicAuth,
     scoreboard: config.LB_LEAST_LOAD ? new LoadScoreboard() : undefined,
     sessionAffinityHeader: config.LB_SESSION_AFFINITY_HEADER,
+  };
+}
+
+/** Build the inbound HTTP Basic auth config from an htpasswd source, or undefined
+ *  when Basic is not configured. Fails fast at boot on a misconfiguration. */
+export function buildBasicAuth(config: Config): BasicAuthConfig | undefined {
+  const body = config.BASIC_AUTH_HTPASSWD_FILE
+    ? readFileSync(config.BASIC_AUTH_HTPASSWD_FILE, 'utf8')
+    : config.BASIC_AUTH_HTPASSWD;
+  if (!body) return undefined;
+
+  if (!config.BASIC_AUTH_DEFAULT_ORG_ID || !config.BASIC_AUTH_DEFAULT_WORKSPACE_ID) {
+    throw new Error(
+      'BASIC_AUTH requires BASIC_AUTH_DEFAULT_ORG_ID and BASIC_AUTH_DEFAULT_WORKSPACE_ID',
+    );
+  }
+  const htpasswd = parseHtpasswd(body);
+  if (htpasswd.size === 0) throw new Error('BASIC_AUTH htpasswd source has no entries');
+
+  let users: Map<string, BasicUserScope> | undefined;
+  if (config.BASIC_AUTH_USER_SCOPES) {
+    const parsed = JSON.parse(config.BASIC_AUTH_USER_SCOPES) as Record<string, BasicUserScope>;
+    users = new Map(Object.entries(parsed));
+  }
+  return {
+    htpasswd,
+    users,
+    defaultOrgId: config.BASIC_AUTH_DEFAULT_ORG_ID,
+    defaultWorkspaceId: config.BASIC_AUTH_DEFAULT_WORKSPACE_ID,
   };
 }

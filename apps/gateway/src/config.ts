@@ -50,6 +50,17 @@ const Env = z.object({
   JWT_DEFAULT_WORKSPACE_ID: z.string().optional(),
   JWT_DEFAULT_ORG_ID: z.string().optional(),
 
+  // Inbound HTTP Basic auth (data plane) — front the gateway with a standard
+  // htpasswd file (bcrypt/apr1/SHA/plaintext). Enabled when BASIC_AUTH_HTPASSWD
+  // (inline file body) or BASIC_AUTH_HTPASSWD_FILE (path) plus the default
+  // org/workspace are set. Per-user scope overrides via BASIC_AUTH_USER_SCOPES,
+  // a JSON object: {"alice":{"workspaceId":"ws_a","allowedModels":["..."]}}.
+  BASIC_AUTH_HTPASSWD: z.string().optional(),
+  BASIC_AUTH_HTPASSWD_FILE: z.string().optional(),
+  BASIC_AUTH_USER_SCOPES: z.string().optional(),
+  BASIC_AUTH_DEFAULT_WORKSPACE_ID: z.string().optional(),
+  BASIC_AUTH_DEFAULT_ORG_ID: z.string().optional(),
+
   // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
   // Deny-first, then allow-list; expressions run over { request, principal }.
   // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]

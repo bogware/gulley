@@ -1,6 +1,8 @@
 import {
+  type BasicAuthConfig,
   type KeyStore,
   type Principal,
+  resolveBasicPrincipal,
   resolveVirtualKey,
   scopeAllowsModel,
   scopeAllowsProvider,
@@ -96,6 +98,8 @@ export interface GatewayContext {
   transformer?: CelTransformer;
   /** Inbound JWT/JWKS auth mode; absent = virtual keys only. */
   jwtAuth?: JwtAuthConfig;
+  /** Inbound HTTP Basic auth (htpasswd-backed); absent = Basic disabled. */
+  basicAuth?: BasicAuthConfig;
   /** In-flight load scoreboard for power-of-two-choices least-load balancing. */
   scoreboard?: LoadScoreboard;
   /** Request header whose value pins a session to one target (HRW affinity);
@@ -202,11 +206,25 @@ async function handleProxy(
     }
   }
 
-  // --- authn: inbound JWT (if the bearer is a JWT and enabled) OR virtual key ---
-  // Deterministic mode selection by credential channel — no fall-through.
+  // --- authn: Basic (if enabled) OR inbound JWT (bearer is a JWT) OR virtual key ---
+  // Deterministic mode selection by credential channel — no fall-through: the
+  // `Basic ` scheme, a JWT-shaped bearer, and the `gk_` virtual-key prefix are
+  // mutually exclusive.
+  const authHeader = headerValue(request, 'authorization');
   const bearer = bearerToken(request);
   let principal: Principal;
-  if (ctx.jwtAuth && bearer && looksLikeJwt(bearer)) {
+  if (ctx.basicAuth && authHeader && /^basic\s/i.test(authHeader)) {
+    const basic = resolveBasicPrincipal(authHeader, ctx.basicAuth);
+    if (isErr(basic)) {
+      request.log.info({ reason: basic.error.reason }, 'basic auth rejected');
+      await reply.code(401).send({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'invalid credentials' },
+      });
+      return;
+    }
+    principal = basic.value;
+  } else if (ctx.jwtAuth && bearer && looksLikeJwt(bearer)) {
     const jwtPrincipal = await resolveJwtPrincipal(bearer, ctx.jwtAuth);
     if (!jwtPrincipal) {
       request.log.info('jwt auth rejected');

@@ -1,7 +1,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import zlib from 'node:zlib';
-import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
+import { generateVirtualKey, InMemoryKeyStore, parseHtpasswd } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { CelAuthorizer, CelTransformer } from '@gulley/cel';
@@ -882,6 +882,51 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('x-policy')).toBe('applied-ws_1'); // response header injected
     expect(received.body).toContain('"max_tokens":128'); // request body field injected upstream
+
+    await app.close();
+  });
+
+  it('authenticates an inbound HTTP Basic user (htpasswd) and scopes the request', async () => {
+    const { store } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    // apr1 hash of "s3cr3t-pass" (openssl passwd -apr1).
+    ctx.basicAuth = {
+      htpasswd: parseHtpasswd('alice:$apr1$Xy9zAbW1$yWHFWKOrw3L2VFJNzY4D81'),
+      users: new Map([['alice', { allowedModels: ['claude-sonnet-4-6'] }]]),
+      defaultOrgId: 'org_1',
+      defaultWorkspaceId: 'ws_basic',
+    };
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('primary', upstreamUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const basic = (u: string, p: string) => `Basic ${Buffer.from(`${u}:${p}`).toString('base64')}`;
+    const call = (auth: string) =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: auth },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+
+    const ok = await call(basic('alice', 's3cr3t-pass'));
+    await ok.text();
+    expect(ok.status).toBe(200);
+    expect(ledger.entries[0]?.status).toBe('ok'); // metered under the Basic principal
+
+    const bad = await call(basic('alice', 'wrong-pass'));
+    const badJson = (await bad.json()) as { error: { type: string } };
+    expect(bad.status).toBe(401);
+    expect(badJson.error.type).toBe('authentication_error');
 
     await app.close();
   });

@@ -14,7 +14,8 @@
   },
   "dependencies": {
     "@gulley/core": "workspace:*",
-    "@gulley/rbac": "workspace:*"
+    "@gulley/rbac": "workspace:*",
+    "bcryptjs": "^3.0.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

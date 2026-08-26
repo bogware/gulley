@@ -2,6 +2,8 @@ export * from './principal';
 export * from './virtual-key';
 export * from './key-store';
 export * from './resolver';
+export * from './htpasswd';
+export * from './basic-resolver';
 export * from './errors';
 export * from './admin-session';
 export * from './admin-resolver';

@@ -11,7 +11,7 @@ export interface Scope {
 }
 
 export interface Principal {
-  kind: 'virtual-key' | 'oauth-broker' | 'passthrough';
+  kind: 'virtual-key' | 'oauth-broker' | 'passthrough' | 'basic';
   /** Stable principal id (e.g. the virtual key's id) — the metering/audit identity. */
   id: string;
   displayName: string;
