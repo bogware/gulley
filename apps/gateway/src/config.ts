@@ -38,6 +38,18 @@ const Env = z.object({
   MODELS_CATALOG_FILE: z.string().optional(),
   MODELS_DEV_URL: z.string().url().default('https://models.dev/api.json'),
 
+  // Inbound JWT/JWKS auth mode (data plane) — clients authenticate with their
+  // IdP's JWT alongside virtual keys. Enabled when JWT_ISSUER + JWT_AUDIENCE set.
+  // Scope comes from claims (falling back to the JWT_DEFAULT_* below).
+  JWT_ISSUER: z.string().url().optional(),
+  JWT_AUDIENCE: z.string().optional(),
+  JWT_WORKSPACE_CLAIM: z.string().default('gulley_workspace'),
+  JWT_ORG_CLAIM: z.string().default('gulley_org'),
+  JWT_MODELS_CLAIM: z.string().optional(),
+  JWT_PROVIDERS_CLAIM: z.string().optional(),
+  JWT_DEFAULT_WORKSPACE_ID: z.string().optional(),
+  JWT_DEFAULT_ORG_ID: z.string().optional(),
+
   // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
   // Deny-first, then allow-list; expressions run over { request, principal }.
   // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]

@@ -19,6 +19,7 @@ import {
 } from '@gulley/guardrails';
 import type { CelAuthorizer, CelTransformer, HeaderChanges } from '@gulley/cel';
 import type { GatewayMetrics } from '@gulley/metrics';
+import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
@@ -89,6 +90,8 @@ export interface GatewayContext {
   authorizer?: CelAuthorizer;
   /** CEL request/response transformation; absent = no transform. */
   transformer?: CelTransformer;
+  /** Inbound JWT/JWKS auth mode; absent = virtual keys only. */
+  jwtAuth?: JwtAuthConfig;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -190,20 +193,36 @@ async function handleProxy(
     }
   }
 
-  // --- authn: virtual-key mode, deterministic + fail-closed ---
-  const auth = await resolveVirtualKey(
-    { apiKey: headerValue(request, 'x-api-key'), bearer: bearerToken(request) },
-    { keyStore: ctx.keyStore, pepper: ctx.pepper },
-  );
-  if (isErr(auth)) {
-    request.log.info({ reason: auth.error.reason }, 'auth rejected');
-    await reply.code(401).send({
-      type: 'error',
-      error: { type: 'authentication_error', message: 'invalid credentials' },
-    });
-    return;
+  // --- authn: inbound JWT (if the bearer is a JWT and enabled) OR virtual key ---
+  // Deterministic mode selection by credential channel — no fall-through.
+  const bearer = bearerToken(request);
+  let principal: Principal;
+  if (ctx.jwtAuth && bearer && looksLikeJwt(bearer)) {
+    const jwtPrincipal = await resolveJwtPrincipal(bearer, ctx.jwtAuth);
+    if (!jwtPrincipal) {
+      request.log.info('jwt auth rejected');
+      await reply.code(401).send({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'invalid credentials' },
+      });
+      return;
+    }
+    principal = jwtPrincipal;
+  } else {
+    const auth = await resolveVirtualKey(
+      { apiKey: headerValue(request, 'x-api-key'), bearer },
+      { keyStore: ctx.keyStore, pepper: ctx.pepper },
+    );
+    if (isErr(auth)) {
+      request.log.info({ reason: auth.error.reason }, 'auth rejected');
+      await reply.code(401).send({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'invalid credentials' },
+      });
+      return;
+    }
+    principal = auth.value;
   }
-  const principal = auth.value;
 
   // --- authz: model + provider scope (candidates filtered to allowed providers) ---
   if (!scopeAllowsModel(principal.scope, requestedModel)) {

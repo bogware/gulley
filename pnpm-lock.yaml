@@ -126,6 +126,9 @@ importers:
       '@gulley/metrics':
         specifier: workspace:*
         version: link:../../packages/metrics
+      '@gulley/oidc':
+        specifier: workspace:*
+        version: link:../../packages/oidc
       '@gulley/pipeline':
         specifier: workspace:*
         version: link:../../packages/pipeline

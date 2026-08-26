@@ -5,6 +5,8 @@ import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { CelAuthorizer, CelTransformer } from '@gulley/cel';
+import { OidcProvider } from '@gulley/oidc';
+import { createSign, generateKeyPairSync } from 'node:crypto';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
@@ -716,6 +718,89 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     });
     await ok.text();
     expect(ok.status).toBe(200);
+
+    await app.close();
+  });
+
+  it('authenticates a data-plane request with an inbound JWT, scoped from claims', async () => {
+    const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const jwk = {
+      ...(publicKey.export({ format: 'jwk' }) as Record<string, unknown>),
+      kid: 'k1',
+      alg: 'RS256',
+    };
+    const b64 = (o: unknown): string =>
+      Buffer.from(JSON.stringify(o), 'utf8').toString('base64url');
+    const sign = (claims: Record<string, unknown>): string => {
+      const h = b64({ alg: 'RS256', typ: 'JWT', kid: 'k1' });
+      const p = b64(claims);
+      const s = createSign('RSA-SHA256')
+        .update(`${h}.${p}`)
+        .end()
+        .sign(privateKey)
+        .toString('base64url');
+      return `${h}.${p}.${s}`;
+    };
+    const idpFetch = (async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith('/.well-known/openid-configuration')) {
+        return new Response(
+          JSON.stringify({
+            issuer: 'https://idp.test',
+            authorization_endpoint: 'https://idp.test/a',
+            token_endpoint: 'https://idp.test/t',
+            jwks_uri: 'https://idp.test/jwks',
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ keys: [jwk] }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const jwt = sign({
+      iss: 'https://idp.test',
+      aud: 'gulley',
+      sub: 'svc-1',
+      gulley_workspace: 'ws_1',
+      gulley_org: 'org_1',
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+
+    const { store } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.jwtAuth = {
+      provider: new OidcProvider('https://idp.test', { fetchImpl: idpFetch }),
+      audience: 'gulley',
+      workspaceClaim: 'gulley_workspace',
+      orgClaim: 'gulley_org',
+    };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    const ok = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${jwt}` },
+      body,
+    });
+    await ok.text();
+    expect(ok.status).toBe(200);
+    expect(ledger.entries.at(-1)?.workspaceId).toBe('ws_1'); // scope from the JWT claim
+    expect(ledger.entries.at(-1)?.principalId).toBe('svc-1');
+
+    const bad = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.bad',
+      },
+      body,
+    });
+    expect(bad.status).toBe(401);
 
     await app.close();
   });

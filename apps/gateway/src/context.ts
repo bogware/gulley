@@ -28,6 +28,8 @@ import {
   CelTransformer,
 } from '@gulley/cel';
 import type { RateResolver } from '@gulley/cost';
+import { OidcProvider } from '@gulley/oidc';
+import type { JwtAuthConfig } from './jwt-auth';
 import {
   auditOnlyPolicies,
   GuardrailEngine,
@@ -412,6 +414,21 @@ export function createProductionContext(config: Config): GatewayContext {
     transformer = new CelTransformer(cfg, { declaredVars: ['request', 'principal'] });
   }
 
+  // Inbound JWT auth mode (data plane) — clients can present their IdP's JWT.
+  let jwtAuth: JwtAuthConfig | undefined;
+  if (config.JWT_ISSUER && config.JWT_AUDIENCE) {
+    jwtAuth = {
+      provider: new OidcProvider(config.JWT_ISSUER),
+      audience: config.JWT_AUDIENCE,
+      workspaceClaim: config.JWT_WORKSPACE_CLAIM,
+      orgClaim: config.JWT_ORG_CLAIM,
+      modelsClaim: config.JWT_MODELS_CLAIM,
+      providersClaim: config.JWT_PROVIDERS_CLAIM,
+      defaultWorkspaceId: config.JWT_DEFAULT_WORKSPACE_ID,
+      defaultOrgId: config.JWT_DEFAULT_ORG_ID,
+    };
+  }
+
   const db = createDatabase(config.DATABASE_URL);
   // Budgets need Redis counters; without them, enforcement is simply disabled.
   const budgets = config.REDIS_COUNTERS_URL
@@ -482,5 +499,6 @@ export function createProductionContext(config: Config): GatewayContext {
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,
     transformer,
+    jwtAuth,
   };
 }
