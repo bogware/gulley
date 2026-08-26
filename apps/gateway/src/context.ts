@@ -27,7 +27,9 @@ import {
   CelAuthorizer,
   type CelTransformConfig,
   CelTransformer,
+  ExternalAuthorizer,
 } from '@gulley/cel';
+import { assertEgressAllowed } from '@gulley/egress';
 import type { RateResolver } from '@gulley/cost';
 import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulley/auth';
 import { OidcProvider } from '@gulley/oidc';
@@ -478,6 +480,20 @@ export function createProductionContext(config: Config): GatewayContext {
     transformer = new CelTransformer(cfg, { declaredVars: ['request', 'principal'] });
   }
 
+  let externalAuthorizer: ExternalAuthorizer | undefined;
+  if (config.EXTERNAL_AUTHZ_URL) {
+    // SSRF-guard the policy-service URL at boot (same posture as the DLP webhook),
+    // unless the operator opts into an internal endpoint.
+    if (!config.EXTERNAL_AUTHZ_ALLOW_INTERNAL) assertEgressAllowed(config.EXTERNAL_AUTHZ_URL);
+    externalAuthorizer = new ExternalAuthorizer({
+      url: config.EXTERNAL_AUTHZ_URL,
+      cacheKeyExpr: config.EXTERNAL_AUTHZ_CACHE_KEY,
+      ttlMs: config.EXTERNAL_AUTHZ_TTL_MS,
+      timeoutMs: config.EXTERNAL_AUTHZ_TIMEOUT_MS,
+      failMode: config.EXTERNAL_AUTHZ_FAIL_OPEN ? 'allow' : 'deny',
+    });
+  }
+
   // Inbound JWT auth mode (data plane) — clients can present their IdP's JWT.
   let jwtAuth: JwtAuthConfig | undefined;
   if (config.JWT_ISSUER && config.JWT_AUDIENCE) {
@@ -573,6 +589,7 @@ export function createProductionContext(config: Config): GatewayContext {
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,
+    externalAuthorizer,
     transformer,
     jwtAuth,
     basicAuth,

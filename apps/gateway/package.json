@@ -30,6 +30,7 @@
     "@gulley/cel": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
+    "@gulley/egress": "workspace:*",
     "@gulley/guardrails": "workspace:*",
     "@gulley/metrics": "workspace:*",
     "@gulley/oidc": "workspace:*",

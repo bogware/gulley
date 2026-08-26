@@ -19,7 +19,7 @@ import {
   StreamingScanner,
   type TokenVault,
 } from '@gulley/guardrails';
-import type { CelAuthorizer, CelTransformer, HeaderChanges } from '@gulley/cel';
+import type { CelAuthorizer, CelTransformer, ExternalAuthorizer, HeaderChanges } from '@gulley/cel';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
@@ -95,6 +95,8 @@ export interface GatewayContext {
   retryBackoffMs?: number;
   /** CEL authorization rules; absent = scope-based authz only. */
   authorizer?: CelAuthorizer;
+  /** External policy-service authorization hook (cached); absent = none. */
+  externalAuthorizer?: ExternalAuthorizer;
   /** CEL request/response transformation; absent = no transform. */
   transformer?: CelTransformer;
   /** Inbound JWT/JWKS auth mode; absent = virtual keys only. */
@@ -279,41 +281,56 @@ async function handleProxy(
   }
   const provider0 = candidates[0]?.provider ?? 'unknown';
 
-  // Build the CEL activation once, shared by authorization and transformation.
+  // Build the CEL activation once, shared by authorization, transformation, and
+  // the external policy hook.
   const transformActive = ctx.transformer?.active === true;
   const activation =
-    ctx.authorizer || transformActive
+    ctx.authorizer || transformActive || ctx.externalAuthorizer
       ? buildAuthzActivation(request, principal, requestedModel, provider0, parsed)
       : undefined;
+
+  const denyByPolicy = async (reason: string | undefined): Promise<void> => {
+    await ctx.audit.append({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'authz.denied',
+      target: provider0,
+      payload: { model: requestedModel, reason },
+    });
+    ctx.telemetry.recordRequest({
+      provider: provider0,
+      requestModel: requestedModel,
+      responseModel: requestedModel,
+      route: candidates[0]?.upstreamPath ?? '',
+      statusCode: 403,
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      streamed: false,
+      startedAtMs: started,
+    });
+    await reply.code(403).send({
+      type: 'error',
+      error: { type: 'permission_error', message: 'not permitted by policy' },
+    });
+  };
 
   // --- CEL authorization: operator-defined allow/deny rules over the request ---
   if (ctx.authorizer && activation) {
     const decision = ctx.authorizer.authorize(activation);
     if (!decision.allowed) {
-      await ctx.audit.append({
-        orgId: principal.scope.orgId,
-        actor: principal.id,
-        action: 'authz.denied',
-        target: provider0,
-        payload: { model: requestedModel, reason: decision.reason },
-      });
-      ctx.telemetry.recordRequest({
-        provider: provider0,
-        requestModel: requestedModel,
-        responseModel: requestedModel,
-        route: candidates[0]?.upstreamPath ?? '',
-        statusCode: 403,
-        status: 'error',
-        inputTokens: 0,
-        outputTokens: 0,
-        costMicroUsd: 0,
-        streamed: false,
-        startedAtMs: started,
-      });
-      await reply.code(403).send({
-        type: 'error',
-        error: { type: 'permission_error', message: 'not permitted by policy' },
-      });
+      await denyByPolicy(decision.reason);
+      return;
+    }
+  }
+
+  // --- External authorization hook: delegate to an operator policy service
+  // (cached + single-flight). Runs after the cheap local rules. ---
+  if (ctx.externalAuthorizer && activation) {
+    const decision = await ctx.externalAuthorizer.authorize(activation);
+    if (!decision.allowed) {
+      await denyByPolicy(decision.reason);
       return;
     }
   }

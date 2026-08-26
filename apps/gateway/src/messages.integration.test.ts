@@ -4,7 +4,7 @@ import zlib from 'node:zlib';
 import { generateVirtualKey, InMemoryKeyStore, parseHtpasswd } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
-import { CelAuthorizer, CelTransformer } from '@gulley/cel';
+import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
 import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
@@ -882,6 +882,38 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('x-policy')).toBe('applied-ws_1'); // response header injected
     expect(received.body).toContain('"max_tokens":128'); // request body field injected upstream
+
+    await app.close();
+  });
+
+  it('denies a request rejected by the external authorization hook (403)', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    const denyFetch = (async () =>
+      new Response(JSON.stringify({ allow: false, reason: 'blocked-by-policy-svc' }), {
+        status: 200,
+      })) as unknown as typeof fetch;
+    ctx.externalAuthorizer = new ExternalAuthorizer({
+      url: 'https://policy/authz',
+      fetchImpl: denyFetch,
+    });
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    expect(res.status).toBe(403);
+    const json = (await res.json()) as { error: { type: string } };
+    expect(json.error.type).toBe('permission_error');
+    expect(requestLog.entries).toHaveLength(0); // never forwarded upstream
 
     await app.close();
   });

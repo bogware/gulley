@@ -123,6 +123,9 @@ importers:
       '@gulley/cost':
         specifier: workspace:*
         version: link:../../packages/cost
+      '@gulley/egress':
+        specifier: workspace:*
+        version: link:../../packages/egress
       '@gulley/guardrails':
         specifier: workspace:*
         version: link:../../packages/guardrails

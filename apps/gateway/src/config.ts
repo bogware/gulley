@@ -74,6 +74,16 @@ const Env = z.object({
   // Each header/body value is a CEL expression over { request, principal }.
   CEL_TRANSFORM: z.string().optional(),
 
+  // External authorization hook — delegate allow/deny to an operator HTTP policy
+  // service (the { request, principal } activation is POSTed; { allow, reason }
+  // returned). Decisions are cached (TTL) + single-flighted. Runs after CEL rules.
+  EXTERNAL_AUTHZ_URL: z.string().url().optional(),
+  EXTERNAL_AUTHZ_CACHE_KEY: z.string().optional(),
+  EXTERNAL_AUTHZ_TTL_MS: z.coerce.number().int().positive().default(30_000),
+  EXTERNAL_AUTHZ_TIMEOUT_MS: z.coerce.number().int().positive().default(1000),
+  EXTERNAL_AUTHZ_FAIL_OPEN: envBool(false),
+  EXTERNAL_AUTHZ_ALLOW_INTERNAL: envBool(false),
+
   // Custom / OpenAI-compatible providers — a JSON array of entries, each either
   // { "preset": "ollama"|"groq"|…, "models": [...] } or a bespoke
   // { "provider": "x", "baseUrl": "http://…", "apiKey"?: "…", "models": [...] }.
