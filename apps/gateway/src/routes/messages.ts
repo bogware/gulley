@@ -19,7 +19,7 @@ import {
 } from '@gulley/guardrails';
 import type { GatewayMetrics } from '@gulley/metrics';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
-import { SSEParser, type UsageExtractor } from '@gulley/providers';
+import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
 import {
   type CircuitBreaker,
@@ -421,8 +421,10 @@ async function handleProxy(
         credential: target.credential,
         signal: controller.signal,
       });
+      // An upstream Retry-After / rate-limit-reset sets the ejection cooldown.
+      const retryAfterMs = parseRetryAfterMs(resp.headers);
       if (!isLast && resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
-        ctx.breaker.recordFailure(target.name);
+        ctx.breaker.recordFailure(target.name, retryAfterMs);
         ctx.metrics?.recordFailover(target.name);
         resp.body.resume(); // discard the failed body, then try the next target
         request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
@@ -435,7 +437,7 @@ async function handleProxy(
       // breaker for every other tenant sharing this target.
       if (resp.statusCode < 400) ctx.breaker.recordSuccess(target.name);
       else if (isFailoverStatus(strategy, resp.statusCode)) {
-        ctx.breaker.recordFailure(target.name);
+        ctx.breaker.recordFailure(target.name, retryAfterMs);
       }
       break;
     } catch (err) {

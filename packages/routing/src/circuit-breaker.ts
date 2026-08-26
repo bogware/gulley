@@ -1,30 +1,56 @@
 export interface CircuitBreakerOptions {
   /** Consecutive failures before the circuit opens. */
   failureThreshold?: number;
-  /** How long the circuit stays open before a half-open retry. */
+  /** Base cooldown the circuit stays open before a half-open retry. */
   cooldownMs?: number;
+  /** Upper bound on the (backoff-scaled) cooldown. */
+  maxCooldownMs?: number;
+  /** EWMA error-rate at/above which a target is ejected (graded, not just
+   *  consecutive) once `minSamples` have been seen. */
+  errorRateThreshold?: number;
+  /** Minimum observations before the error-rate rule can trip. */
+  minSamples?: number;
+  /** EWMA smoothing factor (0..1); higher = more reactive. */
+  alpha?: number;
   now?: () => number;
 }
 
 interface CircuitState {
-  failures: number;
+  consecutiveFailures: number;
+  /** EWMA of the error indicator (0 = healthy, 1 = all failing). */
+  ewmaError: number;
+  samples: number;
+  /** Successive ejections, for multiplicative backoff; reset on recovery. */
+  ejections: number;
   openUntil: number;
 }
 
 /**
- * Per-target circuit breaker. After `failureThreshold` consecutive failures the
- * target is skipped for `cooldownMs`; after that it becomes half-open (tried
- * once) — a success resets it, another failure re-opens it immediately.
+ * Per-target circuit breaker with graded, self-healing ejection. A target opens
+ * either on `failureThreshold` consecutive failures OR when its EWMA error rate
+ * crosses `errorRateThreshold` (after `minSamples`) — catching a target that
+ * fails half its calls without ever hitting a consecutive streak. The open
+ * duration is the base cooldown scaled by multiplicative backoff on repeated
+ * ejections (capped), and never shorter than an upstream-supplied `Retry-After`.
+ * A half-open success clears the failure state and resets the backoff.
  */
 export class CircuitBreaker {
   private readonly state = new Map<string, CircuitState>();
   private readonly threshold: number;
   private readonly cooldownMs: number;
+  private readonly maxCooldownMs: number;
+  private readonly errorRateThreshold: number;
+  private readonly minSamples: number;
+  private readonly alpha: number;
   private readonly now: () => number;
 
   constructor(opts: CircuitBreakerOptions = {}) {
     this.threshold = opts.failureThreshold ?? 5;
     this.cooldownMs = opts.cooldownMs ?? 30_000;
+    this.maxCooldownMs = opts.maxCooldownMs ?? 300_000;
+    this.errorRateThreshold = opts.errorRateThreshold ?? 0.5;
+    this.minSamples = opts.minSamples ?? 20;
+    this.alpha = opts.alpha ?? 0.2;
     this.now = opts.now ?? ((): number => Date.now());
   }
 
@@ -33,14 +59,44 @@ export class CircuitBreaker {
     return s ? s.openUntil > this.now() : false;
   }
 
-  recordSuccess(key: string): void {
-    this.state.delete(key);
+  /** EWMA error rate (0..1) for observability / least-load selection. */
+  errorRate(key: string): number {
+    return this.state.get(key)?.ewmaError ?? 0;
   }
 
-  recordFailure(key: string): void {
-    const s = this.state.get(key) ?? { failures: 0, openUntil: 0 };
-    s.failures += 1;
-    if (s.failures >= this.threshold) s.openUntil = this.now() + this.cooldownMs;
-    this.state.set(key, s);
+  private get(key: string): CircuitState {
+    let s = this.state.get(key);
+    if (!s) {
+      s = { consecutiveFailures: 0, ewmaError: 0, samples: 0, ejections: 0, openUntil: 0 };
+      this.state.set(key, s);
+    }
+    return s;
+  }
+
+  recordSuccess(key: string): void {
+    const s = this.get(key);
+    s.consecutiveFailures = 0;
+    s.ewmaError = s.ewmaError * (1 - this.alpha);
+    s.samples += 1;
+    // Recovered on a half-open probe → clear the backoff so the next fault
+    // starts from the base cooldown again.
+    if (s.openUntil <= this.now()) s.ejections = 0;
+  }
+
+  /** Record a failure. `retryAfterMs` (parsed from an upstream Retry-After / rate
+   *  limit header) sets a floor on the resulting cooldown. */
+  recordFailure(key: string, retryAfterMs?: number): void {
+    const s = this.get(key);
+    s.consecutiveFailures += 1;
+    s.ewmaError = s.ewmaError * (1 - this.alpha) + this.alpha;
+    s.samples += 1;
+
+    const tripConsecutive = s.consecutiveFailures >= this.threshold;
+    const tripRate = s.samples >= this.minSamples && s.ewmaError >= this.errorRateThreshold;
+    if (tripConsecutive || tripRate) {
+      s.ejections += 1;
+      const backoff = Math.min(this.cooldownMs * 2 ** (s.ejections - 1), this.maxCooldownMs);
+      s.openUntil = this.now() + Math.max(backoff, retryAfterMs ?? 0);
+    }
   }
 }
