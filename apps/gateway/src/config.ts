@@ -42,6 +42,9 @@ const Env = z.object({
   // Deny-first, then allow-list; expressions run over { request, principal }.
   // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]
   CEL_AUTHZ: z.string().optional(),
+  // CEL transformation — JSON { requestHeaders?, responseHeaders?, requestBody? }.
+  // Each header/body value is a CEL expression over { request, principal }.
+  CEL_TRANSFORM: z.string().optional(),
 
   // Custom / OpenAI-compatible providers — a JSON array of entries, each either
   // { "preset": "ollama"|"groq"|…, "models": [...] } or a bespoke

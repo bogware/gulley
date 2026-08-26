@@ -21,7 +21,12 @@ import {
   type VectorIndex,
 } from '@gulley/cache';
 import { loadCatalogFromFile } from '@gulley/catalog';
-import { type AuthzRuleConfig, CelAuthorizer } from '@gulley/cel';
+import {
+  type AuthzRuleConfig,
+  CelAuthorizer,
+  type CelTransformConfig,
+  CelTransformer,
+} from '@gulley/cel';
 import type { RateResolver } from '@gulley/cost';
 import {
   auditOnlyPolicies,
@@ -394,6 +399,19 @@ export function createProductionContext(config: Config): GatewayContext {
     authorizer = new CelAuthorizer(rules, { declaredVars: ['request', 'principal'] });
   }
 
+  let transformer: CelTransformer | undefined;
+  if (config.CEL_TRANSFORM) {
+    let cfg: CelTransformConfig;
+    try {
+      const parsed: unknown = JSON.parse(config.CEL_TRANSFORM);
+      if (typeof parsed !== 'object' || parsed === null) throw new Error('not an object');
+      cfg = parsed as CelTransformConfig;
+    } catch {
+      throw new Error('CEL_TRANSFORM must be a JSON object of header/body mutations');
+    }
+    transformer = new CelTransformer(cfg, { declaredVars: ['request', 'principal'] });
+  }
+
   const db = createDatabase(config.DATABASE_URL);
   // Budgets need Redis counters; without them, enforcement is simply disabled.
   const budgets = config.REDIS_COUNTERS_URL
@@ -463,5 +481,6 @@ export function createProductionContext(config: Config): GatewayContext {
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,
+    transformer,
   };
 }

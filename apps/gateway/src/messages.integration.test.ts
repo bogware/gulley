@@ -4,7 +4,7 @@ import zlib from 'node:zlib';
 import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
-import { CelAuthorizer } from '@gulley/cel';
+import { CelAuthorizer, CelTransformer } from '@gulley/cel';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
@@ -716,6 +716,37 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     });
     await ok.text();
     expect(ok.status).toBe(200);
+
+    await app.close();
+  });
+
+  it('applies CEL request/response transformation', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.transformer = new CelTransformer(
+      {
+        requestBody: [{ field: 'max_tokens', value: '128' }],
+        responseHeaders: [{ name: 'X-Policy', value: '"applied-" + principal.workspaceId' }],
+      },
+      { declaredVars: ['request', 'principal'] },
+    );
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-policy')).toBe('applied-ws_1'); // response header injected
+    expect(received.body).toContain('"max_tokens":128'); // request body field injected upstream
 
     await app.close();
   });

@@ -17,7 +17,7 @@ import {
   StreamingScanner,
   type TokenVault,
 } from '@gulley/guardrails';
-import type { CelAuthorizer } from '@gulley/cel';
+import type { CelAuthorizer, CelTransformer, HeaderChanges } from '@gulley/cel';
 import type { GatewayMetrics } from '@gulley/metrics';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
@@ -87,6 +87,8 @@ export interface GatewayContext {
   retryBackoffMs?: number;
   /** CEL authorization rules; absent = scope-based authz only. */
   authorizer?: CelAuthorizer;
+  /** CEL request/response transformation; absent = no transform. */
+  transformer?: CelTransformer;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -221,11 +223,16 @@ async function handleProxy(
   }
   const provider0 = candidates[0]?.provider ?? 'unknown';
 
+  // Build the CEL activation once, shared by authorization and transformation.
+  const transformActive = ctx.transformer?.active === true;
+  const activation =
+    ctx.authorizer || transformActive
+      ? buildAuthzActivation(request, principal, requestedModel, provider0, parsed)
+      : undefined;
+
   // --- CEL authorization: operator-defined allow/deny rules over the request ---
-  if (ctx.authorizer) {
-    const decision = ctx.authorizer.authorize(
-      buildAuthzActivation(request, principal, requestedModel, provider0, parsed),
-    );
+  if (ctx.authorizer && activation) {
+    const decision = ctx.authorizer.authorize(activation);
     if (!decision.allowed) {
       await ctx.audit.append({
         orgId: principal.scope.orgId,
@@ -253,6 +260,24 @@ async function handleProxy(
       });
       return;
     }
+  }
+
+  // --- CEL transformation: mutate request headers/body (before guardrails/cache) ---
+  let forwardHeaders: Record<string, string | string[] | undefined> = request.headers;
+  let respHeaderChanges: HeaderChanges | undefined;
+  if (transformActive && ctx.transformer && activation) {
+    const reqCh = ctx.transformer.requestHeaderChanges(activation);
+    if (Object.keys(reqCh.set).length > 0 || reqCh.remove.length > 0) {
+      forwardHeaders = { ...request.headers };
+      for (const [k, v] of Object.entries(reqCh.set)) forwardHeaders[k] = v;
+      for (const k of reqCh.remove) delete forwardHeaders[k];
+    }
+    const patch = ctx.transformer.requestBodyPatch(activation);
+    if (Object.keys(patch).length > 0) {
+      parsed = { ...parsed, ...patch };
+      body = Buffer.from(JSON.stringify(parsed), 'utf8');
+    }
+    respHeaderChanges = ctx.transformer.responseHeaderChanges(activation);
   }
 
   // --- rate limit: RPM/TPM admission control (before guardrails/cache/budget) ---
@@ -473,7 +498,7 @@ async function handleProxy(
         const r = await target.adapter.forward({
           path: target.upstreamPath,
           body,
-          headers: request.headers,
+          headers: forwardHeaders,
           credential: target.credential,
           signal: controller.signal,
         });
@@ -748,14 +773,19 @@ async function handleProxy(
   // Take over the raw socket: raw byte fidelity + guaranteed teardown.
   reply.hijack();
   if (!bufferOutput) {
-    reply.raw.writeHead(statusCode, {
+    const responseHeaders: Record<string, string | string[]> = {
       ...filterResponseHeaders(upstream.headers),
       ...rlHeaders,
       ...(passthroughEncoding ? { 'content-encoding': passthroughEncoding } : {}),
       'x-gulley-request-id': requestId,
       'x-gulley-target': served.name,
       'x-gulley-cache': cacheLookup?.status ?? 'bypass',
-    });
+    };
+    if (respHeaderChanges) {
+      for (const [k, v] of Object.entries(respHeaderChanges.set)) responseHeaders[k] = v;
+      for (const k of respHeaderChanges.remove) delete responseHeaders[k];
+    }
+    reply.raw.writeHead(statusCode, responseHeaders);
   }
 
   const servedTarget = served;
