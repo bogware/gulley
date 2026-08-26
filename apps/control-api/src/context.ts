@@ -14,9 +14,11 @@ import {
   createDatabase,
   type Database,
   newOriginId,
+  PostgresAuditSink,
   PostgresConfigStore,
   PostgresConfigVersionStore,
 } from '@gulley/storage';
+import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
 import type { OidcRoleRule } from './oidc-gate';
 import {
@@ -56,6 +58,9 @@ export interface ControlContext {
   configVersions: ConfigVersionStore;
   /** Durable config store (Postgres); absent = in-memory ControlConfigStore. */
   configStore?: ConfigStore;
+  /** Runs a config apply's reconcile + audit + version-append in ONE Postgres
+   *  transaction; absent = the in-memory path (no cross-store atomicity needed). */
+  configAtomic?: <T>(fn: (deps: ApplyCommitDeps) => Promise<T>) => Promise<T>;
   /** Read side of the request log: admin log browser + usage analytics. */
   requestLogQuery: RequestLogQuery;
   resolverDeps: AdminResolverDeps;
@@ -125,6 +130,20 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   const configVersions: ConfigVersionStore = db
     ? new PostgresConfigVersionStore(db)
     : new InMemoryConfigVersionStore();
+  // Atomic config commit: reconcile + audit row + version row in one tx, over
+  // tx-bound Postgres stores (so a failure — incl. a lost version-PK race — rolls
+  // the whole apply back). Postgres audit here keeps the config-apply audit row
+  // durable + atomic with the change.
+  const configAtomic = db
+    ? <T>(fn: (deps: ApplyCommitDeps) => Promise<T>): Promise<T> =>
+        db.transaction((tx) =>
+          fn({
+            store: new PostgresConfigStore(tx as unknown as Database),
+            audit: new PostgresAuditSink(tx as unknown as Database),
+            versions: new PostgresConfigVersionStore(tx as unknown as Database),
+          }),
+        )
+    : undefined;
 
   return {
     orgs: new OrgStore(),
@@ -141,6 +160,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     sessionStore,
     configVersions,
     configStore,
+    configAtomic,
     requestLogQuery: opts.requestLogQuery ?? new InMemoryRequestLog(),
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,

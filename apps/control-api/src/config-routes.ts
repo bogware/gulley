@@ -66,6 +66,7 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
         versions: ctx.configVersions,
         audit: ctx.audit,
         access: ctx.access,
+        atomic: ctx.configAtomic,
         egressAllowlist: ctx.outboundAllowlist,
         onApplied: ctx.notifier
           ? (e) =>

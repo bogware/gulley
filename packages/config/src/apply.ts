@@ -21,13 +21,21 @@ export interface ApplyOutcome {
   summary: DiffSummary;
 }
 
-export interface ApplyDeps {
+/** The stores that must commit atomically together (reconcile + audit + version). */
+export interface ApplyCommitDeps {
   store: ConfigStore;
-  versions: ConfigVersionStore;
   audit: AuditSink;
+  versions: ConfigVersionStore;
+}
+
+export interface ApplyDeps extends ApplyCommitDeps {
   access: AccessControl;
   egressAllowlist?: ReadonlySet<string>;
   now?: () => number;
+  /** Runs the reconcile + audit + version-append in ONE transaction (Postgres);
+   *  absent = run directly (in-memory, single-process). Given a transactional
+   *  view of the three stores. */
+  atomic?: <T>(fn: (deps: ApplyCommitDeps) => Promise<T>) => Promise<T>;
   /** Post-commit broadcast hook: fired AFTER a version is durably appended, so
    *  the change can be signalled to gateway replicas. Best-effort — a throw is
    *  swallowed (the durable write already succeeded). Kept as a bare callback so
@@ -106,25 +114,34 @@ export async function applyConfig(
   // at the same base version loses on the version PK. Full cross-step atomicity
   // (reconcile + version row in one tx) remains a future hardening.
   try {
-    const applied = await deps.store.reconcile(desired, { admin, access: deps.access });
-    const newDoc = await deps.store.exportDocument('*');
-    const hash = contentHash(newDoc);
-    const auditRow = await deps.audit.append({
-      orgId: null,
-      actor: admin.subject,
-      action: 'config.apply',
-      target: `v${reserved}`,
-      payload: { version: reserved, contentHash: hash, summary: applied.summary },
-    });
-    await deps.versions.append({
-      version: reserved,
-      contentHash: hash,
-      yaml: toYaml(newDoc),
-      actor: admin.subject,
-      summary: applied.summary,
-      auditSeq: auditRow.seq,
-      createdAt: new Date(deps.now?.() ?? Date.now()).toISOString(),
-    });
+    // The whole commit (reconcile + audit row + version row) runs atomically when
+    // `atomic` is provided (Postgres): on any failure — including a lost race on
+    // the version PK — the ENTIRE apply rolls back, so a loser never leaves its
+    // reconcile applied without a version row.
+    const commit = async (d: ApplyCommitDeps): Promise<{ hash: string; summary: DiffSummary }> => {
+      const applied = await d.store.reconcile(desired, { admin, access: deps.access });
+      const newDoc = await d.store.exportDocument('*');
+      const hash = contentHash(newDoc);
+      const auditRow = await d.audit.append({
+        orgId: null,
+        actor: admin.subject,
+        action: 'config.apply',
+        target: `v${reserved}`,
+        payload: { version: reserved, contentHash: hash, summary: applied.summary },
+      });
+      await d.versions.append({
+        version: reserved,
+        contentHash: hash,
+        yaml: toYaml(newDoc),
+        actor: admin.subject,
+        summary: applied.summary,
+        auditSeq: auditRow.seq,
+        createdAt: new Date(deps.now?.() ?? Date.now()).toISOString(),
+      });
+      return { hash, summary: applied.summary };
+    };
+    const { hash, summary } = deps.atomic ? await deps.atomic(commit) : await commit(deps);
+
     // Broadcast AFTER the durable commit (never before) so a subscriber can never
     // react to a half-applied version. Best-effort: the write already succeeded.
     if (deps.onApplied) {
@@ -134,7 +151,7 @@ export async function applyConfig(
         /* best-effort broadcast; correctness comes from the durable version */
       }
     }
-    return ok({ version: reserved, contentHash: hash, summary: applied.summary });
+    return ok({ version: reserved, contentHash: hash, summary });
   } catch (err2) {
     return err({ kind: 'internal', detail: (err2 as Error).message });
   }
