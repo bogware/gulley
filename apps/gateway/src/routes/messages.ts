@@ -31,6 +31,7 @@ import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/rate
 import {
   allTargets,
   type CircuitBreaker,
+  type BreakerSync,
   hasShaping,
   isFailoverStatus,
   type LoadScoreboard,
@@ -81,6 +82,8 @@ export interface GatewayContext {
   requestLog: RequestLogSink;
   audit: AuditSink;
   breaker: CircuitBreaker;
+  /** Cross-replica breaker sharing (its refresh timer is stopped on drain). */
+  breakerSync?: BreakerSync & { stop(): void };
   budgets: BudgetStore;
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */

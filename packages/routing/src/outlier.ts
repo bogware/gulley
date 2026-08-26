@@ -38,7 +38,8 @@ interface OutlierState {
  * peer (a single target, or all peers still warming up) a target is never
  * ejected — you must not latency-eject your only usable upstream.
  *
- * All state is per-replica in-memory, exactly like the breaker and scoreboard.
+ * All state is per-replica in-memory (the fault breaker can optionally share its
+ * open state across replicas; passive outlier ejection stays local).
  */
 export class OutlierDetector {
   private readonly state = new Map<string, OutlierState>();

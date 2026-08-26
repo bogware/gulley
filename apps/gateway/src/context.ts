@@ -68,6 +68,7 @@ import {
   type ModelRouteRule,
   ModelRouter,
   OutlierDetector,
+  RedisBreakerSync,
   type RouteTarget,
   type RoutingStrategy,
 } from '@gulley/routing';
@@ -572,6 +573,17 @@ export function createProductionContext(config: Config): GatewayContext {
     intervalMs: config.LOG_BATCH_INTERVAL_MS,
   });
 
+  // Cross-replica breaker sharing rides the counters Redis (noeviction). The
+  // refresh timer is started here and stopped on drain via breakerSync.stop().
+  const breakerSync =
+    config.BREAKER_SHARED && config.REDIS_COUNTERS_URL
+      ? new RedisBreakerSync(createRedisClient(config.REDIS_COUNTERS_URL), {
+          prefix: config.BREAKER_SHARED_PREFIX,
+          refreshMs: config.BREAKER_SHARED_REFRESH_MS,
+        })
+      : undefined;
+  breakerSync?.start();
+
   return {
     routes,
     keyStore: new PostgresKeyStore(db),
@@ -580,7 +592,8 @@ export function createProductionContext(config: Config): GatewayContext {
     requestLog,
     flushLogs: () => requestLog.close(),
     audit: new PostgresAuditSink(db),
-    breaker: new CircuitBreaker(),
+    breaker: new CircuitBreaker(breakerSync ? { sync: breakerSync } : {}),
+    breakerSync,
     outlier: config.OUTLIER_ENABLED
       ? new OutlierDetector({
           latencyFactor: config.OUTLIER_LATENCY_FACTOR,

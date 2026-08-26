@@ -166,6 +166,14 @@ const Env = z.object({
   OUTLIER_BASE_EJECT_MS: z.coerce.number().int().positive().default(30_000),
   OUTLIER_MAX_EJECT_MS: z.coerce.number().int().positive().default(300_000),
 
+  // Cross-replica breaker sharing: broadcast circuit-breaker ejections through the
+  // counters Redis so a target ejected by one replica is honored fleet-wide (an
+  // outage then costs one replica's failure budget, not every replica's). Requires
+  // REDIS_COUNTERS_URL; off by default (per-replica breaker still applies).
+  BREAKER_SHARED: envBool(false),
+  BREAKER_SHARED_PREFIX: z.string().default('gulley'),
+  BREAKER_SHARED_REFRESH_MS: z.coerce.number().int().positive().default(1000),
+
   // Load balancing across a loadbalance strategy's targets. When affinity is off
   // (default) the primary pick uses power-of-two-choices least-load over in-flight
   // counts. Setting LB_SESSION_AFFINITY_HEADER pins a session (that header's

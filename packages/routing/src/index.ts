@@ -1,4 +1,5 @@
 export * from './types';
+export * from './breaker-sync';
 export * from './circuit-breaker';
 export * from './outlier';
 export * from './select';

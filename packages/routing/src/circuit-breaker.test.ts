@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { CircuitBreaker } from './circuit-breaker';
+import type { BreakerSync } from './breaker-sync';
+
+/** In-memory sync standing in for a shared Redis snapshot across replicas. */
+class FakeSync implements BreakerSync {
+  readonly map = new Map<string, number>();
+  publishOpen(key: string, openUntil: number): void {
+    this.map.set(key, openUntil);
+  }
+  sharedOpenUntil(key: string): number {
+    return this.map.get(key) ?? 0;
+  }
+}
 
 function clock(start = 0): { now: () => number; advance: (ms: number) => void } {
   let t = start;
@@ -67,5 +79,46 @@ describe('CircuitBreaker (graded)', () => {
     }
     expect(opened).toBe(true);
     expect(b.errorRate('t')).toBeGreaterThan(0.5);
+  });
+
+  it('broadcasts local ejections and honors a peer replica ejection', () => {
+    const c = clock();
+    const shared = new FakeSync();
+    // Two replicas over ONE shared snapshot.
+    const a = new CircuitBreaker({
+      failureThreshold: 2,
+      cooldownMs: 1000,
+      sync: shared,
+      now: c.now,
+    });
+    const b = new CircuitBreaker({
+      failureThreshold: 2,
+      cooldownMs: 1000,
+      sync: shared,
+      now: c.now,
+    });
+
+    // Replica A trips locally; B has seen no failures of its own.
+    a.recordFailure('t');
+    a.recordFailure('t');
+    expect(a.isOpen('t')).toBe(true);
+    expect(shared.map.get('t')).toBe(1000);
+    // B honors A's ejection through the shared snapshot despite zero local faults.
+    expect(b.isOpen('t')).toBe(true);
+
+    // The shared floor self-heals with the cooldown; both re-admit after it.
+    c.advance(1001);
+    expect(a.isOpen('t')).toBe(false);
+    expect(b.isOpen('t')).toBe(false);
+  });
+
+  it('does not report open from a stale shared entry that has expired', () => {
+    const c = clock();
+    const shared = new FakeSync();
+    shared.map.set('t', 500); // a peer ejected until t=500
+    const b = new CircuitBreaker({ sync: shared, now: c.now });
+    expect(b.isOpen('t')).toBe(true);
+    c.advance(500);
+    expect(b.isOpen('t')).toBe(false); // openUntil is exclusive; healthy at/after
   });
 });

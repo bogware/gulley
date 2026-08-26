@@ -1,3 +1,5 @@
+import { NoopBreakerSync, type BreakerSync } from './breaker-sync';
+
 export interface CircuitBreakerOptions {
   /** Consecutive failures before the circuit opens. */
   failureThreshold?: number;
@@ -12,6 +14,8 @@ export interface CircuitBreakerOptions {
   minSamples?: number;
   /** EWMA smoothing factor (0..1); higher = more reactive. */
   alpha?: number;
+  /** Optional cross-replica ejection sharing (default: no sharing). */
+  sync?: BreakerSync;
   now?: () => number;
 }
 
@@ -37,6 +41,12 @@ interface CircuitState {
  * The breaker tracks UPSTREAM FAULTS only. Latency-based (passive) outlier
  * ejection lives in a separate `OutlierDetector` so the two planes never share a
  * backoff counter (see outlier.ts).
+ *
+ * State is per-replica by default. Supplying a {@link BreakerSync} additionally
+ * shares OPEN state across replicas: an ejection is broadcast, and `isOpen` also
+ * honors a peer's ejection — so a fleet-wide outage costs one replica's failure
+ * budget, not every replica's. The graded EWMA logic stays local; only the
+ * open/closed floor is shared (see breaker-sync.ts).
  */
 export class CircuitBreaker {
   private readonly state = new Map<string, CircuitState>();
@@ -46,6 +56,7 @@ export class CircuitBreaker {
   private readonly errorRateThreshold: number;
   private readonly minSamples: number;
   private readonly alpha: number;
+  private readonly sync: BreakerSync;
   private readonly now: () => number;
 
   constructor(opts: CircuitBreakerOptions = {}) {
@@ -55,12 +66,16 @@ export class CircuitBreaker {
     this.errorRateThreshold = opts.errorRateThreshold ?? 0.5;
     this.minSamples = opts.minSamples ?? 20;
     this.alpha = opts.alpha ?? 0.2;
+    this.sync = opts.sync ?? new NoopBreakerSync();
     this.now = opts.now ?? ((): number => Date.now());
   }
 
   isOpen(key: string): boolean {
+    const now = this.now();
     const s = this.state.get(key);
-    return s ? s.openUntil > this.now() : false;
+    if (s && s.openUntil > now) return true;
+    // A peer replica may have ejected this target even if we haven't locally.
+    return this.sync.sharedOpenUntil(key) > now;
   }
 
   /** EWMA error rate (0..1) for observability / least-load selection. */
@@ -101,6 +116,8 @@ export class CircuitBreaker {
       s.ejections += 1;
       const backoff = Math.min(this.cooldownMs * 2 ** (s.ejections - 1), this.maxCooldownMs);
       s.openUntil = this.now() + Math.max(backoff, retryAfterMs ?? 0);
+      // Broadcast so peer replicas eject this target too (fire-and-forget).
+      this.sync.publishOpen(key, s.openUntil);
     }
   }
 }
