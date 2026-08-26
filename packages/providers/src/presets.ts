@@ -100,6 +100,25 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
     embeddingsPath: '/embeddings',
     requiresKey: true,
   },
+  // GitHub Models / Copilot via its OpenAI-compatible inference surface (auth is a
+  // GitHub token). `chatPath` is the full path under the inference base.
+  copilot: {
+    provider: 'copilot',
+    baseUrl: 'https://models.github.ai/inference',
+    chatPath: '/chat/completions',
+    embeddingsPath: '/embeddings',
+    requiresKey: true,
+  },
+  // Google Vertex AI via its OpenAI-compatible endpoint. The base URL is
+  // project/region-specific, so override `baseUrl` per deployment, e.g.
+  // https://us-central1-aiplatform.googleapis.com/v1beta1/projects/PROJECT/locations/us-central1/endpoints/openapi
+  // Auth is a Google OAuth2 access token (SA/ADC) supplied as the API key.
+  vertex: {
+    provider: 'vertex',
+    baseUrl: 'https://us-central1-aiplatform.googleapis.com/v1beta1',
+    chatPath: '/chat/completions',
+    requiresKey: true,
+  },
 
   // --- Local / self-hosted runtimes (keyless, OpenAI-compatible) ---
   ollama: {

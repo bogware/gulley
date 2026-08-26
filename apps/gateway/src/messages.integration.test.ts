@@ -209,6 +209,83 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
   });
 
+  it('round-trips provider-affine artifacts: cache_control up, thinking signature down', async () => {
+    // Provider-affine artifacts (Anthropic prompt-cache `cache_control` on the way
+    // in, extended-thinking `signature` on the way out) must survive the gateway
+    // byte-for-byte — the raw-pipe fidelity invariant. Synthesizing or dropping
+    // them silently breaks prompt-cache hits and thinking-signature continuation.
+    const SIG = 'EqoBCkgIARABGAIiQ' + 'fakethinkingsig9876543210';
+    const THINK_SSE = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_t","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":1}}}',
+      '',
+      'event: content_block_start',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+      '',
+      'event: content_block_delta',
+      `data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"${SIG}"}}`,
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+      '',
+    ].join('\n');
+
+    let seenBody = '';
+    const thinker = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        seenBody = b;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(THINK_SSE);
+      });
+    });
+    await new Promise<void>((r) => thinker.listen(0, '127.0.0.1', r));
+    const thinkerUrl = `http://127.0.0.1:${(thinker.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', thinkerUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': token,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        system: [{ type: 'text', text: 'ctx', cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    // Request round-trip: the prompt-cache marker reached the upstream verbatim.
+    expect(seenBody).toContain('"cache_control":{"type":"ephemeral"}');
+    // Response round-trip: the thinking signature reached the client verbatim.
+    expect(text).toContain(`"signature":"${SIG}"`);
+    expect(text).toContain('signature_delta');
+
+    await app.close();
+    await new Promise<void>((r) => thinker.close(() => r()));
+  });
+
   it('rejects an invalid virtual key with a generic 401 and does not call upstream', async () => {
     const { store } = seededStore();
     const { ctx, requestLog } = buildContext(store);

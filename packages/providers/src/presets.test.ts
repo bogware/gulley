@@ -54,6 +54,28 @@ describe('resolveCustomProvider', () => {
     expect(r.embeddingsPath).toBe('/embeddings');
   });
 
+  it('resolves Copilot / GitHub Models via its OpenAI-compatible surface', () => {
+    const r = resolveCustomProvider({ preset: 'copilot', apiKey: 'ghp_x' });
+    expect(r.provider).toBe('copilot');
+    expect(r.baseUrl).toBe('https://models.github.ai/inference');
+    expect(r.chatPath).toBe('/chat/completions');
+    expect(r.local).toBe(false);
+  });
+
+  it('resolves Vertex AI with a per-deployment base URL override', () => {
+    // The Vertex OpenAI endpoint is project/region-specific, so the operator
+    // supplies the real base; the preset just carries the scheme + chat path.
+    const r = resolveCustomProvider({
+      preset: 'vertex',
+      baseUrl:
+        'https://us-central1-aiplatform.googleapis.com/v1beta1/projects/p/locations/us-central1/endpoints/openapi',
+      apiKey: 'ya29.token',
+    });
+    expect(r.provider).toBe('vertex');
+    expect(r.baseUrl).toContain('/endpoints/openapi');
+    expect(r.chatPath).toBe('/chat/completions');
+  });
+
   it('treats embeddings as opt-in with a default path', () => {
     expect(resolveCustomProvider({ preset: 'ollama' }).embeddingsPath).toBeUndefined();
     expect(resolveCustomProvider({ preset: 'ollama', embeddings: true }).embeddingsPath).toBe(
