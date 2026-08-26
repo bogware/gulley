@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { registerConfigRoutes } from './config-routes';
 import type { ControlContext } from './context';
+import { registerHttpEdge } from './http-edge';
 import { registerLogRoutes } from './log-routes';
 import { registerOidcRoutes } from './oidc-routes';
 import { registerAdminRoutes } from './routes';
@@ -23,6 +24,8 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
       },
     },
   });
+
+  registerHttpEdge(app, config);
 
   app.get('/health', async () => ({
     status: 'ok',

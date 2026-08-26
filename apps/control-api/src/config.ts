@@ -33,6 +33,13 @@ const Env = z.object({
   // Provider base-URL egress allowlist (comma-separated hostnames).
   OUTBOUND_HOST_ALLOWLIST: z.string().default(''),
 
+  // Admin-surface HTTP edge. CORS is credentials-safe: exact-origin allowlist
+  // (comma-separated full origins), reflected with Allow-Credentials; empty =
+  // CORS off (same-origin /control proxy deployment). CSRF gates cookie-authed
+  // unsafe methods via Sec-Fetch-Site (on by default; bearer/API clients exempt).
+  ADMIN_CORS_ORIGINS: z.string().default(''),
+  ADMIN_CSRF_ENABLED: envBool(true),
+
   // OIDC session gate for the admin console (generic, discovery-based). When
   // OIDC_ISSUER + OIDC_CLIENT_ID are set, /auth/login → the IdP; /auth/callback
   // mints an admin session cookie. Group→role mapping via OIDC_ROLE_MAP (JSON
@@ -64,6 +71,15 @@ export function outboundAllowlist(config: Config): Set<string> {
   return new Set(
     config.OUTBOUND_HOST_ALLOWLIST.split(',')
       .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+/** Exact CORS origins (case preserved — an Origin header is compared verbatim). */
+export function corsOrigins(config: Config): Set<string> {
+  return new Set(
+    config.ADMIN_CORS_ORIGINS.split(',')
+      .map((s) => s.trim())
       .filter(Boolean),
   );
 }

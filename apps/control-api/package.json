@@ -22,6 +22,7 @@
     "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/egress": "workspace:*",
+    "@gulley/http-edge": "workspace:*",
     "@gulley/crypto": "workspace:*",
     "@gulley/oauth": "workspace:*",
     "@gulley/oidc": "workspace:*",

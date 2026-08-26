@@ -47,6 +47,9 @@ importers:
       '@gulley/egress':
         specifier: workspace:*
         version: link:../../packages/egress
+      '@gulley/http-edge':
+        specifier: workspace:*
+        version: link:../../packages/http-edge
       '@gulley/oauth':
         specifier: workspace:*
         version: link:../../packages/oauth
@@ -371,6 +374,18 @@ importers:
       '@gulley/egress':
         specifier: workspace:*
         version: link:../egress
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/http-edge:
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
