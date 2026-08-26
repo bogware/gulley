@@ -106,7 +106,22 @@ L1 → L2 → L3, each its own verify-then-commit wave, with an adversarial-revi
 workflow after L3 (the reconcile touches the hottest file). Est. the largest of the
 port's milestones; L1 is mechanical, L3 is where the care goes.
 
-## Open questions (for kickoff)
+## Kickoff decisions (locked)
 
-See the kickoff discussion — deployment target for the DB config path, secret
-resolver scope, and how aggressively to refactor Fastify dispatch.
+1. **Secret resolution (L2): a pluggable `SecretResolver` interface** with a real
+   AWS Secrets Manager implementation AND a local/env-backed implementation. The
+   local impl is what tests and `pnpm dev` use; the AWS impl is production. This
+   keeps the DB config path exercisable in this environment (no live AWS) while
+   staying production-faithful, and matches the existing split-KMS/`SecretRef`
+   posture.
+2. **Fastify dispatch (L3): the full mutable dispatcher.** Register the proxy
+   surface as one parametric dispatcher that path-matches `holder.ctx.routes` at
+   request time, so adding/removing a provider path reloads live (not just field
+   swaps). Bigger rewrite of `registerRoutes`/`handleProxy`, so it gets the
+   adversarial-review pass and preserves the raw-pipe + single-teardown invariants
+   (the handler resolves the holder exactly once at entry).
+3. **DB testing (L1): in-memory + a `config:check` live script.** Unit/integration
+   the reconcile logic against the existing in-memory adapters (the repo pattern),
+   plus a manual `config:check` script that runs the real SQL reconcile against a
+   docker-compose Postgres. CI stays infra-free; real Postgres is exercised the way
+   `worm:check`/`kms:check` already are.
