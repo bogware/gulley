@@ -1,0 +1,129 @@
+import type { ConfigDocument, ConfigStore } from '@gulley/config';
+import { InMemoryConfigVersionStore } from '@gulley/config';
+import { MapSecretResolver } from '@gulley/core';
+import { CircuitBreaker, LoadScoreboard } from '@gulley/routing';
+import { type ConfigSignal, InMemoryConfigBus } from '@gulley/storage';
+import { describe, expect, it, vi } from 'vitest';
+import { ConfigWatcher, GatewayReconciler } from './reconcile';
+import { type GatewayContext, RouteHolder } from './routes/messages';
+
+const ARN = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:anthropic';
+
+const docWith = (kind: string): ConfigDocument => ({
+  apiVersion: 'gulley/v1',
+  orgs: [
+    {
+      name: 'Acme',
+      workspaces: [
+        {
+          name: 'prod',
+          providers: [
+            {
+              kind,
+              baseUrl: null,
+              enabled: true,
+              credential: { secretArn: ARN, secretVersion: 'v1' } as never,
+            },
+          ],
+          routes: [],
+          policies: [],
+          budgets: [],
+          rateLimits: [],
+          guardrails: [],
+          modelAliases: [],
+          virtualKeys: [],
+        },
+      ],
+    },
+  ],
+});
+
+const storeReturning = (doc: ConfigDocument): ConfigStore => ({
+  exportDocument: async () => doc,
+  authorize: async () => true,
+  reconcile: async () => ({ summary: { added: [], removed: [], changed: [] } }),
+});
+
+function holderWithState(): {
+  holder: RouteHolder;
+  breaker: CircuitBreaker;
+  scoreboard: LoadScoreboard;
+} {
+  const breaker = new CircuitBreaker();
+  const scoreboard = new LoadScoreboard();
+  const ctx = { routes: [], breaker, scoreboard } as unknown as GatewayContext;
+  return { holder: new RouteHolder(ctx), breaker, scoreboard };
+}
+
+describe('GatewayReconciler', () => {
+  it('swaps the route table from the document, preserving live state by reference', async () => {
+    const { holder, breaker, scoreboard } = holderWithState();
+    breaker.recordFailure('anthropic'); // some live state to preserve
+    const reconciler = new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      new MapSecretResolver(new Map([[ARN, 'sk-ant-x']])),
+    );
+    expect(holder.routeFor('/v1/messages')).toBeUndefined(); // empty to start
+    await reconciler.reconcile();
+    expect(holder.routeFor('/v1/messages')?.strategy).toMatchObject({
+      target: { provider: 'anthropic' },
+    });
+    // The SAME breaker/scoreboard instances survive the swap (state preserved).
+    expect(holder.ctx.breaker).toBe(breaker);
+    expect(holder.ctx.scoreboard).toBe(scoreboard);
+    expect(breaker.errorRate('anthropic')).toBeGreaterThan(0);
+  });
+
+  it('KEEPS the current config when a secret cannot be resolved (fail-safe)', async () => {
+    const { holder } = holderWithState();
+    // Seed a working config first.
+    await new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      new MapSecretResolver(new Map([[ARN, 'sk-ant-x']])),
+    ).reconcile();
+    expect(holder.routeFor('/v1/messages')).toBeDefined();
+
+    // A reconcile whose resolver can't resolve the ARN must NOT wipe the routes.
+    await new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      new MapSecretResolver(new Map()), // empty → resolve throws
+    ).reconcile();
+    expect(holder.routeFor('/v1/messages')).toBeDefined(); // old routes intact
+  });
+});
+
+describe('ConfigWatcher', () => {
+  it('reconciles on a foreign signal and ignores its own', async () => {
+    const { holder } = holderWithState();
+    const store = storeReturning(docWith('anthropic'));
+    const reconciler = new GatewayReconciler(
+      holder,
+      store,
+      new MapSecretResolver(new Map([[ARN, 'k']])),
+    );
+    const bus = new InMemoryConfigBus();
+    const versions = new InMemoryConfigVersionStore();
+    const watcher = new ConfigWatcher(bus, reconciler, versions, 'me');
+    await watcher.start(); // initial reconcile
+    expect(holder.routeFor('/v1/messages')).toBeDefined();
+
+    // Swap the store to openai; a foreign signal should drive a re-reconcile.
+    (store as unknown as { exportDocument: () => Promise<ConfigDocument> }).exportDocument =
+      async () => docWith('openai');
+    const sig: ConfigSignal = { v: 5, hash: 'h', origin: 'peer', ts: 0 };
+    await bus.emit(sig);
+    await vi.waitFor(() => expect(holder.routeFor('/v1/chat/completions')).toBeDefined());
+
+    // A self-origin signal is dropped (no reconcile) — swap store, emit self, no change.
+    (store as unknown as { exportDocument: () => Promise<ConfigDocument> }).exportDocument =
+      async () => docWith('anthropic');
+    await bus.emit({ v: 6, hash: 'h', origin: 'me', ts: 0 });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(holder.routeFor('/v1/chat/completions')).toBeDefined(); // still openai (self ignored)
+
+    await watcher.stop();
+  });
+});

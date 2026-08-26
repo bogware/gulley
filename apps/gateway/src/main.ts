@@ -1,12 +1,15 @@
 import { type MetricsServerHandle, startMetricsServer } from '@gulley/metrics';
 import { closeUpstreamPool } from '@gulley/providers';
 import { loadConfig } from './config';
+import { buildConfigWatcher } from './config-reload';
 import { createProductionContext } from './context';
+import type { ConfigWatcher } from './reconcile';
 import type { GatewayContext } from './routes/messages';
 import { buildServer } from './server';
 
 const config = loadConfig();
 let metricsServer: MetricsServerHandle | undefined;
+let configWatcher: ConfigWatcher | undefined;
 
 let context: GatewayContext | undefined;
 try {
@@ -29,6 +32,17 @@ async function start(): Promise<void> {
         host: config.METRICS_HOST,
       });
       app.log.info({ port: metricsServer.port }, 'metrics listener up on /metrics');
+    }
+    // M13: start the config-reload watcher after listen (loads DB config + subscribes).
+    if (app.routeHolder) {
+      configWatcher = buildConfigWatcher(config, app.routeHolder, {
+        info: (msg) => app.log.info(msg),
+        error: (err, msg) => app.log.error({ err }, msg),
+      });
+      if (configWatcher) {
+        await configWatcher.start();
+        app.log.info('config hot-reload watcher started (CONFIG_SOURCE=db)');
+      }
     }
   } catch (error) {
     app.log.error(error);
@@ -58,6 +72,7 @@ async function shutdown(signal: string): Promise<void> {
   }, SHUTDOWN_GRACE_MS);
   backstop.unref();
   try {
+    await configWatcher?.stop(); // stop reloads before draining so none races the close
     await app.close();
     await context?.flushLogs?.(); // drain buffered request logs before exit
     await metricsServer?.close();

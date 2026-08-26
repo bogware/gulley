@@ -28,6 +28,7 @@ import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/p
 import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
 import {
+  allTargets,
   type CircuitBreaker,
   hasShaping,
   isFailoverStatus,
@@ -158,20 +159,66 @@ const DROP_RESPONSE_HEADERS = new Set([
   'content-encoding',
 ]);
 
-export function registerRoutes(app: FastifyInstance, ctx: GatewayContext): void {
-  for (const route of ctx.routes) {
-    const handler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
-      handleProxy(ctx, route, req, reply);
-    for (const path of route.clientPaths) app.post(path, handler);
+/**
+ * Holds the live GatewayContext + a path→route index, both swappable at runtime
+ * (M13 config hot-reload). Long-lived state (breaker, scoreboard, outlier,
+ * budgets, counters, telemetry, connections) stays on the SAME ctx object across
+ * a swap — only `routes` (and other config-derived fields) are replaced — so a
+ * reconcile never resets it. The request handler reads the holder exactly once at
+ * entry, so an in-flight stream + its single teardown finish on the ctx they
+ * started with.
+ */
+export class RouteHolder {
+  private index = new Map<string, ProviderRoute>();
+  constructor(public ctx: GatewayContext) {
+    this.reindex();
   }
+  private reindex(): void {
+    this.index = new Map();
+    for (const route of this.ctx.routes) {
+      for (const path of route.clientPaths) this.index.set(path, route);
+    }
+  }
+  routeFor(path: string): ProviderRoute | undefined {
+    return this.index.get(path);
+  }
+  /** Swap the route table (preserving the ctx object + all its live state). */
+  swapRoutes(routes: ProviderRoute[]): void {
+    this.ctx.routes = routes;
+    this.reindex();
+  }
+  /** Distinct provider names across the current routes (for /ready). */
+  providers(): string[] {
+    return [
+      ...new Set(this.ctx.routes.flatMap((r) => allTargets(r.strategy).map((t) => t.provider))),
+    ];
+  }
+}
+
+export function registerRoutes(app: FastifyInstance, holder: RouteHolder): void {
+  // One dispatcher for every proxy path: the route is looked up per request from
+  // the swappable holder, so a reconcile that adds/removes/changes routes takes
+  // effect for new requests with NO Fastify re-registration. handleProxy resolves
+  // holder.ctx ONCE here; it never re-reads it mid-request.
+  app.post('/*', (req: FastifyRequest, reply: FastifyReply): Promise<void> | void => {
+    const path = (req.url.split('?')[0] ?? req.url) || '/';
+    const route = holder.routeFor(path);
+    if (!route) {
+      return reply.code(404).send({
+        type: 'error',
+        error: { type: 'not_found', message: 'no route for path' },
+      }) as unknown as void;
+    }
+    return handleProxy(holder.ctx, route, req, reply);
+  });
   // Model discovery (OpenAI-shaped list), filtered to the caller's allowed models.
   const modelsHandler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
-    handleModels(ctx, req, reply);
+    handleModels(holder.ctx, req, reply);
   for (const path of ['/v1/models', '/openai/v1/models']) app.get(path, modelsHandler);
 
   // Live request tracer over SSE — only when enabled + token-guarded.
-  if (ctx.tracer && ctx.debugTraceToken) {
-    app.get('/debug/trace', (req, reply) => handleDebugTrace(ctx, req, reply));
+  if (holder.ctx.tracer && holder.ctx.debugTraceToken) {
+    app.get('/debug/trace', (req, reply) => handleDebugTrace(holder.ctx, req, reply));
   }
 }
 

@@ -97,6 +97,11 @@ const Env = z.object({
   CUSTOM_PROVIDERS: z.string().optional(),
 
   DATABASE_URL: z.string().url().optional(),
+  // Config source. 'env' (default) builds routes from env once at boot. 'db'
+  // enables M13 hot-reload: the gateway builds routes from the config document in
+  // Postgres and reconciles live when a control-plane apply broadcasts a change.
+  CONFIG_SOURCE: z.enum(['env', 'db']).default('env'),
+  CONFIG_NOTIFY_CHANNEL: z.string().default('gulley:config'),
   // Secret resolution for the DB config path (provider ARNs → values at reload).
   // SECRETS_LOCAL_MAP (JSON {arn:value}) selects the in-process resolver for
   // dev/tests; otherwise AWS Secrets Manager (SECRETS_REGION optional).
