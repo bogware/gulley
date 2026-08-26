@@ -202,4 +202,33 @@ describe('GuardrailEngine with a provider plugin', () => {
     expect(r.blocked).toBe(false);
     expect(r.transformedText).toBe('REDACTED BY PROVIDER');
   });
+
+  it('consults the plugin on the OUTPUT path (block + mask), even under audit', async () => {
+    const seen: string[] = [];
+    const directionPlugin = (result: {
+      action: 'blocked' | 'masked' | 'none';
+      maskedText?: string;
+    }): GuardrailPlugin => ({
+      name: 'out',
+      async inspect(_t, direction) {
+        seen.push(direction);
+        return { findings: [], ...result };
+      },
+    });
+
+    const blocked = await new GuardrailEngine(
+      [det],
+      auditOnlyPolicies(),
+      directionPlugin({ action: 'blocked' }),
+    ).inspectOutput('a leaked response');
+    expect(blocked.blocked).toBe(true);
+    expect(seen).toContain('output'); // the plugin ran on the output direction
+
+    const masked = await new GuardrailEngine(
+      [det],
+      auditOnlyPolicies(),
+      directionPlugin({ action: 'masked', maskedText: 'SANITIZED' }),
+    ).inspectOutput('a leaked response');
+    expect(masked).toMatchObject({ blocked: false, transformedText: 'SANITIZED' });
+  });
 });

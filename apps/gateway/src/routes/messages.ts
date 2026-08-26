@@ -926,6 +926,21 @@ async function handleProxy(
   });
 
   upstreamBody.on('end', () => {
+    // The buffered-output branch consults the async output plugin, so the whole
+    // handler runs in an async IIFE with teardown guaranteed in `finally`.
+    void (async () => {
+      try {
+        await onUpstreamEnd();
+      } catch (err) {
+        request.log.error({ err }, 'output finalization failed');
+        if (!reply.raw.writableEnded) reply.raw.end();
+      } finally {
+        await teardown();
+      }
+    })();
+  });
+
+  async function onUpstreamEnd(): Promise<void> {
     clearWatchdog();
     const tail = decoder ? decoder.end() : '';
     if (tail && outScanner) outScanner.push(tail);
@@ -951,7 +966,7 @@ async function handleProxy(
       // would-redact) WITHHOLDS the response (a terminal error frame); otherwise
       // flush the buffered SSE, detokenized.
       const text = Buffer.concat(fullChunks).toString('utf8');
-      const out = engine.inspectOutputText(text);
+      const out = await engine.inspectOutput(text);
       outputEnforced = out;
       const withhold = out.blocked || out.transformedText !== undefined;
       const bodyOut = withhold
@@ -975,7 +990,7 @@ async function handleProxy(
     } else if (bufferOutput && engine) {
       // Enforce the output policy on the whole (non-streamed) body, then write.
       const text = Buffer.concat(fullChunks).toString('utf8');
-      const out = engine.inspectOutputText(text);
+      const out = await engine.inspectOutput(text);
       outputEnforced = out;
       const bodyOut = out.blocked
         ? Buffer.from(
@@ -1009,8 +1024,7 @@ async function handleProxy(
       }
       if (!reply.raw.writableEnded) reply.raw.end();
     }
-    void teardown();
-  });
+  }
 
   upstreamBody.on('error', (err: Error) => {
     clearWatchdog();

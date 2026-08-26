@@ -102,11 +102,20 @@ export class ModelArmorPlugin implements GuardrailPlugin {
       this.name,
     );
 
-    // If SDP returned de-identified text, prefer masking over an outright block.
+    // Mask (via SDP de-identified text) ONLY when SDP is the *sole* matched
+    // filter. If any non-SDP filter also matched — prompt-injection/jailbreak,
+    // RAI, CSAM, malicious URIs — that is a hard block, and downgrading it to a
+    // de-identify mask would forward the still-malicious content. Block wins.
+    const nonSdpMatch = matched.some(([k]) => k !== 'sdp');
     const deident = (result.filterResults?.['sdp'] as SdpResult | undefined)?.sdpFilterResult
       ?.deidentifyResult;
     const maskedText = deident?.data?.text;
-    if (deident?.matchState === MATCH && typeof maskedText === 'string' && maskedText.length > 0) {
+    if (
+      !nonSdpMatch &&
+      deident?.matchState === MATCH &&
+      typeof maskedText === 'string' &&
+      maskedText.length > 0
+    ) {
       return { action: 'masked', findings, maskedText };
     }
     return { action: 'blocked', findings };

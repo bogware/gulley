@@ -155,8 +155,9 @@ export class GuardrailEngine {
     return { findings, summary, blocked: false, plugin };
   }
 
-  /** Non-streaming / buffered output enforcement. Output `mask` redacts toward
-   *  the client (returning tokens to the caller would leak nothing useful). */
+  /** Non-streaming / buffered output enforcement — native detectors only (sync).
+   *  Output `mask` redacts toward the client (returning tokens to the caller
+   *  would leak nothing useful). */
   inspectOutputText(text: string): OutputInspection {
     const policy = this.policies.output;
     const findings = filterByPolicy(this.detectAll(text), policy);
@@ -167,5 +168,35 @@ export class GuardrailEngine {
       return { findings, summary, blocked: false, transformedText: redactText(text, findings) };
     }
     return { findings, summary, blocked: false };
+  }
+
+  /**
+   * Buffered output enforcement INCLUDING the async provider plugin (e.g. Model
+   * Armor `sanitizeModelResponse`, a webhook DLP). The plugin runs on the whole
+   * response body; a `blocked` verdict is authoritative even under an audit-only
+   * output policy (as on the input side), and a `masked` verdict rewrites the
+   * response toward the client. Native detectors still apply per the output
+   * policy. Use this on the buffered / hold-then-flush path; the streaming audit
+   * scanner stays detector-only.
+   */
+  async inspectOutput(text: string): Promise<OutputInspection> {
+    const native = this.inspectOutputText(text);
+    if (!this.plugin) return native;
+
+    const result = await this.plugin.inspect(text, 'output');
+    const findings =
+      result.findings.length > 0
+        ? resolveOverlaps([...native.findings, ...result.findings])
+        : native.findings;
+    const summary = summarize(findings);
+
+    if (result.action === 'blocked' || native.blocked) {
+      return { findings, summary, blocked: true };
+    }
+    if (result.action === 'masked' && result.maskedText !== undefined) {
+      return { findings, summary, blocked: false, transformedText: result.maskedText };
+    }
+    // No plugin enforcement — fall back to the native policy's transform (if any).
+    return { findings, summary, blocked: false, transformedText: native.transformedText };
   }
 }
