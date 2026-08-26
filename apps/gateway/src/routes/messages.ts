@@ -23,6 +23,7 @@ import type { CelAuthorizer, CelTransformer, ExternalAuthorizer, HeaderChanges }
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
+import type { RequestTracer } from '../tracer';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
@@ -133,6 +134,10 @@ export interface GatewayContext {
   headerModifier?: HeaderModifierConfig;
   /** Shadow-traffic mirror; fires a sampled copy of the effective request. */
   mirror?: RequestMirror;
+  /** Live request tracer feeding the /debug/trace SSE endpoint; absent = off. */
+  tracer?: RequestTracer;
+  /** Bearer token guarding /debug/trace; the endpoint is only served when set. */
+  debugTraceToken?: string;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -163,6 +168,46 @@ export function registerRoutes(app: FastifyInstance, ctx: GatewayContext): void 
   const modelsHandler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
     handleModels(ctx, req, reply);
   for (const path of ['/v1/models', '/openai/v1/models']) app.get(path, modelsHandler);
+
+  // Live request tracer over SSE — only when enabled + token-guarded.
+  if (ctx.tracer && ctx.debugTraceToken) {
+    app.get('/debug/trace', (req, reply) => handleDebugTrace(ctx, req, reply));
+  }
+}
+
+/** GET /debug/trace — an SSE stream of recent + live request summaries for an
+ *  operator. Bearer-guarded; the payload is credential-free (never content). */
+function handleDebugTrace(ctx: GatewayContext, request: FastifyRequest, reply: FastifyReply): void {
+  if (bearerToken(request) !== ctx.debugTraceToken) {
+    void reply.code(401).send({ type: 'error', error: { type: 'authentication_error' } });
+    return;
+  }
+  const tracer = ctx.tracer;
+  if (!tracer) {
+    void reply.code(404).send({ type: 'error', error: { type: 'not_found' } });
+    return;
+  }
+  reply.hijack();
+  reply.raw.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
+  const write = (e: unknown): void => {
+    if (!reply.raw.writableEnded) reply.raw.write(`data: ${JSON.stringify(e)}\n\n`);
+  };
+  for (const e of tracer.recent()) write(e); // replay the ring
+  const unsubscribe = tracer.subscribe(write); // then stream live
+  // Heartbeat so an idle stream + dead peer is detected and cleaned up.
+  const heartbeat = setInterval(() => {
+    if (!reply.raw.writableEnded) reply.raw.write(': ping\n\n');
+  }, 15_000);
+  const cleanup = (): void => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  };
+  reply.raw.on('close', cleanup);
+  request.raw.on('close', cleanup);
 }
 
 /** GET /v1/models — the models this principal may use, as an OpenAI model list. */
@@ -931,6 +976,23 @@ async function handleProxy(
       guardrailOutputFindings: engine ? outFindings.length : undefined,
       guardrailAction: guardrailAction ?? (outputEnforced?.blocked ? 'block' : undefined),
       traceId: trace?.traceId,
+    });
+
+    // Feed the live request tracer (credential-free summary; per-replica, lossy).
+    ctx.tracer?.record({
+      requestId,
+      traceId: trace?.traceId,
+      principalId: principal.id,
+      provider,
+      model: meteredModel,
+      status,
+      statusCode,
+      streamed,
+      latencyMs: Date.now() - started,
+      costMicroUsd,
+      cache: cacheLookup?.status ?? 'bypass',
+      guardrailAction: guardrailAction ?? (outputEnforced?.blocked ? 'block' : undefined),
+      ts: Date.now(),
     });
   };
 

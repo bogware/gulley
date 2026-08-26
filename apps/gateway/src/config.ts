@@ -197,6 +197,12 @@ const Env = z.object({
   REQUEST_MIRROR: z.string().optional(),
   REQUEST_MIRROR_ALLOW_INTERNAL: envBool(false),
 
+  // Live request tracer — a bounded in-memory ring streamed over SSE at
+  // /debug/trace (credential-free summaries). Served only when a bearer token is
+  // set; the ring holds the last DEBUG_TRACE_BUFFER requests.
+  DEBUG_TRACE_TOKEN: z.string().optional(),
+  DEBUG_TRACE_BUFFER: z.coerce.number().int().positive().default(200),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),

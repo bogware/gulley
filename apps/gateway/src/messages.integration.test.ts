@@ -7,6 +7,7 @@ import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
 import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { RequestMirror } from '@gulley/http-edge';
+import { RequestTracer } from './tracer';
 import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
@@ -937,6 +938,50 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('x-policy')).toBe('applied-ws_1'); // response header injected
     expect(received.body).toContain('"max_tokens":128'); // request body field injected upstream
+
+    await app.close();
+  });
+
+  it('streams the live request tracer over SSE (token-guarded)', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.tracer = new RequestTracer(50);
+    ctx.debugTraceToken = 'trace-secret';
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    // Unauthenticated → 401.
+    const anon = await fetch(`${base}/debug/trace`);
+    expect(anon.status).toBe(401);
+
+    // Make a proxied request so the tracer records an event.
+    await (
+      await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      })
+    ).text();
+
+    // Connect to the SSE stream; the ring replays the recorded event immediately.
+    const ac = new AbortController();
+    const stream = await fetch(`${base}/debug/trace`, {
+      headers: { authorization: 'Bearer trace-secret' },
+      signal: ac.signal,
+    });
+    expect(stream.status).toBe(200);
+    expect(stream.headers.get('content-type')).toContain('text/event-stream');
+    const reader = stream.body!.getReader();
+    const { value } = await reader.read();
+    const chunk = new TextDecoder().decode(value);
+    ac.abort();
+    expect(chunk).toContain('data:');
+    expect(chunk).toContain('"provider":"anthropic"');
+    expect(chunk).not.toContain(token); // credential-free
 
     await app.close();
   });

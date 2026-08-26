@@ -40,6 +40,7 @@ import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulle
 import { OidcProvider } from '@gulley/oidc';
 import { readFileSync } from 'node:fs';
 import type { JwtAuthConfig } from './jwt-auth';
+import { RequestTracer } from './tracer';
 import {
   auditOnlyPolicies,
   AzureContentSafetyPlugin,
@@ -611,6 +612,8 @@ export function createProductionContext(config: Config): GatewayContext {
       ? (JSON.parse(config.HEADER_MODIFIER) as HeaderModifierConfig)
       : undefined,
     mirror: buildMirror(config),
+    tracer: config.DEBUG_TRACE_TOKEN ? new RequestTracer(config.DEBUG_TRACE_BUFFER) : undefined,
+    debugTraceToken: config.DEBUG_TRACE_TOKEN,
   };
 }
 
