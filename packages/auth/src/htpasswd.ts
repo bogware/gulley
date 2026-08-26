@@ -90,8 +90,13 @@ export function apr1(password: string, salt: string): string {
   return `${magic}${salt}$${encoded}`;
 }
 
-/** Verify a password against one htpasswd hash entry. Unknown/DES formats fail. */
+/** Verify a password against one htpasswd hash entry. Unknown/DES/blank formats
+ *  FAIL CLOSED — they are never treated as a plaintext password (which would
+ *  otherwise accept the hash string itself, or a blank password for a blank
+ *  entry). Only an explicit `{plain}` marker or a value that does not look like
+ *  any crypt hash is compared as plaintext. */
 export function verifyPassword(hash: string, password: string): boolean {
+  if (hash.length === 0) return false; // a blank entry authenticates nobody
   if (/^\$2[abxy]\$/.test(hash)) {
     // $2x/$2y are algorithmically identical to $2b; normalize so bcryptjs accepts them.
     const normalized = hash.replace(/^\$2[xy]\$/, '$2b$');
@@ -121,7 +126,15 @@ export function verifyPassword(hash: string, password: string): boolean {
       timingSafeEqual(expected, blob.subarray(0, 20))
     );
   }
-  // Plaintext (with or without an explicit {plain} marker).
-  const plain = hash.startsWith('{plain}') ? hash.slice('{plain}'.length) : hash;
-  return safeEqual(plain, password);
+  // An explicit plaintext marker is honored.
+  if (hash.startsWith('{plain}')) return safeEqual(hash.slice('{plain}'.length), password);
+  // A value that looks like an UNSUPPORTED crypt hash — any `$…$` scheme we did
+  // not handle above ($5$/$6$/$2c$…), a `{scheme}` we don't know, or a 13-char
+  // DES hash — must fail closed, NEVER be plaintext-compared (that would accept
+  // the hash string as its own password, and reject the real one).
+  if (hash.startsWith('$') || hash.startsWith('{') || /^[./0-9A-Za-z]{13}$/.test(hash)) {
+    return false;
+  }
+  // Otherwise treat it as an unmarked plaintext entry (htpasswd -p).
+  return safeEqual(hash, password);
 }

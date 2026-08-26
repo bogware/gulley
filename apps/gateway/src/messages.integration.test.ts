@@ -892,7 +892,9 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     // apr1 hash of "s3cr3t-pass" (openssl passwd -apr1).
     ctx.basicAuth = {
       htpasswd: parseHtpasswd('alice:$apr1$Xy9zAbW1$yWHFWKOrw3L2VFJNzY4D81'),
-      users: new Map([['alice', { allowedModels: ['claude-sonnet-4-6'] }]]),
+      users: new Map([
+        ['alice', { allowedModels: ['claude-sonnet-4-6'], allowedProviders: ['anthropic'] }],
+      ]),
       defaultOrgId: 'org_1',
       defaultWorkspaceId: 'ws_basic',
     };

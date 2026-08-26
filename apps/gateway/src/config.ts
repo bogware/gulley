@@ -60,6 +60,11 @@ const Env = z.object({
   BASIC_AUTH_USER_SCOPES: z.string().optional(),
   BASIC_AUTH_DEFAULT_WORKSPACE_ID: z.string().optional(),
   BASIC_AUTH_DEFAULT_ORG_ID: z.string().optional(),
+  // Default allow-list for Basic users NOT named in BASIC_AUTH_USER_SCOPES.
+  // Deny-by-default: unset = the user can reach nothing. Comma-separated ids, or
+  // "*" to allow all (opt-in). Per-user overrides always win.
+  BASIC_AUTH_DEFAULT_ALLOWED_PROVIDERS: z.string().optional(),
+  BASIC_AUTH_DEFAULT_ALLOWED_MODELS: z.string().optional(),
 
   // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
   // Deny-first, then allow-list; expressions run over { request, principal }.

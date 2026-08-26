@@ -29,12 +29,18 @@ describe('verifyPassword', () => {
     expect(verifyPassword(SHA1, 'nope')).toBe(false);
   });
 
-  it('verifies plaintext and rejects unknown/DES formats', () => {
+  it('verifies plaintext and FAILS CLOSED on unsupported/blank formats', () => {
     expect(verifyPassword('{plain}letmein', 'letmein')).toBe(true);
-    expect(verifyPassword('letmein', 'letmein')).toBe(true);
+    expect(verifyPassword('letmein', 'letmein')).toBe(true); // unmarked plaintext
     expect(verifyPassword('letmein', 'other')).toBe(false);
-    // DES crypt (13 chars) is intentionally unsupported → never verifies.
+    // DES crypt (13 chars) is unsupported → fails closed, and is NEVER accepted as
+    // its own password (the plaintext-fallthrough vulnerability).
     expect(verifyPassword('abJnggxhB/yWI', PW)).toBe(false);
+    expect(verifyPassword('abJnggxhB/yWI', 'abJnggxhB/yWI')).toBe(false);
+    // Unsupported $5$/$6$ crypt schemes fail closed too.
+    expect(verifyPassword('$6$salt$hashhashhash', '$6$salt$hashhashhash')).toBe(false);
+    // A blank hash entry authenticates nobody — not even a blank password.
+    expect(verifyPassword('', '')).toBe(false);
   });
 });
 
@@ -70,11 +76,28 @@ describe('resolveBasicPrincipal', () => {
     });
   });
 
-  it('falls back to default scope for a user without overrides', () => {
+  it('DENIES by default for a user without overrides or a configured default', () => {
     const r = resolveBasicPrincipal(header('bob', PW), cfg);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.value.scope).toMatchObject({ workspaceId: 'ws_default', allowedModels: '*' });
+    // Deny-by-default: no override + no default ⇒ empty allow-lists (reaches nothing).
+    expect(r.value.scope).toMatchObject({
+      workspaceId: 'ws_default',
+      allowedProviders: [],
+      allowedModels: [],
+    });
+  });
+
+  it('honors an explicitly configured permissive default', () => {
+    const permissive = {
+      ...cfg,
+      defaultAllowedProviders: '*' as const,
+      defaultAllowedModels: '*' as const,
+    };
+    const r = resolveBasicPrincipal(header('bob', PW), permissive);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.scope).toMatchObject({ allowedProviders: '*', allowedModels: '*' });
   });
 
   it('rejects a bad password, unknown user, and malformed header', () => {

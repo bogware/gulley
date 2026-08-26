@@ -591,10 +591,23 @@ export function buildBasicAuth(config: Config): BasicAuthConfig | undefined {
     const parsed = JSON.parse(config.BASIC_AUTH_USER_SCOPES) as Record<string, BasicUserScope>;
     users = new Map(Object.entries(parsed));
   }
+  // "*" allows all; a comma-list allows those ids; unset ⇒ deny-by-default in the
+  // resolver (a user with no override reaches nothing).
+  const defaultList = (v: string | undefined): readonly string[] | '*' | undefined =>
+    v === undefined
+      ? undefined
+      : v.trim() === '*'
+        ? '*'
+        : v
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
   return {
     htpasswd,
     users,
     defaultOrgId: config.BASIC_AUTH_DEFAULT_ORG_ID,
     defaultWorkspaceId: config.BASIC_AUTH_DEFAULT_WORKSPACE_ID,
+    defaultAllowedProviders: defaultList(config.BASIC_AUTH_DEFAULT_ALLOWED_PROVIDERS),
+    defaultAllowedModels: defaultList(config.BASIC_AUTH_DEFAULT_ALLOWED_MODELS),
   };
 }
