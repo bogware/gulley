@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { registerConfigRoutes } from './config-routes';
 import type { ControlContext } from './context';
+import { registerDebugRoutes } from './debug-routes';
 import { registerHttpEdge } from './http-edge';
 import { registerLogRoutes } from './log-routes';
 import { registerOidcRoutes } from './oidc-routes';
@@ -46,6 +47,7 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     registerConfigRoutes(app, ctx);
     registerLogRoutes(app, ctx);
     registerOidcRoutes(app, ctx);
+    registerDebugRoutes(app, ctx, config);
   }
 
   return app;
