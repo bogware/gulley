@@ -31,6 +31,14 @@ const Env = z.object({
   AZURE_ENDPOINT: z.string().url().optional(),
   AZURE_UPSTREAM_API_KEY: z.string().min(1).optional(),
 
+  // Custom / OpenAI-compatible providers — a JSON array of entries, each either
+  // { "preset": "ollama"|"groq"|…, "models": [...] } or a bespoke
+  // { "provider": "x", "baseUrl": "http://…", "apiKey"?: "…", "models": [...] }.
+  // Presets cover hosted (Groq/Mistral/Together/OpenRouter/DeepSeek/…) and local
+  // runtimes (Ollama/Jan/LM Studio/vLLM/LocalAI/llama.cpp). Local runtimes are
+  // keyless http on loopback — server-side config, not an SSRF vector.
+  CUSTOM_PROVIDERS: z.string().optional(),
+
   DATABASE_URL: z.string().url().optional(),
   // Redis counters (budget reserve/commit). Absent = budgets disabled.
   REDIS_COUNTERS_URL: z.string().url().optional(),

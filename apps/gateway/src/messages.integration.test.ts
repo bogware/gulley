@@ -4,12 +4,13 @@ import zlib from 'node:zlib';
 import { generateVirtualKey, InMemoryKeyStore } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
-import { AnthropicAdapter, AnthropicUsageExtractor } from '@gulley/providers';
+import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
 import { initTelemetry } from '@gulley/telemetry';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
+import { buildCustomProviders } from './context';
 import type { GatewayContext } from './routes/messages';
 import { buildServer } from './server';
 
@@ -509,6 +510,86 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(bad.status).toBe(401);
 
     await app.close();
+  });
+
+  it('routes to a keyless local OpenAI-compatible provider (Ollama-style)', async () => {
+    let localAuth: string | undefined = 'unset';
+    let localBody = '';
+    const local = http.createServer((req, res) => {
+      localAuth = req.headers['authorization'];
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        localBody = b;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            id: 'cmpl',
+            model: 'llama3.1',
+            choices: [
+              { index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' },
+            ],
+            usage: { prompt_tokens: 10, completion_tokens: 5 },
+          }),
+        );
+      });
+    });
+    await new Promise<void>((r) => local.listen(0, '127.0.0.1', r));
+    const localUrl = `http://127.0.0.1:${(local.address() as AddressInfo).port}`;
+
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      CUSTOM_PROVIDERS: JSON.stringify([
+        { provider: 'ollama', baseUrl: localUrl, models: ['llama3.1'] },
+      ]),
+    } as NodeJS.ProcessEnv);
+    const custom = buildCustomProviders(config);
+
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [
+      ...custom.routes,
+      {
+        clientPaths: ['/v1/chat/completions'],
+        createExtractor: () => new OpenAIUsageExtractor(),
+        strategy: custom.routes[0]!.strategy,
+      },
+    ];
+    ctx.modelRouter = new ModelRouter(custom.modelRules);
+    ctx.models = custom.models;
+
+    const app = buildServer(config, ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const headers = { 'content-type': 'application/json', 'x-api-key': token };
+    const bodyFor = (model: string) =>
+      JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] });
+
+    // Namespaced path → the local runtime, keyless, metered under 'ollama'.
+    const r1 = await fetch(`${base}/ollama/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: bodyFor('llama3.1'),
+    });
+    await r1.text();
+    expect(r1.status).toBe(200);
+    expect(localAuth).toBeUndefined(); // keyless — no Authorization sent upstream
+    expect(localBody).toContain('llama3.1');
+    expect(ledger.entries.at(-1)?.provider).toBe('ollama');
+    expect(ledger.entries.at(-1)?.cost.outputTokens).toBe(5);
+
+    // Shared endpoint dispatched by model to the same local backend.
+    const r2 = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: bodyFor('llama3.1'),
+    });
+    await r2.text();
+    expect(r2.status).toBe(200);
+    expect(ledger.entries.at(-1)?.provider).toBe('ollama');
+
+    await app.close();
+    await new Promise<void>((r) => local.close(() => r()));
   });
 });
 

@@ -57,12 +57,17 @@ export class PassthroughAdapter implements ProviderAdapter {
     for (const [k, v] of Object.entries(this.defaultHeaders)) {
       if (!(k in headers)) headers[k] = v;
     }
-    if (req.credential.scheme === 'x-api-key') {
-      headers['x-api-key'] = req.credential.value;
-    } else if (req.credential.scheme === 'api-key') {
-      headers['api-key'] = req.credential.value;
-    } else {
-      headers['authorization'] = `Bearer ${req.credential.value}`;
+    // An empty credential value = keyless upstream (self-hosted / local models
+    // like Ollama, Jan, LM Studio) — attach no auth header at all.
+    const cred = req.credential.value;
+    if (cred) {
+      if (req.credential.scheme === 'x-api-key') {
+        headers['x-api-key'] = cred;
+      } else if (req.credential.scheme === 'api-key') {
+        headers['api-key'] = cred;
+      } else {
+        headers['authorization'] = `Bearer ${cred}`;
+      }
     }
     headers['content-type'] = headers['content-type'] ?? 'application/json';
 

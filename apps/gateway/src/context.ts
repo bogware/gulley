@@ -3,8 +3,11 @@ import {
   AnthropicUsageExtractor,
   AzureAdapter,
   BedrockAdapter,
+  type CustomProviderConfig,
   OpenAIAdapter,
   OpenAIUsageExtractor,
+  PassthroughAdapter,
+  resolveCustomProvider,
   type UpstreamCredential,
 } from '@gulley/providers';
 import { InMemoryBudgetStore, RedisBudgetStore } from '@gulley/budget';
@@ -26,7 +29,13 @@ import {
   type RateLimitStore,
   RedisRateLimitStore,
 } from '@gulley/ratelimit';
-import { CircuitBreaker } from '@gulley/routing';
+import {
+  CircuitBreaker,
+  type ModelRouteRule,
+  ModelRouter,
+  type RouteTarget,
+  type RoutingStrategy,
+} from '@gulley/routing';
 import {
   createBudgetCapResolver,
   createDatabase,
@@ -227,16 +236,89 @@ export function buildRoutes(config: Config): ProviderRoute[] {
   return routes;
 }
 
+/**
+ * Register custom / OpenAI-compatible providers (hosted presets and local
+ * runtimes like Ollama/Jan/LM Studio) from `CUSTOM_PROVIDERS`. Each gets a
+ * namespaced `/{provider}/v1/chat/completions` route; declared models become
+ * model-router rules so a shared `/v1/chat/completions` request can be dispatched
+ * by model, and are surfaced by `/v1/models`.
+ */
+export function buildCustomProviders(config: Config): {
+  routes: ProviderRoute[];
+  modelRules: ModelRouteRule[];
+  models: string[];
+} {
+  const routes: ProviderRoute[] = [];
+  const modelRules: ModelRouteRule[] = [];
+  const models: string[] = [];
+  if (!config.CUSTOM_PROVIDERS) return { routes, modelRules, models };
+
+  let entries: CustomProviderConfig[];
+  try {
+    const parsed: unknown = JSON.parse(config.CUSTOM_PROVIDERS);
+    if (!Array.isArray(parsed)) throw new Error('not an array');
+    entries = parsed as CustomProviderConfig[];
+  } catch {
+    throw new Error('CUSTOM_PROVIDERS must be a JSON array of provider entries');
+  }
+
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const r = resolveCustomProvider(entry);
+    if (seen.has(r.provider)) throw new Error(`duplicate custom provider label: ${r.provider}`);
+    seen.add(r.provider);
+    const credential: UpstreamCredential = { scheme: 'bearer', value: r.apiKey };
+    const target: RouteTarget = {
+      name: r.provider,
+      provider: r.provider,
+      adapter: new PassthroughAdapter({ name: r.provider, baseUrl: r.baseUrl }),
+      credential,
+      upstreamPath: r.chatPath,
+    };
+    const strategy: RoutingStrategy = { mode: 'single', target };
+    routes.push({
+      clientPaths: [`/${r.provider}/v1/chat/completions`],
+      createExtractor: () => new OpenAIUsageExtractor(),
+      strategy,
+    });
+    for (const m of r.models) {
+      models.push(m);
+      modelRules.push({ pattern: m, strategy, provider: r.provider });
+    }
+  }
+  return { routes, modelRules, models };
+}
+
 export function createProductionContext(config: Config): GatewayContext {
   if (!config.DATABASE_URL) throw new Error('DATABASE_URL is required to run the data plane');
   if (!config.GULLEY_KEY_PEPPER) throw new Error('GULLEY_KEY_PEPPER is required to validate keys');
 
   const routes = buildRoutes(config);
+  const custom = buildCustomProviders(config);
+  routes.push(...custom.routes);
+
+  // If no built-in OpenAI route claimed the shared chat path but custom/local
+  // providers exist, expose /v1/chat/completions with the first as the default
+  // target; the model router dispatches per requested model to the right backend.
+  if (
+    !routes.some((r) => r.clientPaths.includes('/v1/chat/completions')) &&
+    custom.routes.length > 0
+  ) {
+    const first = custom.routes[0] as ProviderRoute;
+    routes.push({
+      clientPaths: ['/v1/chat/completions', '/openai/v1/chat/completions'],
+      createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: first.strategy,
+    });
+  }
+
   if (routes.length === 0) {
     throw new Error(
-      'no providers configured — set ANTHROPIC_UPSTREAM_API_KEY and/or OPENAI_UPSTREAM_API_KEY',
+      'no providers configured — set ANTHROPIC_UPSTREAM_API_KEY / OPENAI_UPSTREAM_API_KEY or CUSTOM_PROVIDERS',
     );
   }
+  const modelRouter = custom.modelRules.length > 0 ? new ModelRouter(custom.modelRules) : undefined;
+  const catalogModels = custom.models.length > 0 ? [...new Set(custom.models)] : undefined;
 
   const db = createDatabase(config.DATABASE_URL);
   // Budgets need Redis counters; without them, enforcement is simply disabled.
@@ -301,5 +383,7 @@ export function createProductionContext(config: Config): GatewayContext {
     cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,
     rateLimiter,
     metrics,
+    modelRouter,
+    models: catalogModels,
   };
 }

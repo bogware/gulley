@@ -59,6 +59,10 @@ The gaps that make an enterprise gateway; mostly small/medium and self-contained
 
 **Done when:** a request to a preset backend (e.g. Groq) meters and costs correctly; Gemini + Vertex + Copilot each run a streamed request end-to-end; prompt-cache breakpoints translate across providers; the catalog refreshes from models.dev on an admin action with a pinned fallback on failure.
 
+**Delivered (in progress):**
+
+- **Custom / OpenAI-compatible providers + local models — ✅ delivered.** `@gulley/providers` `presets.ts` ships a preset registry — hosted (Groq, Mistral, Together, OpenRouter, DeepSeek, Fireworks, Cerebras, xAI, Nvidia, DeepInfra, Perplexity) **and local runtimes** (Ollama, Jan, LM Studio, vLLM, LocalAI, llama.cpp, KoboldCpp, text-generation-webui) — plus `resolveCustomProvider`. `PassthroughAdapter` gained **keyless mode** (empty credential → no auth header) so loopback runtimes work. The gateway reads `CUSTOM_PROVIDERS` (JSON), registers each at `/{provider}/v1/chat/completions`, builds a `ModelRouter` from declared models so a shared `/v1/chat/completions` request dispatches by model to the right backend (local or cloud), surfaces them in `GET /v1/models`, and — when only custom providers exist — registers the shared chat path itself. Local http/loopback base URLs are server-side config (not client-supplied), so they are exempt from the SSRF guard by construction. 6 provider + 1 gateway integration test. _Next: models.dev cost catalog (prices these), then Gemini/Vertex/Copilot native adapters + translation depth._
+
 ## M9 — Backend auth & credential signing (P1)
 
 - **AWS SigV4** (late-signing/buffer seam on signed routes) + **STS AssumeRole** session tags for per-tenant cost attribution; **GCP** token minting (ADC/SA/impersonation, per-audience cache); **Azure** DefaultAzureCredential chain + IMDS reachability probe.
