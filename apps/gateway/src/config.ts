@@ -31,6 +31,13 @@ const Env = z.object({
   AZURE_ENDPOINT: z.string().url().optional(),
   AZURE_UPSTREAM_API_KEY: z.string().min(1).optional(),
 
+  // Model cost catalog — an operator-maintained JSON file (a CatalogEntry[])
+  // loaded on boot to override/extend the in-tree seed prices. Regenerate it
+  // manually from models.dev with `pnpm --filter @gulley/gateway catalog:refresh`
+  // (per the manual-updates rule; there is no runtime auto-fetch).
+  MODELS_CATALOG_FILE: z.string().optional(),
+  MODELS_DEV_URL: z.string().url().default('https://models.dev/api.json'),
+
   // Custom / OpenAI-compatible providers — a JSON array of entries, each either
   // { "preset": "ollama"|"groq"|…, "models": [...] } or a bespoke
   // { "provider": "x", "baseUrl": "http://…", "apiKey"?: "…", "models": [...] }.

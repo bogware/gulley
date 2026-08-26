@@ -7,7 +7,7 @@ import {
 } from '@gulley/auth';
 import { type BudgetStore, estimateWorstCaseMicroUsd } from '@gulley/budget';
 import type { CacheableRequest, CacheEngine, CacheLookup } from '@gulley/cache';
-import { computeCost, toMicroUsd } from '@gulley/cost';
+import { computeCost, type RateResolver, toMicroUsd } from '@gulley/cost';
 import { isErr } from '@gulley/core';
 import {
   filterByPolicy,
@@ -78,6 +78,8 @@ export interface GatewayContext {
   modelRouter?: ModelRouter;
   /** Static model catalog surfaced by GET /v1/models (merged with router models). */
   models?: string[];
+  /** Pricing override source (models.dev catalog); absent = seed tables only. */
+  rateResolver?: RateResolver;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -482,7 +484,7 @@ async function handleProxy(
 
     const n = usage.normalized();
     const meteredModel = n.model ?? requestedModel;
-    const cost = computeCost(provider, meteredModel, n);
+    const cost = computeCost(provider, meteredModel, n, ctx.rateResolver);
     const costMicroUsd = toMicroUsd(cost.totalUsd);
     const createdAt = new Date();
 

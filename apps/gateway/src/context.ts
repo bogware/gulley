@@ -20,6 +20,8 @@ import {
   OpenAIEmbeddingProvider,
   type VectorIndex,
 } from '@gulley/cache';
+import { loadCatalogFromFile } from '@gulley/catalog';
+import type { RateResolver } from '@gulley/cost';
 import { auditOnlyPolicies, GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { GatewayMetrics } from '@gulley/metrics';
 import { BatchingRequestLog } from '@gulley/pipeline';
@@ -320,6 +322,17 @@ export function createProductionContext(config: Config): GatewayContext {
   const modelRouter = custom.modelRules.length > 0 ? new ModelRouter(custom.modelRules) : undefined;
   const catalogModels = custom.models.length > 0 ? [...new Set(custom.models)] : undefined;
 
+  // Optional models.dev-derived pricing catalog (operator-maintained file loaded
+  // on boot); absent = seed rate tables only.
+  let rateResolver: RateResolver | undefined;
+  if (config.MODELS_CATALOG_FILE) {
+    try {
+      rateResolver = loadCatalogFromFile(config.MODELS_CATALOG_FILE).resolver();
+    } catch (err) {
+      throw new Error(`failed to load MODELS_CATALOG_FILE: ${(err as Error).message}`);
+    }
+  }
+
   const db = createDatabase(config.DATABASE_URL);
   // Budgets need Redis counters; without them, enforcement is simply disabled.
   const budgets = config.REDIS_COUNTERS_URL
@@ -385,5 +398,6 @@ export function createProductionContext(config: Config): GatewayContext {
     metrics,
     modelRouter,
     models: catalogModels,
+    rateResolver,
   };
 }
