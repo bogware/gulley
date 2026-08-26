@@ -9,4 +9,5 @@ export * from './plugin';
 export * from './webhook';
 export * from './moderation';
 export * from './azure-content-safety';
+export * from './model-armor';
 export * from './composite';

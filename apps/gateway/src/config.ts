@@ -113,6 +113,12 @@ const Env = z.object({
   GUARDRAILS_BEDROCK_GUARDRAIL_ID: z.string().optional(),
   GUARDRAILS_BEDROCK_API_KEY: z.string().optional(),
   GUARDRAILS_BEDROCK_REGION: z.string().optional(),
+  // Google Cloud Model Armor (prompt/response sanitization). Needs a GCP OAuth2
+  // access token — supply a (refreshed) token here; production wires a provider.
+  GUARDRAILS_MODEL_ARMOR_PROJECT: z.string().optional(),
+  GUARDRAILS_MODEL_ARMOR_LOCATION: z.string().optional(),
+  GUARDRAILS_MODEL_ARMOR_TEMPLATE: z.string().optional(),
+  GUARDRAILS_MODEL_ARMOR_ACCESS_TOKEN: z.string().optional(),
 
   // Same-target retry (pre-first-byte, body already buffered): bounded attempts
   // on transient errors before failing over to the next candidate. Default 1 =

@@ -39,6 +39,7 @@ import {
   composePlugins,
   GuardrailEngine,
   type GuardrailPlugin,
+  ModelArmorPlugin,
   NativeDetector,
   OpenAIModerationPlugin,
   WebhookGuardrailPlugin,
@@ -119,6 +120,21 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
         guardrailId: config.GUARDRAILS_BEDROCK_GUARDRAIL_ID,
         apiKey: config.GUARDRAILS_BEDROCK_API_KEY,
         region: config.GUARDRAILS_BEDROCK_REGION,
+      }),
+    );
+  }
+  if (
+    config.GUARDRAILS_MODEL_ARMOR_PROJECT &&
+    config.GUARDRAILS_MODEL_ARMOR_LOCATION &&
+    config.GUARDRAILS_MODEL_ARMOR_TEMPLATE &&
+    config.GUARDRAILS_MODEL_ARMOR_ACCESS_TOKEN
+  ) {
+    plugins.push(
+      new ModelArmorPlugin({
+        projectId: config.GUARDRAILS_MODEL_ARMOR_PROJECT,
+        location: config.GUARDRAILS_MODEL_ARMOR_LOCATION,
+        template: config.GUARDRAILS_MODEL_ARMOR_TEMPLATE,
+        accessToken: config.GUARDRAILS_MODEL_ARMOR_ACCESS_TOKEN,
       }),
     );
   }
