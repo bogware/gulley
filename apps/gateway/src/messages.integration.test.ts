@@ -634,6 +634,54 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
     await new Promise<void>((r) => emb.close(() => r()));
   });
+
+  it('retries the same target on a transient 503 (pre-first-byte body replay)', async () => {
+    let calls = 0;
+    const flaky = http.createServer((_req, res) => {
+      calls += 1;
+      if (calls === 1) {
+        res.writeHead(503);
+        res.end('overloaded');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(GOLDEN_SSE);
+    });
+    await new Promise<void>((r) => flaky.listen(0, '127.0.0.1', r));
+    const flakyUrl = `http://127.0.0.1:${(flaky.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.retryMaxAttempts = 2;
+    ctx.retryBackoffMs = 1;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('flaky', flakyUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(calls).toBe(2); // first 503, retried once → success on the same target
+    expect(text).toContain('message_start');
+
+    await app.close();
+    await new Promise<void>((r) => flaky.close(() => r()));
+  });
 });
 
 function single(v: string | string[] | undefined): string | undefined {

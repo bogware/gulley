@@ -80,6 +80,10 @@ export interface GatewayContext {
   models?: string[];
   /** Pricing override source (models.dev catalog); absent = seed tables only. */
   rateResolver?: RateResolver;
+  /** Max same-target attempts (pre-first-byte) before failover. 1 = no retry. */
+  retryMaxAttempts?: number;
+  /** Base exponential backoff between same-target retries (ms). */
+  retryBackoffMs?: number;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -407,44 +411,83 @@ async function handleProxy(
     if (!reply.raw.writableEnded && !controller.signal.aborted) controller.abort();
   });
 
-  // --- pre-first-byte failover: try candidates until one serves a response ---
+  // --- pre-first-byte failover + bounded same-target retry ---
+  // The request body is fully buffered, so replaying it to the same target on a
+  // transient error is safe (nothing has streamed yet). We retry the same target
+  // up to retryMaxAttempts, then fail over to the next candidate.
+  const maxAttempts = Math.max(1, ctx.retryMaxAttempts ?? 1);
+  const retryBackoffMs = ctx.retryBackoffMs ?? 250;
   let upstream: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
   let served: RouteTarget | undefined;
   for (let i = 0; i < candidates.length; i++) {
     const target = candidates[i] as RouteTarget;
     const isLast = i === candidates.length - 1;
-    try {
-      const resp = await target.adapter.forward({
-        path: target.upstreamPath,
-        body,
-        headers: request.headers,
-        credential: target.credential,
-        signal: controller.signal,
-      });
-      // An upstream Retry-After / rate-limit-reset sets the ejection cooldown.
-      const retryAfterMs = parseRetryAfterMs(resp.headers);
-      if (!isLast && resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
-        ctx.breaker.recordFailure(target.name, retryAfterMs);
-        ctx.metrics?.recordFailover(target.name);
-        resp.body.resume(); // discard the failed body, then try the next target
-        request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
-        continue;
+    let resp: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
+    let retryAfterMs: number | undefined;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (controller.signal.aborted) break;
+      if (attempt > 0) {
+        const backoff = Math.min(retryBackoffMs * 2 ** (attempt - 1), 2000);
+        await abortableSleep(Math.max(backoff, retryAfterMs ?? 0), controller.signal);
+        if (controller.signal.aborted) break;
       }
-      upstream = resp;
-      served = target;
-      // The breaker should track UPSTREAM faults, not client mistakes: a terminal
-      // 4xx (400/401/403/404/422) is the caller's error and must not trip the
-      // breaker for every other tenant sharing this target.
-      if (resp.statusCode < 400) ctx.breaker.recordSuccess(target.name);
-      else if (isFailoverStatus(strategy, resp.statusCode)) {
-        ctx.breaker.recordFailure(target.name, retryAfterMs);
+      try {
+        const r = await target.adapter.forward({
+          path: target.upstreamPath,
+          body,
+          headers: request.headers,
+          credential: target.credential,
+          signal: controller.signal,
+        });
+        retryAfterMs = parseRetryAfterMs(r.headers);
+        // A transient status with attempts left → discard and retry the SAME target.
+        if (
+          r.statusCode >= 400 &&
+          isFailoverStatus(strategy, r.statusCode) &&
+          attempt < maxAttempts - 1
+        ) {
+          ctx.breaker.recordFailure(target.name, retryAfterMs);
+          r.body.resume();
+          request.log.warn({ target: target.name, status: r.statusCode, attempt }, 'retrying');
+          continue;
+        }
+        resp = r;
+        break;
+      } catch (err) {
+        request.log.warn({ target: target.name, err, attempt }, 'target attempt error');
+        if (controller.signal.aborted) break;
+        if (attempt < maxAttempts - 1) {
+          ctx.breaker.recordFailure(target.name); // connection error → retry same target
+          continue;
+        }
       }
-      break;
-    } catch (err) {
-      ctx.breaker.recordFailure(target.name);
-      request.log.warn({ target: target.name, err }, 'target error');
-      if (controller.signal.aborted) break; // client gone — stop trying
     }
+
+    if (!resp) {
+      // All attempts on this target hard-failed (connection errors) or aborted.
+      ctx.breaker.recordFailure(target.name);
+      if (controller.signal.aborted) break; // client gone — stop trying
+      continue; // fail over to the next candidate
+    }
+
+    if (!isLast && resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
+      ctx.breaker.recordFailure(target.name, retryAfterMs);
+      ctx.metrics?.recordFailover(target.name);
+      resp.body.resume(); // discard the failed body, then try the next target
+      request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
+      continue;
+    }
+    upstream = resp;
+    served = target;
+    // The breaker should track UPSTREAM faults, not client mistakes: a terminal
+    // 4xx (400/401/403/404/422) is the caller's error and must not trip the
+    // breaker for every other tenant sharing this target.
+    if (resp.statusCode < 400) ctx.breaker.recordSuccess(target.name);
+    else if (isFailoverStatus(strategy, resp.statusCode)) {
+      ctx.breaker.recordFailure(target.name, retryAfterMs);
+    }
+    break;
   }
 
   const streamed = served?.alwaysStream === true || parsed['stream'] === true;
@@ -834,6 +877,22 @@ function providerErrorFrame(provider: string, message: string): string {
     return `data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`;
   }
   return `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message } })}\n\n`;
+}
+
+/** Sleep that resolves early if the request is aborted (client gone / timeout),
+ *  so a retry backoff never outlives the request it is backing off for. */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    timer.unref?.();
+    signal.addEventListener('abort', done, { once: true });
+  });
 }
 
 /** A decompression transform for a Content-Encoding, or undefined for an encoding

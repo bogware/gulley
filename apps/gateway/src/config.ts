@@ -68,6 +68,12 @@ const Env = z.object({
   GUARDRAILS_ENABLED: envBool(true),
   GUARDRAILS_ENTROPY: envBool(true),
 
+  // Same-target retry (pre-first-byte, body already buffered): bounded attempts
+  // on transient errors before failing over to the next candidate. Default 1 =
+  // no retry (behavior unchanged). Backoff is exponential, floored by Retry-After.
+  RETRY_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(1),
+  RETRY_BACKOFF_MS: z.coerce.number().int().positive().default(250),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),

@@ -432,5 +432,7 @@ export function createProductionContext(config: Config): GatewayContext {
     modelRouter,
     models: catalogModels,
     rateResolver,
+    retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
+    retryBackoffMs: config.RETRY_BACKOFF_MS,
   };
 }
