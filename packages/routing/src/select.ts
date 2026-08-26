@@ -1,4 +1,5 @@
 import type { CircuitBreaker } from './circuit-breaker';
+import type { OutlierDetector } from './outlier';
 import type { RouteTarget, RoutingStrategy } from './types';
 
 /** Retryable/failover-worthy upstream statuses (transient + overload). Terminal
@@ -37,6 +38,9 @@ export interface SelectOptions {
   /** When present (and no sessionKey), `loadbalance` uses power-of-two-choices
    *  least-load for the primary pick. */
   scoreboard?: LoadScoreboard;
+  /** When present, passively-ejected slow outliers are skipped too (union with
+   *  the breaker's open-circuit filter). */
+  outlier?: OutlierDetector;
 }
 
 /** Stable 32-bit FNV-1a hash → a unit float in [0, 1). */
@@ -98,8 +102,12 @@ export function selectCandidates(
   const rand = o.rand ?? Math.random;
   if (strategy.mode === 'single') return [strategy.target];
 
-  const open = strategy.targets.filter((t) => !breaker.isOpen(t.name));
-  const pool = open.length > 0 ? open : strategy.targets;
+  const healthy = strategy.targets.filter(
+    (t) => !breaker.isOpen(t.name) && !o.outlier?.isEjected(t.name),
+  );
+  // If everything is open/ejected we still return the full set — a half-open
+  // probe beats a hard fail, and you must never latency-eject your last upstream.
+  const pool = healthy.length > 0 ? healthy : strategy.targets;
   if (strategy.mode === 'fallback') return pool;
 
   if (o.sessionKey) return hrwOrder(pool, o.sessionKey);

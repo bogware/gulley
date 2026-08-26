@@ -57,6 +57,7 @@ import {
   LoadScoreboard,
   type ModelRouteRule,
   ModelRouter,
+  OutlierDetector,
   type RouteTarget,
   type RoutingStrategy,
 } from '@gulley/routing';
@@ -545,11 +546,16 @@ export function createProductionContext(config: Config): GatewayContext {
     requestLog,
     flushLogs: () => requestLog.close(),
     audit: new PostgresAuditSink(db),
-    breaker: new CircuitBreaker({
-      latencyThresholdMs: config.BREAKER_LATENCY_THRESHOLD_MS,
-      minLatencySamples: config.BREAKER_LATENCY_MIN_SAMPLES,
-      latencyEjectionMs: config.BREAKER_LATENCY_EJECTION_MS,
-    }),
+    breaker: new CircuitBreaker(),
+    outlier: config.OUTLIER_ENABLED
+      ? new OutlierDetector({
+          latencyFactor: config.OUTLIER_LATENCY_FACTOR,
+          minSamples: config.OUTLIER_MIN_SAMPLES,
+          minEjectLatencyMs: config.OUTLIER_MIN_EJECT_MS,
+          baseEjectMs: config.OUTLIER_BASE_EJECT_MS,
+          maxEjectMs: config.OUTLIER_MAX_EJECT_MS,
+        })
+      : undefined,
     budgets,
     telemetry,
     guardrails: buildGuardrails(config),

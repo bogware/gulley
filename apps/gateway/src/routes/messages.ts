@@ -31,6 +31,7 @@ import {
   isFailoverStatus,
   type LoadScoreboard,
   type ModelRouter,
+  type OutlierDetector,
   type RequestShaping,
   type RouteTarget,
   type RoutingStrategy,
@@ -102,6 +103,8 @@ export interface GatewayContext {
   basicAuth?: BasicAuthConfig;
   /** In-flight load scoreboard for power-of-two-choices least-load balancing. */
   scoreboard?: LoadScoreboard;
+  /** Passive latency-outlier detector (peer-relative slow-target ejection). */
+  outlier?: OutlierDetector;
   /** Request header whose value pins a session to one target (HRW affinity);
    *  falls back to the principal id. Absent = no affinity (P2C / weighted). */
   sessionAffinityHeader?: string;
@@ -264,6 +267,7 @@ async function handleProxy(
   const candidates = selectCandidates(strategy, ctx.breaker, {
     sessionKey,
     scoreboard: ctx.scoreboard,
+    outlier: ctx.outlier,
   }).filter((t) => scopeAllowsProvider(principal.scope, t.provider));
   if (candidates.length === 0) {
     await reply
@@ -595,9 +599,14 @@ async function handleProxy(
     }
     upstream = resp;
     served = target;
-    // Feed time-to-response-headers to the breaker's latency EWMA (drives passive
-    // slow-outlier ejection when configured; measured independent of stream body).
-    ctx.breaker.recordLatency(target.name, Date.now() - forwardStart);
+    // Feed time-to-response-headers (peer-relative) to the passive outlier
+    // detector — measured independent of stream-body duration, judged against the
+    // candidate pool. Only served (pre-first-byte) responses count.
+    ctx.outlier?.recordLatency(
+      target.name,
+      Date.now() - forwardStart,
+      candidates.map((c) => c.name),
+    );
     // Mark this target in-flight for power-of-two-choices least-load; released
     // in teardown (guarded so a double teardown can't double-decrement).
     if (ctx.scoreboard) {

@@ -132,11 +132,15 @@ const Env = z.object({
   RETRY_BACKOFF_MS: z.coerce.number().int().positive().default(250),
 
   // Passive outlier detection: eject a target whose EWMA time-to-response-headers
-  // crosses this many ms (even with zero errors), re-probed after the ejection
-  // window. Unset = disabled (error/failure rules still apply).
-  BREAKER_LATENCY_THRESHOLD_MS: z.coerce.number().int().positive().optional(),
-  BREAKER_LATENCY_MIN_SAMPLES: z.coerce.number().int().positive().default(20),
-  BREAKER_LATENCY_EJECTION_MS: z.coerce.number().int().positive().default(30_000),
+  // is >= OUTLIER_LATENCY_FACTOR x the peer baseline (and above the floor), even
+  // with zero errors; re-probed by time. Off by default (error/failure rules
+  // still apply). Independent of the fault circuit breaker.
+  OUTLIER_ENABLED: envBool(false),
+  OUTLIER_LATENCY_FACTOR: z.coerce.number().positive().default(3),
+  OUTLIER_MIN_SAMPLES: z.coerce.number().int().positive().default(20),
+  OUTLIER_MIN_EJECT_MS: z.coerce.number().int().positive().default(500),
+  OUTLIER_BASE_EJECT_MS: z.coerce.number().int().positive().default(30_000),
+  OUTLIER_MAX_EJECT_MS: z.coerce.number().int().positive().default(300_000),
 
   // Load balancing across a loadbalance strategy's targets. When affinity is off
   // (default) the primary pick uses power-of-two-choices least-load over in-flight
