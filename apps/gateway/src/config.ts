@@ -191,6 +191,12 @@ const Env = z.object({
   // {"request":{"set":{"x-tenant":"acme"}},"response":{"remove":["x-internal"]}}
   HEADER_MODIFIER: z.string().optional(),
 
+  // Request mirror (shadow traffic) — a sampled, fire-and-forget copy of the
+  // EFFECTIVE (masked/shaped) request POSTed to a second endpoint, never metered.
+  // JSON: {"url":"https://shadow/v1/messages","sampleRate":0.1,"headers":{...}}
+  REQUEST_MIRROR: z.string().optional(),
+  REQUEST_MIRROR_ALLOW_INTERNAL: envBool(false),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),

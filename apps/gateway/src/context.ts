@@ -30,7 +30,11 @@ import {
   ExternalAuthorizer,
 } from '@gulley/cel';
 import { assertEgressAllowed } from '@gulley/egress';
-import type { HeaderModifierConfig } from '@gulley/http-edge';
+import {
+  type HeaderModifierConfig,
+  RequestMirror,
+  type RequestMirrorConfig,
+} from '@gulley/http-edge';
 import type { RateResolver } from '@gulley/cost';
 import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulley/auth';
 import { OidcProvider } from '@gulley/oidc';
@@ -606,7 +610,16 @@ export function createProductionContext(config: Config): GatewayContext {
     headerModifier: config.HEADER_MODIFIER
       ? (JSON.parse(config.HEADER_MODIFIER) as HeaderModifierConfig)
       : undefined,
+    mirror: buildMirror(config),
   };
+}
+
+/** Build the shadow-traffic mirror, SSRF-guarding its target at boot. */
+export function buildMirror(config: Config): RequestMirror | undefined {
+  if (!config.REQUEST_MIRROR) return undefined;
+  const cfg = JSON.parse(config.REQUEST_MIRROR) as RequestMirrorConfig;
+  if (!config.REQUEST_MIRROR_ALLOW_INTERNAL) assertEgressAllowed(cfg.url);
+  return new RequestMirror(cfg);
 }
 
 /** Build the access-log field engine, FAIL-OPEN: a bad JSON/CEL config disables

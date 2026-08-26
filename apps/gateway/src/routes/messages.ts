@@ -20,7 +20,7 @@ import {
   type TokenVault,
 } from '@gulley/guardrails';
 import type { CelAuthorizer, CelTransformer, ExternalAuthorizer, HeaderChanges } from '@gulley/cel';
-import { applyHeaderRules, type HeaderModifierConfig } from '@gulley/http-edge';
+import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
@@ -131,6 +131,8 @@ export interface GatewayContext {
   /** Static request/response header set/remove applied to every proxied request
    *  (the non-CEL sibling of the transformer). */
   headerModifier?: HeaderModifierConfig;
+  /** Shadow-traffic mirror; fires a sampled copy of the effective request. */
+  mirror?: RequestMirror;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -603,6 +605,11 @@ async function handleProxy(
   reply.raw.on('close', () => {
     if (!reply.raw.writableEnded && !controller.signal.aborted) controller.abort();
   });
+
+  // Shadow traffic: fire-and-forget a sampled copy of the EFFECTIVE (masked/
+  // shaped/transformed) request to the mirror target. Fully detached — never
+  // awaited, never metered, errors swallowed; can't affect the real request.
+  ctx.mirror?.fire(body);
 
   // --- pre-first-byte failover + bounded same-target retry ---
   // The request body is fully buffered, so replaying it to the same target on a

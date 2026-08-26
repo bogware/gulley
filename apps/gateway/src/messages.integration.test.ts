@@ -6,13 +6,14 @@ import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/p
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
 import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
+import { RequestMirror } from '@gulley/http-edge';
 import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
 import { initTelemetry } from '@gulley/telemetry';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from './config';
 import { buildCustomProviders } from './context';
 import type { GatewayContext } from './routes/messages';
@@ -938,6 +939,45 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(received.body).toContain('"max_tokens":128'); // request body field injected upstream
 
     await app.close();
+  });
+
+  it('mirrors a sampled copy of the request to a shadow endpoint without affecting it', async () => {
+    let shadowBody = '';
+    const shadow = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        shadowBody = b;
+        res.writeHead(200).end('ok');
+      });
+    });
+    await new Promise<void>((r) => shadow.listen(0, '127.0.0.1', r));
+    const shadowUrl = `http://127.0.0.1:${(shadow.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.mirror = new RequestMirror({ url: shadowUrl, sampleRate: 1 });
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'shadow me' }],
+      }),
+    });
+    await res.text();
+    expect(res.status).toBe(200); // the real request is unaffected
+
+    // The shadow received the request body; it was NOT metered a second time.
+    await vi.waitFor(() => expect(shadowBody).toContain('shadow me'));
+    expect(ledger.entries).toHaveLength(1); // exactly one real metering, not two
+
+    await app.close();
+    await new Promise<void>((r) => shadow.close(() => r()));
   });
 
   it('applies the static header modifier (request injected upstream, response to client)', async () => {
