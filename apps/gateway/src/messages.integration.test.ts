@@ -416,6 +416,190 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
   });
 
+  it('hedges a slow primary: serves the fast secondary, aborts the primary, meters once', async () => {
+    let slowHit = false;
+    let slowAborted = false;
+    let slowResponded = false;
+    const slow = http.createServer((req, res) => {
+      slowHit = true;
+      req.resume();
+      const t = setTimeout(() => {
+        if (res.writableEnded || res.destroyed) return;
+        slowResponded = true;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(GOLDEN_SSE);
+      }, 400);
+      res.on('close', () => {
+        clearTimeout(t);
+        if (!slowResponded) slowAborted = true;
+      });
+    });
+    await new Promise<void>((r) => slow.listen(0, '127.0.0.1', r));
+    const slowUrl = `http://127.0.0.1:${(slow.address() as AddressInfo).port}`;
+    const fast = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(GOLDEN_SSE);
+    });
+    await new Promise<void>((r) => fast.listen(0, '127.0.0.1', r));
+    const fastUrl = `http://127.0.0.1:${(fast.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        hedgeDelayMs: 50, // hedge if the primary hasn't answered in 50ms
+        strategy: {
+          mode: 'fallback',
+          targets: [anthropicTarget('slow', slowUrl), anthropicTarget('fast', fastUrl)],
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    // The slow socket's close event may land just after the client finishes;
+    // wait briefly for it so the cancellation assertion is deterministic.
+    const deadline = Date.now() + 1000;
+    while (!slowAborted && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-target')).toBe('fast'); // the hedge won
+    expect(text).toContain('message_start');
+    expect(slowHit).toBe(true); // the primary WAS dispatched (then hedged)
+    expect(slowResponded).toBe(false);
+    expect(slowAborted).toBe(true); // ...and cancelled once the hedge won
+    expect(ledger.entries).toHaveLength(1); // metered exactly once (the winner)
+    expect(ledger.entries[0]?.cost.outputTokens).toBe(42);
+
+    await app.close();
+    await new Promise<void>((r) => slow.close(() => r()));
+    await new Promise<void>((r) => fast.close(() => r()));
+  });
+
+  it('relays the last candidate real failover status (not a synthetic 502) when a hedge finds no usable response', async () => {
+    // 2-candidate hedged route where BOTH branches return a failover status: the
+    // client must still receive the last candidate's genuine upstream error
+    // (status + body), the last-resort relay — not a synthetic gateway 502.
+    const slow503 = http.createServer((req, res) => {
+      req.resume();
+      setTimeout(() => {
+        if (res.writableEnded || res.destroyed) return;
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end('{"type":"error","error":{"type":"overloaded_error","message":"primary 503"}}');
+      }, 250);
+    });
+    await new Promise<void>((r) => slow503.listen(0, '127.0.0.1', r));
+    const slow503Url = `http://127.0.0.1:${(slow503.address() as AddressInfo).port}`;
+    const fast529 = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(529, { 'content-type': 'application/json', 'retry-after': '7' });
+      res.end('{"type":"error","error":{"type":"overloaded_error","message":"upstream 529"}}');
+    });
+    await new Promise<void>((r) => fast529.listen(0, '127.0.0.1', r));
+    const fast529Url = `http://127.0.0.1:${(fast529.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        hedgeDelayMs: 50,
+        strategy: {
+          mode: 'fallback',
+          targets: [anthropicTarget('primary', slow503Url), anthropicTarget('last', fast529Url)],
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(529); // the real provider error, not a synthetic 502
+    expect(res.headers.get('x-gulley-target')).toBe('last');
+    expect(text).toContain('upstream 529'); // the genuine upstream body is relayed
+
+    await app.close();
+    await new Promise<void>((r) => slow503.close(() => r()));
+    await new Promise<void>((r) => fast529.close(() => r()));
+  });
+
+  it('does not fire the hedge when the primary answers within the delay', async () => {
+    let secondaryHit = false;
+    const secondary = http.createServer((req, res) => {
+      secondaryHit = true;
+      req.resume();
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(GOLDEN_SSE);
+    });
+    await new Promise<void>((r) => secondary.listen(0, '127.0.0.1', r));
+    const secondaryUrl = `http://127.0.0.1:${(secondary.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        hedgeDelayMs: 300, // primary answers well within this
+        strategy: {
+          mode: 'fallback',
+          targets: [
+            anthropicTarget('primary', upstreamUrl),
+            anthropicTarget('secondary', secondaryUrl),
+          ],
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-target')).toBe('primary');
+    expect(secondaryHit).toBe(false); // hedge never fired — no wasted upstream call
+
+    await app.close();
+    await new Promise<void>((r) => secondary.close(() => r()));
+  });
+
   it('rejects a request whose worst-case reservation exceeds the workspace budget', async () => {
     const { store, token } = seededStore();
     // Tiny cap: sonnet-4-6 with max_tokens=1000 reserves well over 500 microUSD.

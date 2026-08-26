@@ -73,6 +73,11 @@ export interface ProviderRoute {
   /** Opt in to hold-then-flush enforcement of the OUTPUT policy on streamed
    *  responses (buffers the stream, then blocks/withholds). Trades streaming. */
   holdStreamedOutput?: boolean;
+  /** Request hedging: if the primary candidate hasn't returned response headers
+   *  within this many ms, dispatch the next candidate in parallel and serve
+   *  whichever answers first (pre-first-byte only). Overrides the ctx default;
+   *  0/undefined = use ctx.hedgeDelayMs. */
+  hedgeDelayMs?: number;
 }
 
 export interface GatewayContext {
@@ -87,6 +92,9 @@ export interface GatewayContext {
   breakerSync?: BreakerSync & { stop(): void };
   /** Per-target adaptive concurrency limiter; absent = no admission ceiling. */
   limiter?: AdaptiveLimiter;
+  /** Default request-hedging delay (ms) applied to multi-target routes; a route's
+   *  own `hedgeDelayMs` overrides it. Absent/0 = hedging off. */
+  hedgeDelayMs?: number;
   budgets: BudgetStore;
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */
@@ -737,119 +745,290 @@ async function handleProxy(
   let anyRealAttempt = false; // we actually forwarded to at least one upstream
   let dispatchMs: number | undefined; // when we dispatched to the serving target
   let firstByteMs: number | undefined; // when its response headers arrived
-  for (let i = 0; i < candidates.length; i++) {
-    const target = candidates[i] as RouteTarget;
-    const isLast = i === candidates.length - 1;
-    let resp: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
-    let retryAfterMs: number | undefined;
-    let forwardStart = 0;
 
-    // Adaptive concurrency: a target at its dynamic in-flight ceiling is skipped
-    // (a load-shed, NOT a fault — the breaker must not trip). The slot is held for
-    // the whole request and released with the observed RTT in teardown / on failover.
-    let limiterAcquired = false;
-    if (ctx.limiter) {
-      if (!ctx.limiter.tryAcquire(target.name)) {
-        anySaturation = true;
-        request.log.warn({ target: target.name }, 'target at capacity — skipping');
-        continue;
-      }
-      limiterAcquired = true;
-    }
-    anyRealAttempt = true;
+  type UpstreamResp = Awaited<ReturnType<RouteTarget['adapter']['forward']>>;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (controller.signal.aborted) break;
-      if (attempt > 0) {
-        const backoff = Math.min(retryBackoffMs * 2 ** (attempt - 1), 2000);
-        await abortableSleep(Math.max(backoff, retryAfterMs ?? 0), controller.signal);
-        if (controller.signal.aborted) break;
-      }
-      try {
-        // Multi-tenant isolation: forward with THIS tenant's own provider key
-        // when it has one, else the gateway's default (route/env) credential.
-        const credential =
-          (await ctx.tenantCredentials?.resolve(principal.scope.workspaceId, target.provider)) ??
-          target.credential;
-        forwardStart = Date.now();
-        const r = await target.adapter.forward({
-          path: target.upstreamPath,
-          body,
-          headers: forwardHeaders,
-          credential,
-          signal: controller.signal,
-        });
-        retryAfterMs = parseRetryAfterMs(r.headers);
-        // A transient status with attempts left → discard and retry the SAME target.
-        if (
-          r.statusCode >= 400 &&
-          isFailoverStatus(strategy, r.statusCode) &&
-          attempt < maxAttempts - 1
-        ) {
-          ctx.breaker.recordFailure(target.name, retryAfterMs);
-          r.body.resume();
-          request.log.warn({ target: target.name, status: r.statusCode, attempt }, 'retrying');
-          continue;
-        }
-        resp = r;
-        break;
-      } catch (err) {
-        request.log.warn({ target: target.name, err, attempt }, 'target attempt error');
-        if (controller.signal.aborted) break;
-        if (attempt < maxAttempts - 1) {
-          ctx.breaker.recordFailure(target.name); // connection error → retry same target
-          continue;
-        }
-      }
-    }
-
-    if (!resp) {
-      // All attempts on this target hard-failed (connection errors) or aborted.
-      ctx.breaker.recordFailure(target.name);
-      if (limiterAcquired)
-        ctx.limiter?.record(target.name, forwardStart ? Date.now() - forwardStart : 0, true);
-      if (controller.signal.aborted) break; // client gone — stop trying
-      continue; // fail over to the next candidate
-    }
-
-    if (!isLast && resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
-      ctx.breaker.recordFailure(target.name, retryAfterMs);
-      if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
-      ctx.metrics?.recordFailover(target.name);
-      resp.body.resume(); // discard the failed body, then try the next target
-      request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
-      continue;
-    }
+  // Commit a chosen (pre-first-byte) upstream response as the one we serve: record
+  // its TTFB to the outlier detector, hold the scoreboard + limiter slots, and
+  // update the breaker. Shared by the sequential failover loop and the hedge race
+  // so both commit identically.
+  const commitServed = (
+    target: RouteTarget,
+    resp: UpstreamResp,
+    fwdStart: number,
+    limiterAcquired: boolean,
+  ): void => {
     upstream = resp;
     served = target;
-    dispatchMs = forwardStart;
+    dispatchMs = fwdStart;
     firstByteMs = Date.now();
-    // Feed time-to-response-headers (peer-relative) to the passive outlier
-    // detector — measured independent of stream-body duration, judged against the
-    // candidate pool. Only served (pre-first-byte) responses count.
     ctx.outlier?.recordLatency(
       target.name,
-      Date.now() - forwardStart,
+      firstByteMs - fwdStart,
       candidates.map((c) => c.name),
     );
-    // Mark this target in-flight for power-of-two-choices least-load; released
-    // in teardown (guarded so a double teardown can't double-decrement).
     if (ctx.scoreboard) {
       ctx.scoreboard.begin(target.name);
       scoreboardHeld = true;
     }
-    // Hold the adaptive-concurrency slot for the whole request; teardown releases
-    // it with the full request duration (the concurrency it actually consumed).
     if (limiterAcquired) limiterHeld = true;
-    // The breaker should track UPSTREAM faults, not client mistakes: a terminal
-    // 4xx (400/401/403/404/422) is the caller's error and must not trip the
-    // breaker for every other tenant sharing this target.
     if (resp.statusCode < 400) ctx.breaker.recordSuccess(target.name);
     else if (isFailoverStatus(strategy, resp.statusCode)) {
-      ctx.breaker.recordFailure(target.name, retryAfterMs);
+      ctx.breaker.recordFailure(target.name, parseRetryAfterMs(resp.headers));
     }
-    break;
+  };
+
+  const credentialFor = async (target: RouteTarget): Promise<typeof target.credential> =>
+    (await ctx.tenantCredentials?.resolve(principal.scope.workspaceId, target.provider)) ??
+    target.credential;
+
+  // --- request hedging (opt-in, pre-first-byte only) ---
+  // One hedge branch = a SINGLE forward (no same-target retry — hedging is a
+  // cross-target concern) with its own breaker/limiter accounting.
+  type BranchResult =
+    | {
+        kind: 'usable';
+        target: RouteTarget;
+        resp: UpstreamResp;
+        forwardStart: number;
+        limiterAcquired: boolean;
+      }
+    | { kind: 'failed'; target: RouteTarget }
+    | { kind: 'saturated'; target: RouteTarget }
+    | { kind: 'aborted'; target: RouteTarget };
+
+  const hedgeBranch = async (target: RouteTarget, signal: AbortSignal): Promise<BranchResult> => {
+    let limiterAcquired = false;
+    if (ctx.limiter) {
+      if (!ctx.limiter.tryAcquire(target.name)) {
+        anySaturation = true;
+        return { kind: 'saturated', target };
+      }
+      limiterAcquired = true;
+    }
+    anyRealAttempt = true;
+    const forwardStart = Date.now();
+    try {
+      const resp = await target.adapter.forward({
+        path: target.upstreamPath,
+        body,
+        headers: forwardHeaders,
+        credential: await credentialFor(target),
+        signal,
+      });
+      if (resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
+        ctx.breaker.recordFailure(target.name, parseRetryAfterMs(resp.headers));
+        if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
+        resp.body.resume();
+        return { kind: 'failed', target };
+      }
+      return { kind: 'usable', target, resp, forwardStart, limiterAcquired };
+    } catch (err) {
+      if (signal.aborted) {
+        // We (or the client) cancelled this branch — not a fault: free the slot
+        // without adapting the limit, and don't blame the breaker.
+        if (limiterAcquired) ctx.limiter?.release(target.name);
+        return { kind: 'aborted', target };
+      }
+      request.log.warn({ target: target.name, err }, 'hedge branch error');
+      ctx.breaker.recordFailure(target.name);
+      if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
+      return { kind: 'failed', target };
+    }
+  };
+
+  const linkChild = (): AbortController => {
+    const child = new AbortController();
+    if (controller.signal.aborted) child.abort();
+    else controller.signal.addEventListener('abort', () => child.abort(), { once: true });
+    return child;
+  };
+
+  // A branch that lost the race but had already returned headers: drain its body
+  // and free its slot (it succeeded; we simply discard it).
+  const drainLoser = async (p: Promise<BranchResult>): Promise<void> => {
+    const r = await p;
+    if (r.kind === 'usable') {
+      r.resp.body.resume();
+      if (r.limiterAcquired) ctx.limiter?.release(r.target.name);
+    }
+  };
+
+  type Winner = {
+    target: RouteTarget;
+    resp: UpstreamResp;
+    forwardStart: number;
+    limiterAcquired: boolean;
+  };
+
+  // Resolve to the first branch that returns a USABLE response, aborting + draining
+  // the losers. Non-usable branches (failover/error/saturated) are awaited out; if
+  // none is usable, resolve undefined so outer failover continues.
+  const firstUsable = async (
+    branches: { p: Promise<BranchResult>; ctrl: AbortController }[],
+  ): Promise<Winner | undefined> => {
+    let pool = branches.map((b, i) => ({ i, tagged: b.p.then((r) => ({ i, r })) }));
+    while (pool.length > 0) {
+      const { i, r } = await Promise.race(pool.map((x) => x.tagged));
+      pool = pool.filter((x) => x.i !== i);
+      if (r.kind === 'usable') {
+        for (const [j, b] of branches.entries()) if (j !== i) b.ctrl.abort();
+        await Promise.all(branches.map((b, j) => (j === i ? Promise.resolve() : drainLoser(b.p))));
+        return {
+          target: r.target,
+          resp: r.resp,
+          forwardStart: r.forwardStart,
+          limiterAcquired: r.limiterAcquired,
+        };
+      }
+    }
+    return undefined;
+  };
+
+  // Run the primary; if it hasn't answered within `delayMs`, launch the hedge and
+  // race both. Returns the winner (to commit) or the index the sequential loop
+  // should resume from (so already-attempted candidates aren't re-forwarded).
+  const runHedge = async (
+    a: RouteTarget,
+    b: RouteTarget,
+    delayMs: number,
+  ): Promise<{ winner?: Winner; nextIndex: number }> => {
+    const ctrlA = linkChild();
+    const pA = hedgeBranch(a, ctrlA.signal);
+    const raced = await Promise.race([
+      pA.then((r) => ({ tag: 'a' as const, r })),
+      abortableSleep(delayMs, controller.signal).then(() => ({ tag: 'timer' as const })),
+    ]);
+    if (raced.tag === 'a') {
+      if (raced.r.kind === 'usable') return { winner: raced.r, nextIndex: 2 };
+      if (raced.r.kind === 'aborted') return { nextIndex: candidates.length }; // client gone
+      return { nextIndex: 1 }; // A failed/saturated fast → failover to B normally
+    }
+    if (controller.signal.aborted) {
+      await drainLoser(pA);
+      return { nextIndex: candidates.length };
+    }
+    const ctrlB = linkChild();
+    const pB = hedgeBranch(b, ctrlB.signal);
+    const winner = await firstUsable([
+      { p: pA, ctrl: ctrlA },
+      { p: pB, ctrl: ctrlB },
+    ]);
+    return { winner, nextIndex: 2 };
+  };
+
+  let startIndex = 0;
+  const hedgeDelay = route.hedgeDelayMs ?? ctx.hedgeDelayMs ?? 0;
+  if (hedgeDelay > 0 && candidates.length >= 2 && !controller.signal.aborted) {
+    const hr = await runHedge(
+      candidates[0] as RouteTarget,
+      candidates[1] as RouteTarget,
+      hedgeDelay,
+    );
+    if (hr.winner)
+      commitServed(
+        hr.winner.target,
+        hr.winner.resp,
+        hr.winner.forwardStart,
+        hr.winner.limiterAcquired,
+      );
+    else if (hr.nextIndex >= candidates.length && !controller.signal.aborted)
+      // The hedge exhausted the whole candidate list with no usable response and
+      // discarded the (drained) failover-status bodies. Re-run the LAST candidate
+      // through the sequential path so its genuine failover-status response
+      // (provider status + body + Retry-After) is relayed as the last resort —
+      // matching the non-hedge failover behavior — instead of a synthetic 502.
+      startIndex = candidates.length - 1;
+    else startIndex = hr.nextIndex;
   }
+
+  if (!upstream)
+    for (let i = startIndex; i < candidates.length; i++) {
+      const target = candidates[i] as RouteTarget;
+      const isLast = i === candidates.length - 1;
+      let resp: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
+      let retryAfterMs: number | undefined;
+      let forwardStart = 0;
+
+      // Adaptive concurrency: a target at its dynamic in-flight ceiling is skipped
+      // (a load-shed, NOT a fault — the breaker must not trip). The slot is held for
+      // the whole request and released with the observed RTT in teardown / on failover.
+      let limiterAcquired = false;
+      if (ctx.limiter) {
+        if (!ctx.limiter.tryAcquire(target.name)) {
+          anySaturation = true;
+          request.log.warn({ target: target.name }, 'target at capacity — skipping');
+          continue;
+        }
+        limiterAcquired = true;
+      }
+      anyRealAttempt = true;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (controller.signal.aborted) break;
+        if (attempt > 0) {
+          const backoff = Math.min(retryBackoffMs * 2 ** (attempt - 1), 2000);
+          await abortableSleep(Math.max(backoff, retryAfterMs ?? 0), controller.signal);
+          if (controller.signal.aborted) break;
+        }
+        try {
+          // Multi-tenant isolation: forward with THIS tenant's own provider key
+          // when it has one, else the gateway's default (route/env) credential.
+          const credential = await credentialFor(target);
+          forwardStart = Date.now();
+          const r = await target.adapter.forward({
+            path: target.upstreamPath,
+            body,
+            headers: forwardHeaders,
+            credential,
+            signal: controller.signal,
+          });
+          retryAfterMs = parseRetryAfterMs(r.headers);
+          // A transient status with attempts left → discard and retry the SAME target.
+          if (
+            r.statusCode >= 400 &&
+            isFailoverStatus(strategy, r.statusCode) &&
+            attempt < maxAttempts - 1
+          ) {
+            ctx.breaker.recordFailure(target.name, retryAfterMs);
+            r.body.resume();
+            request.log.warn({ target: target.name, status: r.statusCode, attempt }, 'retrying');
+            continue;
+          }
+          resp = r;
+          break;
+        } catch (err) {
+          request.log.warn({ target: target.name, err, attempt }, 'target attempt error');
+          if (controller.signal.aborted) break;
+          if (attempt < maxAttempts - 1) {
+            ctx.breaker.recordFailure(target.name); // connection error → retry same target
+            continue;
+          }
+        }
+      }
+
+      if (!resp) {
+        // All attempts on this target hard-failed (connection errors) or aborted.
+        ctx.breaker.recordFailure(target.name);
+        if (limiterAcquired)
+          ctx.limiter?.record(target.name, forwardStart ? Date.now() - forwardStart : 0, true);
+        if (controller.signal.aborted) break; // client gone — stop trying
+        continue; // fail over to the next candidate
+      }
+
+      if (!isLast && resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
+        ctx.breaker.recordFailure(target.name, retryAfterMs);
+        if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
+        ctx.metrics?.recordFailover(target.name);
+        resp.body.resume(); // discard the failed body, then try the next target
+        request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
+        continue;
+      }
+      // Commit this (pre-first-byte) response: outlier TTFB, scoreboard + limiter
+      // holds, and the breaker success/terminal-4xx handling — see commitServed.
+      commitServed(target, resp, forwardStart, limiterAcquired);
+      break;
+    }
 
   const streamed = served?.alwaysStream === true || parsed['stream'] === true;
   const provider = served?.provider ?? provider0;

@@ -96,6 +96,13 @@ export class AdaptiveLimiter {
     );
   }
 
+  /** Release a slot WITHOUT adapting the limit — for a request that was cancelled
+   *  (e.g. a hedge loser aborted mid-flight), whose latency is not a real signal. */
+  release(name: string): void {
+    const s = this.get(name);
+    s.inflight = Math.max(0, s.inflight - 1);
+  }
+
   /** Current concurrency limit (floored) for `name`. */
   currentLimit(name: string): number {
     return Math.max(this.minLimit, Math.floor(this.get(name).limit));

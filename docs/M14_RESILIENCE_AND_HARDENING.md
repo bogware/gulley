@@ -77,6 +77,11 @@ by default.
   if both hedges are unusable, outer failover continues to the remaining
   candidates. Breaker/outlier/limiter side effects are recorded per branch, but
   only the winner holds the scoreboard/limiter slot into teardown.
+- **Last-resort relay preserved.** When a hedge exhausts the whole candidate list
+  with no usable response, the last candidate is re-run through the sequential
+  path so its genuine failover-status response (provider status + body +
+  Retry-After) is relayed — never collapsed to a synthetic 502. (Caught by the
+  adversarial review; regression-tested.)
 
 **Invariants preserved:** single `teardown()`; failover pre-first-byte only (a
 hedge IS pre-first-byte); budget reserved once (worst-case for one response);
