@@ -27,6 +27,21 @@ import {
   workspace,
 } from './schema';
 
+/** Resolve one tenant's provider credential reference (ARN) by workspace +
+ *  provider kind — for multi-tenant per-tenant upstream credentials. */
+export async function resolveProviderCredentialRef(
+  db: Database,
+  workspaceId: string,
+  kind: string,
+): Promise<SecretRef | null> {
+  const [row] = await db
+    .select({ arn: providerCredential.secretArn, version: providerCredential.secretVersion })
+    .from(provider)
+    .innerJoin(providerCredential, eq(providerCredential.providerId, provider.id))
+    .where(sql`${provider.workspaceId} = ${workspaceId} and ${provider.kind} = ${kind}`);
+  return row ? secretRef(row.arn, row.version) : null;
+}
+
 /** The five identically-shaped jsonb collection tables (id/workspace_id/name/config). */
 function jsonbTable(kind: ConfigCollectionKind): typeof route {
   switch (kind) {

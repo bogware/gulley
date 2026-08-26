@@ -8,6 +8,7 @@ import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
 import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { RequestMirror } from '@gulley/http-edge';
 import { RequestTracer } from './tracer';
+import { MapTenantCredentialResolver } from './tenant';
 import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
@@ -1053,6 +1054,34 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(res.status).toBe(200);
     expect(received.tenant).toBe('acme'); // request header reached upstream
     expect(res.headers.get('x-gateway')).toBe('gulley'); // response header reached the client
+
+    await app.close();
+  });
+
+  it("forwards with the tenant's own upstream credential (multi-tenant isolation)", async () => {
+    const { store, token } = seededStore(); // virtual key is in workspace ws_1
+    const { ctx } = buildContext(store);
+    ctx.tenantCredentials = new MapTenantCredentialResolver(
+      new Map([['ws_1', new Map([['anthropic', { scheme: 'x-api-key', value: 'tenant-1-key' }]])]]),
+    );
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    await (
+      await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      })
+    ).text();
+
+    // The gateway's default upstream key is UPSTREAM_KEY; ws_1's tenant key wins.
+    expect(received.apiKey).toBe('tenant-1-key');
+    expect(received.apiKey).not.toBe(UPSTREAM_KEY);
 
     await app.close();
   });

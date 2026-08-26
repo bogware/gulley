@@ -24,6 +24,7 @@ import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from 
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
 import type { RequestTracer } from '../tracer';
+import type { TenantCredentialResolver } from '../tenant';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
@@ -142,6 +143,9 @@ export interface GatewayContext {
   tracer?: RequestTracer;
   /** Bearer token guarding /debug/trace; the endpoint is only served when set. */
   debugTraceToken?: string;
+  /** Multi-tenant upstream credentials — resolves a tenant's own provider key by
+   *  workspace; absent = every tenant uses the gateway's default credential. */
+  tenantCredentials?: TenantCredentialResolver;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -739,12 +743,17 @@ async function handleProxy(
         if (controller.signal.aborted) break;
       }
       try {
+        // Multi-tenant isolation: forward with THIS tenant's own provider key
+        // when it has one, else the gateway's default (route/env) credential.
+        const credential =
+          (await ctx.tenantCredentials?.resolve(principal.scope.workspaceId, target.provider)) ??
+          target.credential;
         forwardStart = Date.now();
         const r = await target.adapter.forward({
           path: target.upstreamPath,
           body,
           headers: forwardHeaders,
-          credential: target.credential,
+          credential,
           signal: controller.signal,
         });
         retryAfterMs = parseRetryAfterMs(r.headers);

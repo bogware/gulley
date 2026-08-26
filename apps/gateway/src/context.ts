@@ -40,6 +40,8 @@ import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulle
 import { OidcProvider } from '@gulley/oidc';
 import { readFileSync } from 'node:fs';
 import type { JwtAuthConfig } from './jwt-auth';
+import { buildSecretResolver } from './secrets';
+import { DbTenantCredentialResolver } from './tenant';
 import { RequestTracer } from './tracer';
 import {
   auditOnlyPolicies,
@@ -625,6 +627,12 @@ export function createProductionContext(config: Config): GatewayContext {
     mirror: buildMirror(config),
     tracer: config.DEBUG_TRACE_TOKEN ? new RequestTracer(config.DEBUG_TRACE_BUFFER) : undefined,
     debugTraceToken: config.DEBUG_TRACE_TOKEN,
+    // Multi-tenant per-tenant upstream credentials (db config mode): each tenant
+    // authenticates upstream with its own key, resolved from Postgres + secrets.
+    tenantCredentials:
+      config.CONFIG_SOURCE === 'db'
+        ? new DbTenantCredentialResolver(db, buildSecretResolver(config))
+        : undefined,
   };
 }
 
