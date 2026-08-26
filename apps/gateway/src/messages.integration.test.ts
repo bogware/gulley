@@ -591,6 +591,49 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
     await new Promise<void>((r) => local.close(() => r()));
   });
+
+  it('proxies and meters an embeddings request to a local provider', async () => {
+    const emb = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          object: 'list',
+          model: 'nomic-embed-text',
+          data: [{ object: 'embedding', index: 0, embedding: [0.1, 0.2, 0.3] }],
+          usage: { prompt_tokens: 8, total_tokens: 8 },
+        }),
+      );
+    });
+    await new Promise<void>((r) => emb.listen(0, '127.0.0.1', r));
+    const embUrl = `http://127.0.0.1:${(emb.address() as AddressInfo).port}`;
+
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      CUSTOM_PROVIDERS: JSON.stringify([{ provider: 'ollama', baseUrl: embUrl, embeddings: true }]),
+    } as NodeJS.ProcessEnv);
+    const custom = buildCustomProviders(config);
+
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = custom.routes;
+
+    const app = buildServer(config, ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/ollama/v1/embeddings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({ model: 'nomic-embed-text', input: 'hello' }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    expect(ledger.entries.at(-1)?.provider).toBe('ollama');
+    expect(ledger.entries.at(-1)?.cost.totalInputTokens).toBe(8);
+
+    await app.close();
+    await new Promise<void>((r) => emb.close(() => r()));
+  });
 });
 
 function single(v: string | string[] | undefined): string | undefined {

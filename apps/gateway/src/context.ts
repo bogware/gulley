@@ -179,6 +179,21 @@ export function buildRoutes(config: Config): ProviderRoute[] {
         },
       },
     });
+    routes.push({
+      clientPaths: ['/v1/embeddings', '/openai/v1/embeddings'],
+      createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'openai',
+          provider: 'openai',
+          adapter,
+          credential,
+          upstreamPath: '/v1/embeddings',
+        },
+      },
+      cacheable: false,
+    });
   }
 
   if (config.BEDROCK_UPSTREAM_API_KEY) {
@@ -270,10 +285,11 @@ export function buildCustomProviders(config: Config): {
     if (seen.has(r.provider)) throw new Error(`duplicate custom provider label: ${r.provider}`);
     seen.add(r.provider);
     const credential: UpstreamCredential = { scheme: 'bearer', value: r.apiKey };
+    const adapter = new PassthroughAdapter({ name: r.provider, baseUrl: r.baseUrl });
     const target: RouteTarget = {
       name: r.provider,
       provider: r.provider,
-      adapter: new PassthroughAdapter({ name: r.provider, baseUrl: r.baseUrl }),
+      adapter,
       credential,
       upstreamPath: r.chatPath,
     };
@@ -283,6 +299,23 @@ export function buildCustomProviders(config: Config): {
       createExtractor: () => new OpenAIUsageExtractor(),
       strategy,
     });
+    if (r.embeddingsPath) {
+      routes.push({
+        clientPaths: [`/${r.provider}/v1/embeddings`],
+        createExtractor: () => new OpenAIUsageExtractor(),
+        strategy: {
+          mode: 'single',
+          target: {
+            name: r.provider,
+            provider: r.provider,
+            adapter,
+            credential,
+            upstreamPath: r.embeddingsPath,
+          },
+        },
+        cacheable: false,
+      });
+    }
     for (const m of r.models) {
       models.push(m);
       modelRules.push({ pattern: m, strategy, provider: r.provider });

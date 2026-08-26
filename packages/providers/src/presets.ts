@@ -16,6 +16,8 @@ export interface ProviderPreset {
   baseUrl: string;
   /** Path appended to baseUrl for chat completions. */
   chatPath: string;
+  /** Path for embeddings, when the preset's base differs from `/v1/embeddings`. */
+  embeddingsPath?: string;
   /** True if the backend needs an API key (local runtimes do not). */
   requiresKey: boolean;
   /** Loopback/self-hosted runtime (keyless, http, operator-configured host). */
@@ -23,6 +25,7 @@ export interface ProviderPreset {
 }
 
 const CHAT = '/v1/chat/completions';
+const EMBED = '/v1/embeddings';
 
 export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
   // --- Hosted OpenAI-compatible ---
@@ -79,12 +82,22 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
     provider: 'deepinfra',
     baseUrl: 'https://api.deepinfra.com/v1/openai',
     chatPath: '/chat/completions',
+    embeddingsPath: '/embeddings',
     requiresKey: true,
   },
   perplexity: {
     provider: 'perplexity',
     baseUrl: 'https://api.perplexity.ai',
     chatPath: '/chat/completions',
+    requiresKey: true,
+  },
+  // Google Gemini via its OpenAI-compatible surface (native generateContent
+  // adapter with thoughtSignature round-trip is a later, higher-fidelity add).
+  gemini: {
+    provider: 'gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    chatPath: '/chat/completions',
+    embeddingsPath: '/embeddings',
     requiresKey: true,
   },
 
@@ -162,6 +175,10 @@ export interface CustomProviderConfig {
   /** Model ids this provider serves — surfaced by /v1/models and used to route
    *  a shared /v1/chat/completions request by model. */
   models?: string[];
+  /** Expose a /{provider}/v1/embeddings passthrough (many local runtimes serve
+   *  embeddings too). Defaults the path to /v1/embeddings unless overridden. */
+  embeddings?: boolean;
+  embeddingsPath?: string;
 }
 
 export interface ResolvedProvider {
@@ -171,6 +188,8 @@ export interface ResolvedProvider {
   apiKey: string;
   local: boolean;
   models: string[];
+  /** Present when this provider should expose an embeddings passthrough. */
+  embeddingsPath?: string;
 }
 
 /** Resolve a declarative entry against the preset table. Throws on missing
@@ -182,6 +201,11 @@ export function resolveCustomProvider(entry: CustomProviderConfig): ResolvedProv
   const baseUrl = entry.baseUrl ?? preset?.baseUrl;
   if (!provider) throw new Error('custom provider requires a "provider" label (or a preset)');
   if (!baseUrl) throw new Error(`custom provider "${provider}" requires a baseUrl (or a preset)`);
+  // Embeddings are opt-in: an explicit path, or the `embeddings` flag which uses
+  // the preset's embeddings path (falling back to /v1/embeddings).
+  const embeddingsPath =
+    entry.embeddingsPath ?? (entry.embeddings ? (preset?.embeddingsPath ?? EMBED) : undefined);
+
   return {
     provider,
     baseUrl,
@@ -189,5 +213,6 @@ export function resolveCustomProvider(entry: CustomProviderConfig): ResolvedProv
     apiKey: entry.apiKey ?? '',
     local: preset?.local ?? false,
     models: Array.isArray(entry.models) ? entry.models.filter((m) => typeof m === 'string') : [],
+    ...(embeddingsPath ? { embeddingsPath } : {}),
   };
 }

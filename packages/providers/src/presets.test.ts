@@ -46,6 +46,20 @@ describe('resolveCustomProvider', () => {
     expect(PROVIDER_PRESETS['ollama']?.local).toBe(true);
     expect(PROVIDER_PRESETS['lmstudio']?.baseUrl).toContain('1234');
   });
+
+  it('resolves Gemini via its OpenAI-compatible surface', () => {
+    const r = resolveCustomProvider({ preset: 'gemini', apiKey: 'k', embeddings: true });
+    expect(r.baseUrl).toContain('generativelanguage.googleapis.com');
+    expect(r.chatPath).toBe('/chat/completions');
+    expect(r.embeddingsPath).toBe('/embeddings');
+  });
+
+  it('treats embeddings as opt-in with a default path', () => {
+    expect(resolveCustomProvider({ preset: 'ollama' }).embeddingsPath).toBeUndefined();
+    expect(resolveCustomProvider({ preset: 'ollama', embeddings: true }).embeddingsPath).toBe(
+      '/v1/embeddings',
+    );
+  });
 });
 
 describe('PassthroughAdapter keyless mode', () => {
