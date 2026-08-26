@@ -41,7 +41,7 @@ pnpm typecheck
 pnpm test
 ```
 
-Or in one shot, the way CI does it: `bash ci/all.sh`.
+Or in one shot, the way CI does it: `bash ci/verify.sh`.
 
 ### Guidelines
 
@@ -50,6 +50,7 @@ Or in one shot, the way CI does it: `bash ci/all.sh`.
 - **Tests travel with code.** New behavior needs tests; bug fixes need a regression test.
 - **Never commit secrets.** Only Secrets Manager ARNs belong in the tree — no provider keys, tokens, or credentials, even in tests or `.env` examples.
 - **Respect the architecture.** The request pipeline, provider abstraction, and security invariants in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) are deliberate. If a change works against them, open an issue to discuss first.
+- **Hot-path changes get an adversarial review.** If a change touches the data-plane hot path (`bash ci/hotpath-guard.sh` lists what qualifies), run the adversarial review pass in [`docs/HOTPATH_REVIEW.md`](docs/HOTPATH_REVIEW.md) and add a `Hotpath-Reviewed:` trailer to a commit — CI (`HOTPATH_STRICT=1`) requires it.
 
 ## Dependency updates
 

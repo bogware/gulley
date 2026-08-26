@@ -26,6 +26,16 @@ jobs:
       - script: bash ci/verify.sh
         displayName: Verify (format/lint/types/tests/build)
 
+  - job: hotpath
+    displayName: Hot-path review guard
+    steps:
+      # Azure shallow-clones by default; fetch history so the diff vs origin/main
+      # is available to ci/hotpath-guard.sh.
+      - checkout: self
+        fetchDepth: 0
+      - script: HOTPATH_STRICT=1 bash ci/hotpath-guard.sh
+        displayName: Hot-path review guard (strict)
+
   - job: terraform
     displayName: Terraform
     steps:

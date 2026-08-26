@@ -25,6 +25,19 @@ jobs:
         # ReDoS, and guard fuzz tests) / build.
         run: bash ci/verify.sh
 
+  hotpath:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need history to diff against origin/main
+      - name: Hot-path review guard
+        # Fails a PR that touches data-plane invariants unless a commit carries a
+        # `Hotpath-Reviewed:` trailer. See docs/HOTPATH_REVIEW.md.
+        env:
+          HOTPATH_STRICT: '1'
+        run: bash ci/hotpath-guard.sh
+
   terraform:
     runs-on: ubuntu-latest
     steps:
