@@ -1,6 +1,6 @@
 import { shannonEntropy } from './entropy';
-import { NATIVE_PATTERNS } from './patterns';
-import type { Detector, Finding } from './types';
+import { CONTEXT_WORDS, NATIVE_PATTERNS } from './patterns';
+import type { Detector, Finding, PiiCategory } from './types';
 
 export interface NativeDetectorOptions {
   /** Enable the high-entropy catch-all for unkeyed secrets. Default true. */
@@ -9,9 +9,33 @@ export interface NativeDetectorOptions {
   minEntropyBits?: number;
   /** Minimum length of a token considered by the entropy pass. Default 24. */
   minEntropyLength?: number;
+  /** Raise a finding's confidence when a category context word sits nearby
+   *  (e.g. "SSN" beside a 9-digit run). Default true. */
+  contextBoost?: boolean;
 }
 
 const ENTROPY_CANDIDATE = /[A-Za-z0-9+/=_-]{16,}/g;
+
+// Context-word boosting: a match near a category keyword is more likely genuine.
+const CTX_BEFORE = 48;
+const CTX_AFTER = 24;
+const CTX_BOOST = 0.2;
+const CTX_MAX = 0.98;
+
+/** Boost (in place) the confidence of findings that sit near a context word for
+ *  their category. Mutates before overlap resolution so a boosted weak finding
+ *  can win its span. */
+export function applyContextBoost(text: string, findings: Finding[]): void {
+  for (const f of findings) {
+    const rx = CONTEXT_WORDS[f.category as PiiCategory];
+    if (!rx) continue;
+    const before = text.slice(Math.max(0, f.start - CTX_BEFORE), f.start);
+    const after = text.slice(f.end, f.end + CTX_AFTER);
+    if (rx.test(before) || rx.test(after)) {
+      f.confidence = Math.min(CTX_MAX, f.confidence + CTX_BOOST);
+    }
+  }
+}
 
 /**
  * The native, in-process detector: bounded-regex patterns + secret-prefix
@@ -23,11 +47,13 @@ export class NativeDetector implements Detector {
   private readonly entropyOn: boolean;
   private readonly minBits: number;
   private readonly minLen: number;
+  private readonly contextBoost: boolean;
 
   constructor(opts: NativeDetectorOptions = {}) {
     this.entropyOn = opts.entropy !== false;
     this.minBits = opts.minEntropyBits ?? 3.5;
     this.minLen = opts.minEntropyLength ?? 24;
+    this.contextBoost = opts.contextBoost !== false;
   }
 
   detect(text: string): Finding[] {
@@ -71,6 +97,7 @@ export class NativeDetector implements Detector {
       }
     }
 
+    if (this.contextBoost) applyContextBoost(text, raw);
     return resolveOverlaps(raw);
   }
 }

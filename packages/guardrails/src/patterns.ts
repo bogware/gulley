@@ -16,10 +16,10 @@ export interface PatternDef {
   validate?: (match: string) => boolean;
 }
 
-/** Luhn checksum — filters random 13–19 digit runs from real card numbers. */
-export function luhnValid(value: string): boolean {
+/** Luhn checksum over the digits, restricted to [minLen, maxLen] digit runs. */
+function luhn(value: string, minLen: number, maxLen: number): boolean {
   const digits = value.replace(/[^0-9]/g, '');
-  if (digits.length < 13 || digits.length > 19) return false;
+  if (digits.length < minLen || digits.length > maxLen) return false;
   let sum = 0;
   let alt = false;
   for (let i = digits.length - 1; i >= 0; i--) {
@@ -32,6 +32,28 @@ export function luhnValid(value: string): boolean {
     alt = !alt;
   }
   return sum % 10 === 0;
+}
+
+/** Luhn checksum — filters random 13–19 digit runs from real card numbers. */
+export function luhnValid(value: string): boolean {
+  return luhn(value, 13, 19);
+}
+
+/** Canadian SIN: exactly 9 digits and Luhn-valid (weeds out arbitrary 9-runs). */
+export function sinValid(value: string): boolean {
+  return luhn(value, 9, 9);
+}
+
+/**
+ * Lightweight phone plausibility (a libphonenumber-lite): NANP numbers must have
+ * valid area/exchange leading digits (2–9); other lengths are accepted as E.164
+ * (8–15 digits, non-zero lead). Filters digit runs the shape-regex lets through.
+ */
+export function phonePlausible(match: string): boolean {
+  const digits = match.replace(/\D/g, '');
+  const local = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+  if (local.length === 10) return /^[2-9]\d{2}[2-9]\d{6}$/.test(local);
+  return digits.length >= 8 && digits.length <= 15 && !digits.startsWith('0');
 }
 
 // Secret prefixes are matched before generic PII so a keyed token (e.g.
@@ -120,10 +142,41 @@ export const PII_PATTERNS: PatternDef[] = [
     category: 'phone',
     source: 'pattern',
     // North-American / E.164-ish; deliberately conservative (dashes/spaces or
-    // parens) so it does not swallow arbitrary digit runs.
+    // parens) so it does not swallow arbitrary digit runs. Validated for NANP/E.164
+    // plausibility to drop shape-matching-but-implausible runs.
     regex: /(?:\+?\d{1,3}[ -])?(?:\(\d{3}\)[ -]?|\d{3}[ -])\d{3}[ -]\d{4}\b/g,
     confidence: 0.5,
+    validate: phonePlausible,
+  },
+  {
+    category: 'ca_sin',
+    source: 'pattern',
+    // Canadian SIN: 9 digits in 3-3-3 groups; Luhn-checked so it does not fire on
+    // arbitrary 9-digit runs. Weak on its own — context words boost it.
+    regex: /\b\d{3}[- ]?\d{3}[- ]?\d{3}\b/g,
+    confidence: 0.5,
+    validate: sinValid,
+  },
+  {
+    category: 'url',
+    source: 'pattern',
+    // http(s) URLs (may carry tokens / tracking params). Bounded, linear-time.
+    regex: /\bhttps?:\/\/[^\s<>"'()]{3,2048}/g,
+    confidence: 0.35,
   },
 ];
+
+/** Context words that, when found near a match, raise its confidence — the
+ *  "context-word boosting" that lets weak shape patterns be trusted in context
+ *  (e.g. a 9-digit run beside "SIN") without over-firing elsewhere. */
+export const CONTEXT_WORDS: Partial<Record<PiiCategory, RegExp>> = {
+  ssn: /social security|\bssn\b/i,
+  ca_sin: /social insurance|\bsin\b/i,
+  credit_card: /\b(?:card|credit|debit|cc|visa|mastercard|amex)\b/i,
+  phone: /\b(?:phone|mobile|cell|tel|call|fax|contact)\b/i,
+  ip_address: /\b(?:ip|address|host|server|gateway)\b/i,
+  email: /\b(?:e-?mail|contact)\b/i,
+  url: /\b(?:url|link|href|site|visit|endpoint)\b/i,
+};
 
 export const NATIVE_PATTERNS: PatternDef[] = [...SECRET_PATTERNS, ...PII_PATTERNS];

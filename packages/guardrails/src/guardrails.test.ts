@@ -45,6 +45,33 @@ describe('NativeDetector', () => {
     expect(resolved).toHaveLength(1);
     expect(resolved[0]?.category).toBe('anthropic_key');
   });
+
+  it('validates phone numbers for NANP/E.164 plausibility', () => {
+    expect(cats('call 415-555-2671')).toContain('phone'); // valid NANP
+    expect(cats('ref 111-555-2671 here')).not.toContain('phone'); // area code starts with 1
+  });
+
+  it('detects a Luhn-valid Canadian SIN and http(s) URLs', () => {
+    expect(cats('SIN 046 454 286 on file')).toContain('ca_sin'); // Luhn-valid example SIN
+    expect(cats('random 123 456 789 here')).not.toContain('ca_sin'); // fails Luhn
+    expect(cats('visit https://acme.example.com/path?token=abc')).toContain('url');
+  });
+
+  it('boosts confidence when a category context word sits nearby', () => {
+    const find = (text: string, category: string) =>
+      det.detect(text).find((f) => f.category === category);
+    // SSN base confidence 0.8 → 0.98 with the "SSN" context word.
+    expect(find('SSN 123-45-6789 on file', 'ssn')?.confidence).toBeGreaterThan(0.9);
+    // Same digits, no context word → base confidence only.
+    expect(find('value 123-45-6789 logged', 'ssn')?.confidence).toBeCloseTo(0.8, 5);
+
+    const boosted = new NativeDetector();
+    const plain = new NativeDetector({ contextBoost: false });
+    const sinCtx = 'social insurance 046 454 286';
+    expect(boosted.detect(sinCtx).find((f) => f.category === 'ca_sin')?.confidence).toBeGreaterThan(
+      plain.detect(sinCtx).find((f) => f.category === 'ca_sin')?.confidence ?? 0,
+    );
+  });
 });
 
 describe('shannonEntropy', () => {
