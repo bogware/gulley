@@ -4,6 +4,7 @@ import type { Config } from './config';
 import { registerConfigRoutes } from './config-routes';
 import type { ControlContext } from './context';
 import { registerLogRoutes } from './log-routes';
+import { registerOidcRoutes } from './oidc-routes';
 import { registerAdminRoutes } from './routes';
 
 export function buildServer(config: Config, ctx?: ControlContext): FastifyInstance {
@@ -41,6 +42,7 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     registerAdminRoutes(app, ctx);
     registerConfigRoutes(app, ctx);
     registerLogRoutes(app, ctx);
+    registerOidcRoutes(app, ctx);
   }
 
   return app;

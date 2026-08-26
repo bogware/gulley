@@ -24,6 +24,7 @@
     "@gulley/egress": "workspace:*",
     "@gulley/crypto": "workspace:*",
     "@gulley/oauth": "workspace:*",
+    "@gulley/oidc": "workspace:*",
     "@gulley/pipeline": "workspace:*",
     "@gulley/rbac": "workspace:*",
     "@gulley/redact": "workspace:*",

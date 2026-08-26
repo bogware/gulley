@@ -20,17 +20,19 @@ import type {
 export class GulleyAdminApi {
   constructor(
     private readonly baseUrl: string,
-    private readonly token: string,
+    private readonly token?: string,
   ) {}
 
   private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
       headers: {
-        authorization: `Bearer ${this.token}`,
+        ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
         ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
+      // Include the OIDC session cookie (http-only) so pasted-token auth is optional.
+      credentials: 'include',
       cache: 'no-store',
     });
     if (!res.ok) {
@@ -38,6 +40,17 @@ export class GulleyAdminApi {
       throw new Error(`${method} ${path} → ${res.status}${text ? `: ${text}` : ''}`);
     }
     return (await res.json()) as T;
+  }
+
+  // --- auth (OIDC session gate) ---
+  authConfig(): Promise<{ enabled: boolean; loginUrl: string }> {
+    return this.req<{ enabled: boolean; loginUrl: string }>('GET', '/auth/config');
+  }
+  me(): Promise<{ subject: string; name: string; memberships: unknown[] }> {
+    return this.req<{ subject: string; name: string; memberships: unknown[] }>('GET', '/auth/me');
+  }
+  async logout(): Promise<void> {
+    await fetch(`${this.baseUrl}/auth/logout`, { method: 'POST', credentials: 'include' });
   }
 
   private qs(params: object): string {

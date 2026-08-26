@@ -5,6 +5,8 @@ import {
   InMemoryKeyStore,
 } from '@gulley/auth';
 import { type ConfigVersionStore, InMemoryConfigVersionStore } from '@gulley/config';
+import type { OidcProvider } from '@gulley/oidc';
+import type { OidcRoleRule } from './oidc-gate';
 import {
   type AuditSink,
   GuardedAuditSink,
@@ -47,6 +49,22 @@ export interface ControlContext {
   verifyAudit: () => { verified: boolean; count: number };
   /** Hosts a provider base URL may egress to; empty = any non-blocked host. */
   outboundAllowlist: ReadonlySet<string>;
+  /** OIDC session gate config; absent = OIDC login disabled (token-paste only). */
+  oidc?: OidcSessionConfig;
+}
+
+export interface OidcSessionConfig {
+  provider: OidcProvider;
+  clientId: string;
+  clientSecret?: string;
+  redirectUri: string;
+  scopes: string;
+  groupsClaim: string;
+  roleRules: OidcRoleRule[];
+  postLoginRedirect: string;
+  cookieSecure: boolean;
+  /** Injected HTTP for the token exchange (tests); defaults to global fetch. */
+  fetchImpl?: typeof fetch;
 }
 
 export interface InMemoryContextOptions {
@@ -58,6 +76,7 @@ export interface InMemoryContextOptions {
   outboundAllowlist?: ReadonlySet<string>;
   /** Inject a pre-seeded query backend (tests); defaults to a fresh in-memory log. */
   requestLogQuery?: RequestLogQuery;
+  oidc?: OidcSessionConfig;
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -96,5 +115,6 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     },
     verifyAudit: () => ({ verified: inner.verify(), count: inner.rows.length }),
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
+    oidc: opts.oidc,
   };
 }

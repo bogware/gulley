@@ -32,6 +32,20 @@ const Env = z.object({
 
   // Provider base-URL egress allowlist (comma-separated hostnames).
   OUTBOUND_HOST_ALLOWLIST: z.string().default(''),
+
+  // OIDC session gate for the admin console (generic, discovery-based). When
+  // OIDC_ISSUER + OIDC_CLIENT_ID are set, /auth/login → the IdP; /auth/callback
+  // mints an admin session cookie. Group→role mapping via OIDC_ROLE_MAP (JSON
+  // [{ group, role, orgId }]; orgId "*" = all orgs).
+  OIDC_ISSUER: z.string().url().optional(),
+  OIDC_CLIENT_ID: z.string().optional(),
+  OIDC_CLIENT_SECRET: z.string().optional(),
+  OIDC_REDIRECT_URI: z.string().url().default('http://localhost:3000/control/auth/callback'),
+  OIDC_SCOPES: z.string().default('openid profile email'),
+  OIDC_GROUPS_CLAIM: z.string().default('groups'),
+  OIDC_ROLE_MAP: z.string().default('[]'),
+  OIDC_POST_LOGIN_REDIRECT: z.string().default('/'),
+  OIDC_COOKIE_SECURE: envBool(false),
 });
 
 export type Config = z.infer<typeof Env>;

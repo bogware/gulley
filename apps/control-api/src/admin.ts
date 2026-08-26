@@ -2,6 +2,7 @@ import { resolveAdmin } from '@gulley/auth';
 import { type AdminPrincipal, coversWorkspace, type Permission, type ScopeRef } from '@gulley/rbac';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { ControlContext } from './context';
+import { parseCookies, SESSION_COOKIE } from './oidc-gate';
 
 /** Workspace ids the principal is actually allowed to see (org-wide membership →
  *  all workspaces in that org; workspace-scoped → only that workspace). */
@@ -21,6 +22,11 @@ export function bearerToken(request: FastifyRequest): string | undefined {
   return undefined;
 }
 
+/** The admin token from either the Authorization bearer or the OIDC session cookie. */
+export function sessionToken(request: FastifyRequest): string | undefined {
+  return bearerToken(request) ?? parseCookies(request.headers.cookie)[SESSION_COOKIE];
+}
+
 type AdminHandler = (
   request: FastifyRequest,
   reply: FastifyReply,
@@ -31,7 +37,7 @@ type AdminHandler = (
  *  otherwise (the control surface never falls through to another auth mode). */
 export function adminRoute(ctx: ControlContext, handler: AdminHandler) {
   return async (request: FastifyRequest, reply: FastifyReply): Promise<unknown> => {
-    const res = await resolveAdmin(bearerToken(request), ctx.resolverDeps);
+    const res = await resolveAdmin(sessionToken(request), ctx.resolverDeps);
     if (!res.ok) {
       return reply
         .code(401)

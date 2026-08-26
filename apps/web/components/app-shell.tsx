@@ -21,7 +21,7 @@ const NAV: Array<{ href: string; label: string }> = [
 ];
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const { token, ready, setToken } = useAdmin();
+  const { authed, ready, setToken } = useAdmin();
   const pathname = usePathname();
 
   if (!ready) {
@@ -31,7 +31,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       </div>
     );
   }
-  if (!token) return <TokenGate />;
+  if (!authed) return <TokenGate />;
 
   return (
     <div className="flex min-h-screen">

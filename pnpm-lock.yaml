@@ -50,6 +50,9 @@ importers:
       '@gulley/oauth':
         specifier: workspace:*
         version: link:../../packages/oauth
+      '@gulley/oidc':
+        specifier: workspace:*
+        version: link:../../packages/oidc
       '@gulley/pipeline':
         specifier: workspace:*
         version: link:../../packages/pipeline
@@ -396,6 +399,18 @@ importers:
       '@gulley/egress':
         specifier: workspace:*
         version: link:../egress
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/oidc:
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
