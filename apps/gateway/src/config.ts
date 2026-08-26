@@ -174,6 +174,18 @@ const Env = z.object({
   BREAKER_SHARED_PREFIX: z.string().default('gulley'),
   BREAKER_SHARED_REFRESH_MS: z.coerce.number().int().positive().default(1000),
 
+  // Adaptive concurrency: a per-target dynamic in-flight ceiling (gradient
+  // limiter) that shrinks under rising latency/errors so the gateway stops
+  // piling work onto a degrading upstream. A saturated target is skipped
+  // (load-shed, not a fault); when every candidate is saturated the request is
+  // shed with 503 + Retry-After. Off by default (no admission ceiling).
+  ADAPTIVE_CONCURRENCY_ENABLED: envBool(false),
+  ADAPTIVE_MIN_LIMIT: z.coerce.number().int().positive().default(4),
+  ADAPTIVE_MAX_LIMIT: z.coerce.number().int().positive().default(200),
+  ADAPTIVE_INITIAL_LIMIT: z.coerce.number().int().positive().default(20),
+  ADAPTIVE_BACKOFF_RATIO: z.coerce.number().positive().max(0.99).default(0.9),
+  ADAPTIVE_SMOOTHING: z.coerce.number().positive().max(1).default(0.2),
+
   // Load balancing across a loadbalance strategy's targets. When affinity is off
   // (default) the primary pick uses power-of-two-choices least-load over in-flight
   // counts. Setting LB_SESSION_AFFINITY_HEADER pins a session (that header's

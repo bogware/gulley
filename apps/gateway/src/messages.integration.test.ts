@@ -13,7 +13,7 @@ import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
 import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
-import { CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
+import { AdaptiveLimiter, CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
 import { initTelemetry } from '@gulley/telemetry';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from './config';
@@ -284,6 +284,64 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     await app.close();
     await new Promise<void>((r) => thinker.close(() => r()));
+  });
+
+  it('sheds with 503 + Retry-After when every candidate is at capacity', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog, ledger } = buildContext(store);
+    const limiter = new AdaptiveLimiter({ minLimit: 1, initialLimit: 1 });
+    ctx.limiter = limiter;
+    expect(limiter.tryAcquire('anthropic')).toBe(true); // occupy the only slot
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.headers.get('retry-after')).toBe('1');
+    const json = (await res.json()) as { error: { type: string } };
+    expect(json.error.type).toBe('overloaded_error');
+    // Load-shed, not a served request: nothing metered, but teardown still logged it.
+    expect(ledger.entries).toHaveLength(0);
+    expect(requestLog.entries.some((e) => e.statusCode === 503)).toBe(true);
+
+    await app.close();
+  });
+
+  it('releases the adaptive-concurrency slot in teardown so a later request is admitted', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.limiter = new AdaptiveLimiter({ minLimit: 1, initialLimit: 1 }); // one slot
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    // Two SEQUENTIAL requests over a single-slot limiter: the second can only be
+    // admitted if the first released its slot in teardown.
+    for (let i = 0; i < 2; i++) {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+      await res.text();
+      expect(res.status).toBe(200);
+    }
+
+    await app.close();
   });
 
   it('rejects an invalid virtual key with a generic 401 and does not call upstream', async () => {

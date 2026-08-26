@@ -63,6 +63,7 @@ import {
   RedisRateLimitStore,
 } from '@gulley/ratelimit';
 import {
+  AdaptiveLimiter,
   CircuitBreaker,
   LoadScoreboard,
   type ModelRouteRule,
@@ -594,6 +595,15 @@ export function createProductionContext(config: Config): GatewayContext {
     audit: new PostgresAuditSink(db),
     breaker: new CircuitBreaker(breakerSync ? { sync: breakerSync } : {}),
     breakerSync,
+    limiter: config.ADAPTIVE_CONCURRENCY_ENABLED
+      ? new AdaptiveLimiter({
+          minLimit: config.ADAPTIVE_MIN_LIMIT,
+          maxLimit: config.ADAPTIVE_MAX_LIMIT,
+          initialLimit: config.ADAPTIVE_INITIAL_LIMIT,
+          backoffRatio: config.ADAPTIVE_BACKOFF_RATIO,
+          smoothing: config.ADAPTIVE_SMOOTHING,
+        })
+      : undefined,
     outlier: config.OUTLIER_ENABLED
       ? new OutlierDetector({
           latencyFactor: config.OUTLIER_LATENCY_FACTOR,

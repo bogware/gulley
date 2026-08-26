@@ -31,6 +31,7 @@ import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/rate
 import {
   allTargets,
   type CircuitBreaker,
+  type AdaptiveLimiter,
   type BreakerSync,
   hasShaping,
   isFailoverStatus,
@@ -84,6 +85,8 @@ export interface GatewayContext {
   breaker: CircuitBreaker;
   /** Cross-replica breaker sharing (its refresh timer is stopped on drain). */
   breakerSync?: BreakerSync & { stop(): void };
+  /** Per-target adaptive concurrency limiter; absent = no admission ceiling. */
+  limiter?: AdaptiveLimiter;
   budgets: BudgetStore;
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */
@@ -729,6 +732,9 @@ async function handleProxy(
   let upstream: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
   let served: RouteTarget | undefined;
   let scoreboardHeld = false;
+  let limiterHeld = false; // the served target's adaptive-concurrency slot
+  let anySaturation = false; // a candidate was skipped because it was at capacity
+  let anyRealAttempt = false; // we actually forwarded to at least one upstream
   let dispatchMs: number | undefined; // when we dispatched to the serving target
   let firstByteMs: number | undefined; // when its response headers arrived
   for (let i = 0; i < candidates.length; i++) {
@@ -737,6 +743,20 @@ async function handleProxy(
     let resp: Awaited<ReturnType<RouteTarget['adapter']['forward']>> | undefined;
     let retryAfterMs: number | undefined;
     let forwardStart = 0;
+
+    // Adaptive concurrency: a target at its dynamic in-flight ceiling is skipped
+    // (a load-shed, NOT a fault — the breaker must not trip). The slot is held for
+    // the whole request and released with the observed RTT in teardown / on failover.
+    let limiterAcquired = false;
+    if (ctx.limiter) {
+      if (!ctx.limiter.tryAcquire(target.name)) {
+        anySaturation = true;
+        request.log.warn({ target: target.name }, 'target at capacity — skipping');
+        continue;
+      }
+      limiterAcquired = true;
+    }
+    anyRealAttempt = true;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (controller.signal.aborted) break;
@@ -786,12 +806,15 @@ async function handleProxy(
     if (!resp) {
       // All attempts on this target hard-failed (connection errors) or aborted.
       ctx.breaker.recordFailure(target.name);
+      if (limiterAcquired)
+        ctx.limiter?.record(target.name, forwardStart ? Date.now() - forwardStart : 0, true);
       if (controller.signal.aborted) break; // client gone — stop trying
       continue; // fail over to the next candidate
     }
 
     if (!isLast && resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
       ctx.breaker.recordFailure(target.name, retryAfterMs);
+      if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
       ctx.metrics?.recordFailover(target.name);
       resp.body.resume(); // discard the failed body, then try the next target
       request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
@@ -815,6 +838,9 @@ async function handleProxy(
       ctx.scoreboard.begin(target.name);
       scoreboardHeld = true;
     }
+    // Hold the adaptive-concurrency slot for the whole request; teardown releases
+    // it with the full request duration (the concurrency it actually consumed).
+    if (limiterAcquired) limiterHeld = true;
     // The breaker should track UPSTREAM faults, not client mistakes: a terminal
     // 4xx (400/401/403/404/422) is the caller's error and must not trip the
     // breaker for every other tenant sharing this target.
@@ -871,6 +897,12 @@ async function handleProxy(
     if (scoreboardHeld && served) {
       scoreboardHeld = false;
       ctx.scoreboard?.end(served.name);
+    }
+    if (limiterHeld && served) {
+      limiterHeld = false;
+      // RTT for concurrency = full request duration; drop = fault (5xx) or abort.
+      const dropped = status === 'aborted' || statusCode >= 500;
+      ctx.limiter?.record(served.name, Date.now() - (dispatchMs ?? started), dropped);
     }
 
     const n = usage.normalized();
@@ -1085,15 +1117,28 @@ async function handleProxy(
     });
   };
 
-  // Every candidate failed to produce a response (all connection errors).
+  // No response served. If EVERY candidate was skipped purely for saturation (no
+  // real upstream attempt failed), this is backpressure — shed with 503 +
+  // Retry-After so the caller backs off, rather than a misleading 502.
   if (!upstream || !served) {
+    const shed = anySaturation && !anyRealAttempt;
     status = controller.signal.aborted ? 'aborted' : 'error';
-    statusCode = 502;
+    statusCode = shed ? 503 : 502;
     await teardown();
     if (!reply.sent) {
-      await reply
-        .code(502)
-        .send({ type: 'error', error: { type: 'api_error', message: 'no upstream available' } });
+      if (shed) {
+        await reply
+          .code(503)
+          .header('retry-after', '1')
+          .send({
+            type: 'error',
+            error: { type: 'overloaded_error', message: 'all upstreams at capacity' },
+          });
+      } else {
+        await reply
+          .code(502)
+          .send({ type: 'error', error: { type: 'api_error', message: 'no upstream available' } });
+      }
     }
     return;
   }
