@@ -116,10 +116,26 @@ teardown, budget committed once. Then the adversarial hot-path review pass.
   k6 profile for a deployed gateway, encoding the same thresholds. See
   `ops/load/README.md`.
 
-## B — Native Vertex + Copilot adapters (planned)
+## B — Native Vertex + Copilot adapters (delivered)
 
-Real `generateContent` ↔ canonical translation, Vertex SA-JWT/ADC auth, and
-`thoughtSignature` round-trip fidelity (beyond the OpenAI-compat presets).
+- **Native Gemini/Vertex translation** (`packages/providers/src/gemini.ts`):
+  `anthropicToGemini` (request) + `geminiSseToAnthropic` (streaming response) speak
+  Gemini's real `contents`/`parts` protocol and **round-trip the `thoughtSignature`
+  reasoning artifact** the OpenAI-compat shim drops — into the request (a prior
+  `thinking` block's signature → the Gemini part) and out of the response (a part's
+  `thoughtSignature` → a `signature_delta`). Usage maps from `usageMetadata`.
+  `GeminiNativeAdapter` is Anthropic-in / native-Gemini-upstream / Anthropic-out.
+- **Vertex auth** (`packages/providers/src/google-auth.ts`):
+  `GoogleServiceAccountTokenProvider` mints a Vertex OAuth2 access token from a
+  service account via the self-signed-JWT grant, cached until near expiry
+  (single-flight). The adapter mints + rotates it per call, so no gateway plumbing
+  is needed. See `docs/NATIVE_PROVIDERS.md` for the composition recipe.
+- **Copilot / GitHub Models** is genuinely OpenAI-shaped, so the `copilot` preset
+  - the existing `AnthropicToOpenAIAdapter` is the complete story — no separate
+    native protocol.
+- Scope: text + thinking (with signature) round-trip and usage are covered; tool
+  and image blocks are refused (`canTranslateAnthropicToGemini`) rather than
+  silently dropped — the extension point for a fuller native surface.
 
 ## D — Per-tenant routing (planned)
 
