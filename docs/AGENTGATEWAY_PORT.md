@@ -122,6 +122,15 @@ _Still open in M8: Vertex + Copilot native adapters, provider prompt-cache break
 
 **Done when:** a config change propagates across Fargate tasks without a redeploy and preserves live state; access-log fields are operator-configurable; external authz decisions are cached; the admin surface exposes runtime log control + a live tracer.
 
+**Delivered:**
+
+- **Config-change propagation bus — ✅ delivered.** New `@gulley/storage` pubsub: a transport-agnostic `ConfigNotifier`/`ConfigSubscriber` with `PostgresConfigBus` (sql.listen/notify on a dedicated max:1 connection + onListen reconnect-catchup), `RedisConfigBus` (dedicated subscriber), `CompositeConfigNotifier`, and a `SignalGate` (self-notification guard + monotonic version dedupe making the dual bus idempotent). Signals carry only `{v, hash, origin, ts}` — never the config body or a secret. `applyConfig` gains a post-commit `onApplied` hook; control-api `/config/apply` emits after a successful commit.
+- **Access-log field engine — ✅ delivered.** `@gulley/telemetry` `AccessLogFieldEngine` (CEL-valued fields via `@gulley/cel`, remove/filter/flatten, fail-open) over a credential-free record; emitted as a structured `access` log line in gateway teardown. `ACCESS_LOG_FIELDS` config.
+- **External authorization hook — ✅ delivered.** `@gulley/cel` `ExternalAuthorizer` — POSTs the `{request, principal}` activation to an operator policy service, `{allow, reason}` back; decision cache (key = a CEL expr or principal+model+provider) with TTL + single-flight; timeout/error → failMode, uncached. Gateway runs it after the local CEL rules; SSRF-guarded URL. `EXTERNAL_AUTHZ_*` config.
+- **HTTP edge: CORS + CSRF — ✅ delivered.** New `@gulley/http-edge` (credentials-safe exact-origin CORS, Sec-Fetch-Site CSRF exempting allowlisted/bearer/same-origin), wired into the control-api as Fastify hooks. `ADMIN_CORS_ORIGINS` / `ADMIN_CSRF_ENABLED`.
+- **Admin DX: runtime log-level + redacted config dump — ✅ delivered.** Admin-guarded `/admin/log-level` (runtime, audited) and `/admin/config-dump` (secret-bearing keys → set/unset marker, URL creds stripped).
+- _Still open in M12: the config HOT-RELOAD reconcile itself (needs a durable `PostgresConfigStore` + gateway-builds-routes-from-DB + mutable Fastify dispatch — a large prerequisite the propagation bus above unblocks); child spans + traceparent injection + OTLP access-log exporter; HTTP edge peekbody / per-route BufferLimit / HeaderModifier / RequestMirror; a live SSE request tracer._
+
 ---
 
 ## Explicitly out of scope (this effort)
