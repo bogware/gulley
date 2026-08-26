@@ -33,6 +33,11 @@ const Env = z.object({
   // Provider base-URL egress allowlist (comma-separated hostnames).
   OUTBOUND_HOST_ALLOWLIST: z.string().default(''),
 
+  // Durable config store. When set, POST /config/apply persists to Postgres (the
+  // tables the gateway reads) via PostgresConfigStore + PostgresConfigVersionStore,
+  // instead of the in-memory ControlConfigStore. Enables M13 config hot-reload.
+  DATABASE_URL: z.string().url().optional(),
+
   // Admin-surface HTTP edge. CORS is credentials-safe: exact-origin allowlist
   // (comma-separated full origins), reflected with Allow-Credentials; empty =
   // CORS off (same-origin /control proxy deployment). CSRF gates cookie-authed

@@ -564,6 +564,9 @@ importers:
       '@gulley/cache':
         specifier: workspace:*
         version: link:../cache
+      '@gulley/config':
+        specifier: workspace:*
+        version: link:../config
       '@gulley/core':
         specifier: workspace:*
         version: link:../core

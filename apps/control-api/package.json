@@ -10,6 +10,7 @@
     "rbac:check": "tsx src/rbac-check.ts",
     "oauth:check": "tsx src/oauth-check.ts",
     "config:check": "tsx src/config-check.ts",
+    "config:db:check": "tsx src/config-db-check.ts",
     "worm:check": "tsx src/worm-check.ts",
     "kms:check": "tsx src/kms-check.ts",
     "ssrf:check": "tsx src/ssrf-check.ts",

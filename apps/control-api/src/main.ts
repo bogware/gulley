@@ -41,6 +41,7 @@ function buildContext(config: Config): ControlContext | undefined {
     maxSessionTtlMs: config.ADMIN_SESSION_MAX_MS,
     outboundAllowlist: outboundAllowlist(config),
     oidc,
+    databaseUrl: config.DATABASE_URL,
   });
 }
 

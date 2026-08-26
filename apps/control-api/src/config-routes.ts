@@ -23,7 +23,8 @@ function applyErrorStatus(kind: string): number {
 /** GitOps surface: export the config as a document, dry-run a plan, apply through
  *  the guarded (audit + RBAC + secret + concurrency) path, and report drift. */
 export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext): void {
-  const store = new ControlConfigStore(ctx);
+  // Durable Postgres config store when configured, else the in-memory one.
+  const store = ctx.configStore ?? new ControlConfigStore(ctx);
   const readableOrgs = (covered: readonly string[] | '*'): ReadonlySet<string> | '*' =>
     covered === '*' ? '*' : new Set(covered);
 

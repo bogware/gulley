@@ -4,8 +4,19 @@ import {
   InMemoryAdminSessionStore,
   InMemoryKeyStore,
 } from '@gulley/auth';
-import { type ConfigVersionStore, InMemoryConfigVersionStore } from '@gulley/config';
-import { type ConfigNotifier, newOriginId } from '@gulley/storage';
+import {
+  type ConfigStore,
+  type ConfigVersionStore,
+  InMemoryConfigVersionStore,
+} from '@gulley/config';
+import {
+  type ConfigNotifier,
+  createDatabase,
+  type Database,
+  newOriginId,
+  PostgresConfigStore,
+  PostgresConfigVersionStore,
+} from '@gulley/storage';
 import type { OidcProvider } from '@gulley/oidc';
 import type { OidcRoleRule } from './oidc-gate';
 import {
@@ -43,6 +54,8 @@ export interface ControlContext {
   access: AccessControl;
   sessionStore: AdminSessionStore;
   configVersions: ConfigVersionStore;
+  /** Durable config store (Postgres); absent = in-memory ControlConfigStore. */
+  configStore?: ConfigStore;
   /** Read side of the request log: admin log browser + usage analytics. */
   requestLogQuery: RequestLogQuery;
   resolverDeps: AdminResolverDeps;
@@ -86,6 +99,11 @@ export interface InMemoryContextOptions {
   oidc?: OidcSessionConfig;
   /** Config-change broadcaster (composite PG+Redis bus in prod); absent = none. */
   notifier?: ConfigNotifier;
+  /** Postgres URL; when set, the config path is durable (persists to the tables
+   *  the gateway reads) instead of in-memory. */
+  databaseUrl?: string;
+  /** Inject a pre-built Database (tests); overrides databaseUrl. */
+  db?: Database;
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -100,6 +118,14 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     COLLECTION_KINDS.map((k) => [k, new ScopedCollection()]),
   ) as Record<CollectionKind, ScopedCollection>;
 
+  // Durable config path (opt-in): when a DB is available, config apply persists
+  // to the Postgres tables the gateway reads, and versions are durable too.
+  const db = opts.db ?? (opts.databaseUrl ? createDatabase(opts.databaseUrl) : undefined);
+  const configStore = db ? new PostgresConfigStore(db) : undefined;
+  const configVersions: ConfigVersionStore = db
+    ? new PostgresConfigVersionStore(db)
+    : new InMemoryConfigVersionStore();
+
   return {
     orgs: new OrgStore(),
     workspaces: new WorkspaceStore(),
@@ -113,7 +139,8 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     audit,
     access: new InMemoryAccessControl(),
     sessionStore,
-    configVersions: new InMemoryConfigVersionStore(),
+    configVersions,
+    configStore,
     requestLogQuery: opts.requestLogQuery ?? new InMemoryRequestLog(),
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,

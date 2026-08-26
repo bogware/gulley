@@ -17,6 +17,7 @@
   "dependencies": {
     "@gulley/auth": "workspace:*",
     "@gulley/cache": "workspace:*",
+    "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
     "@gulley/pipeline": "workspace:*",
