@@ -137,9 +137,15 @@ _Still open in M8: Vertex + Copilot native adapters, provider prompt-cache break
 - _peekbody: satisfied by design for the request path (the JSON body is a fully-buffered Buffer, so any policy peeks `body.subarray(0,N)` with no re-injection); a response-side peek was judged low-value / high raw-pipe risk and deferred._
 - **Status: M12 COMPLETE** except the config **hot-reload reconcile** itself, promoted to its own milestone **M13** below (it needs a durable config store + a data-plane refactor — too large to be an M12 slice). The propagation bus, delivered here, is M13's transport.
 
-## M13 — Config hot-reload (durable DB config + live reconcile)
+## M13 — Config hot-reload (durable DB config + live reconcile) — ✅ DELIVERED
 
-The one remaining agentgateway-port capability: a config change applied through the control plane propagates to every running gateway replica **without a redeploy**, and each replica **reconciles live** — preserving in-flight requests and all in-memory routing state. The M12 propagation bus (`@gulley/storage` pubsub) is the transport; this milestone builds the durable source of truth and the data-plane reconcile the bus drives.
+The last agentgateway-port capability: a config change applied through the control plane propagates to every running gateway replica **without a redeploy**, and each replica **reconciles live** — preserving in-flight requests and all in-memory routing state. Delivered in three layers (see `docs/M13_CONFIG_HOTRELOAD.md`):
+
+- **L1 — durable config store.** A storage-agnostic `ConfigBackend` + a reconcile/export/authorize algorithm written once (upsert-then-prune; providers by kind, entities by name; virtual keys untouched) and **CI-tested** via `InMemoryConfigBackend`; `BackendConfigStore` implements `ConfigStore` over any backend. A thin `PostgresConfigBackend` (per-table Drizzle CRUD; budget special-cased for its typed columns; credentials as ARN refs) → `PostgresConfigStore`, plus `PostgresConfigVersionStore` (atomic `tryReserve` gate). `/config/apply` persists to the tables the gateway reads when `DATABASE_URL` is set; a `config:db:check` live script exercises the real SQL.
+- **L2 — gateway builds from the document.** A pluggable `SecretResolver` (`MapSecretResolver` for dev/tests, `AwsSecretsManagerResolver` for prod) — the only place a secret value materializes. `buildRoutesFromDocument` maps each enabled provider (kind → adapter + paths + credential) with its resolved credential; an unresolvable ARN **rejects** so the reconcile aborts atomically.
+- **L3 — live reconcile + full mutable dispatcher.** One `/*` dispatcher looks the route up per request from a swappable `RouteHolder` (ctx read once at entry → in-flight streams + their single teardown finish on their original ctx; path-set changes reload with no Fastify re-register). `GatewayReconciler` swaps the route table **preserving breaker/scoreboard/outlier/budgets/counters/telemetry/connections by reference**, single-flight + fail-safe (keeps the old config on any build/secret failure). `ConfigWatcher` subscribes to the Postgres LISTEN/NOTIFY bus with a `SignalGate`, reconciles on a foreign signal, resyncs on reconnect; wired in `main.ts` behind `CONFIG_SOURCE=db`, started after listen and stopped first on the drain.
+
+**Original spec below (retained):** The M12 propagation bus (`@gulley/storage` pubsub) is the transport; this milestone builds the durable source of truth and the data-plane reconcile the bus drives.
 
 Three layers (the shape the M12 research established):
 
