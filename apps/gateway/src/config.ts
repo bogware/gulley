@@ -186,6 +186,13 @@ const Env = z.object({
   ADAPTIVE_BACKOFF_RATIO: z.coerce.number().positive().max(0.99).default(0.9),
   ADAPTIVE_SMOOTHING: z.coerce.number().positive().max(1).default(0.2),
 
+  // Smart routing (M15): classify each request and reroute by category. DB config
+  // only (the smartRoutingPolicies collection). Off by default; when on, the
+  // reconciler builds the smart router from the config document. The rules-based
+  // classifier needs no upstream; embedding/LLM classifier backends are wired
+  // separately (they meter their own spend).
+  SMART_ROUTING_ENABLED: envBool(false),
+
   // Load balancing across a loadbalance strategy's targets. When affinity is off
   // (default) the primary pick uses power-of-two-choices least-load over in-flight
   // counts. Setting LB_SESSION_AFFINITY_HEADER pins a session (that header's

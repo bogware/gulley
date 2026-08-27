@@ -30,7 +30,11 @@ export function buildConfigWatcher(
   const store = new PostgresConfigStore(db);
   const versions = new PostgresConfigVersionStore(db);
   const resolver = buildSecretResolver(config);
-  const reconciler = new GatewayReconciler(holder, store, resolver, log);
+  // Rules-based smart routing needs no upstream classifier deps; embedding/LLM
+  // backends and their metering are wired in a later step.
+  const reconciler = new GatewayReconciler(holder, store, resolver, log, {
+    enabled: config.SMART_ROUTING_ENABLED,
+  });
 
   const listen = createListenConnection(config.DATABASE_URL);
   // The reconnect hook references the watcher created just below; a const ref

@@ -1,8 +1,18 @@
 import type { ConfigStore, ConfigVersionStore } from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
+import type { ClassifierDeps } from '@gulley/routing';
 import { type ConfigSubscriber, SignalGate } from '@gulley/storage';
 import { buildRoutesFromDocument } from './config-builder';
 import type { RouteHolder } from './routes/messages';
+import { buildSmartRouter } from './smart-router';
+import { parseSmartRoutingPolicies } from './smart-routing-config';
+
+/** Smart-routing reconcile options; absent/disabled ⇒ the smart router is never
+ *  built and the data plane ignores any smartRoutingPolicies in the document. */
+export interface SmartRoutingReconcile {
+  enabled: boolean;
+  deps?: ClassifierDeps;
+}
 
 export interface ReconcileLog {
   info(msg: string): void;
@@ -26,6 +36,7 @@ export class GatewayReconciler {
     private readonly store: ConfigStore,
     private readonly resolver: SecretResolver,
     private readonly log?: ReconcileLog,
+    private readonly smartRouting?: SmartRoutingReconcile,
   ) {}
 
   /** Trigger a reconcile; serialized behind any in-flight one. Resolves to true
@@ -46,7 +57,14 @@ export class GatewayReconciler {
     try {
       const doc = await this.store.exportDocument('*');
       const routes = await buildRoutesFromDocument(doc, this.resolver);
+      // Build the smart router BEFORE swapping anything: a malformed policy throws
+      // here and the catch keeps the CURRENT routes + smart router intact (never a
+      // partial swap), matching the credential-resolution failure contract.
+      const smartRouter = this.smartRouting?.enabled
+        ? buildSmartRouter(parseSmartRoutingPolicies(doc), routes, this.smartRouting.deps)
+        : undefined;
       this.holder.swapRoutes(routes);
+      if (this.smartRouting?.enabled) this.holder.swapSmartRouter(smartRouter);
       this.log?.info(`config reconciled: ${routes.length} routes active`);
       return true;
     } catch (err) {

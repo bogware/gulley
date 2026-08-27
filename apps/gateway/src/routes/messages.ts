@@ -6,9 +6,15 @@ import {
   resolveVirtualKey,
   scopeAllowsModel,
   scopeAllowsProvider,
+  scopeGroups,
 } from '@gulley/auth';
 import { type BudgetStore, estimateWorstCaseMicroUsd } from '@gulley/budget';
-import type { CacheableRequest, CacheEngine, CacheLookup } from '@gulley/cache';
+import {
+  type CacheableRequest,
+  type CacheEngine,
+  type CacheLookup,
+  semanticText,
+} from '@gulley/cache';
 import { computeCost, type RateResolver, toMicroUsd } from '@gulley/cost';
 import { isErr } from '@gulley/core';
 import {
@@ -24,6 +30,7 @@ import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from 
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
 import type { RequestTracer } from '../tracer';
+import type { SmartRouter } from '../smart-router';
 import type { TenantCredentialResolver } from '../tenant';
 import type { TenantRouteResolver } from '../tenant-routes';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
@@ -98,6 +105,9 @@ export interface GatewayContext {
   hedgeDelayMs?: number;
   /** Per-tenant routing overrides (workspace may reroute a client path). */
   tenantRoutes?: TenantRouteResolver;
+  /** Classification-driven smart routing (M15); absent = disabled. Consulted
+   *  after authn and only when no per-tenant override pins the request. */
+  smartRouter?: SmartRouter;
   budgets: BudgetStore;
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */
@@ -210,6 +220,10 @@ export class RouteHolder {
   swapRoutes(routes: ProviderRoute[]): void {
     this.ctx.routes = routes;
     this.reindex();
+  }
+  /** Swap the smart router (config-derived, rebuilt with the routes on reconcile). */
+  swapSmartRouter(smartRouter: SmartRouter | undefined): void {
+    this.ctx.smartRouter = smartRouter;
   }
   /** Distinct provider names across the current routes (for /ready). */
   providers(): string[] {
@@ -416,6 +430,32 @@ async function handleProxy(
   if (tenantRoute) {
     strategy = tenantRoute.strategy;
     if (tenantRoute.createExtractor) createExtractor = tenantRoute.createExtractor;
+  } else if (ctx.smartRouter && parseOk) {
+    // --- smart routing (M15): classify the prompt, reroute by category ---
+    // Runs ONLY when no residency pin applies (the tenant override wins outright,
+    // per the residency-first rule), and before candidate selection so the cache
+    // key, budget, authz, and telemetry all see the effective target/model. It is
+    // fail-open: a policy miss, an abstention, or a classifier timeout/error
+    // returns no decision, leaving the model-router/route strategy in place.
+    const decision = await ctx.smartRouter.route(
+      {
+        userId: principal.id,
+        groups: scopeGroups(principal.scope),
+        orgId: principal.scope.orgId,
+        workspaceId: principal.scope.workspaceId,
+        clientPaths: route.clientPaths,
+      },
+      semanticText(body),
+    );
+    if (decision) {
+      if (decision.strategy) strategy = decision.strategy;
+      if (decision.createExtractor) createExtractor = decision.createExtractor;
+      if (decision.model && decision.model !== requestedModel) {
+        requestedModel = decision.model;
+        parsed['model'] = decision.model;
+        body = Buffer.from(JSON.stringify(parsed), 'utf8');
+      }
+    }
   }
 
   // --- authz: model + provider scope (candidates filtered to allowed providers) ---

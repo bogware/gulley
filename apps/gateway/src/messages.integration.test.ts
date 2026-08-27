@@ -21,6 +21,8 @@ import { loadConfig } from './config';
 import { buildCustomProviders } from './context';
 import type { GatewayContext } from './routes/messages';
 import { buildServer } from './server';
+import { buildSmartRouter } from './smart-router';
+import type { SmartRoutingPolicy } from '@gulley/routing';
 
 const PEPPER = 'itest-pepper';
 const UPSTREAM_KEY = 'sk-ant-upstream-secret';
@@ -686,6 +688,106 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(resB.headers.get('x-gulley-target')).toBe('tenant-b-target'); // per-tenant override
     expect(resBAlias.headers.get('x-gulley-target')).toBe('tenant-b-target'); // alias honored
 
+    await app.close();
+  });
+
+  const costTierPolicy = (over: Partial<SmartRoutingPolicy> = {}): SmartRoutingPolicy => ({
+    name: 'cost',
+    objective: 'cost-tier',
+    classifier: { mode: 'rules-then-llm', rules: [{ category: 'cheap', maxChars: 20 }] },
+    categoryRoutes: { cheap: 'claude-haiku-4-5' },
+    selector: {},
+    ...over,
+  });
+
+  const smartReq = (content: string): string =>
+    JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      max_tokens: 10,
+      messages: [{ role: 'user', content }],
+    });
+
+  it('smart routing rewrites the model by classified category, metered once', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger, requestLog, audit } = buildContext(store);
+    ctx.smartRouter = buildSmartRouter([costTierPolicy()], ctx.routes);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    // A short prompt ⇒ rule 'cheap' ⇒ the model is rewritten before dispatch.
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: smartReq('hi'),
+    });
+    await res.text();
+
+    // The upstream received the rewritten model, metered exactly once (single
+    // teardown). received.body is the effective outbound request.
+    expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5');
+    expect(ledger.entries).toHaveLength(1);
+    expect(requestLog.entries).toHaveLength(1);
+    expect(audit.rows).toHaveLength(1);
+
+    await app.close();
+  });
+
+  it('smart routing abstains on no match and falls back to the original model', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    // No default category + a long prompt ⇒ the rule never fires ⇒ no decision.
+    ctx.smartRouter = buildSmartRouter([costTierPolicy()], ctx.routes);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: smartReq('this is a much longer prompt that exceeds the twenty character cap'),
+    });
+    await res.text();
+
+    expect(JSON.parse(received.body).model).toBe('claude-sonnet-4-6'); // unchanged
+    await app.close();
+  });
+
+  it('a per-tenant residency pin preempts smart routing entirely', async () => {
+    const { store, token } = seededStore(); // workspace ws_1
+    const { ctx } = buildContext(store);
+    // Both are wired; the tenant pin must win AND smart routing must not run (so
+    // the model is NOT rewritten) — residency-first.
+    ctx.tenantRoutes = new MapTenantRouteResolver(
+      new Map([
+        [
+          'ws_1',
+          new Map([
+            [
+              '/v1/messages',
+              {
+                strategy: {
+                  mode: 'single' as const,
+                  target: anthropicTarget('pinned', upstreamUrl),
+                },
+              },
+            ],
+          ]),
+        ],
+      ]),
+    );
+    ctx.smartRouter = buildSmartRouter([costTierPolicy()], ctx.routes);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: smartReq('hi'), // would classify 'cheap' if smart routing ran
+    });
+    await res.text();
+
+    expect(res.headers.get('x-gulley-target')).toBe('pinned'); // tenant pin served
+    expect(JSON.parse(received.body).model).toBe('claude-sonnet-4-6'); // NOT rewritten
     await app.close();
   });
 
