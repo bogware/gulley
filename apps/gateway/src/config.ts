@@ -127,6 +127,17 @@ const Env = z.object({
   // per-route in code. Detection runs on request and response text.
   GUARDRAILS_ENABLED: envBool(true),
   GUARDRAILS_ENTROPY: envBool(true),
+  // Output guardrail policy. `audit` (default) records findings only; block /
+  // mask / redact enforce. Enforcement on a NON-streamed body is always exact;
+  // on a STREAMED body it is audit-only UNLESS a route opts into hold-then-flush
+  // (holdStreamedOutput) or STREAMING_ENFORCE (windowed in-stream redaction, M17).
+  GUARDRAILS_OUTPUT_ACTION: z.enum(['audit', 'block', 'mask', 'redact']).default('audit'),
+  GUARDRAILS_OUTPUT_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
+  // M17: windowed in-stream enforcement of the output policy on Anthropic-canonical
+  // streamed responses (redact matched spans / block on first violation), trading
+  // raw-byte-fidelity + a bounded delay for enforcement. Off by default.
+  STREAMING_ENFORCE: envBool(false),
+  STREAMING_ENFORCE_WINDOW_CHARS: z.coerce.number().int().positive().default(512),
   // Optional bring-your-own-DLP webhook guardrail (runs on request input). A
   // block/mask verdict is authoritative even under the audit-only default.
   GUARDRAILS_WEBHOOK_URL: z.string().url().optional(),

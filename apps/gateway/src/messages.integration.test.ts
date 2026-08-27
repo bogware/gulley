@@ -12,7 +12,12 @@ import { MapTenantCredentialResolver } from './tenant';
 import { MapTenantRouteResolver } from './tenant-routes';
 import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
-import { AnthropicAdapter, AnthropicUsageExtractor, OpenAIUsageExtractor } from '@gulley/providers';
+import {
+  AnthropicAdapter,
+  AnthropicUsageExtractor,
+  OpenAIUsageExtractor,
+  SSEParser,
+} from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { AdaptiveLimiter, CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
 import { initTelemetry } from '@gulley/telemetry';
@@ -1549,6 +1554,164 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     await app.close();
     await new Promise<void>((r) => leaky.close(() => r()));
+  });
+
+  // Build an Anthropic-canonical SSE stream from a list of text_delta payloads.
+  const anthropicSse = (deltas: string[], outputTokens = 9): string => {
+    const delta = (text: string): string =>
+      'event: content_block_delta\ndata: ' +
+      JSON.stringify({
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text },
+      }) +
+      '\n\n';
+    return (
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":7}}}\n\n' +
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n' +
+      deltas.map(delta).join('') +
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+      `event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"output_tokens":${outputTokens}}}\n\n` +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    );
+  };
+
+  const streamEnforceRoute = async (
+    deltas: string[],
+    action: 'redact' | 'block',
+  ): Promise<{
+    app: Awaited<ReturnType<typeof buildServer>>;
+    base: string;
+    server: http.Server;
+    ledger: InMemoryLedger;
+    token: string;
+  }> => {
+    const body = anthropicSse(deltas);
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(body);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.streamEnforce = true;
+    ctx.streamEnforceWindowChars = 32;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('enforce', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action, minConfidence: 0.5 },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    return { app, base, server, ledger, token };
+  };
+
+  const streamReqBody = JSON.stringify({
+    model: 'claude-sonnet-4-6',
+    stream: true,
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+
+  // The logical assistant text the CLIENT reassembles from the (possibly
+  // re-framed) text_delta events — what stream-enforce actually redacts.
+  const clientText = (sse: string): string =>
+    new SSEParser()
+      .push(sse)
+      .flatMap((e) => {
+        try {
+          const d = JSON.parse(e.data) as { delta?: { type?: string; text?: string } };
+          return d.delta?.type === 'text_delta' && typeof d.delta.text === 'string'
+            ? [d.delta.text]
+            : [];
+        } catch {
+          return [];
+        }
+      })
+      .join('');
+
+  it('redacts a secret in a streamed Anthropic response (windowed in-stream enforcement)', async () => {
+    const { app, base, server, ledger, token } = await streamEnforceRoute(
+      [
+        'Here is a long clean intro with nothing sensitive at all. The key is AKIA',
+        'IOSFODNN7EXAMPLE and here is clean trailing text continuing well past the window.',
+      ],
+      'redact',
+    );
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamReqBody,
+    });
+    const text = await res.text();
+
+    const ct = clientText(text);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-guardrail')).toBe('stream-enforce');
+    expect(ct).not.toContain('AKIAIOSFODNN7EXAMPLE'); // the secret is redacted mid-stream
+    expect(ct).toContain('<<REDACTED_AWS_ACCESS_KEY_ID>>');
+    expect(ct).toContain('Here is a long clean intro'); // clean prefix delivered
+    expect(ct).toContain('clean trailing text'); // clean suffix delivered
+    expect(ledger.entries).toHaveLength(1); // single teardown
+    expect(ledger.entries[0]?.cost.outputTokens).toBe(9); // metered from ORIGINAL frames
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('blocks a streamed response at the first violation (terminal error, secret withheld)', async () => {
+    const { app, base, server, ledger, token } = await streamEnforceRoute(
+      [
+        'A clean opening sentence with nothing to hide here at all. Then the key is AKIA',
+        'IOSFODNN7EXAMPLE plus a good amount of clean trailing text past the window edge.',
+      ],
+      'block',
+    );
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamReqBody,
+    });
+    const text = await res.text();
+
+    expect(clientText(text)).toContain('A clean opening'); // clean prefix streamed before the block
+    expect(text).not.toContain('AKIAIOSFODNN7EXAMPLE'); // the secret is never emitted
+    expect(text).toContain('event: error'); // terminal SSE error frame
+    expect(ledger.entries).toHaveLength(1); // single teardown even on a mid-stream block
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('passes a clean streamed response through unchanged under stream-enforce', async () => {
+    const { app, base, server, ledger, token } = await streamEnforceRoute(
+      ['This is a perfectly clean response with no sensitive data whatsoever, all good.'],
+      'redact',
+    );
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamReqBody,
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-guardrail')).toBe('stream-enforce');
+    // The client reassembles the clean text byte-for-byte (no redaction).
+    expect(clientText(text)).toBe(
+      'This is a perfectly clean response with no sensitive data whatsoever, all good.',
+    );
+    expect(text).not.toContain('REDACTED');
+    expect(ledger.entries).toHaveLength(1);
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
   });
 
   it('withholds a buffered response that overflows the enforcement buffer (fail-closed)', async () => {

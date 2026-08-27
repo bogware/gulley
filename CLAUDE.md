@@ -110,7 +110,10 @@ Non-negotiable invariants baked into that flow (do not regress them):
 - **Never buffer by default.** Bytes pipe straight through with `highWaterMark` backpressure
   (pause upstream on a full client socket). Full capture happens only for non-streamed metering,
   buffered output enforcement, or a cacheable miss — and is byte-capped. Streaming output
-  guardrails are **audit-only**; block/redact enforcement requires buffering (non-streamed only).
+  guardrails are **audit-only** by default; block/redact enforcement requires buffering
+  (non-streamed only) UNLESS the opt-in windowed streaming enforcer is on (M17,
+  `STREAMING_ENFORCE`), which redacts/blocks in-stream on Anthropic-canonical responses —
+  relaxing raw-byte-fidelity for that mode only (`docs/M17_STREAMING_ENFORCEMENT.md`).
 - **Budget = reserve/commit.** Reserve worst-case at admission; commit actual (or refund) in
   teardown, released _first and independently_ of the best-effort durable sinks so a failed
   audit/ledger write can't leak a reservation and DoS the workspace budget. Always meter partial

@@ -1,5 +1,6 @@
 export * from './types';
 export * from './sse';
+export * from './sse-rewriter';
 export * from './retry-after';
 export * from './presets';
 export * from './anthropic-usage';

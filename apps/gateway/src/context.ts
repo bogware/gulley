@@ -160,7 +160,13 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
 
   return new GuardrailEngine(
     [new NativeDetector({ entropy: config.GUARDRAILS_ENTROPY })],
-    auditOnlyPolicies(),
+    {
+      input: auditOnlyPolicies().input,
+      output: {
+        action: config.GUARDRAILS_OUTPUT_ACTION,
+        minConfidence: config.GUARDRAILS_OUTPUT_MIN_CONFIDENCE,
+      },
+    },
     composePlugins(plugins),
   );
 }
@@ -644,6 +650,8 @@ export function createProductionContext(config: Config): GatewayContext {
       : undefined,
     responseBufferLimit: config.RESPONSE_BUFFER_LIMIT_BYTES,
     bufferFailClosed: config.BUFFER_FAIL_CLOSED,
+    streamEnforce: config.STREAMING_ENFORCE,
+    streamEnforceWindowChars: config.STREAMING_ENFORCE_WINDOW_CHARS,
     headerModifier: config.HEADER_MODIFIER
       ? (JSON.parse(config.HEADER_MODIFIER) as HeaderModifierConfig)
       : undefined,

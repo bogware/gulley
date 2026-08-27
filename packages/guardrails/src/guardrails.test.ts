@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { NativeDetector, resolveOverlaps } from './detector';
-import { GuardrailEngine } from './engine';
+import { filterByPolicy, GuardrailEngine } from './engine';
 import { shannonEntropy } from './entropy';
-import { StreamingReplacer, StreamingScanner } from './streaming';
-import { auditOnlyPolicies, type GuardrailPlugin } from './types';
+import { StreamingRedactor, StreamingReplacer, StreamingScanner } from './streaming';
+import { auditOnlyPolicies, type Detector, type GuardrailPlugin } from './types';
 import { redactText, TokenVault } from './vault';
 
 const det = new NativeDetector();
@@ -129,6 +129,135 @@ describe('StreamingScanner', () => {
     scanner.push('the address is jane.d');
     scanner.push('oe@example.com today');
     expect(scanner.findings().map((f) => f.category)).toContain('email');
+  });
+});
+
+describe('StreamingRedactor', () => {
+  const redact = { action: 'redact' as const };
+
+  it('redacts equivalently to redactText across arbitrary chunk boundaries', () => {
+    const text = 'contact jane@example.com or bob@work.io before noon';
+    const expected = redactText(text, filterByPolicy(det.detect(text), redact));
+    const r = new StreamingRedactor(det, redact, 32);
+    let out = '';
+    for (const ch of text) out += r.push(ch); // char-by-char: worst case for boundaries
+    out += r.flush();
+    expect(out).toBe(expected);
+    expect(out).not.toContain('jane@example.com');
+  });
+
+  it('holds a match spanning two chunks, then redacts it (never emits a partial secret)', () => {
+    const r = new StreamingRedactor(det, redact, 64);
+    let out = r.push('the address is jane.d'); // partial email must be held back
+    expect(out).not.toContain('jane.d');
+    out += r.push('oe@example.com today');
+    out += r.flush();
+    expect(out).toContain('<<REDACTED_EMAIL>>');
+    expect(out).not.toContain('jane.doe@example.com');
+    expect(out).toContain('today');
+  });
+
+  it('records de-duplicated findings for the audit trail', () => {
+    const r = new StreamingRedactor(det, redact, 16);
+    for (const ch of 'x jane@example.com y') r.push(ch);
+    r.flush();
+    expect(r.findings().filter((f) => f.category === 'email')).toHaveLength(1);
+  });
+
+  it('block: emits clean content up to the first finding, then blocks (no partial leak)', () => {
+    const r = new StreamingRedactor(det, { action: 'block' }, 8);
+    let out = r.push('all clear ');
+    out += r.push('leak jane@example.com ' + 'z'.repeat(40));
+    expect(r.blocked).toBe(true);
+    expect(out).toContain('all clear');
+    expect(out).not.toContain('jane@example.com');
+    expect(r.push('more')).toBe(''); // terminal: nothing more is emitted
+  });
+
+  it('fails closed when an open-ended match overflows the hold buffer', () => {
+    // A pathological detector whose match always spans the whole buffer keeps
+    // pulling the safe boundary back, so the hold buffer grows past the cap.
+    const growing: Detector = {
+      name: 'growing',
+      detect: (t) =>
+        t.length
+          ? [
+              {
+                category: 'high_entropy',
+                start: 0,
+                end: t.length,
+                source: 'entropy',
+                confidence: 1,
+              },
+            ]
+          : [],
+    };
+    const r = new StreamingRedactor(growing, redact, 8); // maxBuffer floors at 8192
+    for (let i = 0; i < 2000; i++) r.push('xxxxx'); // 10000 chars, never emittable
+    expect(r.failClosed).toBe(true);
+  });
+
+  it('never leaks the prefix of a long unkeyed high-entropy secret (self-straddling)', () => {
+    // The entropy candidate regex is open-ended (matches a run to the buffer end),
+    // so a long secret with no known prefix is detected on its partial run and its
+    // finding straddles the window boundary — held without needing an anchor.
+    const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const secret = alpha.repeat(14); // 868 chars, high entropy, > window, no prefix
+    const text = 'here is a token ' + secret + ' end';
+    const r = new StreamingRedactor(det, { action: 'redact', minConfidence: 0.3 }, 64);
+    let out = '';
+    for (let i = 0; i < text.length; i += 19) out += r.push(text.slice(i, i + 19));
+    out += r.flush();
+    expect(out).not.toContain(alpha.repeat(2)); // no run of the secret ever emitted
+    expect(out).toContain('<<REDACTED_HIGH_ENTROPY>>');
+    expect(out).toContain('end');
+  });
+
+  it('never leaks the leading bytes of a PEM private key longer than the window', () => {
+    const bodyLine = 'MIIBOwIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q';
+    const pem =
+      '-----BEGIN RSA PRIVATE KEY-----\n' +
+      Array(15).fill(bodyLine).join('\n') +
+      '\n-----END RSA PRIVATE KEY-----';
+    const r = new StreamingRedactor(det, { action: 'redact', minConfidence: 0.5 }, 64); // window << pem
+    let out = '';
+    for (let i = 0; i < pem.length; i += 17) out += r.push(pem.slice(i, i + 17));
+    out += r.flush();
+    expect(out).not.toContain(bodyLine); // no key material ever emitted
+    expect(out).toContain('<<REDACTED_PRIVATE_KEY>>');
+  });
+
+  it('never leaks a JWT longer than the window', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' + 'a'.repeat(300) + '.' + 'b'.repeat(300);
+    const text = 'token ' + jwt + ' end';
+    const r = new StreamingRedactor(det, { action: 'redact', minConfidence: 0.5 }, 64);
+    let out = '';
+    for (let i = 0; i < text.length; i += 13) out += r.push(text.slice(i, i + 13));
+    out += r.flush();
+    expect(out).not.toContain('a'.repeat(64)); // JWT payload never emitted
+    expect(out).toContain('<<REDACTED_JWT>>');
+    expect(out).toContain('token');
+    expect(out).toContain('end');
+  });
+
+  it('does not fail closed on a long base64 blob that merely begins with eyJ', () => {
+    // No dot after the header run → not a forming JWT → must not be held/withheld.
+    const blob = 'eyJ' + 'A'.repeat(4000); // > maxBuffer, but not a JWT
+    const text = 'data: ' + blob + ' done';
+    const r = new StreamingRedactor(det, { action: 'redact', minConfidence: 0.5 }, 64);
+    let out = '';
+    for (let i = 0; i < text.length; i += 29) out += r.push(text.slice(i, i + 29));
+    out += r.flush();
+    expect(r.failClosed).toBe(false);
+    expect(out).toContain(blob); // emitted intact, not withheld
+  });
+
+  it('fails closed when a PEM begin marker never closes (over cap, no leak)', () => {
+    const r = new StreamingRedactor(det, { action: 'redact' }, 64); // maxBuffer 8192
+    let out = r.push('-----BEGIN RSA PRIVATE KEY-----\n');
+    for (let i = 0; i < 500; i++) out += r.push('MIIBOwIBAAJBAKj34GkxFhD9\n'); // 12500 chars, no END
+    expect(r.failClosed).toBe(true);
+    expect(out).not.toContain('MIIBOwIBAAJBAKj34GkxFhD9'); // body withheld, never emitted
   });
 });
 

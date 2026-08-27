@@ -21,6 +21,7 @@ import {
   filterByPolicy,
   type GuardrailEngine,
   type OutputInspection,
+  StreamingRedactor,
   StreamingReplacer,
   StreamingScanner,
   type TokenVault,
@@ -35,7 +36,13 @@ import type { SmartRouter } from '../smart-router';
 import type { TenantCredentialResolver } from '../tenant';
 import type { TenantRouteResolver } from '../tenant-routes';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
-import { parseRetryAfterMs, SSEParser, type UsageExtractor } from '@gulley/providers';
+import {
+  AnthropicSseRewriter,
+  parseRetryAfterMs,
+  SSEParser,
+  type TextTransform,
+  type UsageExtractor,
+} from '@gulley/providers';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
 import {
   allTargets,
@@ -160,6 +167,13 @@ export interface GatewayContext {
   /** When a buffered-enforcement body exceeds the limit, withhold (true) rather
    *  than forward it unenforced+truncated (false). Default true. */
   bufferFailClosed?: boolean;
+  /** M17: windowed in-stream output enforcement (redact/block) on Anthropic-
+   *  canonical streamed responses; absent/false = streamed output stays audit-only. */
+  streamEnforce?: boolean;
+  /** Hold-back window (chars) for streaming enforcement. Covers bounded matches;
+   *  effectively-unbounded secrets (PEM keys, long JWTs) are start-anchored by the
+   *  redactor regardless of window size. Default 512. */
+  streamEnforceWindowChars?: number;
   /** Request header whose value pins a session to one target (HRW affinity);
    *  falls back to the principal id. Absent = no affinity (P2C / weighted). */
   sessionAffinityHeader?: string;
@@ -1148,6 +1162,40 @@ async function handleProxy(
     streamed && outputEnforcing && route.holdStreamedOutput === true && statusCode < 400;
   const bufferOutput = (outputEnforcing && !streamed && statusCode < 400) || holdStreamed;
 
+  // M17: windowed in-stream output enforcement (opt-in) for an Anthropic-canonical
+  // streamed response — redacts matched spans / blocks on the first violation via a
+  // delayed-emit window, trading raw-byte-fidelity + a bounded delay for
+  // enforcement. Skipped for a hold-then-flush route (it buffers-and-withholds) and
+  // for a non-Anthropic client stream (whose wire shape isn't content_block_delta).
+  const streamEnforce =
+    streamed &&
+    outputEnforcing &&
+    ctx.streamEnforce === true &&
+    !holdStreamed &&
+    statusCode < 400 &&
+    route.clientPaths.some((p) => p.endsWith('/v1/messages'));
+  const redactor =
+    streamEnforce && engine
+      ? new StreamingRedactor(
+          engine.combinedDetector(),
+          engine.outputPolicy,
+          ctx.streamEnforceWindowChars ?? 512,
+        )
+      : undefined;
+  // The client-bound transform: detokenize masked-input values (in logical-text
+  // space) BEFORE redacting, so the redactor sees the real values.
+  const enforcer =
+    redactor !== undefined
+      ? new AnthropicSseRewriter(
+          detok
+            ? ({
+                push: (t) => redactor.push(detok.push(t)),
+                flush: () => redactor.push(detok.flush()) + redactor.flush(),
+              } satisfies TextTransform)
+            : redactor,
+        )
+      : undefined;
+
   // Capture the full response when we need it whole: non-streamed metering,
   // buffered enforcement, or a cacheable miss we intend to store.
   const storeCache =
@@ -1189,9 +1237,11 @@ async function handleProxy(
     // streaming audit scanner, filtered to what the output policy cares about.
     const outFindings = bufferOutput
       ? (outputEnforced?.findings ?? [])
-      : outScanner && engine
-        ? filterByPolicy(outScanner.findings(), engine.outputPolicy)
-        : [];
+      : redactor
+        ? redactor.findings() // already policy-filtered; the windowed enforcer's set
+        : outScanner && engine
+          ? filterByPolicy(outScanner.findings(), engine.outputPolicy)
+          : [];
     const outputSensitive = outFindings.some((f) => f.confidence >= CACHE_SENSITIVE_CONFIDENCE);
 
     // Release the reservation FIRST and independently of the best-effort durable
@@ -1442,6 +1492,9 @@ async function handleProxy(
       'x-gulley-request-id': requestId,
       'x-gulley-target': served.name,
       'x-gulley-cache': cacheLookup?.status ?? 'bypass',
+      // Advertise the enforcement MODE up front (the outcome — redacted spans or a
+      // terminal error — is signalled in-band, since headers are already flushed).
+      ...(streamEnforce ? { 'x-gulley-guardrail': 'stream-enforce' } : {}),
     };
     reply.raw.writeHead(statusCode, finalizeResp(responseHeaders));
   }
@@ -1481,7 +1534,9 @@ async function handleProxy(
     let text: string | undefined;
     if (decoder) {
       text = decoder.write(chunk);
-      if (outScanner && text) outScanner.push(text);
+      // The windowed enforcer (redactor) supersedes the raw audit scanner: it
+      // detects on logical text and its findings() feed the audit trail.
+      if (outScanner && text && !redactor) outScanner.push(text);
     }
 
     if (streamed) {
@@ -1495,16 +1550,35 @@ async function handleProxy(
     if (bufferOutput) return; // hold bytes; enforce + write once at end
 
     let outBuf = chunk;
-    if (detok && text !== undefined) outBuf = Buffer.from(detok.push(text), 'utf8');
+    if (enforcer && text !== undefined) {
+      outBuf = Buffer.from(enforcer.push(text), 'utf8'); // windowed redact/block
+    } else if (detok && text !== undefined) {
+      outBuf = Buffer.from(detok.push(text), 'utf8');
+    }
     try {
       if (!reply.raw.writableEnded) {
         // Honor backpressure: if the client-bound socket buffer is full, pause
         // the upstream until it drains. Without this a slow reader makes the
         // (bodyTimeout-disabled) upstream fill memory unbounded — an OOM vector.
-        const flushed = reply.raw.write(outBuf);
-        if (!flushed) {
-          upstreamBody.pause();
-          reply.raw.once('drain', () => upstreamBody.resume());
+        if (outBuf.length > 0) {
+          const flushed = reply.raw.write(outBuf);
+          if (!flushed) {
+            upstreamBody.pause();
+            reply.raw.once('drain', () => upstreamBody.resume());
+          }
+        }
+        // M17: a block or fail-closed verdict terminates the stream AFTER the safe
+        // prefix was emitted — a terminal SSE error, then abort → single teardown.
+        if (redactor && (redactor.blocked || redactor.failClosed)) {
+          reply.raw.write(
+            providerErrorFrame(
+              provider,
+              redactor.blocked ? 'response blocked by guardrail' : 'response withheld by guardrail',
+            ),
+          );
+          reply.raw.end();
+          clearWatchdog();
+          controller.abort();
         }
       }
     } catch {
@@ -1649,10 +1723,10 @@ async function handleProxy(
         reply.raw.end();
       }
     } else {
-      if (detok) {
-        const rest = detok.flush();
-        if (rest && !reply.raw.writableEnded) reply.raw.write(Buffer.from(rest, 'utf8'));
-      }
+      // Flush the streaming transform's held tail (the windowed enforcer, else the
+      // detokenizer) so no bytes are lost at stream end.
+      const rest = enforcer ? enforcer.flush() : detok ? detok.flush() : '';
+      if (rest && !reply.raw.writableEnded) reply.raw.write(Buffer.from(rest, 'utf8'));
       if (!reply.raw.writableEnded) reply.raw.end();
     }
   }

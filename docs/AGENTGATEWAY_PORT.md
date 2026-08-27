@@ -202,20 +202,39 @@ passed the adversarial-review gate (D: 2 findings fixed; E: 0 confirmed):
   non-Anthropic classifier completer; the per-policy safety-overrides-residency
   flag.
 
+## M16 — Embedding-nearest-label classifier backend — ✅ DELIVERED
+
+Completes the smart-routing classifier trio. A policy's config `exemplars`
+(example prompts per category) are embedded into per-category centroids at
+reconcile (reusing the semantic-cache `OpenAIEmbeddingProvider`, memoized so an
+unchanged policy is not re-embedded); a request routes to the category whose
+exemplar is nearest (cosine) above `SMART_ROUTING_SIMILARITY_THRESHOLD`. The
+reconciler now wires the embedder + a classifier breaker + the threshold; prompt
+embedding is bounded and abort-aware. In-memory centroids (a persistent
+`classifier_centroid` table is a documented follow-on). See
+`docs/M15_SMART_ROUTING.md`.
+
+## M17 — Streaming output-guardrail enforcement — ✅ DELIVERED
+
+Closes the biggest pipeline gap: streamed output guardrails were audit-only.
+M17 adds an opt-in windowed delayed-emit enforcer that **redacts** matched
+PII/secret spans (or **blocks** on the first violation) in an Anthropic-canonical
+streamed response — trading raw-byte fidelity + a bounded latency window, for
+that mode only, for enforcement. Two composable primitives (`StreamingRedactor`
+in `@gulley/guardrails`, `AnthropicSseRewriter` in `@gulley/providers`) wired at
+the single byte-transform seam; single teardown, backpressure, watchdog, and
+meter-from-raw-usage all preserved. See `docs/M17_STREAMING_ENFORCEMENT.md`.
+
 ## Recommended next steps (candidate roadmap → world-class)
 
-Ranked; the first three finish the smart-routing story or close the biggest
-pipeline gap.
-
 - **Tier 1 (differentiators).**
-  1. **Embedding-nearest-label backend** — the 3rd classifier: a
-     `classifier_centroid` table + Postgres adapter + exemplar loading, reusing
-     the semantic-cache embedder. No LLM round-trip; cheapest classification.
-  2. **Streaming output-guardrail enforcement** — the biggest pipeline gap:
-     streaming guardrails are audit-only; block/redact needs a windowed
-     delayed-emit scanner.
-  3. **Native Gemini tool + image translation** — makes Vertex first-class (M14 B
+  1. **Native Gemini tool + image translation** — makes Vertex first-class (M14 B
      covered text + thinking only).
+  2. **Reversible streaming output-mask + non-Anthropic re-framing** — M17's
+     streamed `mask` currently maps to irreversible redaction and covers
+     Anthropic-canonical routes only.
+  3. **Persistent classifier-centroid store** — so replicas don't each re-embed
+     M16 exemplars (a `classifier_centroid` table + adapter).
 - **Tier 2 (completeness).** Classification memoization (per session/prompt-hash);
   per-tenant noisy-neighbor controls (per-tenant concurrency + priority); admin UI
   depth (surface smart-routing policies + `proxy.classify` spend, budgets/audit,
