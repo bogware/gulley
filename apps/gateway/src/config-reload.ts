@@ -4,6 +4,7 @@ import {
   createClosableDatabase,
   createListenConnection,
   newOriginId,
+  PostgresCentroidStore,
   PostgresConfigBus,
   PostgresConfigStore,
   PostgresConfigVersionStore,
@@ -51,11 +52,18 @@ export function buildConfigWatcher(
     record: (k, ok) =>
       ok ? holder.ctx.breaker.recordSuccess(k) : holder.ctx.breaker.recordFailure(k),
   };
+  // Persist embedded exemplar centroids so replicas reuse them instead of each
+  // re-embedding on boot (opt-out via SMART_ROUTING_PERSIST_CENTROIDS). Keyed by
+  // the embedding model, so a model change transparently re-embeds.
+  const persistCentroids =
+    config.SMART_ROUTING_ENABLED && embedder && config.SMART_ROUTING_PERSIST_CENTROIDS;
   const reconciler = new GatewayReconciler(holder, store, resolver, log, {
     enabled: config.SMART_ROUTING_ENABLED,
     embedder,
     breaker: config.SMART_ROUTING_ENABLED ? breaker : undefined,
     similarityThreshold: config.SMART_ROUTING_SIMILARITY_THRESHOLD,
+    store: persistCentroids ? new PostgresCentroidStore(db) : undefined,
+    model: persistCentroids ? config.EMBEDDINGS_MODEL : undefined,
   });
 
   const listen = createListenConnection(config.DATABASE_URL);

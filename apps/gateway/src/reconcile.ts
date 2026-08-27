@@ -1,10 +1,14 @@
 import type { ConfigStore, ConfigVersionStore } from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
 import type { ClassifierBreaker, ClassifierEmbedder } from '@gulley/routing';
-import { type ConfigSubscriber, SignalGate } from '@gulley/storage';
+import { type CentroidStore, type ConfigSubscriber, SignalGate } from '@gulley/storage';
 import { buildRoutesFromDocument } from './config-builder';
 import type { RouteHolder } from './routes/messages';
-import { buildEmbeddingCentroids, type EmbeddingCache } from './smart-classifier-embedding';
+import {
+  buildEmbeddingCentroids,
+  buildPersistentCentroids,
+  type EmbeddingCache,
+} from './smart-classifier-embedding';
 import { buildSmartRouter } from './smart-router';
 import { parseSmartRoutingPolicies } from './smart-routing-config';
 
@@ -19,6 +23,11 @@ export interface SmartRoutingReconcile {
   breaker?: ClassifierBreaker;
   /** Cosine-similarity floor for embedding classification (engine default 0.6). */
   similarityThreshold?: number;
+  /** Durable centroid store; present ⇒ exemplar embeddings are persisted/reused
+   *  across replicas (requires `model`) instead of re-embedded every reconcile. */
+  store?: CentroidStore;
+  /** Embedding model id keying persisted centroids (a model change re-embeds). */
+  model?: string;
 }
 
 export interface ReconcileLog {
@@ -73,8 +82,11 @@ export class GatewayReconciler {
       let smartRouter;
       if (this.smartRouting?.enabled) {
         const policies = parseSmartRoutingPolicies(doc);
-        const centroids = this.smartRouting.embedder
-          ? await buildEmbeddingCentroids(policies, this.smartRouting.embedder, this.embedCache)
+        const { embedder, store, model } = this.smartRouting;
+        const centroids = embedder
+          ? store && model
+            ? await buildPersistentCentroids(policies, embedder, store, model)
+            : await buildEmbeddingCentroids(policies, embedder, this.embedCache)
           : undefined;
         smartRouter = buildSmartRouter(policies, routes, {
           embedder: this.smartRouting.embedder,

@@ -1714,6 +1714,255 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await new Promise<void>((r) => server.close(() => r()));
   });
 
+  // --- M17 non-Anthropic re-framing: the OpenAI chat.completions stream shape ---
+
+  const openaiSse = (contents: string[], outputTokens = 9): string => {
+    const chunk = (o: unknown): string => `data: ${JSON.stringify(o)}\n\n`;
+    const content = (text: string): string =>
+      chunk({
+        id: 'c',
+        object: 'chat.completion.chunk',
+        model: 'gpt-4o-mini',
+        choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+      });
+    return (
+      chunk({
+        id: 'c',
+        object: 'chat.completion.chunk',
+        model: 'gpt-4o-mini',
+        choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+      }) +
+      contents.map(content).join('') +
+      chunk({
+        id: 'c',
+        object: 'chat.completion.chunk',
+        model: 'gpt-4o-mini',
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      }) +
+      chunk({ choices: [], usage: { prompt_tokens: 7, completion_tokens: outputTokens } }) +
+      'data: [DONE]\n\n'
+    );
+  };
+
+  const openaiClientText = (sse: string): string =>
+    new SSEParser()
+      .push(sse)
+      .flatMap((e) => {
+        if (e.data === '[DONE]') return [];
+        try {
+          const d = JSON.parse(e.data) as { choices?: Array<{ delta?: { content?: string } }> };
+          return (d.choices ?? [])
+            .map((c) => c.delta?.content)
+            .filter((x): x is string => typeof x === 'string');
+        } catch {
+          return [];
+        }
+      })
+      .join('');
+
+  const openaiStreamEnforceRoute = async (
+    contents: string[],
+    action: 'redact' | 'block' | 'mask',
+  ): Promise<{
+    app: Awaited<ReturnType<typeof buildServer>>;
+    base: string;
+    server: http.Server;
+    ledger: InMemoryLedger;
+    token: string;
+  }> => {
+    const body = openaiSse(contents);
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(body);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.streamEnforce = true;
+    ctx.streamEnforceWindowChars = 32;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/chat/completions'],
+        createExtractor: () => new OpenAIUsageExtractor(),
+        strategy: {
+          mode: 'single',
+          target: {
+            name: 'oai',
+            provider: 'openai',
+            adapter: new AnthropicAdapter({ baseUrl: url }), // passthrough to the canned server
+            credential: { scheme: 'bearer', value: UPSTREAM_KEY },
+            upstreamPath: '/v1/chat/completions',
+          },
+        },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action, minConfidence: 0.5 },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    return { app, base, server, ledger, token };
+  };
+
+  const openaiReqBody = JSON.stringify({
+    model: 'gpt-4o-mini',
+    stream: true,
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+
+  it('redacts a secret in a streamed OpenAI chat.completions response', async () => {
+    const { app, base, server, ledger, token } = await openaiStreamEnforceRoute(
+      [
+        'Here is a long clean intro with nothing sensitive at all. The key is AKIA',
+        'IOSFODNN7EXAMPLE and here is clean trailing text continuing well past the window.',
+      ],
+      'redact',
+    );
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: openaiReqBody,
+    });
+    const text = await res.text();
+    const ct = openaiClientText(text);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-guardrail')).toBe('stream-enforce');
+    expect(ct).not.toContain('AKIAIOSFODNN7EXAMPLE'); // secret redacted mid-stream
+    expect(ct).toContain('<<REDACTED_AWS_ACCESS_KEY_ID>>');
+    expect(ct).toContain('Here is a long clean intro'); // clean prefix delivered
+    expect(ct).toContain('clean trailing text'); // clean suffix delivered
+    expect(text).toContain('[DONE]'); // terminator preserved
+    expect(text).toContain('"usage"'); // usage frame preserved
+    expect(ledger.entries).toHaveLength(1); // single teardown
+    expect(ledger.entries[0]?.cost.outputTokens).toBe(9); // metered from ORIGINAL frames
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('reversibly masks a secret in a streamed OpenAI response (client gets stable tokens)', async () => {
+    const { app, base, server, ledger, token } = await openaiStreamEnforceRoute(
+      [
+        'Clean intro text that comfortably exceeds the hold window here. Contact jane@examp',
+        'le.com now and then jane@example.com again, plus clean trailing text past the edge.',
+      ],
+      'mask',
+    );
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: openaiReqBody,
+    });
+    const text = await res.text();
+    const ct = openaiClientText(text);
+
+    expect(res.status).toBe(200);
+    expect(ct).not.toContain('jane@example.com'); // raw value never reaches the client
+    const tokens = [...ct.matchAll(/<<GULLEY_EMAIL_\d+>>/g)].map((m) => m[0]);
+    expect(tokens.length).toBe(2); // both occurrences tokenized
+    expect(tokens[0]).toBe(tokens[1]); // stable token (coreference preserved)
+    expect(ledger.entries).toHaveLength(1);
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('blocks a streamed OpenAI response with an OpenAI-dialect terminal error', async () => {
+    const { app, base, server, ledger, token } = await openaiStreamEnforceRoute(
+      [
+        'A clean opening sentence with nothing to hide here at all. Then the key is AKIA',
+        'IOSFODNN7EXAMPLE plus a good amount of clean trailing text past the window edge.',
+      ],
+      'block',
+    );
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: openaiReqBody,
+    });
+    const text = await res.text();
+
+    expect(openaiClientText(text)).toContain('A clean opening'); // clean prefix streamed
+    expect(text).not.toContain('AKIAIOSFODNN7EXAMPLE'); // secret never emitted
+    expect(text).toContain('"type":"api_error"'); // OpenAI-shaped terminal error
+    expect(text).not.toContain('event: error'); // NOT the Anthropic dialect
+    expect(ledger.entries).toHaveLength(1); // single teardown even on a mid-stream block
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('fails closed on a multi-choice (n>1) OpenAI stream instead of corrupting text', async () => {
+    const chunk = (o: unknown): string => `data: ${JSON.stringify(o)}\n\n`;
+    const body =
+      chunk({
+        id: 'c',
+        object: 'chat.completion.chunk',
+        model: 'gpt-4o-mini',
+        choices: [
+          { index: 0, delta: { content: 'Hello from choice zero here.' }, finish_reason: null },
+        ],
+      }) +
+      chunk({
+        id: 'c',
+        object: 'chat.completion.chunk',
+        model: 'gpt-4o-mini',
+        choices: [
+          { index: 1, delta: { content: 'Bonjour depuis le choix un.' }, finish_reason: null },
+        ],
+      }) +
+      chunk({ choices: [], usage: { prompt_tokens: 7, completion_tokens: 4 } }) +
+      'data: [DONE]\n\n';
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(body);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.streamEnforce = true;
+    ctx.streamEnforceWindowChars = 32;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/chat/completions'],
+        createExtractor: () => new OpenAIUsageExtractor(),
+        strategy: {
+          mode: 'single',
+          target: {
+            name: 'oai',
+            provider: 'openai',
+            adapter: new AnthropicAdapter({ baseUrl: url }),
+            credential: { scheme: 'bearer', value: UPSTREAM_KEY },
+            upstreamPath: '/v1/chat/completions',
+          },
+        },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action: 'redact', minConfidence: 0.5 },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: openaiReqBody,
+    });
+    const text = await res.text();
+
+    expect(text).not.toContain('Bonjour depuis le choix un'); // 2nd choice never corrupts/leaks
+    expect(text).toContain('"type":"api_error"'); // OpenAI-dialect terminal error
+    expect(ledger.entries).toHaveLength(1); // single teardown
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
   it('withholds a buffered response that overflows the enforcement buffer (fail-closed)', async () => {
     const big = http.createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });

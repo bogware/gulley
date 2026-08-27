@@ -211,8 +211,7 @@ unchanged policy is not re-embedded); a request routes to the category whose
 exemplar is nearest (cosine) above `SMART_ROUTING_SIMILARITY_THRESHOLD`. The
 reconciler now wires the embedder + a classifier breaker + the threshold; prompt
 embedding is bounded and abort-aware. In-memory centroids (a persistent
-`classifier_centroid` table is a documented follow-on). See
-`docs/M15_SMART_ROUTING.md`.
+`classifier_centroid` store followed in **M18**). See `docs/M15_SMART_ROUTING.md`.
 
 ## M17 — Streaming output-guardrail enforcement — ✅ DELIVERED
 
@@ -225,16 +224,36 @@ in `@gulley/guardrails`, `AnthropicSseRewriter` in `@gulley/providers`) wired at
 the single byte-transform seam; single teardown, backpressure, watchdog, and
 meter-from-raw-usage all preserved. See `docs/M17_STREAMING_ENFORCEMENT.md`.
 
+## M18 — Streaming reach: non-Anthropic re-framing, reversible mask, persistent centroids — ✅ DELIVERED
+
+Two Tier-1 follow-ons, completing M16/M17's asterisks.
+
+- **Non-Anthropic streaming enforcement.** A new `OpenAiSseRewriter`
+  (`@gulley/providers`) re-frames the OpenAI `chat.completions` stream
+  (`choices[].delta.content`), so streaming redact/mask/block now covers the
+  OpenAI-compatible surface, not just `/v1/messages`. The gateway selects the
+  rewriter by client dialect and emits a **dialect-correct** terminal error frame
+  on block/fail-closed. `/v1/responses` + `/v1/embeddings` stay audit-only.
+- **Reversible streaming mask.** `StreamingRedactor` (and the buffered
+  `inspectOutputText`) now implement `mask` as stable per-value tokenization via a
+  `TokenVault` — coreference-preserving and gateway-reversible — instead of
+  collapsing to irreversible redaction. `redact` is unchanged (irreversible).
+- **Persistent classifier centroids.** A `classifier_centroid` table (jsonb
+  embeddings) + `PostgresCentroidStore`; `buildPersistentCentroids` reuses
+  persisted exemplar embeddings across replicas instead of re-embedding on boot,
+  keyed by embedding model, fail-open at every layer
+  (`SMART_ROUTING_PERSIST_CENTROIDS`).
+
 ## Recommended next steps (candidate roadmap → world-class)
 
 - **Tier 1 (differentiators).**
   1. **Native Gemini tool + image translation** — makes Vertex first-class (M14 B
      covered text + thinking only).
-  2. **Reversible streaming output-mask + non-Anthropic re-framing** — M17's
-     streamed `mask` currently maps to irreversible redaction and covers
-     Anthropic-canonical routes only.
-  3. **Persistent classifier-centroid store** — so replicas don't each re-embed
-     M16 exemplars (a `classifier_centroid` table + adapter).
+  2. **`/v1/responses` streaming enforcement + persisted-vault reversal path** —
+     M18 covers Anthropic + OpenAI-chat streams; the Responses API stream and a
+     durable (encrypted) reversal store for masked output are the remaining edges.
+  3. **pgvector-backed centroid ANN** — M18 persists centroids as jsonb (load-all +
+     in-JS cosine); a `vector`-typed column + ANN index scales large exemplar sets.
 - **Tier 2 (completeness).** Classification memoization (per session/prompt-hash);
   per-tenant noisy-neighbor controls (per-tenant concurrency + priority); admin UI
   depth (surface smart-routing policies + `proxy.classify` spend, budgets/audit,

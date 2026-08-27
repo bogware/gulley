@@ -14,11 +14,15 @@ With `STREAMING_ENFORCE=true` and an enforcing `GUARDRAILS_OUTPUT_ACTION`
 (`redact` / `mask` / `block`), a streamed **Anthropic-canonical** response is
 rewritten as it flows to the client:
 
-- **redact / mask** — each matched span (above `GUARDRAILS_OUTPUT_MIN_CONFIDENCE`)
-  is replaced with `<<REDACTED_CATEGORY>>` before it reaches the client. A
-  bounded tail is held back so a match forming at a chunk boundary is never
-  split, and the safe-emit boundary is pulled earlier so a span's leading bytes
-  are never emitted ahead of its redaction.
+- **redact** — each matched span (above `GUARDRAILS_OUTPUT_MIN_CONFIDENCE`) is
+  replaced with an irreversible `<<REDACTED_CATEGORY>>` placeholder before it
+  reaches the client. A bounded tail is held back so a match forming at a chunk
+  boundary is never split, and the safe-emit boundary is pulled earlier so a
+  span's leading bytes are never emitted ahead of its redaction.
+- **mask** (reversible, M18) — each matched span is replaced with a stable
+  per-value token (`<<GULLEY_CATEGORY_N>>`) via a stream-long `TokenVault`:
+  recurring values keep one token (coreference preserved) and the emitted stream
+  detokenizes back to the original for an authorized consumer, unlike `redact`.
 - **block** — the clean content up to the first violation is streamed, then the
   stream is terminated with a provider-shaped terminal SSE error. Content already
   streamed before the violation is inherent to streaming (irrevocable); a route
@@ -71,26 +75,25 @@ routes are never cached).
 ## Config
 
 `GUARDRAILS_OUTPUT_ACTION` (audit | block | mask | redact) + `..._MIN_CONFIDENCE`,
-`STREAMING_ENFORCE` (bool), `STREAMING_ENFORCE_WINDOW_CHARS` (default 256).
+`STREAMING_ENFORCE` (bool), `STREAMING_ENFORCE_WINDOW_CHARS` (default 512).
 
-## Scope & limitations (v1)
+## Scope & limitations
 
-- **Anthropic-canonical routes only.** The rewriter understands
-  `content_block_delta`/`text_delta`; the gate restricts streaming enforcement to
-  `/v1/messages`-family client paths (whose client-bound stream is Anthropic SSE).
-  For other client shapes (native OpenAI `/v1/chat/completions`, Bedrock
-  eventstream) use `holdStreamedOutput` for strict enforcement; streamed output
-  there stays audit-only.
-- **`windowChars` must exceed the longest expected match** — a match longer than
-  the window can leak a prefix before it is recognized. Bounded categories
-  (patterns + secret prefixes) are well-behaved; an open-ended `high_entropy`
-  match trips the fail-closed cap.
-- **Streaming `mask` == redaction.** There is no reversible client-side mask on
-  the output side today (the vault is input-side); a streamed `mask` policy maps
-  to irreversible `<<REDACTED_…>>` placeholders. Genuine reversible output-mask is
-  a later milestone.
-- **A persistent record + native non-Anthropic re-framing** are additive
-  follow-ons.
+- **Anthropic Messages + OpenAI chat.completions streams** (OpenAI added in M18).
+  The gate enables enforcement for `/v1/messages`- and `/v1/chat/completions`-
+  family client paths and picks the matching rewriter (`AnthropicSseRewriter` /
+  `OpenAiSseRewriter`) by client dialect. `/v1/responses` and `/v1/embeddings`
+  (and Bedrock eventstream) stay audit-only — use `holdStreamedOutput` for strict
+  enforcement there.
+- **Window-exceeding secrets are anchored, not leaked** (M17 fix). A match longer
+  than the window (a multi-line PEM key, a long JWT) is held from its start anchor
+  (`LONG_MATCH_ANCHORS`) until it completes; an open-ended `high_entropy` match
+  self-straddles the window; a forming match that overruns the buffer cap trips
+  fail-closed. So `windowChars` tunes latency, not correctness.
+- **Reversible `mask`** (M18): a streamed/buffered `mask` policy now emits stable
+  reversible tokens via a `TokenVault` (see above). The vault is retained
+  in-process; a durable (encrypted) reversal store for masked output is a
+  follow-on — do not treat the current mask as a persistence mechanism.
 
 ## Phases
 

@@ -5,4 +5,5 @@ export * from './pubsub';
 export * from './env';
 export * from './adapters';
 export * from './cache-adapters';
+export * from './centroid-store';
 export * from './config-store';

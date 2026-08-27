@@ -38,6 +38,7 @@ import type { TenantRouteResolver } from '../tenant-routes';
 import type { AuditSink, Ledger, RequestLogSink, RequestStatus } from '@gulley/pipeline';
 import {
   AnthropicSseRewriter,
+  OpenAiSseRewriter,
   parseRetryAfterMs,
   SSEParser,
   type TextTransform,
@@ -1162,18 +1163,26 @@ async function handleProxy(
     streamed && outputEnforcing && route.holdStreamedOutput === true && statusCode < 400;
   const bufferOutput = (outputEnforcing && !streamed && statusCode < 400) || holdStreamed;
 
-  // M17: windowed in-stream output enforcement (opt-in) for an Anthropic-canonical
-  // streamed response — redacts matched spans / blocks on the first violation via a
-  // delayed-emit window, trading raw-byte-fidelity + a bounded delay for
-  // enforcement. Skipped for a hold-then-flush route (it buffers-and-withholds) and
-  // for a non-Anthropic client stream (whose wire shape isn't content_block_delta).
+  // M17: windowed in-stream output enforcement (opt-in) — redacts matched spans,
+  // reversibly masks, or blocks on the first violation via a delayed-emit window,
+  // trading raw-byte-fidelity + a bounded delay for enforcement. Enabled for the two
+  // text-stream shapes we can re-frame — the Anthropic Messages stream
+  // (content_block_delta) and the OpenAI chat.completions stream (choices[].delta.
+  // content). Skipped for a hold-then-flush route (it buffers-and-withholds) and for
+  // any other client dialect (e.g. /v1/responses, /v1/embeddings — left audit-only).
+  const anthropicClient = route.clientPaths.some((p) => p.endsWith('/v1/messages'));
+  const openaiChatClient = route.clientPaths.some((p) => p.endsWith('/v1/chat/completions'));
+  // Terminal error frames are client-bound, so their SSE shape follows the client's
+  // dialect, not the upstream provider (an OpenAI-compatible backend may not be
+  // literally "openai").
+  const clientDialect: 'openai' | 'anthropic' = anthropicClient ? 'anthropic' : 'openai';
   const streamEnforce =
     streamed &&
     outputEnforcing &&
     ctx.streamEnforce === true &&
     !holdStreamed &&
     statusCode < 400 &&
-    route.clientPaths.some((p) => p.endsWith('/v1/messages'));
+    (anthropicClient || openaiChatClient);
   const redactor =
     streamEnforce && engine
       ? new StreamingRedactor(
@@ -1183,18 +1192,23 @@ async function handleProxy(
         )
       : undefined;
   // The client-bound transform: detokenize masked-input values (in logical-text
-  // space) BEFORE redacting, so the redactor sees the real values.
+  // space) BEFORE enforcing, so the enforcer sees the real values. The SSE rewriter
+  // is chosen by client dialect — both apply the same text transform.
+  const enforceTransform: TextTransform | undefined =
+    redactor === undefined
+      ? undefined
+      : detok
+        ? {
+            push: (t) => redactor.push(detok.push(t)),
+            flush: () => redactor.push(detok.flush()) + redactor.flush(),
+          }
+        : redactor;
   const enforcer =
-    redactor !== undefined
-      ? new AnthropicSseRewriter(
-          detok
-            ? ({
-                push: (t) => redactor.push(detok.push(t)),
-                flush: () => redactor.push(detok.flush()) + redactor.flush(),
-              } satisfies TextTransform)
-            : redactor,
-        )
-      : undefined;
+    enforceTransform === undefined
+      ? undefined
+      : openaiChatClient
+        ? new OpenAiSseRewriter(enforceTransform)
+        : new AnthropicSseRewriter(enforceTransform);
 
   // Capture the full response when we need it whole: non-streamed metering,
   // buffered enforcement, or a cacheable miss we intend to store.
@@ -1569,10 +1583,11 @@ async function handleProxy(
         }
         // M17: a block or fail-closed verdict terminates the stream AFTER the safe
         // prefix was emitted — a terminal SSE error, then abort → single teardown.
-        if (redactor && (redactor.blocked || redactor.failClosed)) {
+        // `enforcer.failClosed` covers the OpenAI rewriter refusing an n>1 stream.
+        if (redactor && (redactor.blocked || redactor.failClosed || enforcer?.failClosed)) {
           reply.raw.write(
             providerErrorFrame(
-              provider,
+              clientDialect,
               redactor.blocked ? 'response blocked by guardrail' : 'response withheld by guardrail',
             ),
           );
@@ -1633,7 +1648,7 @@ async function handleProxy(
       };
       const bodyOut = bufferFailClosed
         ? sse
-          ? providerErrorFrame(provider, 'response too large to enforce guardrail')
+          ? providerErrorFrame(clientDialect, 'response too large to enforce guardrail')
           : Buffer.from(
               JSON.stringify({
                 type: 'error',
@@ -1669,7 +1684,7 @@ async function handleProxy(
       outputEnforced = out;
       const withhold = out.blocked || out.transformedText !== undefined;
       const bodyOut = withhold
-        ? providerErrorFrame(provider, 'response withheld by guardrail')
+        ? providerErrorFrame(clientDialect, 'response withheld by guardrail')
         : detok
           ? detok.push(text) + detok.flush()
           : text;
@@ -1741,7 +1756,7 @@ async function handleProxy(
       // emit a clean provider-shaped terminal error event before closing.
       if (streamed && !controller.signal.aborted) {
         try {
-          reply.raw.write(providerErrorFrame(provider, 'upstream stream error'));
+          reply.raw.write(providerErrorFrame(clientDialect, 'upstream stream error'));
         } catch {
           /* client already gone */
         }
@@ -1754,10 +1769,11 @@ async function handleProxy(
 
 /** A terminal SSE error event in the served provider's streaming dialect, so a
  *  mid-stream failure surfaces to the client as a parseable error rather than a
- *  dropped connection. Anthropic-canonical by default; OpenAI/Azure use the
- *  `data: {error}` shape their SDKs expect. */
-function providerErrorFrame(provider: string, message: string): string {
-  if (provider === 'openai' || provider === 'azure') {
+ *  dropped connection. Keyed on the CLIENT dialect (not the upstream provider),
+ *  since the frame is client-bound: Anthropic-canonical by default; the OpenAI
+ *  family uses the `data: {error}` shape their SDKs expect. */
+function providerErrorFrame(dialect: string, message: string): string {
+  if (dialect === 'openai' || dialect === 'azure') {
     return `data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`;
   }
   return `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message } })}\n\n`;

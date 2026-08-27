@@ -1,6 +1,6 @@
 import { filterByPolicy } from './engine';
 import type { Detector, Finding, GuardrailPolicy } from './types';
-import { redactText } from './vault';
+import { redactText, TokenVault } from './vault';
 
 /**
  * Starts of a potentially-LONG match — one that can exceed the hold window, so the
@@ -131,14 +131,20 @@ export class StreamingScanner {
  *
  * `push(chunk)` holds back a `windowChars` tail (so a match forming at a chunk
  * boundary is never split), pulls that boundary earlier so no enforceable
- * finding straddles it, then — for a `redact`/`mask` policy — replaces the
- * findings fully inside the safe prefix with `<<REDACTED_CAT>>` and emits; for a
- * `block` policy it emits the clean content up to the first enforceable finding,
- * sets {@link blocked}, and stops. `flush()` handles the residual at stream end.
+ * finding straddles it, then replaces the findings fully inside the safe prefix
+ * and emits: a `redact` policy substitutes the irreversible `<<REDACTED_CAT>>`
+ * placeholder; a `mask` policy substitutes a reversible per-value token via a
+ * stream-long {@link TokenVault} (recurring values keep one token — coreference
+ * preserved — and the emitted stream detokenizes back to the original via
+ * {@link vault}). A `block` policy emits the clean content up to the first
+ * enforceable finding, sets {@link blocked}, and stops. `flush()` handles the
+ * residual at stream end.
  *
  * Guarantee (mirrors {@link StreamingReplacer}): for a `redact` policy the
  * concatenation of all `push`+`flush` output equals `redactText` applied to the
- * fully-buffered logical body, for any chunk boundaries. `findings()` returns the
+ * fully-buffered logical body, for any chunk boundaries; for a `mask` policy that
+ * concatenation detokenizes (via {@link vault}) back to the fully-buffered body,
+ * with no raw sensitive value ever emitted. `findings()` returns the
  * de-duplicated absolute-offset findings for the audit trail. The hold buffer is
  * byte-capped: an open-ended match that keeps pulling the boundary back trips
  * {@link failClosed} so the caller withholds the rest rather than emit unenforced
@@ -156,6 +162,8 @@ export class StreamingRedactor {
   private readonly window: number;
   private readonly maxBuffer: number;
   private readonly block: boolean;
+  private readonly _vault?: TokenVault;
+  private readonly anchors: ReadonlyArray<{ start: RegExp; category: string }>;
 
   constructor(
     private readonly detector: Detector,
@@ -167,6 +175,19 @@ export class StreamingRedactor {
     // in full; beyond this it fails closed (withheld) rather than leaked.
     this.maxBuffer = Math.max(this.window * 8, 8192);
     this.block = policy.action === 'block';
+    // `mask` tokenizes reversibly (stable per-value token, restorable via the vault);
+    // `redact` (and any other action) replaces irreversibly. One vault spans the
+    // whole stream so a value recurring across chunks keeps its token (coreference).
+    this._vault = policy.action === 'mask' ? new TokenVault() : undefined;
+    // Only hold an anchor whose category this policy could enforce. Under a policy
+    // that excludes the category (e.g. mask PII only, not secrets), a matching
+    // JWT/PEM is not sensitive — holding it would add latency for nothing. The
+    // `minConfidence`-excluded case is handled separately by checking anchor
+    // completion against the RAW (unfiltered) detector findings in process().
+    const cats = policy.categories;
+    this.anchors = cats
+      ? LONG_MATCH_ANCHORS.filter((a) => cats.includes(a.category))
+      : LONG_MATCH_ANCHORS;
   }
 
   /** A `block` policy hit an enforceable finding; the caller terminates the stream. */
@@ -176,6 +197,11 @@ export class StreamingRedactor {
   /** The hold buffer overflowed (open-ended match); withhold the rest (fail closed). */
   get failClosed(): boolean {
     return this._failClosed;
+  }
+  /** For a `mask` policy: the reversible token↔original map accumulated over the
+   *  stream (so an authorized consumer can detokenize). Undefined for other actions. */
+  get vault(): TokenVault | undefined {
+    return this._vault;
   }
 
   push(chunk: string): string {
@@ -190,7 +216,8 @@ export class StreamingRedactor {
   }
 
   private process(final: boolean): string {
-    const findings = filterByPolicy(this.detector.detect(this.buffer), this.policy);
+    const raw = this.detector.detect(this.buffer);
+    const findings = filterByPolicy(raw, this.policy);
     // Record every detected finding once (absolute offsets), like StreamingScanner —
     // the audit trail teardown reads. redactText is not offset-idempotent, so this
     // de-dup is also what prevents a re-seen span being redacted/counted twice.
@@ -211,11 +238,15 @@ export class StreamingRedactor {
       }
       // Also hold from the start of any FORMING long match (see LONG_MATCH_ANCHORS):
       // detection needs the whole match, so without this a match longer than the
-      // window would leak its leading bytes before it completes. Hold only while the
-      // full match is NOT yet detected — once the finding appears, finding-redaction
-      // takes over (no deadlock); a match that never completes grows the buffer →
+      // window would leak its leading bytes before it completes. Completion is
+      // judged against the RAW (unfiltered) detector findings — a detector-
+      // recognition question, independent of the policy filter — so a match the
+      // policy will NOT enforce (below `minConfidence`) still releases when the
+      // detector recognizes it (then emits un-redacted) instead of deadlocking the
+      // hold into a fail-closed. `this.anchors` already drops categories outside the
+      // policy's `categories` scope. A match that never completes grows the buffer →
       // failClosed (withheld, not leaked).
-      for (const { start, category } of LONG_MATCH_ANCHORS) {
+      for (const { start, category } of this.anchors) {
         start.lastIndex = 0;
         for (let m = start.exec(this.buffer); m !== null; m = start.exec(this.buffer)) {
           if (m[0].length === 0) {
@@ -223,7 +254,7 @@ export class StreamingRedactor {
             continue;
           }
           const idx = m.index;
-          const complete = findings.some(
+          const complete = raw.some(
             (f) => f.category === category && f.start <= idx && f.end > idx,
           );
           if (!complete) safeEnd = Math.min(safeEnd, idx);
@@ -242,12 +273,12 @@ export class StreamingRedactor {
     }
 
     const prefix = this.buffer.slice(0, safeEnd);
+    const enforceable = findings.filter((f) => f.end <= safeEnd);
     const emitted = this.block
       ? prefix
-      : redactText(
-          prefix,
-          findings.filter((f) => f.end <= safeEnd),
-        );
+      : this._vault
+        ? this._vault.tokenize(prefix, enforceable) // reversible mask
+        : redactText(prefix, enforceable); // irreversible redact
     this.buffer = this.buffer.slice(safeEnd);
     this.base += safeEnd;
 

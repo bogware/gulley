@@ -164,6 +164,32 @@ describe('StreamingRedactor', () => {
     expect(r.findings().filter((f) => f.category === 'email')).toHaveLength(1);
   });
 
+  it('mask: emits reversible tokens (no raw value) that detokenize to the original', () => {
+    const text = 'contact jane@example.com or bob@work.io before noon';
+    const r = new StreamingRedactor(det, { action: 'mask' }, 16);
+    let out = '';
+    for (const ch of text) out += r.push(ch); // char-by-char: worst case for boundaries
+    out += r.flush();
+    expect(out).not.toContain('jane@example.com');
+    expect(out).not.toContain('bob@work.io');
+    expect(out).toMatch(/<<GULLEY_EMAIL_\d+>>/); // reversible token, not <<REDACTED_…>>
+    expect(out).not.toContain('<<REDACTED_');
+    expect(r.vault?.detokenize(out)).toBe(text); // fully reversible round-trip
+  });
+
+  it('mask: a value recurring across chunks keeps one stable token (coreference)', () => {
+    const text = 'from jane@example.com to jane@example.com and bob@work.io';
+    const r = new StreamingRedactor(det, { action: 'mask' }, 12);
+    let out = '';
+    for (let i = 0; i < text.length; i += 5) out += r.push(text.slice(i, i + 5));
+    out += r.flush();
+    const tokens = [...out.matchAll(/<<GULLEY_EMAIL_\d+>>/g)].map((m) => m[0]);
+    expect(tokens).toHaveLength(3); // three occurrences tokenized
+    expect(tokens[0]).toBe(tokens[1]); // the repeated jane@… shares one token
+    expect(tokens[0]).not.toBe(tokens[2]); // bob@… is a distinct token
+    expect(r.vault?.size).toBe(2); // two distinct originals
+  });
+
   it('block: emits clean content up to the first finding, then blocks (no partial leak)', () => {
     const r = new StreamingRedactor(det, { action: 'block' }, 8);
     let out = r.push('all clear ');
@@ -259,6 +285,36 @@ describe('StreamingRedactor', () => {
     expect(r.failClosed).toBe(true);
     expect(out).not.toContain('MIIBOwIBAAJBAKj34GkxFhD9'); // body withheld, never emitted
   });
+
+  it('does not hold or fail-closed on an anchor category the policy excludes (categories)', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' + 'a'.repeat(40) + '.' + 'b'.repeat(40);
+    const trailing = ' plain trailing text. '.repeat(500); // well past maxBuffer (8192)
+    const text = 'start ' + jwt + trailing;
+    // Mask PII only — the JWT is out of policy scope, so its anchor must NOT hold.
+    const r = new StreamingRedactor(det, { action: 'redact', categories: ['email'] }, 64);
+    let out = '';
+    for (let i = 0; i < text.length; i += 37) out += r.push(text.slice(i, i + 37));
+    out += r.flush();
+    expect(r.failClosed).toBe(false); // no deadlock/truncation for an out-of-scope match
+    expect(out).toContain(jwt); // emitted un-redacted (policy does not enforce it)
+    expect(out.length).toBeGreaterThan(8192); // the full response streamed through
+  });
+
+  it('does not fail-closed on an anchor category below minConfidence (raw-findings completion)', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payloadpayloadpayload.signaturesignature';
+    const trailing = ' plain trailing text. '.repeat(500);
+    const text = 'start ' + jwt + trailing;
+    // JWT confidence is 0.85; a 0.9 floor drops it from the enforced set, but the
+    // anchor is still active (no `categories`). Completion must come from the RAW
+    // detector findings so the hold releases instead of deadlocking to fail-closed.
+    const r = new StreamingRedactor(det, { action: 'redact', minConfidence: 0.9 }, 64);
+    let out = '';
+    for (let i = 0; i < text.length; i += 37) out += r.push(text.slice(i, i + 37));
+    out += r.flush();
+    expect(r.failClosed).toBe(false); // anchor releases on raw detection — no deadlock
+    expect(out).toContain(jwt); // emitted un-redacted (below the confidence floor)
+    expect(out).toContain('start');
+  });
 });
 
 describe('GuardrailEngine', () => {
@@ -298,6 +354,27 @@ describe('GuardrailEngine', () => {
     });
     // phone confidence is 0.5 — below the threshold, so not enforced.
     expect((await engine.inspectInput('call 415-555-2671')).blocked).toBe(false);
+  });
+
+  it('buffered output mask rewrites to reversible tokens and returns the vault', () => {
+    const engine = new GuardrailEngine([det], {
+      input: { action: 'audit' },
+      output: { action: 'mask' },
+    });
+    const r = engine.inspectOutputText(text);
+    expect(r.transformedText).not.toContain('jane@example.com');
+    expect(r.transformedText).toMatch(/<<GULLEY_EMAIL_\d+>>/); // reversible token
+    expect(r.vault?.detokenize(r.transformedText ?? '')).toBe(text); // fully restorable
+  });
+
+  it('buffered output redact rewrites irreversibly (no vault)', () => {
+    const engine = new GuardrailEngine([det], {
+      input: { action: 'audit' },
+      output: { action: 'redact' },
+    });
+    const r = engine.inspectOutputText(text);
+    expect(r.transformedText).toBe('contact <<REDACTED_EMAIL>> now');
+    expect(r.vault).toBeUndefined();
   });
 });
 

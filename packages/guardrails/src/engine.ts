@@ -49,8 +49,11 @@ export interface OutputInspection {
   findings: Finding[];
   summary: FindingSummary;
   blocked: boolean;
-  /** Rewritten (redacted) response text, when the output policy transforms. */
+  /** Rewritten response text, when the output policy transforms (mask / redact). */
   transformedText?: string;
+  /** Present for `mask`: the reversible token↔original map for the rewrite above,
+   *  so an authorized consumer can restore originals. Absent for `redact`. */
+  vault?: TokenVault;
 }
 
 /**
@@ -156,15 +159,27 @@ export class GuardrailEngine {
   }
 
   /** Non-streaming / buffered output enforcement — native detectors only (sync).
-   *  Output `mask` redacts toward the client (returning tokens to the caller
-   *  would leak nothing useful). */
+   *  `mask` rewrites to reversible per-value tokens (coreference preserved; the
+   *  returned `vault` restores originals for an authorized consumer); `redact`
+   *  replaces irreversibly. Mirrors the streaming enforcer so `mask` means the
+   *  same thing on both paths. */
   inspectOutputText(text: string): OutputInspection {
     const policy = this.policies.output;
     const findings = filterByPolicy(this.detectAll(text), policy);
     const summary = summarize(findings);
     if (findings.length === 0) return { findings, summary, blocked: false };
     if (policy.action === 'block') return { findings, summary, blocked: true };
-    if (policy.action === 'mask' || policy.action === 'redact') {
+    if (policy.action === 'mask') {
+      const vault = new TokenVault();
+      return {
+        findings,
+        summary,
+        blocked: false,
+        transformedText: vault.tokenize(text, findings),
+        vault,
+      };
+    }
+    if (policy.action === 'redact') {
       return { findings, summary, blocked: false, transformedText: redactText(text, findings) };
     }
     return { findings, summary, blocked: false };
@@ -197,6 +212,12 @@ export class GuardrailEngine {
       return { findings, summary, blocked: false, transformedText: result.maskedText };
     }
     // No plugin enforcement — fall back to the native policy's transform (if any).
-    return { findings, summary, blocked: false, transformedText: native.transformedText };
+    return {
+      findings,
+      summary,
+      blocked: false,
+      transformedText: native.transformedText,
+      vault: native.vault,
+    };
   }
 }

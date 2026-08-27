@@ -101,14 +101,12 @@ async function main(): Promise<void> {
     });
     const target =
       decision?.strategy?.mode === 'single' ? decision.strategy.target.provider : '(same route)';
-    // eslint-disable-next-line no-console
     console.log(`- ${p.label}\n    → provider=${target} model=${decision?.model ?? '(unchanged)'}`);
   }
 
   // Let the fire-and-forget meters flush.
   await new Promise((r) => setTimeout(r, 10));
 
-  // eslint-disable-next-line no-console
   console.log(
     `\nmetered classifier sub-calls: ${ledger.entries.filter((e) => e.requestId.endsWith('#classify')).length}` +
       ` (audit '${audit.rows.map((r) => r.action).join(', ')}')`,
@@ -123,12 +121,10 @@ async function main(): Promise<void> {
   if (!audit.rows.some((r) => r.action === 'proxy.classify'))
     throw new Error('missing proxy.classify audit line');
 
-  // eslint-disable-next-line no-console
   console.log('\nsmart:check OK');
 }
 
 main().catch((err) => {
-  // eslint-disable-next-line no-console
   console.error('smart:check FAILED:', err);
   process.exit(1);
 });

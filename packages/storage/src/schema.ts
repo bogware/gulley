@@ -200,6 +200,30 @@ export const semanticVector = pgTable(
   (t) => [index('semantic_vector_scope_idx').on(t.scope)],
 );
 
+// Persistent classifier centroids (M16 persistence): the embedded exemplar points
+// for `embedding-nearest-label` smart routing. One row per (policy scope, category
+// label, embedding model, exemplar). The reconciler loads all rows for the active
+// policies once — so a fresh replica reuses these instead of re-embedding every
+// exemplar on boot — and computes cosine nearest-label in memory. The embedding is
+// jsonb (a number[]), not pgvector: no SQL ANN is needed (load-all + in-JS cosine),
+// so it works at any embedding dimension and needs no hand-edited migration.
+export const classifierCentroid = pgTable(
+  'classifier_centroid',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    scope: text('scope').notNull(),
+    label: text('label').notNull(),
+    model: text('model').notNull(),
+    exemplarSha: text('exemplar_sha').notNull(),
+    embedding: jsonb('embedding').$type<number[]>().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('classifier_centroid_uniq').on(t.scope, t.label, t.model, t.exemplarSha),
+    index('classifier_centroid_scope_idx').on(t.scope),
+  ],
+);
+
 // --- M5.1 control-plane / RBAC ---------------------------------------------
 
 // Admin users (Entra oid, or a bootstrap subject). Distinct from data-plane keys.

@@ -209,6 +209,10 @@ const Env = z.object({
   // the classification hot path).
   SMART_ROUTING_SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6),
   SMART_ROUTING_EMBED_TIMEOUT_MS: z.coerce.number().int().positive().default(1500),
+  // Persist embedded exemplar centroids to Postgres (DB config mode only) so a
+  // fresh replica reuses them instead of re-embedding on boot. Fail-open: a store
+  // error degrades to in-process embedding, never blocking a reconcile.
+  SMART_ROUTING_PERSIST_CENTROIDS: envBool(true),
 
   // Load balancing across a loadbalance strategy's targets. When affinity is off
   // (default) the primary pick uses power-of-two-choices least-load over in-flight
