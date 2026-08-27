@@ -159,6 +159,73 @@ Three layers (the shape the M12 research established):
 
 ---
 
+## M14 — Resilience & hardening — ✅ DELIVERED
+
+Finishes the reliability story and closes remaining enterprise gaps (full detail
+in `docs/M14_RESILIENCE_AND_HARDENING.md`). Each phase shipped verified + the
+hot-path ones passed the adversarial-review gate:
+
+- **A — resilience triad.** Per-target **adaptive concurrency** (gradient limiter;
+  all-saturated ⇒ 503 + Retry-After, distinct from a 502 fault) + opt-in
+  **pre-first-byte request hedging** (race a second candidate, meter only the
+  winner; last-resort real-error relay preserved).
+- **C — conformance & load harness.** `conformance.test.ts` replays captured
+  provider SSE through the full gateway asserting raw-fidelity + meter-from-raw +
+  single-teardown; `load:check` SLO gate (p99 < 10s, err < 0.005) + a k6 profile.
+- **B — native Gemini/Vertex.** `contents`/`parts` translation that round-trips
+  the `thoughtSignature` reasoning artifact; SA-JWT → Vertex OAuth token minting.
+- **D — per-tenant routing.** A workspace may reroute a client path to its own
+  strategy/provider (resolved against the route's full alias set).
+- **E — supply chain.** cosign keyless signing of the pushed digest + DR/restore
+  drill docs on top of the existing SBOM + SLSA provenance + Trivy.
+
+## M15 — Smart routing (classification-driven) — ✅ DELIVERED
+
+Classify each request after authn and reroute by category — cheap prompts to a
+small model, code/hard to a specialized provider, sensitive to a guarded path —
+across four objectives (cost-tier / domain-skill / safety-risk / operator
+taxonomy), resolved per user > group > route > workspace > org. Off unless
+`SMART_ROUTING_ENABLED=true` (DB config). Full detail in
+`docs/M15_SMART_ROUTING.md`. Delivered A1→F, each verified; both hot-path phases
+passed the adversarial-review gate (D: 2 findings fixed; E: 0 confirmed):
+
+- **A1** groups as a claim/tag (`scope.groups`); **A2** declarative policy model +
+  selector-precedence resolver; **B** `smartRoutingPolicies` GitOps config
+  collection + `smart_routing_policy` table + Zod validation; **C** classifier
+  engine (rules-then-llm / llm-router / embedding ports) with timeout + breaker,
+  never-throws / always fail-open; **D** the hot-path classify stage (reroute by
+  category; residency pin fully preempts); **E** classifier sub-metering
+  (`${requestId}#classify`, `proxy.classify`, `meterClassifier`) + the real
+  llm-router completer; **F** docs + `smart:check` smoke.
+- **Live backends:** rules-then-llm + metered llm-router. **Follow-ons:** the
+  embedding-nearest-label centroid store; classification memoization; a
+  non-Anthropic classifier completer; the per-policy safety-overrides-residency
+  flag.
+
+## Recommended next steps (candidate roadmap → world-class)
+
+Ranked; the first three finish the smart-routing story or close the biggest
+pipeline gap.
+
+- **Tier 1 (differentiators).**
+  1. **Embedding-nearest-label backend** — the 3rd classifier: a
+     `classifier_centroid` table + Postgres adapter + exemplar loading, reusing
+     the semantic-cache embedder. No LLM round-trip; cheapest classification.
+  2. **Streaming output-guardrail enforcement** — the biggest pipeline gap:
+     streaming guardrails are audit-only; block/redact needs a windowed
+     delayed-emit scanner.
+  3. **Native Gemini tool + image translation** — makes Vertex first-class (M14 B
+     covered text + thinking only).
+- **Tier 2 (completeness).** Classification memoization (per session/prompt-hash);
+  per-tenant noisy-neighbor controls (per-tenant concurrency + priority); admin UI
+  depth (surface smart-routing policies + `proxy.classify` spend, budgets/audit,
+  key management).
+- **Tier 3 (advanced).** Prompt-injection/jailbreak classifier in guardrails;
+  multi-region active-active (shared counters); per-tenant data residency +
+  BYO-KMS; the per-policy safety-overrides-residency knob.
+
+---
+
 ## Explicitly out of scope (this effort)
 
 MCP tool-federation / agent gateway, A2A agent gateway, Kubernetes Gateway-API controller + xDS,

@@ -3,7 +3,7 @@ import { type AdminPrincipal, InMemoryAccessControl } from '@gulley/rbac';
 import { describe, expect, it } from 'vitest';
 import { applyConfig } from './apply';
 import { contentHash, diffDocuments } from './canonical';
-import { type ConfigDocument, emptyDocument } from './document';
+import { type ConfigDocument, emptyDocument, validateConfigDocument } from './document';
 import { type ConfigStore, InMemoryConfigVersionStore, type ReconcileContext } from './store';
 import { fromYaml, toYaml } from './yaml';
 
@@ -69,6 +69,50 @@ describe('canonical + diff', () => {
   it('diff reports a changed route config path', () => {
     const d = diffDocuments(doc({ model: 'haiku' }), doc({ model: 'sonnet' }));
     expect(d.changed.some((p) => p.includes('model'))).toBe(true);
+  });
+});
+
+describe('validateConfigDocument — smartRoutingPolicies (M15)', () => {
+  const baseWs = (over: Record<string, unknown> = {}): unknown => ({
+    apiVersion: 'gulley/v1',
+    orgs: [
+      {
+        name: 'o',
+        workspaces: [
+          {
+            name: 'w',
+            providers: [],
+            routes: [],
+            policies: [],
+            budgets: [],
+            rateLimits: [],
+            guardrails: [],
+            modelAliases: [],
+            virtualKeys: [],
+            ...over,
+          },
+        ],
+      },
+    ],
+  });
+
+  it('accepts an absent collection and a well-formed entry', () => {
+    expect(validateConfigDocument(baseWs())).toBeNull(); // absent ⇒ valid (backward-compatible)
+    expect(
+      validateConfigDocument(baseWs({ smartRoutingPolicies: [{ name: 'p', config: {} }] })),
+    ).toBeNull();
+  });
+
+  it('rejects a non-array collection and a malformed entry', () => {
+    expect(validateConfigDocument(baseWs({ smartRoutingPolicies: 'nope' }))).toContain(
+      'smartRoutingPolicies must be an array',
+    );
+    expect(
+      validateConfigDocument(baseWs({ smartRoutingPolicies: [{ name: 123, config: {} }] })),
+    ).toContain('smartRoutingPolicies[0]');
+    expect(
+      validateConfigDocument(baseWs({ smartRoutingPolicies: [{ name: 'p', config: 'x' }] })),
+    ).toContain('smartRoutingPolicies[0]');
   });
 });
 

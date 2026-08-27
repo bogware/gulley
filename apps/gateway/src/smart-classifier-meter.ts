@@ -56,10 +56,12 @@ export async function meterClassifierSpend(
   const ws = principal.workspaceId;
 
   // Decrement the tenant budget by the actual classifier spend (reserve = commit).
-  // Best-effort: over-cap or a counter outage must not fail the served request.
+  // Commit ONLY when a reservation was actually taken — a workspace with no budget
+  // (reserve → null) has no counter to meter against, matching the served-request
+  // path. Best-effort: over-cap or a counter outage must not fail the request.
   try {
     const decision = await deps.budgets.reserve(ws, subId, micro);
-    if (decision === null || decision.allowed) {
+    if (decision && decision.allowed) {
       await deps.budgets.commit(ws, subId, micro);
     }
   } catch {

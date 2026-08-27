@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
 import { createInMemoryControlContext } from './context';
+import { ControlConfigStore } from './config-store';
 import { buildServer } from './server';
 
 let app: FastifyInstance;
@@ -65,5 +66,52 @@ describe('POST /config/apply broadcast', () => {
     });
     expect(res.statusCode).toBe(409);
     expect(signals).toHaveLength(0); // no broadcast on a failed write
+  });
+});
+
+describe('ControlConfigStore smartRoutingPolicies round-trip (M15)', () => {
+  const mkStore = () =>
+    new ControlConfigStore(
+      createInMemoryControlContext({
+        pepper: 'control-store-test-pepper-16!!!!',
+        bootstrapEnabled: false,
+        sessionSecrets: ['control-store-session-secret-32bytes-ok'],
+        maxSessionTtlMs: 900_000,
+      }),
+    );
+  const ws = (over: Record<string, unknown> = {}) => ({
+    name: 'w',
+    providers: [],
+    routes: [],
+    policies: [],
+    budgets: [],
+    rateLimits: [],
+    guardrails: [],
+    modelAliases: [],
+    virtualKeys: [],
+    ...over,
+  });
+  const doc = (over: Record<string, unknown> = {}) =>
+    ({ apiVersion: 'gulley/v1', orgs: [{ name: 'o', workspaces: [ws(over)] }] }) as never;
+  const policy = {
+    name: 'p',
+    config: {
+      objective: 'cost-tier',
+      classifier: { mode: 'rules-then-llm' },
+      categoryRoutes: { cheap: 'x' },
+      selector: {},
+    },
+  };
+
+  it('round-trips a policy, prunes by absence, and omits the collection when empty', async () => {
+    const store = mkStore();
+    await store.reconcile(doc({ smartRoutingPolicies: [policy] }));
+    let exported = await store.exportDocument('*');
+    expect(exported.orgs[0]?.workspaces[0]?.smartRoutingPolicies?.[0]?.name).toBe('p');
+
+    // Re-apply without the collection → prune by absence, and the key is omitted.
+    await store.reconcile(doc());
+    exported = await store.exportDocument('*');
+    expect(exported.orgs[0]?.workspaces[0]?.smartRoutingPolicies).toBeUndefined();
   });
 });

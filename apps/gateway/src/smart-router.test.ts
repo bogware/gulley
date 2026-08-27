@@ -104,6 +104,26 @@ describe('buildSmartRouter', () => {
     expect(await sr!.route(IDENTITY, 'short')).toBeUndefined();
   });
 
+  it('falls back to defaultCategory when the classifier returns an unrouted category', async () => {
+    // A rule yields a category with no route; the declared default must win.
+    const p = policy({
+      classifier: { mode: 'rules-then-llm', rules: [{ category: 'unknown-label', maxChars: 20 }] },
+      categoryRoutes: { cheap: 'haiku-3-5' },
+      defaultCategory: 'cheap',
+    });
+    expect(await buildSmartRouter([p], ROUTES)!.route(IDENTITY, 'short')).toEqual({
+      model: 'haiku-3-5',
+    });
+  });
+
+  it('returns undefined for an unrouted category when no default is configured', async () => {
+    const p = policy({
+      classifier: { mode: 'rules-then-llm', rules: [{ category: 'unknown-label', maxChars: 20 }] },
+      categoryRoutes: { cheap: 'haiku-3-5' },
+    });
+    expect(await buildSmartRouter([p], ROUTES)!.route(IDENTITY, 'short')).toBeUndefined();
+  });
+
   it('does not bleed routes between workspaces that share a policy name', async () => {
     // Two workspaces each define a policy named "cost" (names are only unique
     // within a workspace). Each request must get ITS workspace's categoryRoutes.

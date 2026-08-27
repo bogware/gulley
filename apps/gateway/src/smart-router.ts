@@ -63,7 +63,12 @@ export class SmartRouter {
     // opts into it; otherwise the sink is never invoked.
     const onSpend = policy.classifier.meterClassifier ? opts?.onSpend : undefined;
     const category = await classifyRequest(policy, text, this.deps, opts?.signal, onSpend);
-    const chosen = category ?? policy.defaultCategory;
+    // Fall back to defaultCategory when the classifier abstains OR returns a
+    // category that has no wired route (an out-of-taxonomy label, or a category
+    // whose reference was unroutable and dropped from `byCategory`) — honoring the
+    // policy's declared default rather than silently no-op'ing.
+    const chosen =
+      category !== undefined && byCategory.has(category) ? category : policy.defaultCategory;
     if (chosen === undefined) return undefined;
     return byCategory.get(chosen);
   }

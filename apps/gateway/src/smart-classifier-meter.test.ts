@@ -51,4 +51,58 @@ describe('meterClassifierSpend', () => {
     };
     await expect(meterClassifierSpend(deps, principal, 'req_1', usage)).resolves.toBeUndefined();
   });
+
+  it('does NOT commit when the workspace has no budget (reserve → null), but still records', async () => {
+    const commits: number[] = [];
+    const ledger = new InMemoryLedger();
+    const audit = new InMemoryAuditSink();
+    const deps: ClassifierMeterDeps = {
+      budgets: {
+        reserve: async () => null,
+        commit: async (_ws, _id, micro) => {
+          commits.push(micro);
+        },
+      },
+      ledger,
+      audit,
+    };
+    await meterClassifierSpend(deps, principal, 'req_1', usage);
+    expect(commits).toHaveLength(0); // no reservation ⇒ no commit (matches the served path)
+    expect(ledger.entries).toHaveLength(1); // attribution still recorded
+    expect(audit.rows[0]?.action).toBe('proxy.classify');
+  });
+
+  it('records the line but does NOT commit when over budget (reserve denied)', async () => {
+    const commits: number[] = [];
+    const audit = new InMemoryAuditSink();
+    const deps: ClassifierMeterDeps = {
+      budgets: {
+        reserve: async () => ({ allowed: false, capMicroUsd: 1, usedMicroUsd: 1 }),
+        commit: async (_ws, _id, micro) => {
+          commits.push(micro);
+        },
+      },
+      ledger: new InMemoryLedger(),
+      audit,
+    };
+    await meterClassifierSpend(deps, principal, 'req_1', usage);
+    expect(commits).toHaveLength(0);
+    expect(audit.rows[0]?.action).toBe('proxy.classify');
+  });
+
+  it('is fail-open when the rateResolver throws — no ledger/audit line, no throw', async () => {
+    const ledger = new InMemoryLedger();
+    const audit = new InMemoryAuditSink();
+    const deps: ClassifierMeterDeps = {
+      budgets: new InMemoryBudgetStore(new Map()),
+      ledger,
+      audit,
+      rateResolver: () => {
+        throw new Error('boom');
+      },
+    };
+    await expect(meterClassifierSpend(deps, principal, 'req_1', usage)).resolves.toBeUndefined();
+    expect(ledger.entries).toHaveLength(0); // costing threw before anything was recorded
+    expect(audit.rows).toHaveLength(0);
+  });
 });

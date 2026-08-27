@@ -27,7 +27,9 @@ export interface ClassifierRule {
 /** How a policy classifies a request into a category. */
 export interface ClassifierSpec {
   mode: ClassifierMode;
-  /** `embedding-nearest-label`: the taxonomy labels (centroids keyed by these). */
+  /** `embedding-nearest-label`: the declared taxonomy labels. Reserved for the
+   *  embedding-backend follow-on; the current engine scopes the centroid lookup
+   *  by the policy name and does not read this field yet. */
   labels?: readonly string[];
   /** `rules-then-llm`: ordered rules; first match wins, else escalate to the model. */
   rules?: readonly ClassifierRule[];
@@ -66,6 +68,8 @@ export interface SmartSelector {
  */
 export interface SmartRoutingPolicy<TRoute = string> {
   name: string;
+  /** Advisory operator metadata — what the policy is FOR. Recorded (not branched
+   *  on): the engine keys entirely off `classifier.mode`. */
   objective: SmartRoutingObjective;
   classifier: ClassifierSpec;
   categoryRoutes: Readonly<Record<string, TRoute>>;

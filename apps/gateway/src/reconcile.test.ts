@@ -111,6 +111,105 @@ describe('GatewayReconciler', () => {
   });
 });
 
+describe('GatewayReconciler smart routing', () => {
+  const validPolicy = {
+    name: 'p',
+    config: {
+      objective: 'cost-tier',
+      classifier: { mode: 'rules-then-llm', rules: [{ category: 'cheap', maxChars: 20 }] },
+      categoryRoutes: { cheap: 'claude-haiku-4-5' },
+      selector: {},
+    },
+  };
+  const identity = {
+    userId: 'u',
+    groups: [],
+    orgId: 'o',
+    workspaceId: 'w',
+    clientPaths: ['/v1/messages'],
+  };
+  const docWithPolicies = (policies: unknown[]): ConfigDocument => {
+    const d = docWith('anthropic');
+    (d.orgs[0]!.workspaces[0]! as { smartRoutingPolicies?: unknown }).smartRoutingPolicies =
+      policies;
+    return d;
+  };
+  const resolver = () => new MapSecretResolver(new Map([[ARN, 'sk-ant-x']]));
+
+  it('builds + swaps the smart router when enabled with valid policies', async () => {
+    const { holder } = holderWithState();
+    await new GatewayReconciler(
+      holder,
+      storeReturning(docWithPolicies([validPolicy])),
+      resolver(),
+      undefined,
+      {
+        enabled: true,
+      },
+    ).reconcile();
+    expect(holder.ctx.smartRouter).toBeDefined();
+    expect(await holder.ctx.smartRouter!.route(identity, 'hi')).toEqual({
+      model: 'claude-haiku-4-5',
+    });
+  });
+
+  it('KEEPS the old routes AND smart router when a policy is malformed (no partial swap)', async () => {
+    const { holder } = holderWithState();
+    await new GatewayReconciler(
+      holder,
+      storeReturning(docWithPolicies([validPolicy])),
+      resolver(),
+      undefined,
+      {
+        enabled: true,
+      },
+    ).reconcile();
+    const goodRouter = holder.ctx.smartRouter;
+    expect(goodRouter).toBeDefined();
+
+    // A malformed policy (no classifier/categoryRoutes) throws in parse → reconcile
+    // fails and must keep BOTH the old routes and the old smart router intact.
+    const bad = new GatewayReconciler(
+      holder,
+      storeReturning(docWithPolicies([{ name: 'bad', config: { objective: 'cost-tier' } }])),
+      resolver(),
+      undefined,
+      { enabled: true },
+    );
+    expect(await bad.reconcile()).toBe(false);
+    expect(holder.routeFor('/v1/messages')).toBeDefined();
+    expect(holder.ctx.smartRouter).toBe(goodRouter);
+  });
+
+  it('never builds a smart router when disabled, even with policies present', async () => {
+    const { holder } = holderWithState();
+    await new GatewayReconciler(
+      holder,
+      storeReturning(docWithPolicies([validPolicy])),
+      resolver(),
+      undefined,
+      {
+        enabled: false,
+      },
+    ).reconcile();
+    expect(holder.ctx.smartRouter).toBeUndefined();
+  });
+
+  it('swaps to no smart router when enabled but the document has zero policies', async () => {
+    const { holder } = holderWithState();
+    await new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      resolver(),
+      undefined,
+      {
+        enabled: true,
+      },
+    ).reconcile();
+    expect(holder.ctx.smartRouter).toBeUndefined();
+  });
+});
+
 describe('ConfigWatcher', () => {
   it('reconciles on a foreign signal and ignores its own', async () => {
     const { holder } = holderWithState();

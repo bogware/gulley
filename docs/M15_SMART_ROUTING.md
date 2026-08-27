@@ -130,3 +130,29 @@ precedence user > group > route > workspace > org with priority tie-break; the
 **Smoke:** `pnpm --filter @gulley/gateway smart:check` runs the router over sample
 prompts (rules + a stubbed metered `llm-router`) and prints the decisions +
 `proxy.classify` metering — a deterministic, no-cost end-to-end demonstration.
+
+## Operator notes & known limitations
+
+- **Classifier ordering / data-handling (llm-router & embedding).** The classifier
+  runs after authn but **before** authz, rate-limit, and input guardrails —
+  because authz must validate the _rewritten_ model, classification has to precede
+  it. So a `llm-router`/`embedding` policy makes a **bounded upstream classifier
+  call** (≤ `timeoutMs`, ≤ 16 output tokens, breaker-guarded, to the **operator's
+  own** provider) that is: (a) **not covered by input-guardrail masking** — the
+  prompt reaching the classifier is the pre-mask prompt; and (b) **not
+  rate-limited** — an over-RPM client can still drive (bounded) classifier calls.
+  If you require masking-before-any-egress or strict rate-limiting of every
+  provider call, use **`rules-then-llm` with local rules** (no upstream, no
+  egress) — the safe default. The classifier sub-call is fail-open and its spend
+  is metered on its own `proxy.classify` line (best-effort, off the served
+  request's critical path).
+- **Multi-tenant selector scoping.** Policies are matched by `selector`, which keys
+  off runtime IDs (workspace/org **ids**) while the config document nests under
+  **names** — so the owning workspace is not auto-injected and a policy with no
+  `selector.workspace` is **global**. Correct for v1 (single-tenant per
+  deployment); a multi-tenant deployment **must pin `selector.workspace`** (the
+  workspace id) on each policy, or it applies to every tenant.
+- **Embedding backend is inert until wired.** With no embedder/centroids in the
+  reconcile deps, an `embedding-nearest-label` policy always abstains (fails open
+  to the model router). The `classifier_centroid` store + a classifier breaker in
+  the production reconcile path are the follow-ons that make it live.

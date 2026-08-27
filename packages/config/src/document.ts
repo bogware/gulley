@@ -33,7 +33,8 @@ export interface ConfigWorkspace {
   guardrails: ConfigEntity[];
   modelAliases: ConfigEntity[];
   /** Smart-routing policies (M15). Optional so pre-feature documents stay valid;
-   *  absent ≡ none. Exported docs always emit it (possibly empty). */
+   *  absent ≡ none. Exporters emit it ONLY when non-empty, so pre-feature
+   *  documents hash/diff identically (absence ≡ empty). */
   smartRoutingPolicies?: ConfigEntity[];
   virtualKeys: ConfigKeyMeta[];
 }

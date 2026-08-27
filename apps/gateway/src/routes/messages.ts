@@ -458,7 +458,16 @@ async function handleProxy(
       },
     );
     if (classifierSpend) {
-      await meterClassifierSpend(
+      // Fire-and-forget: the sub-meter is fully self-contained and fail-open (it
+      // swallows every error and returns void), so it must NOT gate first byte on
+      // durable writes — mirroring the served path, which defers ledger/audit to
+      // teardown. Note (data-handling): for an `llm-router`/`embedding` policy the
+      // classifier makes a bounded upstream call to the OPERATOR'S OWN provider
+      // BEFORE authz/rate-limit/input-guardrails run — so a masking guardrail does
+      // not cover the classifier sub-call, and it is not rate-limited. Use
+      // `rules-then-llm` with local rules (no egress) where that matters. See
+      // docs/M15_SMART_ROUTING.md.
+      void meterClassifierSpend(
         ctx,
         {
           id: principal.id,

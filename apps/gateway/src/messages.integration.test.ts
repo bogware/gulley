@@ -19,7 +19,7 @@ import { initTelemetry } from '@gulley/telemetry';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from './config';
 import { buildCustomProviders } from './context';
-import type { GatewayContext } from './routes/messages';
+import type { GatewayContext, ProviderRoute } from './routes/messages';
 import { buildServer } from './server';
 import { buildSmartRouter } from './smart-router';
 import type { ClassifierCompleter, SmartRoutingPolicy } from '@gulley/routing';
@@ -752,6 +752,92 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
   });
 
+  const scopedStore = (scope: {
+    allowedProviders: readonly string[] | '*';
+    allowedModels: readonly string[] | '*';
+  }): { store: InMemoryKeyStore; token: string } => {
+    const store = new InMemoryKeyStore();
+    const gen = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_1',
+      keyPrefix: gen.keyPrefix,
+      keyHash: gen.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_1',
+      displayName: 'scoped',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: scope.allowedProviders,
+      allowedModels: scope.allowedModels,
+    });
+    return { store, token: gen.token };
+  };
+
+  const openaiRoute = (): ProviderRoute => ({
+    clientPaths: ['/v1/chat/completions'],
+    createExtractor: () => new OpenAIUsageExtractor(),
+    strategy: {
+      mode: 'single',
+      target: {
+        name: 'openai',
+        provider: 'openai',
+        adapter: new AnthropicAdapter({ baseUrl: upstreamUrl }), // never invoked (403)
+        credential: { scheme: 'bearer', value: UPSTREAM_KEY },
+        upstreamPath: '/v1/messages',
+      },
+    },
+  });
+
+  it('deny-by-default authz still filters a smart-rerouted MODEL', async () => {
+    // Key allows the requested model but NOT the category's target model.
+    const { store, token } = scopedStore({
+      allowedProviders: '*',
+      allowedModels: ['claude-sonnet-4-6'],
+    });
+    const { ctx, requestLog } = buildContext(store);
+    ctx.smartRouter = buildSmartRouter([costTierPolicy()], ctx.routes); // 'hi' → claude-haiku-4-5
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: smartReq('hi'),
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe(
+      'model not permitted',
+    );
+    expect(requestLog.entries).toHaveLength(0); // never dispatched
+    await app.close();
+  });
+
+  it('deny-by-default authz still filters a smart-rerouted PROVIDER', async () => {
+    // Key allows only anthropic; a policy reroutes 'cheap' to openai.
+    const { store, token } = scopedStore({ allowedProviders: ['anthropic'], allowedModels: '*' });
+    const { ctx, requestLog } = buildContext(store);
+    ctx.routes.push(openaiRoute()); // so the reroute resolves
+    ctx.smartRouter = buildSmartRouter(
+      [costTierPolicy({ categoryRoutes: { cheap: 'openai:gpt-4o' } })],
+      ctx.routes,
+    );
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: smartReq('hi'), // 'hi' → cheap → openai:gpt-4o (a disallowed provider)
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: { message: string } }).error.message).toBe(
+      'not permitted',
+    );
+    expect(requestLog.entries).toHaveLength(0);
+    await app.close();
+  });
+
   it('a per-tenant residency pin preempts smart routing entirely', async () => {
     const { store, token } = seededStore(); // workspace ws_1
     const { ctx } = buildContext(store);
@@ -835,6 +921,9 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       body: smartReq('hi'),
     });
     await res.text();
+    // The classifier sub-meter is fire-and-forget (off the served critical path);
+    // let it flush before asserting its durable side-effects.
+    await new Promise((r) => setTimeout(r, 20));
 
     // The reroute took effect (upstream saw the rewritten model)...
     expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5');

@@ -82,4 +82,34 @@ describe('GatewayClassifierCompleter', () => {
     const out = await c.complete('router-x', 'x');
     expect(out).toEqual({ text: '' });
   });
+
+  it('destroys the response stream and abstains on an over-cap body (no leak)', async () => {
+    const big = Buffer.alloc(70 * 1024, 0x20); // 70KB > RESPONSE_CAP (64KB), invalid JSON
+    const stream = Readable.from([big]);
+    const c = new GatewayClassifierCompleter(
+      new Map([['router-x', entry(async () => ({ statusCode: 200, headers: {}, body: stream }))]]),
+    );
+    const out = await c.complete('router-x', 'x');
+    expect(out).toEqual({ text: '' });
+    expect(stream.destroyed).toBe(true); // the socket/stream is not left undrained
+  });
+
+  it('returns text WITHOUT usage when the provider reports zero tokens (so no meter fires)', async () => {
+    const c = new GatewayClassifierCompleter(
+      new Map([
+        [
+          'router-x',
+          entry(async () => ({
+            statusCode: 200,
+            headers: {},
+            body: jsonStream({
+              content: [{ type: 'text', text: 'cheap' }],
+              usage: { input_tokens: 0, output_tokens: 0 },
+            }),
+          })),
+        ],
+      ]),
+    );
+    expect(await c.complete('router-x', 'x')).toEqual({ text: 'cheap' });
+  });
 });

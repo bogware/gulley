@@ -64,6 +64,14 @@ export function parseSmartRoutingPolicyConfig(config: unknown): SmartRoutingPoli
  * Extract every workspace's smart-routing policies from a config document as
  * validated, typed `SmartRoutingPolicy` values (route references, not live
  * strategies). Throws (rejecting the reconcile) if any policy config is invalid.
+ *
+ * Policies are flattened into one list matched by their `selector`. Selectors key
+ * off runtime IDs (`scope.workspaceId`/`orgId` are UUIDs) while the document nests
+ * under org/workspace NAMES, so the owning workspace is NOT auto-injected — a
+ * policy with no `selector.workspace` is GLOBAL. That is correct for v1
+ * (single-tenant per deployment); a MULTI-TENANT deployment MUST pin
+ * `selector.workspace` (the workspace id) on each policy, or it applies to every
+ * tenant. See docs/M15_SMART_ROUTING.md.
  */
 export function parseSmartRoutingPolicies(doc: ConfigDocument): SmartRoutingPolicy<string>[] {
   const out: SmartRoutingPolicy<string>[] = [];

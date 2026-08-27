@@ -218,4 +218,68 @@ describe('classifyRequest — resilience', () => {
     });
     expect(records).toContainEqual(['smart:p', true]);
   });
+
+  it('records breaker SUCCESS on an abstention (abstain is not a fault)', async () => {
+    const records: Array<[string, boolean]> = [];
+    const breaker: ClassifierBreaker = {
+      isOpen: () => false,
+      record: (k, ok) => records.push([k, ok]),
+    };
+    // A completion that matches no label ⇒ abstain, but no error ⇒ success.
+    const cat = await classifyRequest(policy({ mode: 'llm-router', model: 'm' }, { a: 'x' }), 'x', {
+      completer: { complete: async () => ({ text: 'nonsense' }) },
+      breaker,
+    });
+    expect(cat).toBeUndefined();
+    expect(records).toContainEqual(['smart:p', true]);
+  });
+
+  it('resolves undefined when the PARENT signal aborts (client disconnect)', async () => {
+    const ctrl = new AbortController();
+    const completer: ClassifierCompleter = {
+      complete: (_m, _p, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        }),
+    };
+    const p = classifyRequest(
+      policy({ mode: 'llm-router', model: 'm' }, { a: 'x' }),
+      'x',
+      { completer },
+      ctrl.signal,
+    );
+    ctrl.abort();
+    expect(await p).toBeUndefined();
+  });
+
+  it('caps the text fed to rules at TEXT_CAP (a rule matching only past the cap does not fire)', () => {
+    const long = 'a'.repeat(5000) + 'NEEDLE'; // NEEDLE sits past the 4096-char cap
+    expect(runRules([{ category: 'x', regex: 'NEEDLE' }], long)).toBeUndefined();
+  });
+
+  it('reports usage to the sink on a rules-then-llm ESCALATION', async () => {
+    const spends: unknown[] = [];
+    const cat = await classifyRequest(
+      policy(
+        { mode: 'rules-then-llm', rules: [{ category: 'cheap', maxChars: 3 }], model: 'm' },
+        {
+          cheap: 'a',
+          hard: 'b',
+        },
+      ),
+      'a long prompt that skips the short-length rule',
+      {
+        completer: {
+          complete: async () => ({
+            text: 'hard',
+            usage: { provider: 'anthropic', model: 'm', inputTokens: 5, outputTokens: 1 },
+          }),
+        },
+      },
+      undefined,
+      (u) => spends.push(u),
+    );
+    expect(cat).toBe('hard');
+    expect(spends).toHaveLength(1);
+  });
 });
