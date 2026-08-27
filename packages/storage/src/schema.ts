@@ -65,6 +65,11 @@ export const virtualKey = pgTable(
     disabled: boolean('disabled').notNull().default(false),
     expiresAt: timestamp('expires_at', { withTimezone: true }),
     lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+    // Group/team tags carried onto the principal's scope (per-group config, e.g.
+    // smart routing). A lightweight claim/tag list, not a managed entity.
+    groups: jsonb('groups')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

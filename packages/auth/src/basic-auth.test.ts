@@ -88,6 +88,21 @@ describe('resolveBasicPrincipal', () => {
     });
   });
 
+  it('carries per-user group tags onto the scope (absent ⇒ undefined)', () => {
+    const withGroups = {
+      ...cfg,
+      users: new Map([['alice', { workspaceId: 'ws_a', groups: ['eng', 'oncall'] }]]),
+    };
+    const r = resolveBasicPrincipal(header('alice', PW), withGroups);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.scope.groups).toEqual(['eng', 'oncall']);
+    // A user without a groups override carries none.
+    const bob = resolveBasicPrincipal(header('bob', PW), withGroups);
+    expect(bob.ok).toBe(true);
+    if (bob.ok) expect(bob.value.scope.groups).toBeUndefined();
+  });
+
   it('honors an explicitly configured permissive default', () => {
     const permissive = {
       ...cfg,

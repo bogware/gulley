@@ -60,6 +60,7 @@ export async function resolveVirtualKey(
       workspaceId: stored.workspaceId,
       allowedProviders: stored.allowedProviders,
       allowedModels: stored.allowedModels,
+      groups: stored.groups,
     },
   });
 }

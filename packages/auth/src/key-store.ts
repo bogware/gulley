@@ -11,6 +11,8 @@ export interface StoredKey {
   expiresAt: Date | null;
   allowedProviders: readonly string[] | '*';
   allowedModels: readonly string[] | '*';
+  /** Group/team tags carried onto the principal's scope (for per-group config). */
+  groups?: readonly string[];
 }
 
 /** Port for looking up virtual keys. Postgres-backed in prod, in-memory in tests. */

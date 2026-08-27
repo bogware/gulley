@@ -19,6 +19,8 @@ export interface JwtAuthConfig {
   modelsClaim?: string;
   /** Claim listing allowed provider kinds; absent ⇒ '*'. */
   providersClaim?: string;
+  /** Claim listing the caller's group/team tags (for per-group config); absent ⇒ none. */
+  groupsClaim?: string;
   defaultWorkspaceId?: string;
   defaultOrgId?: string;
 }
@@ -59,6 +61,7 @@ export async function resolveJwtPrincipal(
     workspaceId,
     allowedProviders: listClaim(c, cfg.providersClaim) ?? '*',
     allowedModels: listClaim(c, cfg.modelsClaim) ?? '*',
+    groups: listClaim(c, cfg.groupsClaim),
   };
   const sub = str(c['sub']) ?? 'jwt';
   return {

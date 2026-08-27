@@ -38,6 +38,7 @@ export class PostgresKeyStore implements KeyStore {
         epoch: virtualKey.epoch,
         disabled: virtualKey.disabled,
         expiresAt: virtualKey.expiresAt,
+        groups: virtualKey.groups,
         orgId: workspace.orgId,
       })
       .from(virtualKey)
@@ -59,6 +60,9 @@ export class PostgresKeyStore implements KeyStore {
       expiresAt: r.expiresAt,
       allowedProviders: '*',
       allowedModels: '*',
+      groups: Array.isArray(r.groups)
+        ? (r.groups as string[]).filter((g) => typeof g === 'string')
+        : [],
     };
   }
 

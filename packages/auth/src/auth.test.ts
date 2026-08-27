@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { isErr, isOk } from '@gulley/core';
 import { InMemoryKeyStore, type StoredKey } from './key-store';
+import { scopeGroups } from './principal';
 import { resolveVirtualKey } from './resolver';
 import { generateVirtualKey, parseVirtualKey, verifySecret } from './virtual-key';
 
@@ -101,6 +102,20 @@ describe('resolveVirtualKey', () => {
     expect(
       isOk(await resolveVirtualKey({ apiKey: good }, { keyStore: store, pepper: PEPPER })),
     ).toBe(true);
+  });
+
+  it('carries the key group tags onto the scope, and defaults to none', async () => {
+    const tagged = new InMemoryKeyStore();
+    const taggedTok = seed(tagged, { groups: ['eng', 'beta'] });
+    const r = await resolveVirtualKey({ apiKey: taggedTok }, { keyStore: tagged, pepper: PEPPER });
+    expect(isOk(r)).toBe(true);
+    if (isOk(r)) expect(scopeGroups(r.value.scope)).toEqual(['eng', 'beta']);
+
+    const plain = new InMemoryKeyStore();
+    const plainTok = seed(plain);
+    const r2 = await resolveVirtualKey({ apiKey: plainTok }, { keyStore: plain, pepper: PEPPER });
+    expect(isOk(r2)).toBe(true);
+    if (isOk(r2)) expect(scopeGroups(r2.value.scope)).toEqual([]);
   });
 
   it('does not fall through to another mode when the secret is wrong', async () => {

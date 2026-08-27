@@ -20,6 +20,8 @@ export interface BasicUserScope {
   workspaceId?: string;
   allowedProviders?: readonly string[] | '*';
   allowedModels?: readonly string[] | '*';
+  /** Group/team tags for per-group config resolution. */
+  groups?: readonly string[];
 }
 
 export interface BasicAuthConfig {
@@ -77,6 +79,7 @@ export function resolveBasicPrincipal(
     workspaceId: override?.workspaceId ?? cfg.defaultWorkspaceId,
     allowedProviders: override?.allowedProviders ?? cfg.defaultAllowedProviders ?? [],
     allowedModels: override?.allowedModels ?? cfg.defaultAllowedModels ?? [],
+    groups: override?.groups,
   };
   return ok({
     kind: 'basic',

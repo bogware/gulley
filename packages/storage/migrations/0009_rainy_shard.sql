@@ -1,0 +1,1 @@
+ALTER TABLE "virtual_key" ADD COLUMN "groups" jsonb DEFAULT '[]'::jsonb NOT NULL;
