@@ -7,3 +7,4 @@ export * from './select';
 export * from './model-router';
 export * from './shaping';
 export * from './smart-router';
+export * from './smart-classifier';
