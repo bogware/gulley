@@ -29,11 +29,32 @@ export interface CentroidIndex {
   ): Promise<Array<{ label: string; score: number }>>;
 }
 
-/** A minimal text-completion port for `llm-router` (the gateway wires the
- *  provider adapter's `forward`). Returns the model's raw completion text. */
-export interface ClassifierCompleter {
-  complete(model: string, prompt: string, signal?: AbortSignal): Promise<string>;
+/** The raw token usage of one classifier sub-call (for metering), read from the
+ *  provider's own usage — never from canonical fields. */
+export interface ClassifierUsage {
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
 }
+
+/** One llm-router completion: the raw text plus (for metering) the sub-call's
+ *  usage, when the completer made a billable upstream call. */
+export interface ClassifierCompletion {
+  text: string;
+  usage?: ClassifierUsage;
+}
+
+/** A minimal text-completion port for `llm-router` (the gateway wires the
+ *  provider adapter's `forward`). Returns the model's completion text + usage. */
+export interface ClassifierCompleter {
+  complete(model: string, prompt: string, signal?: AbortSignal): Promise<ClassifierCompletion>;
+}
+
+/** Per-request sink for a classifier sub-call's usage. The engine invokes it (via
+ *  the caller) ONLY when the policy sets `meterClassifier`; the gateway meters the
+ *  spend against the tenant budget with a `proxy.classify` ledger + audit line. */
+export type ClassifierSpendSink = (usage: ClassifierUsage) => void;
 
 /** Breaker keyed by a synthetic classifier name; open ⇒ skip (fail open). */
 export interface ClassifierBreaker {
@@ -132,6 +153,7 @@ async function llmClassify(
   model: string,
   deps: ClassifierDeps,
   signal: AbortSignal,
+  onSpend?: ClassifierSpendSink,
 ): Promise<string | undefined> {
   if (!deps.completer) return undefined;
   const labels = Object.keys(policy.categoryRoutes);
@@ -141,7 +163,10 @@ async function llmClassify(
     buildClassifyPrompt(text, labels),
     signal,
   );
-  return matchLabel(completion, labels);
+  // Report the sub-call's usage for metering (only when the caller wired a sink,
+  // which it does only for a `meterClassifier` policy).
+  if (completion.usage && onSpend) onSpend(completion.usage);
+  return matchLabel(completion.text, labels);
 }
 
 async function embeddingClassify(
@@ -167,6 +192,7 @@ export async function classifyRequest(
   text: string,
   deps: ClassifierDeps,
   parentSignal?: AbortSignal,
+  onSpend?: ClassifierSpendSink,
 ): Promise<string | undefined> {
   const key = `smart:${policy.name}`;
   if (deps.breaker?.isOpen(key)) return undefined;
@@ -180,7 +206,7 @@ export async function classifyRequest(
       category = runRules(spec.rules ?? [], text);
       if (category === undefined && model) {
         category = await withTimeout(
-          (s) => llmClassify(policy, text, model, deps, s),
+          (s) => llmClassify(policy, text, model, deps, s, onSpend),
           timeoutMs,
           parentSignal,
         );
@@ -188,7 +214,7 @@ export async function classifyRequest(
     } else if (spec.mode === 'llm-router') {
       if (!model) return undefined;
       category = await withTimeout(
-        (s) => llmClassify(policy, text, model, deps, s),
+        (s) => llmClassify(policy, text, model, deps, s, onSpend),
         timeoutMs,
         parentSignal,
       );

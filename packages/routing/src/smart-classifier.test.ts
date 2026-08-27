@@ -38,7 +38,7 @@ describe('runRules', () => {
 
 describe('classifyRequest — rules-then-llm', () => {
   it('returns a rule match without calling the model', async () => {
-    const complete = vi.fn(async () => 'unused');
+    const complete = vi.fn(async () => ({ text: 'unused' }));
     const cat = await classifyRequest(
       policy(
         { mode: 'rules-then-llm', rules: [{ category: 'cheap', maxChars: 50 }], model: 'm' },
@@ -63,7 +63,7 @@ describe('classifyRequest — rules-then-llm', () => {
         },
       ),
       'a long enough prompt to skip the maxChars rule',
-      { completer: { complete: async () => 'hard' } },
+      { completer: { complete: async () => ({ text: 'hard' }) } },
     );
     expect(cat).toBe('hard');
   });
@@ -87,19 +87,21 @@ describe('classifyRequest — llm-router', () => {
   const p = policy({ mode: 'llm-router', model: 'router-mini' }, { code: 'a', prose: 'b' });
 
   it('maps a completion to a candidate label (exact or contained)', async () => {
-    expect(await classifyRequest(p, 'x', { completer: { complete: async () => 'code' } })).toBe(
-      'code',
-    );
+    expect(
+      await classifyRequest(p, 'x', { completer: { complete: async () => ({ text: 'code' }) } }),
+    ).toBe('code');
     expect(
       await classifyRequest(p, 'x', {
-        completer: { complete: async () => 'The category is: prose.' },
+        completer: { complete: async () => ({ text: 'The category is: prose.' }) },
       }),
     ).toBe('prose');
   });
 
   it('abstains when the completion matches no label, or no completer is wired', async () => {
     expect(
-      await classifyRequest(p, 'x', { completer: { complete: async () => 'nonsense' } }),
+      await classifyRequest(p, 'x', {
+        completer: { complete: async () => ({ text: 'nonsense' }) },
+      }),
     ).toBeUndefined();
     expect(await classifyRequest(p, 'x', {})).toBeUndefined();
   });
@@ -107,8 +109,35 @@ describe('classifyRequest — llm-router', () => {
   it('abstains when the policy has no model', async () => {
     const noModel = policy({ mode: 'llm-router' }, { a: 'x' });
     expect(
-      await classifyRequest(noModel, 'x', { completer: { complete: async () => 'a' } }),
+      await classifyRequest(noModel, 'x', { completer: { complete: async () => ({ text: 'a' }) } }),
     ).toBeUndefined();
+  });
+
+  it('reports the sub-call usage to the spend sink for metering', async () => {
+    const spends: unknown[] = [];
+    const cat = await classifyRequest(
+      p,
+      'x',
+      {
+        completer: {
+          complete: async () => ({
+            text: 'code',
+            usage: {
+              provider: 'anthropic',
+              model: 'router-mini',
+              inputTokens: 12,
+              outputTokens: 1,
+            },
+          }),
+        },
+      },
+      undefined,
+      (u) => spends.push(u),
+    );
+    expect(cat).toBe('code');
+    expect(spends).toEqual([
+      { provider: 'anthropic', model: 'router-mini', inputTokens: 12, outputTokens: 1 },
+    ]);
   });
 });
 
@@ -167,7 +196,7 @@ describe('classifyRequest — resilience', () => {
   });
 
   it('skips the classifier entirely when the breaker is open', async () => {
-    const complete = vi.fn(async () => 'a');
+    const complete = vi.fn(async () => ({ text: 'a' }));
     const breaker: ClassifierBreaker = { isOpen: () => true, record: () => {} };
     const cat = await classifyRequest(policy({ mode: 'llm-router', model: 'm' }, { a: 'x' }), 'x', {
       completer: { complete },
@@ -184,7 +213,7 @@ describe('classifyRequest — resilience', () => {
       record: (k, ok) => records.push([k, ok]),
     };
     await classifyRequest(policy({ mode: 'llm-router', model: 'm' }, { a: 'x' }), 'x', {
-      completer: { complete: async () => 'a' },
+      completer: { complete: async () => ({ text: 'a' }) },
       breaker,
     });
     expect(records).toContainEqual(['smart:p', true]);

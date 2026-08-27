@@ -30,6 +30,7 @@ import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from 
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
 import type { RequestTracer } from '../tracer';
+import { meterClassifierSpend } from '../smart-classifier-meter';
 import type { SmartRouter } from '../smart-router';
 import type { TenantCredentialResolver } from '../tenant';
 import type { TenantRouteResolver } from '../tenant-routes';
@@ -41,6 +42,7 @@ import {
   type CircuitBreaker,
   type AdaptiveLimiter,
   type BreakerSync,
+  type ClassifierUsage,
   hasShaping,
   isFailoverStatus,
   type LoadScoreboard,
@@ -437,6 +439,9 @@ async function handleProxy(
     // key, budget, authz, and telemetry all see the effective target/model. It is
     // fail-open: a policy miss, an abstention, or a classifier timeout/error
     // returns no decision, leaving the model-router/route strategy in place.
+    // The classifier reports its sub-call usage here ONLY for a `meterClassifier`
+    // policy; we meter it independently of the served request's reserve/commit.
+    let classifierSpend: ClassifierUsage | undefined;
     const decision = await ctx.smartRouter.route(
       {
         userId: principal.id,
@@ -446,7 +451,24 @@ async function handleProxy(
         clientPaths: route.clientPaths,
       },
       semanticText(body),
+      {
+        onSpend: (u) => {
+          classifierSpend = u;
+        },
+      },
     );
+    if (classifierSpend) {
+      await meterClassifierSpend(
+        ctx,
+        {
+          id: principal.id,
+          orgId: principal.scope.orgId,
+          workspaceId: principal.scope.workspaceId,
+        },
+        requestId,
+        classifierSpend,
+      );
+    }
     if (decision) {
       if (decision.strategy) strategy = decision.strategy;
       if (decision.createExtractor) createExtractor = decision.createExtractor;

@@ -3,13 +3,19 @@ import {
   allTargets,
   type ClassifierDeps,
   classifyRequest,
+  type ClassifierSpendSink,
   MapSmartRouteResolver,
+  type RouteTarget,
   type RoutingStrategy,
   type SmartRouteResolver,
   type SmartRoutingIdentity,
   type SmartRoutingPolicy,
 } from '@gulley/routing';
 import type { ProviderRoute } from './routes/messages';
+import {
+  type ClassifierTargetEntry,
+  GatewayClassifierCompleter,
+} from './smart-classifier-completer';
 
 /**
  * The live routing change a classified category resolves to. Any subset:
@@ -47,13 +53,16 @@ export class SmartRouter {
   async route(
     identity: SmartRoutingIdentity,
     text: string,
-    signal?: AbortSignal,
+    opts?: { signal?: AbortSignal; onSpend?: ClassifierSpendSink },
   ): Promise<SmartRouteDecision | undefined> {
     const policy = this.resolver.resolve(identity);
     if (!policy) return undefined;
     const byCategory = this.decisions.get(policy);
     if (!byCategory) return undefined;
-    const category = await classifyRequest(policy, text, this.deps, signal);
+    // Surface the classifier sub-call's spend for metering ONLY when the policy
+    // opts into it; otherwise the sink is never invoked.
+    const onSpend = policy.classifier.meterClassifier ? opts?.onSpend : undefined;
+    const category = await classifyRequest(policy, text, this.deps, opts?.signal, onSpend);
     const chosen = category ?? policy.defaultCategory;
     if (chosen === undefined) return undefined;
     return byCategory.get(chosen);
@@ -112,6 +121,9 @@ export function buildSmartRouter(
   }
 
   const decisions = new Map<SmartRoutingPolicy<string>, Map<string, SmartRouteDecision>>();
+  // Resolve the classifier target for each llm-router / rules-then-llm policy that
+  // names a model + provider, so the built-in completer can forward to it.
+  const byModel = new Map<string, ClassifierTargetEntry>();
   for (const p of policies) {
     const byCategory = new Map<string, SmartRouteDecision>();
     for (const [category, ref] of Object.entries(p.categoryRoutes)) {
@@ -119,7 +131,23 @@ export function buildSmartRouter(
       if (decision) byCategory.set(category, decision); // drop unroutable categories
     }
     decisions.set(p, byCategory);
+
+    const c = p.classifier;
+    if (c.model && c.providerRef && !byModel.has(c.model)) {
+      const target = singleTarget(byProvider.get(c.providerRef));
+      if (target) byModel.set(c.model, { target, provider: c.providerRef });
+    }
   }
 
-  return new SmartRouter(new MapSmartRouteResolver(policies), decisions, deps);
+  // Use a caller-supplied completer (tests) if present; else build the real one
+  // when any policy configured a wired classifier model+provider.
+  const completer =
+    deps.completer ?? (byModel.size > 0 ? new GatewayClassifierCompleter(byModel) : undefined);
+  const finalDeps: ClassifierDeps = { ...deps, completer };
+
+  return new SmartRouter(new MapSmartRouteResolver(policies), decisions, finalDeps);
+}
+
+function singleTarget(decision: SmartRouteDecision | undefined): RouteTarget | undefined {
+  return decision?.strategy?.mode === 'single' ? decision.strategy.target : undefined;
 }

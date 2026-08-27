@@ -22,7 +22,7 @@ import { buildCustomProviders } from './context';
 import type { GatewayContext } from './routes/messages';
 import { buildServer } from './server';
 import { buildSmartRouter } from './smart-router';
-import type { SmartRoutingPolicy } from '@gulley/routing';
+import type { ClassifierCompleter, SmartRoutingPolicy } from '@gulley/routing';
 
 const PEPPER = 'itest-pepper';
 const UPSTREAM_KEY = 'sk-ant-upstream-secret';
@@ -788,6 +788,92 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     expect(res.headers.get('x-gulley-target')).toBe('pinned'); // tenant pin served
     expect(JSON.parse(received.body).model).toBe('claude-sonnet-4-6'); // NOT rewritten
+    await app.close();
+  });
+
+  // A classifier completer that never touches the network — returns a fixed
+  // category label + usage, so the metering path can be exercised deterministically.
+  const fakeCompleter = (usage?: {
+    provider: string;
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+  }): ClassifierCompleter => ({
+    complete: async () => (usage ? { text: 'cheap', usage } : { text: 'cheap' }),
+  });
+
+  const llmPolicy = (meterClassifier: boolean): SmartRoutingPolicy => ({
+    name: 'route-by-llm',
+    objective: 'domain-skill',
+    classifier: {
+      mode: 'llm-router',
+      model: 'router-x',
+      providerRef: 'anthropic',
+      meterClassifier,
+    },
+    categoryRoutes: { cheap: 'claude-haiku-4-5' },
+    selector: {},
+  });
+
+  it('meters a classifier sub-call as its own proxy.classify line when meterClassifier is on', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger, audit } = buildContext(store);
+    ctx.smartRouter = buildSmartRouter([llmPolicy(true)], ctx.routes, {
+      completer: fakeCompleter({
+        provider: 'anthropic',
+        model: 'router-x',
+        inputTokens: 20,
+        outputTokens: 1,
+      }),
+    });
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: smartReq('hi'),
+    });
+    await res.text();
+
+    // The reroute took effect (upstream saw the rewritten model)...
+    expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5');
+    // ...and the classifier sub-call is metered on its own #classify line, distinct
+    // from the served request's single teardown.
+    expect(audit.rows.map((r) => r.action).sort()).toEqual(['proxy.classify', 'proxy.request']);
+    expect(ledger.entries).toHaveLength(2);
+    expect(ledger.entries.some((e) => e.requestId.endsWith('#classify'))).toBe(true);
+    const classifyLine = ledger.entries.find((e) => e.requestId.endsWith('#classify'));
+    expect(classifyLine?.model).toBe('router-x');
+
+    await app.close();
+  });
+
+  it('does not meter the classifier when meterClassifier is off (reroute still applies)', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger, audit } = buildContext(store);
+    ctx.smartRouter = buildSmartRouter([llmPolicy(false)], ctx.routes, {
+      completer: fakeCompleter({
+        provider: 'anthropic',
+        model: 'router-x',
+        inputTokens: 20,
+        outputTokens: 1,
+      }),
+    });
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: smartReq('hi'),
+    });
+    await res.text();
+
+    expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5'); // still rerouted
+    expect(audit.rows.map((r) => r.action)).toEqual(['proxy.request']); // no classify line
+    expect(ledger.entries).toHaveLength(1);
+
     await app.close();
   });
 
