@@ -19,6 +19,7 @@
     "guardrail:check": "tsx src/guardrail-check.ts",
     "bedrock-guardrail:check": "tsx src/bedrock-guardrail-check.ts",
     "load:check": "tsx src/load-check.ts",
+    "smart:check": "tsx src/smart-check.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"

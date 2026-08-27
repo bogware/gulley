@@ -102,3 +102,31 @@ unchanged.
 | **D**  | Wire `ctx.smartRouter`/`ctx.smartRoutes`; insert the classify stage; miss/timeout = no-op. **→ adversarial review.**               | yes      |
 | **E**  | Classifier sub-metering (`${requestId}#classify`, `proxy.classify`, `meterClassifier`). **→ adversarial review.**                  | yes      |
 | **F**  | Hot-path review, docs + roadmap, `smart:check` live smoke.                                                                         | —        |
+
+## Status — delivered
+
+All phases are delivered, verified (`ci/verify.sh` green), and committed; the two
+hot-path phases (D, E) each passed the adversarial review gate — D fixed two
+confirmed findings (unwired `kind:model` fail-open; decisions keyed by policy
+object, not name), E had zero confirmed findings (cost-compute hardened into the
+fail-open guard as defense-in-depth). Off unless `SMART_ROUTING_ENABLED=true`
+(DB config), so single-tenant deployments are unchanged.
+
+**Classifier backends:** `rules-then-llm` and `llm-router` are fully wired and,
+for `llm-router`, metered. The `embedding-nearest-label` **ports**
+(`ClassifierEmbedder`, `CentroidIndex`) are defined and the engine path exists,
+but its labeled-centroid store + exemplar management is an additive follow-on (it
+needs a `classifier_centroid` table separate from `semantic_vector`, whose
+`cache_entry` FK forbids standalone exemplars). The `llm-router` completer speaks
+the **Anthropic-canonical** response shape; other classifier provider families are
+additive.
+
+**Also delivered:** groups as a claim/tag (`scope.groups` from a key column or JWT
+`groups` claim); per-user via JWT `sub`/Basic username; the residency-pin fully
+preempts smart routing (the per-policy opt-out is a future knob); selector
+precedence user > group > route > workspace > org with priority tie-break; the
+`smartRoutingPolicies` GitOps config collection.
+
+**Smoke:** `pnpm --filter @gulley/gateway smart:check` runs the router over sample
+prompts (rules + a stubbed metered `llm-router`) and prints the decisions +
+`proxy.classify` metering — a deterministic, no-cost end-to-end demonstration.
