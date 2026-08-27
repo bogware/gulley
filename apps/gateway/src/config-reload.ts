@@ -1,3 +1,5 @@
+import { OpenAIEmbeddingProvider } from '@gulley/cache';
+import type { ClassifierBreaker } from '@gulley/routing';
 import {
   createClosableDatabase,
   createListenConnection,
@@ -30,10 +32,30 @@ export function buildConfigWatcher(
   const store = new PostgresConfigStore(db);
   const versions = new PostgresConfigVersionStore(db);
   const resolver = buildSecretResolver(config);
-  // Rules-based smart routing needs no upstream classifier deps; embedding/LLM
-  // backends and their metering are wired in a later step.
+  // Smart-routing classifier deps (only when enabled): the embedding backend
+  // reuses the EMBEDDINGS_* provider (short timeout — it is on the classification
+  // hot path) for exemplar centroids + prompt embedding; a breaker over the shared
+  // circuit breaker short-circuits a persistently-failing classifier.
+  const embedder =
+    config.SMART_ROUTING_ENABLED && config.EMBEDDINGS_API_KEY
+      ? new OpenAIEmbeddingProvider({
+          apiKey: config.EMBEDDINGS_API_KEY,
+          baseUrl: config.EMBEDDINGS_BASE_URL,
+          model: config.EMBEDDINGS_MODEL,
+          dimensions: config.EMBEDDINGS_DIMENSIONS,
+          timeoutMs: config.SMART_ROUTING_EMBED_TIMEOUT_MS,
+        })
+      : undefined;
+  const breaker: ClassifierBreaker = {
+    isOpen: (k) => holder.ctx.breaker.isOpen(k),
+    record: (k, ok) =>
+      ok ? holder.ctx.breaker.recordSuccess(k) : holder.ctx.breaker.recordFailure(k),
+  };
   const reconciler = new GatewayReconciler(holder, store, resolver, log, {
     enabled: config.SMART_ROUTING_ENABLED,
+    embedder,
+    breaker: config.SMART_ROUTING_ENABLED ? breaker : undefined,
+    similarityThreshold: config.SMART_ROUTING_SIMILARITY_THRESHOLD,
   });
 
   const listen = createListenConnection(config.DATABASE_URL);

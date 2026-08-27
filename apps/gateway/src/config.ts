@@ -192,6 +192,12 @@ const Env = z.object({
   // classifier needs no upstream; embedding/LLM classifier backends are wired
   // separately (they meter their own spend).
   SMART_ROUTING_ENABLED: envBool(false),
+  // embedding-nearest-label backend: reuses the EMBEDDINGS_* provider to embed the
+  // policy exemplars (centroids) + the inbound prompt. Cosine-similarity floor to
+  // accept the nearest label; a shorter embed timeout than the cache's (this is on
+  // the classification hot path).
+  SMART_ROUTING_SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6),
+  SMART_ROUTING_EMBED_TIMEOUT_MS: z.coerce.number().int().positive().default(1500),
 
   // Load balancing across a loadbalance strategy's targets. When affinity is off
   // (default) the primary pick uses power-of-two-choices least-load over in-flight

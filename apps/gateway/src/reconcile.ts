@@ -1,9 +1,10 @@
 import type { ConfigStore, ConfigVersionStore } from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
-import type { ClassifierDeps } from '@gulley/routing';
+import type { ClassifierBreaker, ClassifierEmbedder } from '@gulley/routing';
 import { type ConfigSubscriber, SignalGate } from '@gulley/storage';
 import { buildRoutesFromDocument } from './config-builder';
 import type { RouteHolder } from './routes/messages';
+import { buildEmbeddingCentroids, type EmbeddingCache } from './smart-classifier-embedding';
 import { buildSmartRouter } from './smart-router';
 import { parseSmartRoutingPolicies } from './smart-routing-config';
 
@@ -11,7 +12,13 @@ import { parseSmartRoutingPolicies } from './smart-routing-config';
  *  built and the data plane ignores any smartRoutingPolicies in the document. */
 export interface SmartRoutingReconcile {
   enabled: boolean;
-  deps?: ClassifierDeps;
+  /** Embedder for `embedding-nearest-label` centroids; absent ⇒ embedding
+   *  policies abstain (fail open to the model router). */
+  embedder?: ClassifierEmbedder;
+  /** Breaker short-circuiting a persistently-failing llm/embedding classifier. */
+  breaker?: ClassifierBreaker;
+  /** Cosine-similarity floor for embedding classification (engine default 0.6). */
+  similarityThreshold?: number;
 }
 
 export interface ReconcileLog {
@@ -30,6 +37,9 @@ export interface ReconcileLog {
  */
 export class GatewayReconciler {
   private chain: Promise<void> = Promise.resolve();
+  // Memoize exemplar embeddings across reconciles so an unchanged embedding
+  // policy is not re-embedded on every config apply.
+  private readonly embedCache: EmbeddingCache = new Map();
 
   constructor(
     private readonly holder: RouteHolder,
@@ -60,9 +70,19 @@ export class GatewayReconciler {
       // Build the smart router BEFORE swapping anything: a malformed policy throws
       // here and the catch keeps the CURRENT routes + smart router intact (never a
       // partial swap), matching the credential-resolution failure contract.
-      const smartRouter = this.smartRouting?.enabled
-        ? buildSmartRouter(parseSmartRoutingPolicies(doc), routes, this.smartRouting.deps)
-        : undefined;
+      let smartRouter;
+      if (this.smartRouting?.enabled) {
+        const policies = parseSmartRoutingPolicies(doc);
+        const centroids = this.smartRouting.embedder
+          ? await buildEmbeddingCentroids(policies, this.smartRouting.embedder, this.embedCache)
+          : undefined;
+        smartRouter = buildSmartRouter(policies, routes, {
+          embedder: this.smartRouting.embedder,
+          centroids,
+          breaker: this.smartRouting.breaker,
+          similarityThreshold: this.smartRouting.similarityThreshold,
+        });
+      }
       this.holder.swapRoutes(routes);
       if (this.smartRouting?.enabled) this.holder.swapSmartRouter(smartRouter);
       this.log?.info(`config reconciled: ${routes.length} routes active`);

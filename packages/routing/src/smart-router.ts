@@ -27,10 +27,13 @@ export interface ClassifierRule {
 /** How a policy classifies a request into a category. */
 export interface ClassifierSpec {
   mode: ClassifierMode;
-  /** `embedding-nearest-label`: the declared taxonomy labels. Reserved for the
-   *  embedding-backend follow-on; the current engine scopes the centroid lookup
-   *  by the policy name and does not read this field yet. */
+  /** `embedding-nearest-label`: the declared taxonomy labels (advisory metadata;
+   *  the live categories come from `exemplars`/`categoryRoutes`). */
   labels?: readonly string[];
+  /** `embedding-nearest-label`: example prompts per category. The gateway embeds
+   *  these into per-category centroids at reconcile; a request is routed to the
+   *  category whose exemplar is nearest (cosine) above the similarity threshold. */
+  exemplars?: Readonly<Record<string, readonly string[]>>;
   /** `rules-then-llm`: ordered rules; first match wins, else escalate to the model. */
   rules?: readonly ClassifierRule[];
   /** `llm-router` / rules escalation: the model id that returns a category label. */

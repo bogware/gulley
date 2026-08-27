@@ -208,6 +208,33 @@ describe('GatewayReconciler smart routing', () => {
     ).reconcile();
     expect(holder.ctx.smartRouter).toBeUndefined();
   });
+
+  it('builds embedding centroids from a policy exemplar when an embedder is wired', async () => {
+    const { holder } = holderWithState();
+    const embed = vi.fn(async () => [1, 0]); // exemplar + prompt embed identically
+    const embPolicy = {
+      name: 'e',
+      config: {
+        objective: 'domain-skill',
+        classifier: { mode: 'embedding-nearest-label', exemplars: { code: ['write a function'] } },
+        categoryRoutes: { code: 'claude-haiku-4-5' },
+        selector: {},
+      },
+    };
+    await new GatewayReconciler(
+      holder,
+      storeReturning(docWithPolicies([embPolicy])),
+      resolver(),
+      undefined,
+      { enabled: true, embedder: { embed }, similarityThreshold: 0.5 },
+    ).reconcile();
+    expect(holder.ctx.smartRouter).toBeDefined();
+    // The exemplar was embedded at reconcile; the prompt then classifies to 'code'.
+    expect(await holder.ctx.smartRouter!.route(identity, 'anything')).toEqual({
+      model: 'claude-haiku-4-5',
+    });
+    expect(embed).toHaveBeenCalled();
+  });
 });
 
 describe('ConfigWatcher', () => {

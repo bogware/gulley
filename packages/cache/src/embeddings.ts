@@ -31,7 +31,10 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.timeoutMs = opts.timeoutMs ?? 4000;
   }
 
-  async embed(text: string): Promise<number[]> {
+  async embed(text: string, signal?: AbortSignal): Promise<number[]> {
+    // Bound by the internal timeout AND any caller signal (whichever fires first).
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const abort = signal ? AbortSignal.any([signal, timeout]) : timeout;
     const res = await fetch(`${this.baseUrl}/v1/embeddings`, {
       method: 'POST',
       headers: {
@@ -39,7 +42,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
         authorization: `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({ model: this.model, input: text, dimensions: this.dimensions }),
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: abort,
     });
     if (!res.ok) {
       throw new Error(`embeddings request failed: ${res.status} ${await res.text()}`);

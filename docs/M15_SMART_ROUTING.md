@@ -112,12 +112,15 @@ object, not name), E had zero confirmed findings (cost-compute hardened into the
 fail-open guard as defense-in-depth). Off unless `SMART_ROUTING_ENABLED=true`
 (DB config), so single-tenant deployments are unchanged.
 
-**Classifier backends:** `rules-then-llm` and `llm-router` are fully wired and,
-for `llm-router`, metered. The `embedding-nearest-label` **ports**
-(`ClassifierEmbedder`, `CentroidIndex`) are defined and the engine path exists,
-but its labeled-centroid store + exemplar management is an additive follow-on (it
-needs a `classifier_centroid` table separate from `semantic_vector`, whose
-`cache_entry` FK forbids standalone exemplars). The `llm-router` completer speaks
+**Classifier backends — all three live:** `rules-then-llm`, `llm-router`
+(metered), and `embedding-nearest-label` (M16). Embedding mode embeds a policy's
+config `exemplars` into per-category centroids (reusing the semantic-cache
+`OpenAIEmbeddingProvider`) at reconcile — memoized so an unchanged policy is not
+re-embedded — and routes a request to the category whose exemplar is nearest
+(cosine) above `SMART_ROUTING_SIMILARITY_THRESHOLD`; prompt embedding is bounded
+by a short timeout and the classifier breaker. Centroids are held in memory and
+rebuilt each reconcile — a persistent `classifier_centroid` table (so replicas
+don't each re-embed) is a future optimization. The `llm-router` completer speaks
 the **Anthropic-canonical** response shape; other classifier provider families are
 additive.
 
@@ -152,7 +155,9 @@ prompts (rules + a stubbed metered `llm-router`) and prints the decisions +
   `selector.workspace` is **global**. Correct for v1 (single-tenant per
   deployment); a multi-tenant deployment **must pin `selector.workspace`** (the
   workspace id) on each policy, or it applies to every tenant.
-- **Embedding backend is inert until wired.** With no embedder/centroids in the
-  reconcile deps, an `embedding-nearest-label` policy always abstains (fails open
-  to the model router). The `classifier_centroid` store + a classifier breaker in
-  the production reconcile path are the follow-ons that make it live.
+- **Embedding backend (M16).** Live when `SMART_ROUTING_ENABLED` and
+  `EMBEDDINGS_API_KEY` are set: the reconciler builds a shared embedder + a
+  classifier breaker and embeds each `embedding-nearest-label` policy's config
+  `exemplars` into centroids. Absent embeddings config (or no exemplars), an
+  embedding policy abstains (fail-open). A persistent centroid table is a future
+  optimization; today centroids are rebuilt (memoized) each reconcile.

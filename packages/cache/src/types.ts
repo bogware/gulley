@@ -33,11 +33,12 @@ export interface ExactCacheStore {
   set(key: string, value: CachedResponse, ttlSeconds: number): Promise<void>;
 }
 
-/** Produces embedding vectors for the semantic tier. */
+/** Produces embedding vectors for the semantic tier. An optional `signal` lets a
+ *  caller (e.g. the smart-routing classifier's timeout) cancel a slow embed. */
 export interface EmbeddingProvider {
   readonly name: string;
   readonly dimensions: number;
-  embed(text: string): Promise<number[]>;
+  embed(text: string, signal?: AbortSignal): Promise<number[]>;
 }
 
 export interface VectorMatch {

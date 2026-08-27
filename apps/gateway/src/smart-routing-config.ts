@@ -24,6 +24,7 @@ const classifierSpecSchema = z
   .object({
     mode: z.enum(['embedding-nearest-label', 'llm-router', 'rules-then-llm']),
     labels: z.array(z.string()).optional(),
+    exemplars: z.record(z.string(), z.array(z.string())).optional(),
     rules: z.array(classifierRuleSchema).optional(),
     model: z.string().optional(),
     providerRef: z.string().optional(),

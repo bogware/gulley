@@ -2,6 +2,7 @@ import type { UsageExtractor } from '@gulley/providers';
 import type { SmartRoutingIdentity, SmartRoutingPolicy } from '@gulley/routing';
 import { describe, expect, it } from 'vitest';
 import type { ProviderRoute } from './routes/messages';
+import { InMemoryCentroidIndex } from './smart-classifier-embedding';
 import { buildSmartRouter } from './smart-router';
 
 const extractorFor = (name: string) => (): UsageExtractor =>
@@ -91,6 +92,45 @@ describe('buildSmartRouter', () => {
   it('returns undefined when no policy matches the identity', async () => {
     const sr = buildSmartRouter([policy({ selector: { user: 'someone-else' } })], ROUTES);
     expect(await sr!.route(IDENTITY, 'short')).toBeUndefined();
+  });
+
+  it('routes via embedding-nearest-label using centroids + an embedder', async () => {
+    const centroids = new InMemoryCentroidIndex();
+    centroids.add('emb', 'cheap', [1, 0]);
+    centroids.add('emb', 'hard', [0, 1]);
+    // A "simple" prompt embeds near the 'cheap' centroid; a "hard" one near 'hard'.
+    const embed = async (t: string) => (t === 'simple' ? [0.95, 0.05] : [0.05, 0.95]);
+    const p = policy({
+      name: 'emb',
+      classifier: { mode: 'embedding-nearest-label' },
+      categoryRoutes: { cheap: 'claude-haiku-4-5', hard: 'openai' },
+    });
+    const sr = buildSmartRouter([p], ROUTES, {
+      embedder: { embed },
+      centroids,
+      similarityThreshold: 0.5,
+    });
+    expect(await sr!.route(IDENTITY, 'simple')).toEqual({ model: 'claude-haiku-4-5' });
+    expect((await sr!.route(IDENTITY, 'complex'))?.strategy).toMatchObject({
+      target: { provider: 'openai' },
+    });
+  });
+
+  it('abstains (embedding) when the nearest centroid is below the similarity floor', async () => {
+    const centroids = new InMemoryCentroidIndex();
+    centroids.add('emb', 'cheap', [1, 0]);
+    const embed = async () => [0, 1]; // orthogonal ⇒ cosine 0 < floor
+    const p = policy({
+      name: 'emb',
+      classifier: { mode: 'embedding-nearest-label' },
+      categoryRoutes: { cheap: 'claude-haiku-4-5' },
+    });
+    const sr = buildSmartRouter([p], ROUTES, {
+      embedder: { embed },
+      centroids,
+      similarityThreshold: 0.5,
+    });
+    expect(await sr!.route(IDENTITY, 'x')).toBeUndefined();
   });
 
   it('fails open (no decision) when a kind:model reference names an unwired provider', async () => {
