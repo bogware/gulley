@@ -18,6 +18,7 @@ const DOC_TO_KIND: Array<[keyof ConfigWorkspace, CollectionKind]> = [
   ['rateLimits', 'ratelimit'],
   ['guardrails', 'guardrail'],
   ['modelAliases', 'modelalias'],
+  ['smartRoutingPolicies', 'smartroutingpolicy'],
 ];
 
 const byName = <T extends { name: string }>(a: T, b: T): number => a.name.localeCompare(b.name);
@@ -54,7 +55,7 @@ export class ControlConfigStore implements ConfigStore {
       .filter((k) => k.workspaceId === ws.id)
       .sort(byName)
       .map((k) => ({ name: k.name, keyPrefix: k.keyPrefix, disabled: k.disabled }));
-    return {
+    const out: ConfigWorkspace = {
       name: ws.name,
       providers,
       routes: coll('route'),
@@ -65,6 +66,11 @@ export class ControlConfigStore implements ConfigStore {
       modelAliases: coll('modelalias'),
       virtualKeys,
     };
+    // Optional collection: emit only when non-empty (absence ≡ empty) so existing
+    // content hashes and drift are unaffected.
+    const smartRoutingPolicies = coll('smartroutingpolicy');
+    if (smartRoutingPolicies.length > 0) out.smartRoutingPolicies = smartRoutingPolicies;
+    return out;
   }
 
   async exportDocument(orgIds: ReadonlySet<string> | '*'): Promise<ConfigDocument> {
@@ -127,7 +133,8 @@ export class ControlConfigStore implements ConfigStore {
         }
 
         for (const [docKey, kind] of DOC_TO_KIND) {
-          const desiredEntities = dWs[docKey] as ConfigEntity[];
+          // Optional collections (e.g. smartRoutingPolicies) may be absent ⇒ [].
+          const desiredEntities = (dWs[docKey] ?? []) as ConfigEntity[];
           const coll = this.ctx.collections[kind];
           const desiredNames = new Set(desiredEntities.map((e) => e.name));
           for (const e of coll.all().filter((x) => x.workspaceId === ws.id)) {

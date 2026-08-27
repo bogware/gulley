@@ -55,7 +55,7 @@ export interface ScopedEntity {
 }
 
 export type CollectionKind =
-  'route' | 'policy' | 'budget' | 'ratelimit' | 'guardrail' | 'modelalias';
+  'route' | 'policy' | 'budget' | 'ratelimit' | 'guardrail' | 'modelalias' | 'smartroutingpolicy';
 
 export const COLLECTION_KINDS: readonly CollectionKind[] = [
   'route',
@@ -64,6 +64,7 @@ export const COLLECTION_KINDS: readonly CollectionKind[] = [
   'ratelimit',
   'guardrail',
   'modelalias',
+  'smartroutingpolicy',
 ];
 
 /** A virtual key as the admin API exposes it — never the token or the hash. */

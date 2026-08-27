@@ -32,6 +32,9 @@ export interface ConfigWorkspace {
   rateLimits: ConfigEntity[];
   guardrails: ConfigEntity[];
   modelAliases: ConfigEntity[];
+  /** Smart-routing policies (M15). Optional so pre-feature documents stay valid;
+   *  absent ≡ none. Exported docs always emit it (possibly empty). */
+  smartRoutingPolicies?: ConfigEntity[];
   virtualKeys: ConfigKeyMeta[];
 }
 
@@ -104,6 +107,18 @@ export function validateConfigDocument(v: unknown): string | null {
           const ent = arr[ei];
           if (!isObj(ent) || typeof ent['name'] !== 'string' || !isObj(ent['config'])) {
             return `${p}.${coll}[${ei}]: { name (string), config (object) } required`;
+          }
+        }
+      }
+      // Optional collections: validate entries when present, but absence is fine
+      // (pre-feature documents stay valid).
+      if (ws['smartRoutingPolicies'] !== undefined) {
+        const arr = ws['smartRoutingPolicies'];
+        if (!Array.isArray(arr)) return `${p}.smartRoutingPolicies must be an array`;
+        for (let ei = 0; ei < arr.length; ei++) {
+          const ent = arr[ei];
+          if (!isObj(ent) || typeof ent['name'] !== 'string' || !isObj(ent['config'])) {
+            return `${p}.smartRoutingPolicies[${ei}]: { name (string), config (object) } required`;
           }
         }
       }

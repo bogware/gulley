@@ -71,6 +71,13 @@
       "when": 1787792070695,
       "tag": "0009_rainy_shard",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1787792955016,
+      "tag": "0010_tired_dragon_lord",
+      "breakpoints": true
     }
   ]
 }

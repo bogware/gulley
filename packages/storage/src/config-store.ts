@@ -23,6 +23,7 @@ import {
   rateLimit,
   route,
   routePolicy,
+  smartRoutingPolicy,
   virtualKey,
   workspace,
 } from './schema';
@@ -55,6 +56,8 @@ function jsonbTable(kind: ConfigCollectionKind): typeof route {
       return guardrail as unknown as typeof route;
     case 'modelalias':
       return modelAlias as unknown as typeof route;
+    case 'smartroutingpolicy':
+      return smartRoutingPolicy as unknown as typeof route;
     default:
       throw new Error(`not a jsonb collection: ${kind}`);
   }

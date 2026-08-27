@@ -325,6 +325,25 @@ export const modelAlias = pgTable(
   (t) => [index('model_alias_workspace_idx').on(t.workspaceId)],
 );
 
+// Smart-routing policies (M15): a name-keyed jsonb collection identical in shape
+// to `route`. The `config` holds the classifier spec, category→route map,
+// selector, and priority (see @gulley/routing SmartRoutingPolicy).
+export const smartRoutingPolicy = pgTable(
+  'smart_routing_policy',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    config: jsonb('config')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('smart_routing_policy_workspace_idx').on(t.workspaceId)],
+);
+
 export const rateLimit = pgTable(
   'rate_limit',
   {

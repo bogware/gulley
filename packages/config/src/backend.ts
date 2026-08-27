@@ -18,7 +18,7 @@ import type { AppliedDiff, ConfigStore, ReconcileContext } from './store';
  * supplies thin per-table primitives.
  */
 export type ConfigCollectionKind =
-  'route' | 'policy' | 'budget' | 'ratelimit' | 'guardrail' | 'modelalias';
+  'route' | 'policy' | 'budget' | 'ratelimit' | 'guardrail' | 'modelalias' | 'smartroutingpolicy';
 
 /** doc workspace key → collection kind. Order is the canonical apply order. */
 export const DOC_COLLECTIONS: Array<[keyof ConfigWorkspace, ConfigCollectionKind]> = [
@@ -28,6 +28,7 @@ export const DOC_COLLECTIONS: Array<[keyof ConfigWorkspace, ConfigCollectionKind
   ['rateLimits', 'ratelimit'],
   ['guardrails', 'guardrail'],
   ['modelAliases', 'modelalias'],
+  ['smartRoutingPolicies', 'smartroutingpolicy'],
 ];
 
 export interface BackendOrg {
@@ -119,7 +120,7 @@ export async function exportWithBackend(
         (await backend.listEntities(kind, ws.id))
           .sort(byName)
           .map((e) => ({ name: e.name, config: e.config }));
-      outWs.push({
+      const out: ConfigWorkspace = {
         name: ws.name,
         providers,
         routes: await coll('route'),
@@ -129,7 +130,12 @@ export async function exportWithBackend(
         guardrails: await coll('guardrail'),
         modelAliases: await coll('modelalias'),
         virtualKeys: (await backend.listKeyMeta(ws.id)).sort(byName),
-      });
+      };
+      // Optional collection: emit only when non-empty, so pre-feature documents
+      // hash/diff identically (absence ≡ empty).
+      const smartRoutingPolicies = await coll('smartroutingpolicy');
+      if (smartRoutingPolicies.length > 0) out.smartRoutingPolicies = smartRoutingPolicies;
+      outWs.push(out);
     }
     outOrgs.push({ name: org.name, workspaces: outWs });
   }
@@ -193,7 +199,9 @@ export async function reconcileWithBackend(
 
       // Entity collections: delete-by-absence, create-new, update-on-change.
       for (const [docKey, kind] of DOC_COLLECTIONS) {
-        const desiredEntities = dWs[docKey] as ConfigEntity[];
+        // Optional collections (e.g. smartRoutingPolicies) may be absent ⇒ []
+        // (which prunes any existing rows, matching the other collections).
+        const desiredEntities = (dWs[docKey] ?? []) as ConfigEntity[];
         const desiredNames = new Set(desiredEntities.map((e) => e.name));
         const current = await backend.listEntities(kind, ws.id);
         for (const e of current) {

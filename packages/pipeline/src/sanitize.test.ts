@@ -44,6 +44,34 @@ describe('assertNoInlineSecret', () => {
     ).toThrow(InlineSecretError);
   });
 
+  it('rejects an inline secret inside a smart-routing policy config (M15)', () => {
+    // The recursive guard covers the new smartRoutingPolicies collection like any
+    // other document node — a classifier key must be an ARN ref, never inline.
+    expect(() =>
+      assertNoInlineSecret({
+        orgs: [
+          {
+            workspaces: [
+              {
+                smartRoutingPolicies: [
+                  {
+                    name: 'p',
+                    config: {
+                      classifier: {
+                        mode: 'llm-router',
+                        apiKey: 'sk-ant-api03-BBBBBBBBBBBBBBBBBBBB',
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(InlineSecretError);
+  });
+
   it('allows a well-formed SecretRef and ordinary hashes', () => {
     expect(() => assertNoInlineSecret({ credential: secretRef(ARN, 'v1') })).not.toThrow();
     // sha256 chain fields are NOT secrets and must pass.

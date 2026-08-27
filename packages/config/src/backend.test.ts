@@ -105,6 +105,42 @@ describe('reconcileWithBackend + exportWithBackend', () => {
     expect(await backend.listOrgs()).toHaveLength(1);
   });
 
+  it('round-trips smart-routing policies, omitting the collection when empty', async () => {
+    const store = new BackendConfigStore(new InMemoryConfigBackend());
+
+    // Empty: the optional collection is invisible in the export, so a pre-feature
+    // document hashes identically (no spurious drift).
+    await store.reconcile(doc(), { admin, access: allow });
+    expect(
+      (await store.exportDocument('*')).orgs[0]?.workspaces[0]?.smartRoutingPolicies,
+    ).toBeUndefined();
+
+    // Non-empty: reconcile → export round-trips by content hash.
+    const withPolicy = doc({
+      smartRoutingPolicies: [
+        {
+          name: 'cost',
+          config: {
+            objective: 'cost-tier',
+            classifier: { mode: 'rules-then-llm' },
+            categoryRoutes: { cheap: 'small' },
+            selector: { group: 'eng' },
+          },
+        },
+      ],
+    });
+    await store.reconcile(withPolicy, { admin, access: allow });
+    const exported = await store.exportDocument('*');
+    expect(contentHash(exported)).toBe(contentHash(withPolicy));
+    expect(exported.orgs[0]?.workspaces[0]?.smartRoutingPolicies?.[0]?.name).toBe('cost');
+
+    // Prune by absence: re-applying without the collection removes the row.
+    await store.reconcile(doc(), { admin, access: allow });
+    expect(
+      (await store.exportDocument('*')).orgs[0]?.workspaces[0]?.smartRoutingPolicies,
+    ).toBeUndefined();
+  });
+
   it('authorize denies when the admin lacks config:apply', async () => {
     const backend = new InMemoryConfigBackend();
     expect(await authorizeWithBackend(backend, doc(), { admin, access: allow })).toBe(true);
