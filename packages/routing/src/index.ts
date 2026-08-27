@@ -6,3 +6,4 @@ export * from './outlier';
 export * from './select';
 export * from './model-router';
 export * from './shaping';
+export * from './smart-router';

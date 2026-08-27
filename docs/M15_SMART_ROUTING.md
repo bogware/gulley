@@ -93,12 +93,12 @@ unchanged.
 
 ## Phases (each independently verifiable + committable)
 
-| Phase  | Scope                                                                                                                | Hot-path |
-| ------ | -------------------------------------------------------------------------------------------------------------------- | -------- |
-| **A1** | Group primitive: `scope.groups`, `virtual_key.groups`, populate in all resolvers.                                    | no       |
-| **A2** | `SmartRoutingConfig` types + Zod + `SmartRouteConfigResolver` (precedence + priority) + in-memory impl.              | no       |
-| **B**  | `smartRoutingPolicies` collection + `smart_routing_policy` table + `buildSmartRoutingFromDocument` + reconcile swap. | no       |
-| **C**  | Classifier engine (`rules-then-llm`, `embedding-nearest-label` + centroid store, `llm-router`) + timeout/breaker.    | no       |
-| **D**  | Wire `ctx.smartRouter`/`ctx.smartRoutes`; insert the classify stage; miss/timeout = no-op. **→ adversarial review.** | yes      |
-| **E**  | Classifier sub-metering (`${requestId}#classify`, `proxy.classify`, `meterClassifier`). **→ adversarial review.**    | yes      |
-| **F**  | Hot-path review, docs + roadmap, `smart:check` live smoke.                                                           | —        |
+| Phase  | Scope                                                                                                                              | Hot-path |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| **A1** | Group primitive: `scope.groups`, `virtual_key.groups`, populate in all resolvers.                                                  | no       |
+| **A2** | Declarative policy types + `MapSmartRouteResolver` (selector precedence + priority), a pure `@gulley/routing` module.              | no       |
+| **B**  | `smartRoutingPolicies` collection + `smart_routing_policy` table + Zod-validated `buildSmartRoutingFromDocument` + reconcile swap. | no       |
+| **C**  | Classifier engine (`rules-then-llm`, `embedding-nearest-label` + centroid store, `llm-router`) + timeout/breaker.                  | no       |
+| **D**  | Wire `ctx.smartRouter`/`ctx.smartRoutes`; insert the classify stage; miss/timeout = no-op. **→ adversarial review.**               | yes      |
+| **E**  | Classifier sub-metering (`${requestId}#classify`, `proxy.classify`, `meterClassifier`). **→ adversarial review.**                  | yes      |
+| **F**  | Hot-path review, docs + roadmap, `smart:check` live smoke.                                                                         | —        |
