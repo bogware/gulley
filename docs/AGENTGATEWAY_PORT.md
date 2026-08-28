@@ -278,29 +278,41 @@ routing/guardrail forms, TTFT metric). See `docs/M19_WAVE1.md` for the tracker.
   validation); budget counter self-heal from the ledger; DB `model_alias` →
   `ModelRouter`.
 
-## M20 — Wave 2 "Extend the moat" — 🚧 CORE LANDED
+## M20 — Wave 2 "Extend the moat" — ✅ DELIVERED
 
-Presses the ground competitors can't structurally follow. **Slices A–E on `main`**:
+Presses the ground competitors can't structurally follow. **Slices A–F on `main`**:
 native prompt-injection / jailbreak classifier (local, no egress); price/latency-
 aware routing (`select: cheapest|fastest`); prompt-cache savings analytics; budget
-soft-threshold alerts + gauge; budget-aware routing downshift. That's all three
-non-FinOps moat items + two of three FinOps pieces. The remaining piece — multi-level
-budget caps (org/project/key/model) — is a hot-path budget-safety change reserved for
-its own adversarially-reviewed slice (see `docs/M20_WAVE2.md`).
+soft-threshold alerts + gauge; budget-aware routing downshift; and **multi-level
+budget caps** (F) — per-model caps enforced in addition to the workspace cap via a
+per-scope reserve-with-rollback (no risky multi-key Lua; the hard-cap invariant
+holds), ordered after the E downshift so the model actually used is charged, with an
+adversarial hot-path review. All three non-FinOps moat items + the full FinOps
+enforcement core. See `docs/M20_WAVE2.md`.
 
-## Wave 3 — DX & adoption (next)
+## M21 — Wave 3 "DX & adoption" — ✅ DELIVERED
 
-The moat is deep; Wave 3 lowers the barrier to adopting it. Candidates:
+Lowers the barrier to adopting the moat. **Slices A–F on `main`** (see
+`docs/M21_WAVE3.md`):
 
-- **In-console playground** (deferred from Wave 2): send a test request, stream the
-  response, surface the resulting log row (cost/tokens/guardrail) — the first-run
-  "does my key/route work?" unlock, now that analytics (M19 B) work.
-- **Prompt registry** — versioned, audited, hash-chained prompt templates on the
-  existing GitOps/RBAC rails (governance-native, not a me-too studio).
-- **Full admin CRUD + key-lifecycle UI** (revoke/rotate endpoints landed in M19 F).
-- **Published OpenAPI + typed control-API client**; per-provider quickstarts; a
-  Helm chart / one-command deploy.
-- **Compliance-as-a-product**: the audit-verify CLI + auditor attestation export.
+- **A — playground preflight API** (`POST /v1/playground/verify`): the first-run
+  "does my key/route/model work?" unlock — authz / route / guardrail / cost / budget
+  answered faithfully from the live pipeline with **no upstream call or spend** (a
+  reserve-then-release budget peek).
+- **B — governed prompt registry** (`@gulley/prompts`): named, workspace-scoped,
+  **versioned + hash-chained** templates with strict variable render, on the
+  control-api's RBAC (`prompt:*`) + audit rails.
+- **C — full admin CRUD**: PUT/DELETE on every config collection + provider/workspace
+  delete, all through the shared audited-write path.
+- **D — published OpenAPI 3.1 + typed client** (`@gulley/control-client`): a 32-path
+  spec (source of truth + emitted `docs/openapi/control-api.json`) and a
+  dependency-free `ControlClient`.
+- **E — Helm chart + one-command Docker Compose deploy** (`deploy/`): one image, two
+  planes; hardened pods; secret-name-only (secret-ARNs-only ethos); validated by
+  `ci/helm-check.sh`.
+- **F — compliance-as-a-product**: `verifyAuditChain` + a signed **auditor
+  attestation** (`audit:verify` CLI + `GET /audit/attestation`) an auditor verifies
+  independently with the shared key.
 
 ## Recommended next steps (candidate roadmap → world-class)
 
