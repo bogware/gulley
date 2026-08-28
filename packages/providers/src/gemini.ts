@@ -10,8 +10,10 @@ import type { ForwardRequest, ForwardResponse, ProviderAdapter } from './types';
  * round-trip the provider-affine artifacts the shim drops — most importantly the
  * **`thoughtSignature`** on reasoning parts (Gemini's equivalent of Anthropic's
  * extended-thinking signature), which a client must echo back for the model to
- * continue a thinking turn. Text + thinking survive the translation; tool/image
- * blocks are pinned to their origin family and refused (see
+ * continue a thinking turn. Text, thinking, **tool-calls** (functionCall /
+ * functionResponse / functionDeclarations), and **base64 images** (inlineData)
+ * all survive the translation; only genuinely untranslatable content (e.g. a
+ * URL-sourced image, which Gemini's inlineData can't carry) is refused (see
  * {@link canTranslateAnthropicToGemini}).
  */
 
@@ -21,13 +23,24 @@ interface GeminiPart {
   text?: string;
   thought?: boolean;
   thoughtSignature?: string;
+  functionCall?: { name: string; args: Record<string, unknown> };
+  functionResponse?: { name: string; response: Record<string, unknown> };
+  inlineData?: { mimeType: string; data: string };
 }
 
 function textOf(block: Record<string, unknown>): string {
   return block['type'] === 'text' && typeof block['text'] === 'string' ? block['text'] : '';
 }
 
-/** Only text + thinking blocks survive; tool_use/tool_result/image are refused. */
+/** A base64 image block is translatable; a URL-sourced image is not (Gemini
+ *  inlineData is base64-only). */
+function isBase64Image(block: Record<string, unknown>): boolean {
+  const source = block['source'] as Record<string, unknown> | undefined;
+  return block['type'] === 'image' && source?.['type'] === 'base64';
+}
+
+/** Text, thinking, tool_use, tool_result, and base64 images survive; a URL image
+ *  (or any other provider-affine block) is refused. */
 export function canTranslateAnthropicToGemini(body: Record<string, unknown>): boolean {
   const messages = Array.isArray(body['messages']) ? (body['messages'] as unknown[]) : [];
   for (const m of messages) {
@@ -35,15 +48,37 @@ export function canTranslateAnthropicToGemini(body: Record<string, unknown>): bo
     if (typeof content === 'string') continue;
     if (Array.isArray(content)) {
       for (const block of content) {
-        const t = (block as Record<string, unknown>)['type'];
-        if (t !== 'text' && t !== 'thinking') return false;
+        const b = block as Record<string, unknown>;
+        const t = b['type'];
+        const ok =
+          t === 'text' || t === 'thinking' || t === 'tool_use' || t === 'tool_result'
+            ? true
+            : t === 'image'
+              ? isBase64Image(b)
+              : false;
+        if (!ok) return false;
       }
     }
   }
   return true;
 }
 
-function partsForContent(content: unknown): GeminiPart[] {
+/** Coerce an Anthropic tool_result `content` (string | block[]) into the JSON
+ *  object Gemini's functionResponse.response requires. */
+function toolResultResponse(content: unknown): Record<string, unknown> {
+  if (typeof content === 'string') return { result: content };
+  if (Array.isArray(content)) {
+    const text = content
+      .map((b) => textOf(b as Record<string, unknown>))
+      .filter(Boolean)
+      .join('\n');
+    return { result: text };
+  }
+  if (content && typeof content === 'object') return content as Record<string, unknown>;
+  return { result: content ?? null };
+}
+
+function partsForContent(content: unknown, toolNameById: Map<string, string>): GeminiPart[] {
   if (typeof content === 'string') return content ? [{ text: content }] : [];
   if (!Array.isArray(content)) return [];
   const parts: GeminiPart[] = [];
@@ -59,22 +94,103 @@ function partsForContent(content: unknown): GeminiPart[] {
       if (typeof block['thinking'] === 'string') part.text = block['thinking'];
       if (typeof block['signature'] === 'string') part.thoughtSignature = block['signature'];
       parts.push(part);
+    } else if (block['type'] === 'tool_use') {
+      const name = typeof block['name'] === 'string' ? block['name'] : '';
+      const args =
+        block['input'] && typeof block['input'] === 'object'
+          ? (block['input'] as Record<string, unknown>)
+          : {};
+      parts.push({ functionCall: { name, args } });
+    } else if (block['type'] === 'tool_result') {
+      // Gemini keys functionResponse on the function NAME, but the Anthropic block
+      // carries only tool_use_id — resolve it from the prior tool_use blocks.
+      const id = typeof block['tool_use_id'] === 'string' ? block['tool_use_id'] : '';
+      const name = toolNameById.get(id) ?? id;
+      parts.push({ functionResponse: { name, response: toolResultResponse(block['content']) } });
+    } else if (isBase64Image(block)) {
+      const source = block['source'] as Record<string, unknown>;
+      parts.push({
+        inlineData: {
+          mimeType: typeof source['media_type'] === 'string' ? source['media_type'] : '',
+          data: typeof source['data'] === 'string' ? source['data'] : '',
+        },
+      });
     }
   }
   return parts;
 }
 
+/** Scan every assistant `tool_use` block to build the tool_use_id -> name map a
+ *  later `tool_result` needs (Gemini functionResponse keys on name, not id). */
+function toolNameIndex(messages: unknown[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const m of messages) {
+    const content = (m as Record<string, unknown>)['content'];
+    if (!Array.isArray(content)) continue;
+    for (const raw of content) {
+      const block = raw as Record<string, unknown>;
+      if (block['type'] === 'tool_use' && typeof block['id'] === 'string') {
+        map.set(block['id'], typeof block['name'] === 'string' ? block['name'] : block['id']);
+      }
+    }
+  }
+  return map;
+}
+
+/** Map Anthropic top-level `tools` to Gemini functionDeclarations. */
+function toolDeclarations(tools: unknown): Record<string, unknown> | undefined {
+  if (!Array.isArray(tools) || tools.length === 0) return undefined;
+  const decls = tools
+    .map((t) => {
+      const tool = t as Record<string, unknown>;
+      if (typeof tool['name'] !== 'string') return undefined;
+      const decl: Record<string, unknown> = { name: tool['name'] };
+      if (typeof tool['description'] === 'string') decl['description'] = tool['description'];
+      if (tool['input_schema'] && typeof tool['input_schema'] === 'object')
+        decl['parameters'] = tool['input_schema'];
+      return decl;
+    })
+    .filter((d): d is Record<string, unknown> => d !== undefined);
+  return decls.length > 0 ? { functionDeclarations: decls } : undefined;
+}
+
+/** Map Anthropic `tool_choice` to Gemini toolConfig.functionCallingConfig. */
+function toolConfig(choice: unknown): Record<string, unknown> | undefined {
+  // Anthropic uses an object ({type:'auto'|'any'|'tool'|'none', name?}); tolerate a
+  // bare string form too.
+  const type = typeof choice === 'string' ? choice : (choice as Record<string, unknown>)?.['type'];
+  if (type === 'auto') return { functionCallingConfig: { mode: 'AUTO' } };
+  if (type === 'none') return { functionCallingConfig: { mode: 'NONE' } };
+  if (type === 'any') return { functionCallingConfig: { mode: 'ANY' } };
+  if (type === 'tool') {
+    const name = (choice as Record<string, unknown>)['name'];
+    return {
+      functionCallingConfig: {
+        mode: 'ANY',
+        ...(typeof name === 'string' ? { allowedFunctionNames: [name] } : {}),
+      },
+    };
+  }
+  return undefined;
+}
+
 export function anthropicToGemini(body: Record<string, unknown>): Record<string, unknown> {
   const contents: Array<{ role: string; parts: GeminiPart[] }> = [];
   const inMsgs = Array.isArray(body['messages']) ? (body['messages'] as unknown[]) : [];
+  const toolNameById = toolNameIndex(inMsgs);
   for (const m of inMsgs) {
     const msg = m as Record<string, unknown>;
-    const parts = partsForContent(msg['content']);
+    const parts = partsForContent(msg['content'], toolNameById);
     if (parts.length === 0) continue;
     contents.push({ role: msg['role'] === 'assistant' ? 'model' : 'user', parts });
   }
 
   const out: Record<string, unknown> = { contents };
+
+  const tools = toolDeclarations(body['tools']);
+  if (tools) out['tools'] = [tools];
+  const tc = toolConfig(body['tool_choice']);
+  if (tc) out['toolConfig'] = tc;
 
   const system = body['system'];
   let sysText = '';
@@ -133,6 +249,8 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
   let messageStarted = false;
   let open: { type: 'thinking' | 'text'; index: number } | null = null;
   let nextIndex = 0;
+  let toolCallSeq = 0;
+  let sawToolUse = false;
   let finish: unknown = 'STOP';
   let promptTokens = 0;
   let candidateTokens = 0;
@@ -180,7 +298,54 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
     });
   };
 
+  // Gemini delivers a whole functionCall (full args) in one part — no cross-chunk
+  // accumulation. Emit the canonical Anthropic tool_use triple atomically, closing
+  // any open text/thinking block first, and never leaving the block "open".
+  const emitToolUse = (name: string, args: Record<string, unknown>): void => {
+    closeBlock();
+    ensureStart();
+    const index = nextIndex++;
+    sawToolUse = true;
+    const id = `toolu_gulley_${toolCallSeq++}`;
+    emit('content_block_start', {
+      type: 'content_block_start',
+      index,
+      content_block: { type: 'tool_use', id, name, input: {} },
+    });
+    emit('content_block_delta', {
+      type: 'content_block_delta',
+      index,
+      delta: { type: 'input_json_delta', partial_json: JSON.stringify(args ?? {}) },
+    });
+    emit('content_block_stop', { type: 'content_block_stop', index });
+  };
+
+  // A model-generated image part -> a canonical Anthropic image content block.
+  const emitImage = (mimeType: string, data: string): void => {
+    closeBlock();
+    ensureStart();
+    const index = nextIndex++;
+    emit('content_block_start', {
+      type: 'content_block_start',
+      index,
+      content_block: { type: 'image', source: { type: 'base64', media_type: mimeType, data } },
+    });
+    emit('content_block_stop', { type: 'content_block_stop', index });
+  };
+
   const handlePart = (part: Record<string, unknown>): void => {
+    const fc = part['functionCall'] as { name?: unknown; args?: unknown } | undefined;
+    if (fc && typeof fc.name === 'string') {
+      const args =
+        fc.args && typeof fc.args === 'object' ? (fc.args as Record<string, unknown>) : {};
+      emitToolUse(fc.name, args);
+      return;
+    }
+    const inline = part['inlineData'] as { mimeType?: unknown; data?: unknown } | undefined;
+    if (inline && typeof inline.data === 'string') {
+      emitImage(typeof inline.mimeType === 'string' ? inline.mimeType : '', inline.data);
+      return;
+    }
     const text = typeof part['text'] === 'string' ? part['text'] : '';
     const sig = typeof part['thoughtSignature'] === 'string' ? part['thoughtSignature'] : undefined;
     if (part['thought'] === true || (sig && !text)) {
@@ -253,7 +418,9 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
     closeBlock();
     emit('message_delta', {
       type: 'message_delta',
-      delta: { stop_reason: mapGeminiFinish(finish) },
+      // Gemini reports finishReason=STOP even on a tool turn, so a functionCall
+      // part (not the finish reason) is what drives stop_reason='tool_use'.
+      delta: { stop_reason: sawToolUse ? 'tool_use' : mapGeminiFinish(finish) },
       usage: {
         input_tokens: Math.max(0, promptTokens - cachedTokens),
         cache_read_input_tokens: cachedTokens,

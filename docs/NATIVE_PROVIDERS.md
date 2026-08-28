@@ -22,16 +22,24 @@ protocol:
 - `anthropicToGemini(body)` — canonical Anthropic Messages → Gemini
   `generateContent` (roles, `systemInstruction`, `generationConfig`), and
   round-trips a prior `thinking` block's **`thoughtSignature`** back onto the
-  reasoning part so the model accepts it as its own.
+  reasoning part so the model accepts it as its own. **Tool-calls** map both ways:
+  `tool_use` → `functionCall`, `tool_result` → `functionResponse` (resolving the
+  `tool_use_id` back to the function name), top-level `tools` → `functionDeclarations`
+  and `tool_choice` → `toolConfig.functionCallingConfig`. **Base64 images** map to
+  Gemini `inlineData`.
 - `geminiSseToAnthropic(stream, model)` — Gemini `streamGenerateContent?alt=sse`
   → Anthropic Messages SSE: thinking parts become a `thinking` block, a part's
-  `thoughtSignature` is relayed as a `signature_delta`, and `usageMetadata` maps
-  to `message_delta.usage` (input = prompt − cached, cache_read = cached, output =
-  candidates + thoughts).
+  `thoughtSignature` is relayed as a `signature_delta`, a `functionCall` part becomes
+  a `tool_use` block (synthesized id + an `input_json_delta` carrying the args) with
+  `stop_reason:'tool_use'` even though Gemini reports `STOP`, an `inlineData` part
+  becomes an image block, and `usageMetadata` maps to `message_delta.usage` (input =
+  prompt − cached, cache_read = cached, output = candidates + thoughts).
 - `GeminiNativeAdapter` — Anthropic in, native Gemini upstream, Anthropic out.
 
-Text + thinking survive; tool/image blocks are pinned to their family and refused
-(`canTranslateAnthropicToGemini`) so nothing is silently lost.
+Text, thinking, tool-calls, and base64 images survive; only genuinely
+untranslatable content (e.g. a URL-sourced image, which Gemini's `inlineData`
+can't carry) is refused (`canTranslateAnthropicToGemini`) so nothing is silently
+mistranslated.
 
 ### Vertex auth (SA-JWT → OAuth2)
 

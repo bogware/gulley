@@ -51,7 +51,7 @@ describe('anthropicToGemini (request)', () => {
 });
 
 describe('canTranslateAnthropicToGemini', () => {
-  it('allows text + thinking, refuses tool/image', () => {
+  it('allows text, thinking, tool_use, tool_result, and base64 images', () => {
     expect(canTranslateAnthropicToGemini({ messages: [{ role: 'user', content: 'hi' }] })).toBe(
       true,
     );
@@ -62,14 +62,90 @@ describe('canTranslateAnthropicToGemini', () => {
     ).toBe(true);
     expect(
       canTranslateAnthropicToGemini({
-        messages: [{ role: 'user', content: [{ type: 'image', source: {} }] }],
+        messages: [
+          { role: 'user', content: [{ type: 'image', source: { type: 'base64', data: 'AAA' } }] },
+        ],
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       canTranslateAnthropicToGemini({
         messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'f' }] }],
       }),
+    ).toBe(true);
+  });
+
+  it('still refuses a URL-sourced image (Gemini inlineData is base64-only)', () => {
+    expect(
+      canTranslateAnthropicToGemini({
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'image', source: { type: 'url', url: 'http://x/y.png' } }],
+          },
+        ],
+      }),
     ).toBe(false);
+  });
+});
+
+describe('anthropicToGemini (tools + images)', () => {
+  it('maps tool_use/tool_result (resolving id->name), tools, tool_choice, and images', () => {
+    const g = anthropicToGemini({
+      tools: [{ name: 'get_weather', description: 'w', input_schema: { type: 'object' } }],
+      tool_choice: { type: 'tool', name: 'get_weather' },
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'weather?' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 't1', name: 'get_weather', input: { city: 'SF' } }],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 't1', content: '72F' }],
+        },
+      ],
+    });
+    expect(g['contents']).toEqual([
+      {
+        role: 'user',
+        parts: [{ text: 'weather?' }, { inlineData: { mimeType: 'image/png', data: 'AAA' } }],
+      },
+      { role: 'model', parts: [{ functionCall: { name: 'get_weather', args: { city: 'SF' } } }] },
+      {
+        role: 'user',
+        parts: [{ functionResponse: { name: 'get_weather', response: { result: '72F' } } }],
+      },
+    ]);
+    expect(g['tools']).toEqual([
+      {
+        functionDeclarations: [
+          { name: 'get_weather', description: 'w', parameters: { type: 'object' } },
+        ],
+      },
+    ]);
+    expect(g['toolConfig']).toEqual({
+      functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['get_weather'] },
+    });
+  });
+
+  it('maps tool_choice auto/any/none', () => {
+    expect(
+      anthropicToGemini({ tool_choice: { type: 'auto' }, messages: [] })['toolConfig'],
+    ).toEqual({ functionCallingConfig: { mode: 'AUTO' } });
+    expect(anthropicToGemini({ tool_choice: { type: 'any' }, messages: [] })['toolConfig']).toEqual(
+      {
+        functionCallingConfig: { mode: 'ANY' },
+      },
+    );
+    expect(
+      anthropicToGemini({ tool_choice: { type: 'none' }, messages: [] })['toolConfig'],
+    ).toEqual({ functionCallingConfig: { mode: 'NONE' } });
   });
 });
 
@@ -104,6 +180,39 @@ describe('geminiSseToAnthropic (streaming response)', () => {
     // block ordering: thinking (index 0) closes before text (index 1) opens
     expect(out.indexOf('"index":0')).toBeLessThan(out.indexOf('"index":1'));
     expect(out).toContain('"type":"content_block_stop","index":0');
+  });
+
+  it('translates a functionCall part into a tool_use block with stop_reason tool_use', async () => {
+    const sse = [
+      'data: {"candidates":[{"content":{"parts":[{"text":"Checking"}]}}]}',
+      '',
+      'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":4}}',
+      '',
+      '',
+    ].join('\n');
+    const out = await collect(geminiSseToAnthropic(Readable.from([sse]), 'gemini-2.5-pro'));
+
+    // text block (index 0) closes before the tool_use block (index 1) opens
+    expect(out).toContain('"type":"content_block_stop","index":0');
+    expect(out).toContain('"type":"tool_use"');
+    expect(out).toContain('"name":"get_weather"');
+    expect(out).toContain('"type":"input_json_delta","partial_json":"{\\"city\\":\\"SF\\"}"');
+    // atomic: the tool_use block is closed
+    expect(out).toContain('"type":"content_block_stop","index":1');
+    // Gemini reports STOP, but a functionCall part forces stop_reason tool_use
+    expect(out).toContain('"stop_reason":"tool_use"');
+  });
+
+  it('translates an inlineData output part into an image content block', async () => {
+    const sse = [
+      'data: {"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"BBB"}}]},"finishReason":"STOP"}]}',
+      '',
+      '',
+    ].join('\n');
+    const out = await collect(geminiSseToAnthropic(Readable.from([sse]), 'gemini-2.5-pro'));
+    expect(out).toContain('"type":"image"');
+    expect(out).toContain('"media_type":"image/png"');
+    expect(out).toContain('"data":"BBB"');
   });
 });
 
@@ -170,7 +279,37 @@ describe('GeminiNativeAdapter', () => {
     expect(seenCred).toEqual({ scheme: 'bearer', value: 'ya29.minted' }); // minted, not static
   });
 
-  it('refuses a request carrying provider-affine (tool/image) content', async () => {
+  it('translates a tool request instead of refusing it', async () => {
+    let seenBody = '';
+    const inner: ProviderAdapter = {
+      name: 'inner',
+      async forward(req: ForwardRequest): Promise<ForwardResponse> {
+        seenBody = req.body.toString('utf8');
+        return { statusCode: 200, headers: {}, body: Readable.from([GEMINI_SSE]) };
+      },
+    };
+    const adapter = new GeminiNativeAdapter({ inner, targetModel: 'gemini-2.5-pro' });
+    const resp = await adapter.forward({
+      path: '/v1/messages',
+      body: Buffer.from(
+        JSON.stringify({
+          tools: [{ name: 'f', input_schema: { type: 'object' } }],
+          messages: [
+            { role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'f', input: {} }] },
+          ],
+        }),
+      ),
+      headers: {},
+      credential: { scheme: 'bearer', value: 't' },
+      signal: new AbortController().signal,
+    });
+    resp.body.resume();
+    expect(JSON.parse(seenBody)['tools']).toEqual([
+      { functionDeclarations: [{ name: 'f', parameters: { type: 'object' } }] },
+    ]);
+  });
+
+  it('still refuses a URL-sourced image (untranslatable to inlineData)', async () => {
     const inner: ProviderAdapter = {
       name: 'inner',
       forward: () => Promise.reject(new Error('should not be called')),
@@ -180,7 +319,14 @@ describe('GeminiNativeAdapter', () => {
       adapter.forward({
         path: '/v1/messages',
         body: Buffer.from(
-          JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'image' }] }] }),
+          JSON.stringify({
+            messages: [
+              {
+                role: 'user',
+                content: [{ type: 'image', source: { type: 'url', url: 'http://x' } }],
+              },
+            ],
+          }),
         ),
         headers: {},
         credential: { scheme: 'bearer', value: 't' },
