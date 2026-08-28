@@ -1,5 +1,6 @@
 import type { ConfigDocument, ConfigProvider } from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
+import { type ModelRouteRule, ModelRouter } from '@gulley/routing';
 import {
   AnthropicAdapter,
   AnthropicUsageExtractor,
@@ -14,6 +15,32 @@ import type { ProviderRoute } from './routes/messages';
 /** sk-ant-… keys use x-api-key; OAuth/enterprise tokens use bearer. */
 function anthropicCredential(value: string): UpstreamCredential {
   return value.startsWith('sk-ant-') ? { scheme: 'x-api-key', value } : { scheme: 'bearer', value };
+}
+
+/**
+ * Build the model router from the config document's `modelAliases` so
+ * admin-configured aliases/pins take effect in the data plane (they were built only
+ * from the CUSTOM_PROVIDERS env before, so DB-configured aliases were inert). An
+ * alias entity maps a requested-model pattern (its `config.pattern`, else its name)
+ * to an upstream `target` rewrite and/or a `provider` label. Single-tenant v1:
+ * aliases across all workspaces are flattened into one global router.
+ */
+export function buildModelRouterFromDocument(doc: ConfigDocument): ModelRouter | undefined {
+  const rules: ModelRouteRule[] = [];
+  for (const org of doc.orgs) {
+    for (const ws of org.workspaces) {
+      for (const alias of ws.modelAliases ?? []) {
+        const cfg = alias.config;
+        const pattern =
+          typeof cfg['pattern'] === 'string' ? (cfg['pattern'] as string) : alias.name;
+        const rule: ModelRouteRule = { pattern };
+        if (typeof cfg['target'] === 'string') rule.target = cfg['target'] as string;
+        if (typeof cfg['provider'] === 'string') rule.provider = cfg['provider'] as string;
+        rules.push(rule);
+      }
+    }
+  }
+  return rules.length > 0 ? new ModelRouter(rules) : undefined;
 }
 
 /**

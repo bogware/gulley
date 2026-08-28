@@ -2,7 +2,7 @@ import type { ConfigStore, ConfigVersionStore } from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
 import type { ClassifierBreaker, ClassifierEmbedder } from '@gulley/routing';
 import { type CentroidStore, type ConfigSubscriber, SignalGate } from '@gulley/storage';
-import { buildRoutesFromDocument } from './config-builder';
+import { buildModelRouterFromDocument, buildRoutesFromDocument } from './config-builder';
 import type { RouteHolder } from './routes/messages';
 import {
   buildEmbeddingCentroids,
@@ -95,7 +95,11 @@ export class GatewayReconciler {
           similarityThreshold: this.smartRouting.similarityThreshold,
         });
       }
+      // Build the model router from the document's aliases BEFORE swapping, so a
+      // malformed alias throws here (caught → current config kept), never partial.
+      const modelRouter = buildModelRouterFromDocument(doc);
       this.holder.swapRoutes(routes);
+      this.holder.swapModelRouter(modelRouter);
       if (this.smartRouting?.enabled) this.holder.swapSmartRouter(smartRouter);
       this.log?.info(`config reconciled: ${routes.length} routes active`);
       return true;

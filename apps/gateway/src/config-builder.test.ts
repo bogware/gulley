@@ -1,7 +1,11 @@
 import type { ConfigDocument } from '@gulley/config';
 import { MapSecretResolver } from '@gulley/core';
 import { describe, expect, it } from 'vitest';
-import { buildRoutesFromDocument, routesForProvider } from './config-builder';
+import {
+  buildModelRouterFromDocument,
+  buildRoutesFromDocument,
+  routesForProvider,
+} from './config-builder';
 
 const ARN_A = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:anthropic';
 const ARN_O = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:openai';
@@ -89,5 +93,32 @@ describe('buildRoutesFromDocument', () => {
   it('REJECTS when a credential ARN cannot be resolved (reconcile aborts atomically)', async () => {
     const resolver = new MapSecretResolver(new Map([[ARN_A, 'sk-ant-secret']])); // openai ARN missing
     await expect(buildRoutesFromDocument(doc, resolver)).rejects.toThrow(/no secret value/);
+  });
+});
+
+describe('buildModelRouterFromDocument', () => {
+  const withAliases = (
+    aliases: Array<{ name: string; config: Record<string, unknown> }>,
+  ): ConfigDocument => ({
+    apiVersion: 'gulley/v1',
+    orgs: [{ name: 'Acme', workspaces: [{ name: 'prod', modelAliases: aliases } as never] }],
+  });
+
+  it('builds a router from document aliases (pattern from name or config; target rewrite)', () => {
+    const router = buildModelRouterFromDocument(
+      withAliases([
+        { name: 'claude-latest', config: { target: 'claude-opus-4-8', provider: 'anthropic' } },
+        { name: 'cheap', config: { pattern: 'gpt-4o-*', target: 'gpt-4o-mini' } },
+      ]),
+    );
+    expect(router).toBeDefined();
+    expect(router!.resolve('claude-latest')?.resolved).toBe('claude-opus-4-8'); // name as pattern
+    expect(router!.resolve('claude-latest')?.provider).toBe('anthropic');
+    expect(router!.resolve('gpt-4o-2024')?.resolved).toBe('gpt-4o-mini'); // glob from config.pattern
+    expect(router!.resolve('unmatched')).toBeUndefined();
+  });
+
+  it('returns undefined when there are no aliases', () => {
+    expect(buildModelRouterFromDocument(withAliases([]))).toBeUndefined();
   });
 });

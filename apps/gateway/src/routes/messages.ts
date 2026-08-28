@@ -246,6 +246,10 @@ export class RouteHolder {
   swapSmartRouter(smartRouter: SmartRouter | undefined): void {
     this.ctx.smartRouter = smartRouter;
   }
+  /** Swap the model router (config-derived model aliases/pins) on reconcile. */
+  swapModelRouter(modelRouter: ModelRouter | undefined): void {
+    this.ctx.modelRouter = modelRouter;
+  }
   /** Distinct provider names across the current routes (for /ready). */
   providers(): string[] {
     return [
