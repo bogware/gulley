@@ -10,7 +10,7 @@
 
 ---
 
-> **Status:** early development (milestone **M0 — scaffold**). See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> **Status:** actively developed — **M1–M18 delivered** (data plane + pipeline, governance/RBAC/audit/WORM, budgets, caching, guardrails + in-stream enforcement, resilience/routing, config hot-reload, smart classification routing). See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/AGENTGATEWAY_PORT.md`](docs/AGENTGATEWAY_PORT.md) for the real, current state.
 
 Gulley is **Claude-first** (the Anthropic Messages schema is its canonical internal
 model) and **drop-in**: point Claude Code, Codex, or any custom harness at Gulley by
@@ -19,7 +19,7 @@ every request.
 
 ## Why Gulley
 
-- **Multi-provider** — OpenAI, Anthropic (API + Enterprise), AWS Bedrock, Azure AI Foundry, behind one surface.
+- **Multi-provider** — Anthropic (API + Enterprise), OpenAI, AWS Bedrock, Azure AI Foundry, Google Gemini/Vertex, any OpenAI-compatible backend (Groq, Mistral, Together, …), and local runtimes (Ollama, vLLM, LM Studio, …), behind one surface.
 - **Native passthrough + normalized routing** — full-fidelity per-provider APIs _and_ a cross-provider layer for routing, load-balancing, and failover.
 - **Real governance** — RBAC, virtual keys, budgets with hard caps, PII/data masking, guardrails, and a tamper-evident audit trail. Governance is a core primitive, not an upsell.
 - **Observability without lock-in** — emits OpenTelemetry (GenAI semantic conventions) to _your_ backend; enforces cost/rate limits locally.
@@ -35,7 +35,9 @@ topology, and a concrete integration-spec appendix — lives in
 apps/gateway       data plane: the streaming proxy + request pipeline
 apps/control-api   control plane: orgs, keys, routes, policies, OAuth broker
 apps/web           admin UI (Next.js)
-packages/*         core, providers, auth, pipeline, guardrails, cost, config, telemetry, storage, sdk
+packages/*         core, providers, routing, auth, rbac, budget, cost, catalog, cache,
+                   guardrails, pipeline, config, storage, telemetry, metrics, ratelimit,
+                   oauth, oidc, cel, crypto, worm, redact, egress, http-edge
 infra/terraform    AWS infrastructure as code
 ci/                shared build/test/scan/deploy scripts (called by both CIs)
 ```

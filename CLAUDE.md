@@ -34,8 +34,9 @@ pnpm build                       # effectively only `next build` for apps/web â€
 bash ci/verify.sh                # the full local gate CI runs: format:check + lint + typecheck + test + build
 ```
 
-> CONTRIBUTING.md references `ci/all.sh`; that file does not exist. The real shared
-> script is **`ci/verify.sh`** (and `ci/install.sh` for the frozen-lockfile install).
+> The full local gate is **`ci/verify.sh`** (and `ci/install.sh` for the
+> frozen-lockfile install); `ci/hotpath-guard.sh` enforces the `Hotpath-Reviewed:`
+> trailer on data-plane hot-path commits.
 
 ### Running a single package / test
 

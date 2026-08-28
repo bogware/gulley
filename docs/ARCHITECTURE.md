@@ -4,7 +4,7 @@
 >
 > _"Gulley" is the working name; the final product/package namespace is pending (see [Open Decisions](#16-open-decisions))._
 
-**Status:** design, pre-implementation. This document is the source of truth for the v1 build. It folds in a competitor + provider-integration research pass and a four-lens adversarial architecture review (hot-path/streaming, auth/security, provider fidelity, data/ops).
+**Status:** M1–M18 delivered. This document is the design source of truth; where it diverges from the shipped code, **`apps/gateway/src/routes/messages.ts` (`handleProxy`) is authoritative** for the request-pipeline order. It folds in a competitor + provider-integration research pass and a four-lens adversarial architecture review (hot-path/streaming, auth/security, provider fidelity, data/ops).
 
 ---
 
@@ -98,18 +98,18 @@ flowchart LR
 
 ## 4. The request pipeline
 
-Every proxied request flows through one ordered, composable middleware pipeline. Each stage is a small, testable unit; routes enable/disable/configure stages via policy. **Ordering is fixed and documented** (avoids Kong-style plugin sprawl). The catalog is kept small and orthogonal: **authz / budget+ratelimit / cache / guard / transform / meter / emit**.
+Every proxied request flows through one ordered, composable middleware pipeline. Each stage is a small, testable unit; routes enable/disable/configure stages via policy. **Ordering is fixed and documented** (avoids Kong-style plugin sprawl). The catalog is kept small and orthogonal, in the shipped order: **authn / authz / ratelimit / guard-in / cache / budget-reserve / route+failover / meter / emit** — note the cache lookup precedes budget reserve, so a cache hit is `$0` and never touches the budget.
 
 ```mermaid
 flowchart TD
   A[ingest + normalize headers] --> B[authn: resolve Principal]
   B --> C[authz/rbac: resolve Scope]
   C --> D[rate-limit check]
-  D --> E[budget reserve worst-case]
-  E --> F[guardrails-pre input]
+  D --> F[guardrails-pre input]
   F --> G[cache lookup exact then semantic]
   G -->|hit| Z[stream cached / meter=0 / emit]
-  G -->|miss| H[route + load-balance]
+  G -->|miss| E[budget reserve worst-case]
+  E --> H[route + load-balance]
   H --> I[capability preflight matrix]
   I --> J[translate canonical to provider]
   J --> K[provider call via undici]

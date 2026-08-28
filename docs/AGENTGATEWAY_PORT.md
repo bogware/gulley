@@ -244,6 +244,35 @@ Two Tier-1 follow-ons, completing M16/M17's asterisks.
   keyed by embedding model, fail-open at every layer
   (`SMART_ROUTING_PERSIST_CENTROIDS`).
 
+## M19 — Wave 1 "Make it real" (from the killer-feature review) — 🚧 IN PROGRESS
+
+The Aug-2026 principal review found the engine is world-class but several headline
+features are built-but-unwired. Wave 1 turns them on + clears the P0/P1 correctness
+backlog. See `docs/M19_WAVE1.md` for the landed-vs-remaining tracker.
+
+- **M19 A — correctness (✅):** reserve/commit price parity (admission now uses the
+  catalog resolver — no spurious 402s on Gemini/Vertex/Groq); Anthropic multi-block
+  guard (fail-closed on a 2nd text block, mirroring the M18 OpenAI n>1 guard);
+  opt-in no-usage charge knob (`METER_CHARGE_ON_MISSING_USAGE`).
+- **M19 B — working analytics (✅):** `PostgresRequestLogQuery` (keyset search +
+  date_trunc usage rollups with error-rate + p95), wired into control-api when a DB
+  is present. The log browser + usage dashboards were **empty in production**; now
+  functional. Real-SQL PGlite test.
+- **M19 C — durability (✅):** Gemini/Vertex cost seeds (no more $0 billing); Postgres
+  exact-cache sweeper (`CACHE_SWEEP_INTERVAL_SECONDS`) so the cache table + pgvector
+  index don't grow unbounded.
+- **M19 D — docs truth pass (✅):** README status (M0 → M18), provider list, package
+  map; ARCHITECTURE pipeline-order diagram corrected to the shipped order (cache
+  before budget); CLAUDE.md gate note.
+- **Remaining (the substantive wiring — each its own carefully-reviewed slice):**
+  multi-target routing config surface (both builders + doc/env schema + hedge
+  wiring); native Gemini/Vertex adapter wiring; per-workspace guardrails + input
+  vault (`GUARDRAILS_INPUT_ACTION`); durable `PostgresKeyAdminStore` (list/revoke/
+  rotate on `virtual_key` — the admin key store is in-memory today); `request_log`/
+  `spend_ledger` partitioning + rollups + retention (needs real-Postgres
+  validation); budget counter self-heal from the ledger; DB `model_alias` →
+  `ModelRouter`.
+
 ## Recommended next steps (candidate roadmap → world-class)
 
 - **Tier 1 (differentiators).**
