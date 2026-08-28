@@ -15,7 +15,7 @@ import {
   type CacheLookup,
   semanticText,
 } from '@gulley/cache';
-import { computeCost, type RateResolver, toMicroUsd } from '@gulley/cost';
+import { computeCost, rankPrice, type RateResolver, toMicroUsd } from '@gulley/cost';
 import { isErr } from '@gulley/core';
 import {
   filterByPolicy,
@@ -526,6 +526,9 @@ async function handleProxy(
     sessionKey,
     scoreboard: ctx.scoreboard,
     outlier: ctx.outlier,
+    // Cost-aware primary pick (loadbalance select:'cheapest'): rank each target by
+    // the catalog price of the resolved model for its provider.
+    costOf: (t) => rankPrice(t.provider, requestedModel, ctx.rateResolver),
   }).filter((t) => scopeAllowsProvider(principal.scope, t.provider));
   if (candidates.length === 0) {
     await reply

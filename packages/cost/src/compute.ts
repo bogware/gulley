@@ -40,6 +40,22 @@ const perMillion = (tokens: number, rate: number): number => (tokens / 1_000_000
  * Price normalized usage against a provider's rate table. Always returns token
  * totals, so an unknown provider or model still meters usage (priced: false).
  */
+/**
+ * A relative price for ranking a (provider, model) in cost-aware routing: the sum
+ * of the input + output per-MTok rates (catalog resolver wins over the seed).
+ * Undefined for an unpriced model, so the caller ranks it last. Not a billing
+ * figure — a cheap comparable for "which target is cheapest for this model".
+ */
+export function rankPrice(
+  provider: string,
+  model: string,
+  resolve?: RateResolver,
+): number | undefined {
+  const pricing = PROVIDER_PRICING[provider];
+  const rate = resolve?.(provider, model) ?? pricing?.rates[pricing.normalize(model)];
+  return rate ? rate.input + rate.output : undefined;
+}
+
 export function computeCost(
   provider: string,
   model: string,

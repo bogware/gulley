@@ -18,6 +18,8 @@ export const routeGroupSchema = z.object({
   /** Provider names to combine, in preference order (fallback) — each must be a
    *  configured provider that already serves `clientPath`. */
   providers: z.array(z.string().min(1)).min(2),
+  /** loadbalance primary-pick policy: least-load (default) | cheapest | fastest. */
+  select: z.enum(['least-load', 'cheapest', 'fastest']).optional(),
   /** Optional per-provider weight for `loadbalance` (defaults to 1). */
   weights: z.record(z.string(), z.number().positive()).optional(),
   /** Fallback only: upstream status codes that trigger failover to the next target. */
@@ -74,7 +76,7 @@ export function applyRouteGroups(
     if (targets.length < 2) continue;
     const strategy: RoutingStrategy =
       g.mode === 'loadbalance'
-        ? { mode: 'loadbalance', targets }
+        ? { mode: 'loadbalance', targets, ...(g.select ? { select: g.select } : {}) }
         : {
             mode: 'fallback',
             targets,

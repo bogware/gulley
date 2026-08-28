@@ -41,6 +41,17 @@ export interface SelectOptions {
   /** When present, passively-ejected slow outliers are skipped too (union with
    *  the breaker's open-circuit filter). */
   outlier?: OutlierDetector;
+  /** Relative price of a target for the requested model (cost-aware routing);
+   *  undefined ranks the target last. Caller closes over the resolved model. */
+  costOf?: (target: RouteTarget) => number | undefined;
+}
+
+/** Stable ascending sort by a numeric key; ties keep declared order. */
+function orderBy(targets: RouteTarget[], key: (t: RouteTarget) => number): RouteTarget[] {
+  return targets
+    .map((t, i) => ({ t, i, k: key(t) }))
+    .sort((a, b) => a.k - b.k || a.i - b.i)
+    .map((x) => x.t);
 }
 
 /** Stable 32-bit FNV-1a hash → a unit float in [0, 1). */
@@ -109,6 +120,16 @@ export function selectCandidates(
   // probe beats a hard fail, and you must never latency-eject your last upstream.
   const pool = healthy.length > 0 ? healthy : strategy.targets;
   if (strategy.mode === 'fallback') return pool;
+
+  // Cost/latency-aware primary pick (the rest stay as the failover order).
+  if (strategy.select === 'cheapest' && o.costOf) {
+    const cost = o.costOf; // unpriced ⇒ +Infinity ⇒ ranked last
+    return orderBy(pool, (t) => cost(t) ?? Number.POSITIVE_INFINITY);
+  }
+  if (strategy.select === 'fastest' && o.outlier) {
+    const outlier = o.outlier; // 0 EWMA = a not-yet-sampled target ⇒ tried first (exploration)
+    return orderBy(pool, (t) => outlier.latency(t.name));
+  }
 
   if (o.sessionKey) return hrwOrder(pool, o.sessionKey);
   if (o.scoreboard) return p2cOrder(pool, o.scoreboard, rand);

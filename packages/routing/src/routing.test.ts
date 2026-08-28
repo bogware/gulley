@@ -70,6 +70,36 @@ describe('selectCandidates', () => {
     expect(selectCandidates(s, cb, () => 0).map((t) => t.name)).toEqual(['a', 'c']);
   });
 
+  it('loadbalance select:cheapest orders by catalog price (rest = failover order)', () => {
+    const cb = new CircuitBreaker();
+    const price: Record<string, number> = { a: 10, b: 3, c: 7 };
+    const s: RoutingStrategy = {
+      mode: 'loadbalance',
+      select: 'cheapest',
+      targets: [target('a'), target('b'), target('c')],
+    };
+    expect(selectCandidates(s, cb, { costOf: (t) => price[t.name] }).map((t) => t.name)).toEqual([
+      'b',
+      'c',
+      'a',
+    ]);
+  });
+
+  it('loadbalance select:fastest orders by observed EWMA latency', () => {
+    const cb = new CircuitBreaker();
+    const lat: Record<string, number> = { a: 200, b: 50, c: 120 };
+    const outlier = {
+      isEjected: () => false,
+      latency: (n: string) => lat[n] ?? 0,
+    } as unknown as import('./outlier').OutlierDetector;
+    const s: RoutingStrategy = {
+      mode: 'loadbalance',
+      select: 'fastest',
+      targets: [target('a'), target('b'), target('c')],
+    };
+    expect(selectCandidates(s, cb, { outlier }).map((t) => t.name)).toEqual(['b', 'c', 'a']);
+  });
+
   it('returns all targets when every circuit is open (half-open attempt)', () => {
     const cb = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 1000, now: () => 0 });
     cb.recordFailure('a');

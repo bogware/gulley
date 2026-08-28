@@ -18,9 +18,15 @@ export interface RouteTarget {
  * Recursive-in-spirit routing strategy (Portkey-style). v1 supports the three
  * non-nested modes; nesting and `conditional` land in a later milestone.
  */
+/** Primary-pick policy for a `loadbalance` strategy. `least-load` (default) uses
+ *  P2C over in-flight counts (or HRW when a session key is set); `cheapest` ranks
+ *  by the catalog price of the requested model; `fastest` ranks by the outlier
+ *  detector's observed EWMA time-to-first-byte. The rest become the failover order. */
+export type LoadBalanceSelect = 'least-load' | 'cheapest' | 'fastest';
+
 export type RoutingStrategy =
   | { mode: 'single'; target: RouteTarget }
-  | { mode: 'loadbalance'; targets: RouteTarget[] }
+  | { mode: 'loadbalance'; targets: RouteTarget[]; select?: LoadBalanceSelect }
   | { mode: 'fallback'; targets: RouteTarget[]; onStatusCodes?: number[] };
 
 export function allTargets(s: RoutingStrategy): RouteTarget[] {
