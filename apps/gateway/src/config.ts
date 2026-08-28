@@ -247,6 +247,12 @@ const Env = z.object({
     .default(8 * 1024 * 1024),
   BUFFER_FAIL_CLOSED: envBool(true),
 
+  // When a successful (2xx) response emits NO provider usage (some OpenAI-compatible
+  // and local backends omit stream usage), the request would otherwise bill $0 and
+  // fully refund its reservation — leaving budgets unenforced for that backend.
+  // Opt-in: charge the worst-case reservation instead so the cap still bites.
+  METER_CHARGE_ON_MISSING_USAGE: envBool(false),
+
   // Static request/response header set/remove applied to every proxied request
   // (the non-CEL sibling of CEL_TRANSFORM). JSON:
   // {"request":{"set":{"x-tenant":"acme"}},"response":{"remove":["x-internal"]}}

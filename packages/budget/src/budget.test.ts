@@ -16,6 +16,18 @@ describe('estimateWorstCaseMicroUsd', () => {
     // floor = 100*15/1e6 + 1000*75/1e6 = 0.0765 USD => 76500 microUSD.
     expect(estimateWorstCaseMicroUsd('azure', 'prod-custom-deployment', 300, 1000)).toBe(76500);
   });
+
+  it('prices a catalog-only (unseeded) model via the resolver, matching commit', () => {
+    // A model absent from the seed table but priced by the catalog resolver must
+    // reserve at the resolver's rate, NOT the unknown-pricing floor — so admission
+    // and commit agree. gemini-x @ $3/$15 per MTok; input est = ceil(300/3)=100.
+    const resolver = (_p: string, m: string) =>
+      m === 'gemini-x' ? { input: 3, output: 15 } : undefined;
+    // 100*3/1e6 + 1000*15/1e6 = 0.0003 + 0.015 = 0.0153 USD => 15300 microUsd.
+    expect(estimateWorstCaseMicroUsd('gemini', 'gemini-x', 300, 1000, resolver)).toBe(15300);
+    // Without the resolver it would spuriously reserve at the Opus-class floor.
+    expect(estimateWorstCaseMicroUsd('gemini', 'gemini-x', 300, 1000)).toBe(76500);
+  });
 });
 
 describe('InMemoryBudgetStore', () => {

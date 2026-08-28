@@ -1,4 +1,4 @@
-import { computeCost, toMicroUsd } from '@gulley/cost';
+import { computeCost, type RateResolver, toMicroUsd } from '@gulley/cost';
 
 /** Deliberately low chars-per-token so input tokens are OVER-estimated — a hard
  *  cap should reserve conservatively (reject early rather than overspend). */
@@ -23,16 +23,26 @@ export function estimateWorstCaseMicroUsd(
   model: string,
   bodyBytes: number,
   maxOutputTokens: number,
+  /** Catalog rate resolver — MUST be the same one used at commit so admission and
+   *  commit price identically. Without it, catalog-priced-but-unseeded models
+   *  (Gemini/Vertex/Groq/…) reserve at the unknown-pricing floor and spuriously
+   *  402 legitimate cheap traffic while commit prices them correctly. */
+  resolve?: RateResolver,
 ): number {
   const inputTokens = estimateInputTokens(bodyBytes);
-  const cost = computeCost(provider, model, {
-    inputTokens,
-    cacheReadTokens: 0,
-    cacheWrite5mTokens: 0,
-    cacheWrite1hTokens: 0,
-    outputTokens: maxOutputTokens,
-    seen: true,
-  });
+  const cost = computeCost(
+    provider,
+    model,
+    {
+      inputTokens,
+      cacheReadTokens: 0,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      outputTokens: maxOutputTokens,
+      seen: true,
+    },
+    resolve,
+  );
   if (cost.priced) return toMicroUsd(cost.totalUsd);
   // Unknown pricing → reserve a conservative floor so the model can't slip a
   // budget by pricing to $0 (admission control; actual spend still meters as

@@ -45,29 +45,40 @@ function isTextDelta(parsed: Record<string, unknown>): boolean {
  *
  * Text is the only thing rewritten, so metering (which reads the original frames
  * via a separate parser) and provider-affine artifacts (thinking signatures) are
- * untouched. v1 assumes a single text content block (the common chat shape).
+ * untouched. Single text-block only: a `text_delta` on a SECOND content-block index
+ * sets {@link failClosed} (one windowed transform cannot enforce two interleaved
+ * text blocks without mis-attributing a redacted tail) and the caller terminates.
+ * A `tool_use`/`thinking` block on another index is fine — it carries no text_delta.
  */
 export class AnthropicSseRewriter {
   private readonly parser = new SSEParser();
   private lastTextIndex = 0;
+  private firstTextIndex: number | undefined;
+  private _failClosed = false;
 
   constructor(private readonly transform: TextTransform) {}
 
-  /** Symmetry with {@link OpenAiSseRewriter}: the Anthropic stream is single-block,
-   *  so this rewriter never fails closed on its own. */
+  /** Symmetry with {@link OpenAiSseRewriter}: set when a second TEXT content-block
+   *  index appears (multi-text stream), which this single-transform rewriter cannot
+   *  enforce without mis-attributing text; the caller terminates rather than corrupt. */
   get failClosed(): boolean {
-    return false;
+    return this._failClosed;
   }
 
   push(chunk: string): string {
+    if (this._failClosed) return '';
     let out = '';
-    for (const ev of this.parser.push(chunk)) out += this.rewrite(ev);
+    for (const ev of this.parser.push(chunk)) {
+      out += this.rewrite(ev);
+      if (this._failClosed) break; // second text block detected — stop (no corrupt emit)
+    }
     return out;
   }
 
   /** Flush the transform's held tail at stream end (covers a truncated stream that
    *  never delivered content_block_stop / message_stop). */
   flush(): string {
+    if (this._failClosed) return '';
     return this.flushTransform();
   }
 
@@ -83,6 +94,11 @@ export class AnthropicSseRewriter {
     if (type === 'content_block_delta' && isTextDelta(parsed)) {
       const index =
         typeof parsed['index'] === 'number' ? (parsed['index'] as number) : this.lastTextIndex;
+      if (this.firstTextIndex === undefined) this.firstTextIndex = index;
+      else if (index !== this.firstTextIndex) {
+        this._failClosed = true; // a second text block — refuse rather than mis-attribute
+        return '';
+      }
       this.lastTextIndex = index;
       const text = (parsed['delta'] as Record<string, unknown>)['text'] as string;
       const emitted = this.transform.push(text);

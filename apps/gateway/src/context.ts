@@ -650,6 +650,7 @@ export function createProductionContext(config: Config): GatewayContext {
       : undefined,
     responseBufferLimit: config.RESPONSE_BUFFER_LIMIT_BYTES,
     bufferFailClosed: config.BUFFER_FAIL_CLOSED,
+    chargeOnMissingUsage: config.METER_CHARGE_ON_MISSING_USAGE,
     streamEnforce: config.STREAMING_ENFORCE,
     streamEnforceWindowChars: config.STREAMING_ENFORCE_WINDOW_CHARS,
     headerModifier: config.HEADER_MODIFIER

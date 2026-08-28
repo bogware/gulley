@@ -168,6 +168,10 @@ export interface GatewayContext {
   /** When a buffered-enforcement body exceeds the limit, withhold (true) rather
    *  than forward it unenforced+truncated (false). Default true. */
   bufferFailClosed?: boolean;
+  /** Charge the worst-case reservation when a 2xx response emits no provider usage
+   *  (rather than billing $0 + refunding), so budgets stay enforced on backends that
+   *  omit stream usage. Default false. */
+  chargeOnMissingUsage?: boolean;
   /** M17: windowed in-stream output enforcement (redact/block) on Anthropic-
    *  canonical streamed responses; absent/false = streamed output stays audit-only. */
   streamEnforce?: boolean;
@@ -783,7 +787,13 @@ async function handleProxy(
     numField(parsed['max_tokens']) ??
     numField(parsed['max_output_tokens']) ??
     DEFAULT_MAX_OUTPUT_TOKENS;
-  const worstCase = estimateWorstCaseMicroUsd(provider0, requestedModel, body.length, maxOutput);
+  const worstCase = estimateWorstCaseMicroUsd(
+    provider0,
+    requestedModel,
+    body.length,
+    maxOutput,
+    ctx.rateResolver, // price admission identically to commit (no reserve/commit disagreement)
+  );
   let reserved = false;
   if (worstCase > 0) {
     const decision = await ctx.budgets.reserve(principal.scope.workspaceId, requestId, worstCase);
@@ -1244,7 +1254,13 @@ async function handleProxy(
     // Charge the worst-case reservation rather than $0, so a withheld over-cap
     // response can't be used to drive real provider spend past the budget.
     const meteringFailed = captureOverflow && bufferOutput && !n.seen;
-    const costMicroUsd = meteringFailed ? worstCase : toMicroUsd(cost.totalUsd);
+    // A successful response that emitted no usage would bill $0 and fully refund its
+    // reservation — opt-in, charge the worst-case reserve instead so a usage-less
+    // backend can't slip the budget (mirrors the buffered-overflow charge).
+    const usageMissing =
+      !n.seen && !meteringFailed && ctx.chargeOnMissingUsage === true && statusCode < 400;
+    const chargedWorstCase = meteringFailed || usageMissing;
+    const costMicroUsd = chargedWorstCase ? worstCase : toMicroUsd(cost.totalUsd);
     const createdAt = new Date();
 
     // Output guardrail findings: from the buffered enforcement pass, or the
@@ -1281,7 +1297,7 @@ async function handleProxy(
     }
 
     try {
-      if (n.seen || meteringFailed) {
+      if (n.seen || chargedWorstCase) {
         await ctx.ledger.record({
           requestId,
           principalId: principal.id,

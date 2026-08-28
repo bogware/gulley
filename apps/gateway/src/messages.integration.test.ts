@@ -1636,6 +1636,59 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       })
       .join('');
 
+  it('charges worst-case when a 2xx stream emits no usage and the knob is on', async () => {
+    // An OpenAI-compatible stream with NO usage chunk (the backend didn't set
+    // stream_options.include_usage). seen stays false → without the knob this bills
+    // $0 and fully refunds the reservation, leaving the budget unenforced.
+    const body =
+      'data: {"id":"c","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}\n\n' +
+      'data: {"id":"c","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
+      'data: [DONE]\n\n';
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(body);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.chargeOnMissingUsage = true;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/chat/completions'],
+        createExtractor: () => new OpenAIUsageExtractor(),
+        strategy: {
+          mode: 'single',
+          target: {
+            name: 'nousage',
+            provider: 'openai',
+            adapter: new AnthropicAdapter({ baseUrl: url }),
+            credential: { scheme: 'bearer', value: UPSTREAM_KEY },
+            upstreamPath: '/v1/chat/completions',
+          },
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+
+    expect(ledger.entries).toHaveLength(1); // charged despite no usage frame
+    expect(ledger.entries[0]?.costMicroUsd).toBeGreaterThan(0); // worst-case, not $0
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
   it('redacts a secret in a streamed Anthropic response (windowed in-stream enforcement)', async () => {
     const { app, base, server, ledger, token } = await streamEnforceRoute(
       [

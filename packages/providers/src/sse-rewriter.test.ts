@@ -73,6 +73,36 @@ describe('AnthropicSseRewriter', () => {
     expect(parse(out)[0]?.obj.delta?.text).toBe('<<REDACTED_"X"\n>>');
   });
 
+  it('fails closed on a second text content-block index instead of mis-attributing', () => {
+    const r = new AnthropicSseRewriter(identity);
+    const out = r.push(textDelta(0, 'first block ') + textDelta(1, 'SECOND block'));
+    expect(r.failClosed).toBe(true); // a second text-block index was detected
+    expect(out).not.toContain('SECOND block'); // the second block's text is not emitted
+    expect(r.push(textDelta(1, ' more'))).toBe(''); // terminal — nothing more
+    expect(r.flush()).toBe('');
+  });
+
+  it('does NOT fail closed on a tool_use block interleaved with a single text block', () => {
+    const r = new AnthropicSseRewriter(identity);
+    let out = r.push(textDelta(0, 'hello '));
+    // A tool_use block on index 1 carries input_json_delta, not text_delta — fine.
+    out += r.push(
+      frame('content_block_delta', {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'input_json_delta', partial_json: '{"a":1}' },
+      }),
+    );
+    out += r.push(textDelta(0, 'world'));
+    out += r.flush();
+    expect(r.failClosed).toBe(false); // single text block + a tool_use block is allowed
+    const text = parse(out)
+      .filter((e) => e.obj.type === 'content_block_delta' && e.obj.delta?.type === 'text_delta')
+      .map((e) => e.obj.delta?.text ?? '')
+      .join('');
+    expect(text).toBe('hello world');
+  });
+
   it('reassembles and transforms text split across two content_block_delta events', () => {
     let buf = '';
     const redactSecret: TextTransform = {
