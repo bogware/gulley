@@ -5,6 +5,7 @@ import {
   computeRowHash,
   rowContent,
 } from './audit';
+import { verifyAuditChain } from './attestation';
 import {
   decodeLogCursor,
   encodeLogCursor,
@@ -180,13 +181,6 @@ export class InMemoryAuditSink implements AuditSink {
 
   /** Recompute the chain and confirm every link and prev-pointer matches. */
   verify(): boolean {
-    let prev: string | null = null;
-    for (const row of this.rows) {
-      const content = rowContent(row);
-      if (row.prevHash !== prev) return false;
-      if (computeRowHash(prev, content) !== row.rowHash) return false;
-      prev = row.rowHash;
-    }
-    return true;
+    return verifyAuditChain(this.rows).verified;
   }
 }

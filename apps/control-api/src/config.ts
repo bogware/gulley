@@ -33,6 +33,13 @@ const Env = z.object({
   // Provider base-URL egress allowlist (comma-separated hostnames).
   OUTBOUND_HOST_ALLOWLIST: z.string().default(''),
 
+  // Compliance: an HMAC key that signs auditor attestations (GET /audit/attestation
+  // and the audit:verify CLI). Absent = attestation export disabled (501). The
+  // auditor holds the same key to verify the signature independently.
+  AUDIT_ATTESTATION_KEY: z.string().min(16).optional(),
+  // Optional label stamped on the attestation (deployment / environment / org).
+  AUDIT_ATTESTATION_SUBJECT: z.string().optional(),
+
   // Durable config store. When set, POST /config/apply persists to Postgres (the
   // tables the gateway reads) via PostgresConfigStore + PostgresConfigVersionStore,
   // instead of the in-memory ControlConfigStore. Enables M13 config hot-reload.

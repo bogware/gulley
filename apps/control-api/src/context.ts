@@ -19,11 +19,13 @@ import {
   PostgresConfigVersionStore,
   PostgresKeyAdminStore,
   PostgresRequestLogQuery,
+  readAuditRows,
 } from '@gulley/storage';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
 import type { OidcRoleRule } from './oidc-gate';
 import {
+  type AuditRow,
   type AuditSink,
   GuardedAuditSink,
   InMemoryAuditSink,
@@ -71,6 +73,13 @@ export interface ControlContext {
   resolverDeps: AdminResolverDeps;
   /** Verify the underlying audit chain (the sink is guarded, so expose it). */
   verifyAudit: () => { verified: boolean; count: number };
+  /** Read the full audit chain (ordered) for an attestation export; absent = not
+   *  supported by this backend. */
+  auditRows?: () => Promise<AuditRow[]>;
+  /** HMAC key that signs auditor attestations; absent = attestation export off. */
+  attestationKey?: string;
+  /** Optional label stamped on the attestation. */
+  attestationSubject?: string;
   /** Hosts a provider base URL may egress to; empty = any non-blocked host. */
   outboundAllowlist: ReadonlySet<string>;
   /** OIDC session gate config; absent = OIDC login disabled (token-paste only). */
@@ -114,6 +123,10 @@ export interface InMemoryContextOptions {
   databaseUrl?: string;
   /** Inject a pre-built Database (tests); overrides databaseUrl. */
   db?: Database;
+  /** HMAC key that signs auditor attestations; absent = attestation export off. */
+  attestationKey?: string;
+  /** Optional label stamped on the attestation. */
+  attestationSubject?: string;
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -179,6 +192,11 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
       maxSessionTtlMs: opts.maxSessionTtlMs,
     },
     verifyAudit: () => ({ verified: inner.verify(), count: inner.rows.length }),
+    // Attestation reads the durable chain when a DB is present (the auditor-facing
+    // source of truth), else the in-memory sink (dev/test) — same core verifier.
+    auditRows: db ? () => readAuditRows(db) : async () => inner.rows,
+    attestationKey: opts.attestationKey,
+    attestationSubject: opts.attestationSubject,
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
     oidc: opts.oidc,
     notifier: opts.notifier,

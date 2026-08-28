@@ -42,6 +42,8 @@ function buildContext(config: Config): ControlContext | undefined {
     outboundAllowlist: outboundAllowlist(config),
     oidc,
     databaseUrl: config.DATABASE_URL,
+    attestationKey: config.AUDIT_ATTESTATION_KEY,
+    attestationSubject: config.AUDIT_ATTESTATION_SUBJECT,
   });
 }
 

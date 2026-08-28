@@ -12,6 +12,7 @@
     "config:check": "tsx src/config-check.ts",
     "config:db:check": "tsx src/config-db-check.ts",
     "worm:check": "tsx src/worm-check.ts",
+    "audit:verify": "tsx src/audit-verify.ts",
     "kms:check": "tsx src/kms-check.ts",
     "ssrf:check": "tsx src/ssrf-check.ts",
     "typecheck": "tsc --noEmit",

@@ -13,7 +13,7 @@ Scope (from `docs/AGENTGATEWAY_PORT.md` "Wave 3 — DX & adoption"):
 | **C** | Full **admin CRUD** — PUT/DELETE for the config resources that were create/read-only.                      | ✅     |
 | **D** | Published **OpenAPI** spec + a typed control-API client package.                                           | ✅     |
 | **E** | **Helm chart / one-command deploy** — the one image running either plane.                                  | ✅     |
-| **F** | **Compliance-as-a-product** — the audit-verify CLI + an auditor attestation export.                        | ⏳     |
+| **F** | **Compliance-as-a-product** — the audit-verify CLI + an auditor attestation export.                        | ✅     |
 
 ## A — Playground preflight API ✅
 
@@ -133,3 +133,29 @@ plain-YAML manifest + the JSON schema and asserts the structural invariants
 balanced `{{ }}` in every template); if `helm` is on PATH it also `helm lint`s and
 `helm template`s the chart (default + control-api-disabled). Helm templates are
 Go-templated YAML, so they're excluded from Prettier.
+
+## F — Compliance-as-a-product ✅
+
+Turn the tamper-evident audit chain into a deliverable an auditor can trust and
+verify **independently**:
+
+- **Chain verifier core** (`@gulley/pipeline`): `verifyAuditChain(rows)` re-walks the
+  chain — recomputing every `rowHash` from its predecessor, confirming the
+  prev-pointer and monotonic seq — and returns a report (verified, count, first/last
+  seq+hash, time range, `brokenAtSeq`). The in-memory sink's `verify()` now delegates
+  to it (one source of truth). `readAuditRows(db)` reads the durable chain for it.
+- **Signed attestation**: `attestAuditChain(rows, …)` packages the report as an
+  `AuditAttestation` (tool, version, generatedAt, subject) HMAC-SHA256-signed with an
+  operator key; `verifyAttestation(doc, key)` checks it in constant time. The auditor
+  holds the same key and verifies the export themselves — no need to trust the
+  running system.
+- **`audit:verify` CLI** (`apps/control-api`): re-walks the chain from Postgres
+  (`DATABASE_URL`) or a JSON export (`--input`), emits the signed attestation to
+  stdout/`--out`, and **exits non-zero if the chain doesn't verify** — drops straight
+  into a compliance gate.
+- **`GET /audit/attestation`** (admin, `audit:verify`): the same signed attestation
+  over HTTP; `501` until `AUDIT_ATTESTATION_KEY` is set.
+
+7 pipeline tests (chain verify incl. tamper/renumber, sign/verify round-trip, wrong
+key, altered-body) + 5 control-api tests (endpoint 501/200/401, verifiable signature,
+CLI `reviveRows` round-trip). Completes Wave 3.

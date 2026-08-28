@@ -1,7 +1,7 @@
 import { type AdminSessionClaims, signAdminSession } from '@gulley/auth';
-import { assertNoInlineSecret } from '@gulley/pipeline';
+import { assertNoInlineSecret, attestAuditChain } from '@gulley/pipeline';
 import { MissingVariablesError, PromptNameConflictError, renderPrompt } from '@gulley/prompts';
-import { secretRef } from '@gulley/core';
+import { GULLEY_VERSION, secretRef } from '@gulley/core';
 import { assertEgressAllowed } from '@gulley/egress';
 import {
   can,
@@ -646,6 +646,28 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     adminRoute(ctx, async (_req, reply, admin) => {
       if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
       return reply.send(ctx.verifyAudit());
+    }),
+  );
+
+  // Auditor attestation export: an independently-signed statement over the audit
+  // chain (verified status + row count + first/last hash + time range). 501 until an
+  // attestation key is configured. The auditor holds the same key to verify it.
+  app.get(
+    '/audit/attestation',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.attestationKey || !ctx.auditRows)
+        return reply
+          .code(501)
+          .send({ error: { type: 'not_configured', message: 'attestation key not set' } });
+      const rows = await ctx.auditRows();
+      const signed = attestAuditChain(rows, {
+        key: ctx.attestationKey,
+        toolVersion: GULLEY_VERSION,
+        generatedAt: new Date().toISOString(),
+        ...(ctx.attestationSubject !== undefined ? { subject: ctx.attestationSubject } : {}),
+      });
+      return reply.send(signed);
     }),
   );
 }

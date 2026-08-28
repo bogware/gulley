@@ -19,7 +19,7 @@ import {
   type UsageBucket,
   type UsageQuery,
 } from '@gulley/pipeline';
-import { and, desc, eq, gte, inArray, lt, type SQL, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lt, type SQL, sql } from 'drizzle-orm';
 import type { Database } from './db';
 import {
   auditLog,
@@ -392,6 +392,24 @@ export class PostgresAuditSink implements AuditSink {
       return { ...event, seq, prevHash, rowHash, createdAt };
     });
   }
+}
+
+/** Read the full audit chain (ordered by seq) for independent verification — the
+ *  audit-verify CLI / attestation export. Streaming isn't needed: the chain must be
+ *  walked in order anyway, and it is bounded by the deployment's write history. */
+export async function readAuditRows(db: Database): Promise<AuditRow[]> {
+  const rows = await db.select().from(auditLog).orderBy(asc(auditLog.seq));
+  return rows.map((r) => ({
+    seq: r.seq,
+    orgId: r.orgId,
+    actor: r.actor ?? '',
+    action: r.action,
+    target: r.target,
+    payload: (r.payload as Record<string, unknown> | null) ?? {},
+    prevHash: r.prevHash,
+    rowHash: r.rowHash,
+    createdAt: r.createdAt,
+  }));
 }
 
 /** One rate-limit rule as stored in the `rate_limit.config` JSONB column. */
