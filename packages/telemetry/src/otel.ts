@@ -25,6 +25,8 @@ export interface RequestSpanData {
   guardrailOutputFindings?: number;
   /** The enforcing action taken, if any: block | mask | redact. */
   guardrailAction?: string;
+  /** Provider prompt-cache dollars saved on this request (micro-USD). */
+  cacheSavedMicroUsd?: number;
   /** W3C trace id (32-hex) this request belongs to, for cross-system correlation. */
   traceId?: string;
   /** Per-stage timings (epoch ms), materialized as child spans under the request

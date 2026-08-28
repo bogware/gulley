@@ -18,6 +18,8 @@ export interface RequestMetricData {
   startedAtMs: number;
   cacheStatus?: string;
   guardrailAction?: string;
+  /** Provider prompt-cache dollars saved on this request (micro-USD). */
+  cacheSavedMicroUsd?: number;
 }
 
 // End-to-end proxied-request latency; wide upper buckets because streamed LLM
@@ -37,6 +39,7 @@ export class GatewayMetrics {
   private readonly cache: Counter;
   private readonly guardrail: Counter;
   private readonly failovers: Counter;
+  private readonly saved: Counter;
   private readonly duration: Histogram;
 
   constructor(private readonly now: () => number = Date.now) {
@@ -64,6 +67,10 @@ export class GatewayMetrics {
       'gulley_failovers_total',
       'Pre-first-byte failovers by target.',
     );
+    this.saved = this.registry.counter(
+      'gulley_cost_saved_micro_usd_total',
+      'Cost avoided in micro-USD by source (prompt_cache).',
+    );
     this.duration = this.registry.histogram(
       'gulley_request_duration_seconds',
       'End-to-end proxied request duration in seconds.',
@@ -85,6 +92,8 @@ export class GatewayMetrics {
     if (d.costMicroUsd > 0) this.cost.inc(base, d.costMicroUsd);
     if (d.cacheStatus) this.cache.inc({ status: d.cacheStatus });
     if (d.guardrailAction) this.guardrail.inc({ action: d.guardrailAction });
+    if (d.cacheSavedMicroUsd && d.cacheSavedMicroUsd > 0)
+      this.saved.inc({ source: 'prompt_cache' }, d.cacheSavedMicroUsd);
     this.duration.observe(
       { provider: d.provider, status: d.status },
       Math.max(0, (this.now() - d.startedAtMs) / 1000),

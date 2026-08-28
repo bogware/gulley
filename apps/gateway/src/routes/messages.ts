@@ -1437,6 +1437,7 @@ async function handleProxy(
       inputTokens: cost.totalInputTokens,
       outputTokens: cost.outputTokens,
       costMicroUsd,
+      cacheSavedMicroUsd: cost.cacheSavedUsd > 0 ? toMicroUsd(cost.cacheSavedUsd) : undefined,
       streamed,
       stopReason: n.stopReason,
       startedAtMs: started,

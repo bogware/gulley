@@ -103,6 +103,21 @@ describe('computeCost (provider-generic)', () => {
     expect(c.totalInputTokens).toBe(2_000_000);
   });
 
+  it('reports prompt-cache dollars saved for cache_read tokens', () => {
+    // gpt-4o-mini input $0.15/MTok, cache-read at 0.5x. 1M cache-read tokens cost
+    // $0.075 vs $0.15 full ⇒ $0.075 saved.
+    const c = computeCost('openai', 'gpt-4o-mini', {
+      inputTokens: 0,
+      cacheReadTokens: 1_000_000,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      outputTokens: 0,
+      seen: true,
+    });
+    expect(c.cacheReadUsd).toBeCloseTo(0.075, 6);
+    expect(c.cacheSavedUsd).toBeCloseTo(0.075, 6);
+  });
+
   it('prices Gemini and Vertex from the seed (no longer $0)', () => {
     const usage = {
       inputTokens: 1_000_000,

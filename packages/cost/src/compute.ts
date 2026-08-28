@@ -32,6 +32,10 @@ export interface CostBreakdown {
   cacheWriteUsd: number;
   outputUsd: number;
   totalUsd: number;
+  /** Dollars saved by provider prompt caching on this request: what the cache_read
+   *  tokens would have cost at the full input rate, minus what they cost at the
+   *  discounted cache-read rate. 0 when unpriced or nothing was cache-read. */
+  cacheSavedUsd: number;
 }
 
 const perMillion = (tokens: number, rate: number): number => (tokens / 1_000_000) * rate;
@@ -90,6 +94,7 @@ export function computeCost(
       cacheWriteUsd: 0,
       outputUsd: 0,
       totalUsd: 0,
+      cacheSavedUsd: 0,
     };
   }
 
@@ -99,6 +104,9 @@ export function computeCost(
     perMillion(u.cacheWrite5mTokens, rate.input * cache.write5m) +
     perMillion(u.cacheWrite1hTokens, rate.input * cache.write1h);
   const outputUsd = perMillion(u.outputTokens, rate.output);
+  // What cache_read tokens would have cost at the full input rate, minus what they
+  // did cost at the discounted rate — the provider-prompt-cache dollars saved.
+  const cacheSavedUsd = perMillion(u.cacheReadTokens, rate.input * (1 - cache.read));
 
   return {
     ...base,
@@ -108,6 +116,7 @@ export function computeCost(
     cacheWriteUsd,
     outputUsd,
     totalUsd: inputUsd + cacheReadUsd + cacheWriteUsd + outputUsd,
+    cacheSavedUsd,
   };
 }
 
