@@ -278,6 +278,30 @@ routing/guardrail forms, TTFT metric). See `docs/M19_WAVE1.md` for the tracker.
   validation); budget counter self-heal from the ledger; DB `model_alias` →
   `ModelRouter`.
 
+## M20 — Wave 2 "Extend the moat" — 🚧 CORE LANDED
+
+Presses the ground competitors can't structurally follow. **Slices A–E on `main`**:
+native prompt-injection / jailbreak classifier (local, no egress); price/latency-
+aware routing (`select: cheapest|fastest`); prompt-cache savings analytics; budget
+soft-threshold alerts + gauge; budget-aware routing downshift. That's all three
+non-FinOps moat items + two of three FinOps pieces. The remaining piece — multi-level
+budget caps (org/project/key/model) — is a hot-path budget-safety change reserved for
+its own adversarially-reviewed slice (see `docs/M20_WAVE2.md`).
+
+## Wave 3 — DX & adoption (next)
+
+The moat is deep; Wave 3 lowers the barrier to adopting it. Candidates:
+
+- **In-console playground** (deferred from Wave 2): send a test request, stream the
+  response, surface the resulting log row (cost/tokens/guardrail) — the first-run
+  "does my key/route work?" unlock, now that analytics (M19 B) work.
+- **Prompt registry** — versioned, audited, hash-chained prompt templates on the
+  existing GitOps/RBAC rails (governance-native, not a me-too studio).
+- **Full admin CRUD + key-lifecycle UI** (revoke/rotate endpoints landed in M19 F).
+- **Published OpenAPI + typed control-API client**; per-provider quickstarts; a
+  Helm chart / one-command deploy.
+- **Compliance-as-a-product**: the audit-verify CLI + auditor attestation export.
+
 ## Recommended next steps (candidate roadmap → world-class)
 
 - **Tier 1 (differentiators).**
