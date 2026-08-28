@@ -36,4 +36,23 @@ export class InMemoryKeyStore implements KeyStore {
   async touchLastUsed(id: string): Promise<void> {
     this.lastUsed.add(id);
   }
+
+  /** Disable a stored key by prefix (admin revoke); bumps its epoch. */
+  disableByPrefix(prefix: string): void {
+    const k = this.byPrefix.get(prefix);
+    if (k) this.byPrefix.set(prefix, { ...k, disabled: true, epoch: k.epoch + 1 });
+  }
+
+  /** Swap a key's secret in place (admin rotate): re-key under the new prefix/hash. */
+  rekey(oldPrefix: string, newPrefix: string, newHash: string): void {
+    const k = this.byPrefix.get(oldPrefix);
+    if (!k) return;
+    this.byPrefix.delete(oldPrefix);
+    this.byPrefix.set(newPrefix, {
+      ...k,
+      keyPrefix: newPrefix,
+      keyHash: newHash,
+      epoch: k.epoch + 1,
+    });
+  }
 }

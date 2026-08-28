@@ -2,8 +2,11 @@ import { generateVirtualKey, type InMemoryKeyStore, type StoredKey } from '@gull
 import type { SecretRef } from '@gulley/core';
 import { randomUUID } from 'node:crypto';
 import type {
+  KeyAdmin,
   KeyView,
   Membership,
+  MintedKey,
+  MintKeyArgs,
   Org,
   Project,
   Provider,
@@ -146,22 +149,16 @@ export class ScopedCollection {
 }
 
 /** Mints virtual keys into the shared (data-plane) key store and keeps a
- *  secret-free view for the admin API. */
-export class KeyAdminStore {
-  private readonly views = new Map<string, KeyView>();
+ *  secret-free view for the admin API. Implements {@link KeyAdmin} (in-memory). */
+export class KeyAdminStore implements KeyAdmin {
+  private readonly views = new Map<string, KeyView & { orgId: string }>();
 
   constructor(
     private readonly keyStore: InMemoryKeyStore,
     private readonly pepper: string,
   ) {}
 
-  mint(args: {
-    workspaceId: string;
-    orgId: string;
-    name: string;
-    allowedProviders?: readonly string[] | '*';
-    allowedModels?: readonly string[] | '*';
-  }): { id: string; token: string; keyPrefix: string } {
+  async mint(args: MintKeyArgs): Promise<MintedKey> {
     const gen = generateVirtualKey(this.pepper);
     const id = randomUUID();
     const stored: StoredKey = {
@@ -180,6 +177,7 @@ export class KeyAdminStore {
     this.keyStore.add(stored);
     this.views.set(id, {
       id,
+      orgId: args.orgId,
       workspaceId: args.workspaceId,
       name: args.name,
       keyPrefix: gen.keyPrefix,
@@ -189,11 +187,29 @@ export class KeyAdminStore {
     return { id, token: gen.token, keyPrefix: gen.keyPrefix };
   }
 
-  get(id: string): KeyView | undefined {
+  async get(id: string): Promise<KeyView | undefined> {
     return this.views.get(id);
   }
 
-  all(): KeyView[] {
-    return [...this.views.values()];
+  async list(orgIds: readonly string[] | '*'): Promise<KeyView[]> {
+    const all = [...this.views.values()];
+    return orgIds === '*' ? all : all.filter((v) => orgIds.includes(v.orgId));
+  }
+
+  async disable(id: string): Promise<KeyView | undefined> {
+    const v = this.views.get(id);
+    if (!v) return undefined;
+    this.keyStore.disableByPrefix(v.keyPrefix);
+    v.disabled = true;
+    return v;
+  }
+
+  async rotate(id: string): Promise<MintedKey | undefined> {
+    const v = this.views.get(id);
+    if (!v) return undefined;
+    const gen = generateVirtualKey(this.pepper);
+    this.keyStore.rekey(v.keyPrefix, gen.keyPrefix, gen.keyHash);
+    v.keyPrefix = gen.keyPrefix;
+    return { id, token: gen.token, keyPrefix: gen.keyPrefix };
   }
 }

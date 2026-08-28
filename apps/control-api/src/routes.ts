@@ -266,7 +266,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       if (!ws) return notFound(reply, 'workspace');
       const at = { orgId: ws.orgId, workspaceId };
       if (!(await ctx.access.can(admin, 'key:create', at))) return forbidden(reply);
-      const minted = ctx.keys.mint({ workspaceId, orgId: ws.orgId, name });
+      const minted = await ctx.keys.mint({ workspaceId, orgId: ws.orgId, name });
       await ctx.audit.append({
         orgId: ws.orgId,
         actor: admin.subject,
@@ -282,11 +282,63 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   app.get(
     '/keys/:id',
     adminRoute(ctx, async (request, reply, admin) => {
-      const view = ctx.keys.get(paramId(request));
+      const view = await ctx.keys.get(paramId(request));
       if (!view) return notFound(reply, 'key');
       const at = scopeForWorkspace(ctx, view.workspaceId) ?? {};
       if (!(await ctx.access.can(admin, 'key:read', at))) return forbidden(reply);
       return reply.send({ key: view });
+    }),
+  );
+  // List a workspace's keys (secret-free views).
+  app.get(
+    '/keys',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const workspaceId = str((request.query as Record<string, unknown>)?.['workspaceId']);
+      if (!workspaceId) return invalid(reply, 'workspaceId required');
+      const ws = ctx.workspaces.get(workspaceId);
+      if (!ws) return notFound(reply, 'workspace');
+      if (!(await ctx.access.can(admin, 'key:read', { orgId: ws.orgId, workspaceId })))
+        return forbidden(reply);
+      const keys = (await ctx.keys.list([ws.orgId])).filter((k) => k.workspaceId === workspaceId);
+      return reply.send({ keys });
+    }),
+  );
+  // Revoke (disable) a key — effective on the gateway's next lookup.
+  app.post(
+    '/keys/:id/disable',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const view = await ctx.keys.get(paramId(request));
+      if (!view) return notFound(reply, 'key');
+      const at = scopeForWorkspace(ctx, view.workspaceId) ?? {};
+      if (!(await ctx.access.can(admin, 'key:create', at))) return forbidden(reply);
+      const updated = await ctx.keys.disable(view.id);
+      await ctx.audit.append({
+        orgId: at.orgId ?? '',
+        actor: admin.subject,
+        action: 'key.disable',
+        target: view.id,
+        payload: { keyPrefix: view.keyPrefix },
+      });
+      return reply.send({ key: updated });
+    }),
+  );
+  // Rotate a key's secret (new token, same id).
+  app.post(
+    '/keys/:id/rotate',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const view = await ctx.keys.get(paramId(request));
+      if (!view) return notFound(reply, 'key');
+      const at = scopeForWorkspace(ctx, view.workspaceId) ?? {};
+      if (!(await ctx.access.can(admin, 'key:create', at))) return forbidden(reply);
+      const rotated = await ctx.keys.rotate(view.id);
+      await ctx.audit.append({
+        orgId: at.orgId ?? '',
+        actor: admin.subject,
+        action: 'key.rotate',
+        target: view.id,
+        payload: { keyPrefix: rotated?.keyPrefix },
+      });
+      return reply.send({ id: view.id, token: rotated?.token, keyPrefix: rotated?.keyPrefix });
     }),
   );
 

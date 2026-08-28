@@ -76,3 +76,31 @@ export interface KeyView {
   disabled: boolean;
   createdAt: string;
 }
+
+export interface MintKeyArgs {
+  workspaceId: string;
+  orgId: string;
+  name: string;
+  allowedProviders?: readonly string[] | '*';
+  allowedModels?: readonly string[] | '*';
+}
+export interface MintedKey {
+  id: string;
+  token: string;
+  keyPrefix: string;
+}
+
+/** Virtual-key admin surface (mint + full lifecycle). The in-memory impl backs
+ *  tests/dev; the Postgres impl writes the `virtual_key` table the gateway reads,
+ *  so revoke/rotate actually take effect in production. */
+export interface KeyAdmin {
+  mint(args: MintKeyArgs): Promise<MintedKey>;
+  get(id: string): Promise<KeyView | undefined>;
+  /** Workspace-scoped list; `'*'` = all orgs (RBAC filters upstream by org/ws). */
+  list(orgIds: readonly string[] | '*'): Promise<KeyView[]>;
+  /** Disable (revoke) a key + bump its epoch. Returns the updated view, or
+   *  undefined if not found. Effective on the gateway's next key lookup. */
+  disable(id: string): Promise<KeyView | undefined>;
+  /** Rotate the secret (new token, same id); bumps the epoch. */
+  rotate(id: string): Promise<MintedKey | undefined>;
+}

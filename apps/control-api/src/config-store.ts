@@ -29,7 +29,7 @@ const byName = <T extends { name: string }>(a: T, b: T): number => a.name.locale
 export class ControlConfigStore implements ConfigStore {
   constructor(private readonly ctx: ControlContext) {}
 
-  private exportWorkspace(ws: Workspace): ConfigWorkspace {
+  private async exportWorkspace(ws: Workspace): Promise<ConfigWorkspace> {
     const providers: ConfigProvider[] = this.ctx.providers
       .all()
       .filter((p) => p.workspaceId === ws.id)
@@ -50,8 +50,7 @@ export class ControlConfigStore implements ConfigStore {
         .filter((e) => e.workspaceId === ws.id)
         .sort(byName)
         .map((e) => ({ name: e.name, config: e.config }));
-    const virtualKeys = this.ctx.keys
-      .all()
+    const virtualKeys = (await this.ctx.keys.list('*'))
       .filter((k) => k.workspaceId === ws.id)
       .sort(byName)
       .map((k) => ({ name: k.name, keyPrefix: k.keyPrefix, disabled: k.disabled }));
@@ -78,14 +77,18 @@ export class ControlConfigStore implements ConfigStore {
     const orgs = this.ctx.orgs.list(ids).sort(byName);
     return {
       apiVersion: 'gulley/v1',
-      orgs: orgs.map((org) => ({
-        name: org.name,
-        workspaces: this.ctx.workspaces
-          .list('*')
-          .filter((w) => w.orgId === org.id)
-          .sort(byName)
-          .map((ws) => this.exportWorkspace(ws)),
-      })),
+      orgs: await Promise.all(
+        orgs.map(async (org) => ({
+          name: org.name,
+          workspaces: await Promise.all(
+            this.ctx.workspaces
+              .list('*')
+              .filter((w) => w.orgId === org.id)
+              .sort(byName)
+              .map((ws) => this.exportWorkspace(ws)),
+          ),
+        })),
+      ),
     };
   }
 

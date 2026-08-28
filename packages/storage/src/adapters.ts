@@ -1,4 +1,4 @@
-import type { KeyStore, StoredKey } from '@gulley/auth';
+import { generateVirtualKey, type KeyStore, type StoredKey } from '@gulley/auth';
 import {
   type AuditEventInput,
   type AuditRow,
@@ -80,6 +80,92 @@ export class PostgresKeyStore implements KeyStore {
       .update(virtualKey)
       .set({ lastUsedAt: sql`now()` })
       .where(eq(virtualKey.id, id));
+  }
+}
+
+interface KeyViewRow {
+  id: string;
+  workspaceId: string;
+  name: string;
+  keyPrefix: string;
+  disabled: boolean;
+  createdAt: string;
+}
+interface MintKeyArgs {
+  workspaceId: string;
+  orgId: string;
+  name: string;
+}
+
+/**
+ * Durable virtual-key admin over the `virtual_key` table the gateway reads (via
+ * {@link PostgresKeyStore}). Unlike the in-memory admin store, mint/disable/rotate
+ * here actually take effect on the data plane — a revoke (`disabled=true` + epoch
+ * bump) rejects the key on its next lookup, and rotate swaps the secret in place.
+ * Structurally satisfies control-api's `KeyAdmin`. */
+export class PostgresKeyAdminStore {
+  constructor(
+    private readonly db: Database,
+    private readonly pepper: string,
+  ) {}
+
+  private view(r: typeof virtualKey.$inferSelect): KeyViewRow {
+    return {
+      id: r.id,
+      workspaceId: r.workspaceId,
+      name: r.name,
+      keyPrefix: r.keyPrefix,
+      disabled: r.disabled,
+      createdAt: r.createdAt.toISOString(),
+    };
+  }
+
+  async mint(args: MintKeyArgs): Promise<{ id: string; token: string; keyPrefix: string }> {
+    const gen = generateVirtualKey(this.pepper);
+    const [row] = await this.db
+      .insert(virtualKey)
+      .values({
+        workspaceId: args.workspaceId,
+        name: args.name,
+        keyPrefix: gen.keyPrefix,
+        keyHash: gen.keyHash,
+      })
+      .returning({ id: virtualKey.id });
+    return { id: row?.id ?? '', token: gen.token, keyPrefix: gen.keyPrefix };
+  }
+
+  async get(id: string): Promise<KeyViewRow | undefined> {
+    const rows = await this.db.select().from(virtualKey).where(eq(virtualKey.id, id)).limit(1);
+    return rows[0] ? this.view(rows[0]) : undefined;
+  }
+
+  async list(orgIds: readonly string[] | '*'): Promise<KeyViewRow[]> {
+    const q = this.db
+      .select({ k: virtualKey })
+      .from(virtualKey)
+      .innerJoin(workspace, eq(virtualKey.workspaceId, workspace.id))
+      .orderBy(desc(virtualKey.createdAt));
+    const rows = orgIds === '*' ? await q : await q.where(inArray(workspace.orgId, [...orgIds]));
+    return rows.map((r) => this.view(r.k));
+  }
+
+  async disable(id: string): Promise<KeyViewRow | undefined> {
+    const [row] = await this.db
+      .update(virtualKey)
+      .set({ disabled: true, epoch: sql`${virtualKey.epoch} + 1` })
+      .where(eq(virtualKey.id, id))
+      .returning();
+    return row ? this.view(row) : undefined;
+  }
+
+  async rotate(id: string): Promise<{ id: string; token: string; keyPrefix: string } | undefined> {
+    const gen = generateVirtualKey(this.pepper);
+    const [row] = await this.db
+      .update(virtualKey)
+      .set({ keyPrefix: gen.keyPrefix, keyHash: gen.keyHash, epoch: sql`${virtualKey.epoch} + 1` })
+      .where(eq(virtualKey.id, id))
+      .returning({ id: virtualKey.id });
+    return row ? { id: row.id, token: gen.token, keyPrefix: gen.keyPrefix } : undefined;
   }
 }
 

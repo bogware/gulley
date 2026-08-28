@@ -17,6 +17,7 @@ import {
   PostgresAuditSink,
   PostgresConfigStore,
   PostgresConfigVersionStore,
+  PostgresKeyAdminStore,
   PostgresRequestLogQuery,
 } from '@gulley/storage';
 import type { ApplyCommitDeps } from '@gulley/config';
@@ -30,7 +31,7 @@ import {
   type RequestLogQuery,
 } from '@gulley/pipeline';
 import { type AccessControl, InMemoryAccessControl } from '@gulley/rbac';
-import type { CollectionKind } from './domain';
+import type { CollectionKind, KeyAdmin } from './domain';
 import { COLLECTION_KINDS } from './domain';
 import {
   KeyAdminStore,
@@ -51,7 +52,7 @@ export interface ControlContext {
   providers: ProviderStore;
   credentials: ProviderCredentialStore;
   collections: Record<CollectionKind, ScopedCollection>;
-  keys: KeyAdminStore;
+  keys: KeyAdmin;
   keyStore: InMemoryKeyStore;
   audit: AuditSink;
   access: AccessControl;
@@ -154,7 +155,9 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     providers: new ProviderStore(),
     credentials: new ProviderCredentialStore(),
     collections,
-    keys: new KeyAdminStore(keyStore, opts.pepper),
+    keys: db
+      ? new PostgresKeyAdminStore(db, opts.pepper)
+      : new KeyAdminStore(keyStore, opts.pepper),
     keyStore,
     audit,
     access: new InMemoryAccessControl(),
