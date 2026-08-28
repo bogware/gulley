@@ -12,7 +12,7 @@ Scope (from `docs/AGENTGATEWAY_PORT.md` "Wave 3 — DX & adoption"):
 | **B** | Governed **prompt registry** — versioned, audited, hash-chained prompt templates on the GitOps/RBAC rails. | ✅     |
 | **C** | Full **admin CRUD** — PUT/DELETE for the config resources that were create/read-only.                      | ✅     |
 | **D** | Published **OpenAPI** spec + a typed control-API client package.                                           | ✅     |
-| **E** | **Helm chart / one-command deploy** — the one image running either plane.                                  | ⏳     |
+| **E** | **Helm chart / one-command deploy** — the one image running either plane.                                  | ✅     |
 | **F** | **Compliance-as-a-product** — the audit-verify CLI + an auditor attestation export.                        | ⏳     |
 
 ## A — Playground preflight API ✅
@@ -108,3 +108,28 @@ admin API, and the published OpenAPI 3.1 document that describes it:
 fetch) and the OpenAPI document's structural invariants (unique operationIds, all
 tags declared, path params match `{…}`, collection CRUD + prompt registry covered,
 public-vs-secured split).
+
+## E — Helm chart / one-command deploy ✅
+
+Deployment artifacts under `deploy/` so the moat can be self-hosted in one step:
+
+- **`deploy/docker-compose.prod.yml`** — one command brings up both planes plus
+  Postgres and the role-split Redis trio (cache `allkeys-lru`; counters + vector
+  `noeviction`, matching the eviction-policy invariant). Both app services run the
+  **one image** with a plane-selecting `command`; secrets come from `deploy/.env`.
+- **`deploy/helm/gulley/`** — a Helm chart: a shared ConfigMap (non-secret env),
+  ServiceAccount (IRSA-annotatable), the gateway Deployment + Service + optional
+  HPA, and the control-api Deployment + Service. `/ready` gates traffic until routes
+  are wired; SIGTERM drives the bounded drain (`terminationGracePeriodSeconds`);
+  hardened pod/container securityContext (non-root, read-only rootfs + a `/tmp`
+  emptyDir). `values.schema.json` validates inputs. **Secret VALUES never live in
+  the chart** — only the name of an `existingSecret` you supply (secret-ARNs-only
+  ethos carried to Kubernetes).
+
+Validated by **`bash ci/helm-check.sh`** — a dedicated no-cloud gate (mirrors
+`ci/tf-check.sh`, not part of `ci/verify.sh`): a Node validator parses every
+plain-YAML manifest + the JSON schema and asserts the structural invariants
+(single image + plane commands, Redis eviction policies, required chart values,
+balanced `{{ }}` in every template); if `helm` is on PATH it also `helm lint`s and
+`helm template`s the chart (default + control-api-disabled). Helm templates are
+Go-templated YAML, so they're excluded from Prettier.

@@ -10,3 +10,5 @@ CHANGELOG.md
 packages/storage/migrations
 # Generated artifact (emitted by @gulley/control-client openapi:emit).
 docs/openapi/control-api.json
+# Helm templates are Go-templated YAML, not standard YAML (prettier can't parse them).
+deploy/helm/gulley/templates

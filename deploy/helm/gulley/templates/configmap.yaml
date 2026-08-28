@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gulley.fullname" . }}-config
+  labels:
+    {{- include "gulley.labels" . | nindent 4 }}
+data:
+  GATEWAY_PORT: {{ .Values.gateway.port | quote }}
+  METRICS_PORT: {{ .Values.gateway.metricsPort | quote }}
+  CONTROL_API_PORT: {{ .Values.controlApi.port | quote }}
+  {{- range $k, $v := .Values.config }}
+  {{- if and (ne $k "extra") (kindIs "string" $v) }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.config.extra }}
+  {{- range $k, $v := . }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- end }}

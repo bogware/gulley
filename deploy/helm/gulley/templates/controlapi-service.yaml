@@ -1,0 +1,17 @@
+{{- if .Values.controlApi.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gulley.fullname" . }}-control-api
+  labels:
+    {{- include "gulley.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-api
+spec:
+  type: {{ .Values.controlApi.service.type }}
+  selector:
+    {{- include "gulley.selectorLabels" (dict "root" . "plane" "control-api") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.controlApi.service.port }}
+      targetPort: http
+{{- end }}

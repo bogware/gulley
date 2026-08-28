@@ -1,0 +1,49 @@
+{{/* Chart name, overridable. */}}
+{{- define "gulley.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Fully qualified app name. */}}
+{{- define "gulley.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Common labels. */}}
+{{- define "gulley.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
+app.kubernetes.io/name: {{ include "gulley.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{/* Selector labels for a given plane (pass a dict with root + plane). */}}
+{{- define "gulley.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "gulley.name" .root }}
+app.kubernetes.io/instance: {{ .root.Release.Name }}
+app.kubernetes.io/component: {{ .plane }}
+{{- end -}}
+
+{{/* The image reference (tag falls back to appVersion). */}}
+{{- define "gulley.image" -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
+
+{{/* ServiceAccount name. */}}
+{{- define "gulley.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "gulley.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}

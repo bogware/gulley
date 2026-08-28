@@ -1,0 +1,88 @@
+# One-command self-host: the gateway + control-api (one image, two commands) plus
+# Postgres and the role-split Redis trio. From the repo root:
+#
+#   docker compose -f deploy/docker-compose.prod.yml up -d
+#
+# Secrets: copy .env.example to deploy/.env and fill provider keys + the KMS pepper.
+# Never commit deploy/.env. The image tag defaults to `latest`; pin GULLEY_TAG in
+# .env for a real deployment.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gulley
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gulley}
+      POSTGRES_DB: gulley
+    volumes:
+      - gulley_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U gulley -d gulley']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis-cache:
+    image: redis:7-alpine
+    command: ['redis-server', '--maxmemory', '256mb', '--maxmemory-policy', 'allkeys-lru']
+    restart: unless-stopped
+
+  redis-counters:
+    image: redis:7-alpine
+    command: ['redis-server', '--maxmemory-policy', 'noeviction', '--appendonly', 'yes']
+    volumes:
+      - gulley_redis_counters:/data
+    restart: unless-stopped
+
+  redis-vector:
+    image: redis:7-alpine
+    command: ['redis-server', '--maxmemory-policy', 'noeviction']
+    restart: unless-stopped
+
+  gateway:
+    image: ${GULLEY_IMAGE:-ghcr.io/bogware/gulley}:${GULLEY_TAG:-latest}
+    command: ['node', '--import', 'tsx', 'apps/gateway/src/main.ts']
+    env_file:
+      - .env
+    environment:
+      GATEWAY_PORT: '8080'
+      METRICS_PORT: '9090'
+      DATABASE_URL: postgres://gulley:${POSTGRES_PASSWORD:-gulley}@postgres:5432/gulley
+      REDIS_CACHE_URL: redis://redis-cache:6379
+      REDIS_COUNTERS_URL: redis://redis-counters:6379
+      REDIS_VECTOR_URL: redis://redis-vector:6379
+    ports:
+      - '8080:8080'
+      - '9090:9090'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-counters:
+        condition: service_started
+      redis-vector:
+        condition: service_started
+    restart: unless-stopped
+
+  control-api:
+    image: ${GULLEY_IMAGE:-ghcr.io/bogware/gulley}:${GULLEY_TAG:-latest}
+    command: ['node', '--import', 'tsx', 'apps/control-api/src/main.ts']
+    env_file:
+      - .env
+    environment:
+      CONTROL_API_PORT: '8081'
+      DATABASE_URL: postgres://gulley:${POSTGRES_PASSWORD:-gulley}@postgres:5432/gulley
+      REDIS_CACHE_URL: redis://redis-cache:6379
+      REDIS_COUNTERS_URL: redis://redis-counters:6379
+      REDIS_VECTOR_URL: redis://redis-vector:6379
+    ports:
+      - '8081:8081'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  gulley_pg:
+  gulley_redis_counters:

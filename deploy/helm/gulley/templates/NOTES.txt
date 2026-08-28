@@ -1,0 +1,25 @@
+Gulley is deploying.
+
+Planes:
+{{- if .Values.gateway.enabled }}
+  • gateway      Service {{ include "gulley.fullname" . }}-gateway:{{ .Values.gateway.service.port }} (data plane, /v1/messages)
+{{- end }}
+{{- if .Values.controlApi.enabled }}
+  • control-api  Service {{ include "gulley.fullname" . }}-control-api:{{ .Values.controlApi.service.port }} (admin API)
+{{- end }}
+
+Image: {{ include "gulley.image" . }}
+
+1. Watch the rollout:
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "gulley.fullname" . }}-gateway
+
+2. Port-forward the gateway and send a test request:
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "gulley.fullname" . }}-gateway 8080:{{ .Values.gateway.service.port }}
+     curl -s localhost:8080/health
+
+{{- if not .Values.existingSecret }}
+
+WARNING: `existingSecret` is empty. Provider keys and the KMS pepper must be
+supplied via a Kubernetes Secret (secret VALUES never belong in values.yaml).
+Create one and set `--set existingSecret=<name>`.
+{{- end }}

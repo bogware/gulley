@@ -1,0 +1,21 @@
+apiVersion: v2
+name: gulley
+description: >-
+  Gulley — a self-hostable enterprise LLM gateway. One container image runs either
+  plane (the stateless gateway data plane or the control-plane admin API); this
+  chart deploys both, wired to Postgres and the role-split Redis instances.
+type: application
+version: 0.1.0
+# The application version this chart deploys by default (the container image tag).
+appVersion: '1.0.0'
+home: https://github.com/bogware/gulley
+sources:
+  - https://github.com/bogware/gulley
+maintainers:
+  - name: Gulley maintainers
+keywords:
+  - llm
+  - gateway
+  - proxy
+  - finops
+  - guardrails

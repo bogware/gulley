@@ -1,0 +1,91 @@
+# Default values for the gulley chart.
+# One image runs either plane; each Deployment overrides the container `command`.
+
+image:
+  repository: ghcr.io/bogware/gulley
+  # Defaults to the chart's appVersion when empty.
+  tag: ''
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ''
+fullnameOverride: ''
+
+serviceAccount:
+  create: true
+  name: ''
+  # e.g. eks.amazonaws.com/role-arn for IRSA (Bedrock SigV4 / Secrets Manager).
+  annotations: {}
+
+# Non-secret environment shared by both planes → rendered into a ConfigMap.
+# Secret VALUES never live here (secret-ARNs-only): put provider keys, the KMS
+# pepper, etc. in a Kubernetes Secret and name it under `existingSecret`.
+config:
+  DATABASE_URL: ''
+  REDIS_CACHE_URL: ''
+  REDIS_COUNTERS_URL: ''
+  REDIS_VECTOR_URL: ''
+  LOG_LEVEL: info
+  # Arbitrary extra non-secret env (merged verbatim into the ConfigMap).
+  extra: {}
+
+# Name of a pre-existing Kubernetes Secret whose keys are projected as env into
+# both pods (envFrom). Empty = no secret env (dev / secrets injected elsewhere).
+existingSecret: ''
+
+# --- Data plane (the stateless hot path) ---
+gateway:
+  enabled: true
+  replicaCount: 2
+  port: 8080
+  metricsPort: 9090
+  command: ['node', '--import', 'tsx', 'apps/gateway/src/main.ts']
+  service:
+    type: ClusterIP
+    port: 80
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: '1'
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  # SIGTERM → bounded graceful drain; give in-flight streams time to finish.
+  terminationGracePeriodSeconds: 40
+
+# --- Control plane (admin API; every write hash-chain audited) ---
+controlApi:
+  enabled: true
+  replicaCount: 1
+  port: 8081
+  command: ['node', '--import', 'tsx', 'apps/control-api/src/main.ts']
+  service:
+    type: ClusterIP
+    port: 80
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  terminationGracePeriodSeconds: 30
+
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ['ALL']
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
