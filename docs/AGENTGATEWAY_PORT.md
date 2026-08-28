@@ -314,16 +314,32 @@ Lowers the barrier to adopting the moat. **Slices A–F on `main`** (see
   attestation** (`audit:verify` CLI + `GET /audit/attestation`) an auditor verifies
   independently with the shared key.
 
+## M22 — Tier 1 differentiators — ✅ DELIVERED
+
+The Tier-1 edges over the moat, shipped A–D (see `docs/M22_TIER1.md`). Both hot-path
+slices (B, D) passed the adversarial-review gate — B fixed 2 confirmed leaks, D fixed
+4 confirmed issues:
+
+- **A — native Gemini tool + image translation.** `tool_use`↔`functionCall`,
+  `tool_result`↔`functionResponse` (id→name resolution), `tools`→`functionDeclarations`,
+  `tool_choice`→`toolConfig`, base64 image↔`inlineData` — both directions, with
+  `stop_reason:'tool_use'` inferred from a functionCall part. Makes Gemini/Vertex
+  first-class for agentic + multimodal (M14 B did text + thinking).
+- **B — `/v1/responses` streaming enforcement.** `ResponsesSseRewriter` extends the
+  windowed enforcer to the Responses API — substitutes the transformed accumulator
+  into every echo (`output_text.done` / `content_part.done` / `output_item.done` /
+  `response.completed`) and strips per-token `logprobs`, so no un-redacted text leaks.
+- **C — pgvector-backed centroid ANN.** A `vector(256)` column + HNSW cosine index on
+  `classifier_centroid` (migration 0012) + `PostgresCentroidIndex` (`<=>` ANN, fail-open),
+  opt-in behind `SMART_ROUTING_CENTROID_ANN`, replacing the O(N) in-JS scan.
+- **D — durable, encrypted mask-vault reversal.** A `mask_vault` table + envelope
+  encryption (@gulley/crypto, AAD-bound) persists the mask token↔original map at rest;
+  an owner-only, audited `GET /admin/mask-vault/:requestId` reveals it. Root-caused +
+  fixed a fleet-wide non-unique `request.id` (now a globally-unique `genReqId`).
+
 ## Recommended next steps (candidate roadmap → world-class)
 
-- **Tier 1 (differentiators).**
-  1. **Native Gemini tool + image translation** — makes Vertex first-class (M14 B
-     covered text + thinking only).
-  2. **`/v1/responses` streaming enforcement + persisted-vault reversal path** —
-     M18 covers Anthropic + OpenAI-chat streams; the Responses API stream and a
-     durable (encrypted) reversal store for masked output are the remaining edges.
-  3. **pgvector-backed centroid ANN** — M18 persists centroids as jsonb (load-all +
-     in-JS cosine); a `vector`-typed column + ANN index scales large exemplar sets.
+- **Tier 1 (differentiators) — ✅ delivered as M22 A–D above.**
 - **Tier 2 (completeness).** Classification memoization (per session/prompt-hash);
   per-tenant noisy-neighbor controls (per-tenant concurrency + priority); admin UI
   depth (surface smart-routing policies + `proxy.classify` spend, budgets/audit,
