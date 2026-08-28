@@ -11,7 +11,7 @@ Scope (from `docs/AGENTGATEWAY_PORT.md` "Wave 3 — DX & adoption"):
 | **A** | In-console **playground preflight API** — "does my key/route/model work?" with no upstream call/spend.     | ✅     |
 | **B** | Governed **prompt registry** — versioned, audited, hash-chained prompt templates on the GitOps/RBAC rails. | ✅     |
 | **C** | Full **admin CRUD** — PUT/DELETE for the config resources that were create/read-only.                      | ✅     |
-| **D** | Published **OpenAPI** spec + a typed control-API client package.                                           | ⏳     |
+| **D** | Published **OpenAPI** spec + a typed control-API client package.                                           | ✅     |
 | **E** | **Helm chart / one-command deploy** — the one image running either plane.                                  | ⏳     |
 | **F** | **Compliance-as-a-product** — the audit-verify CLI + an auditor attestation export.                        | ⏳     |
 
@@ -85,3 +85,26 @@ Every write goes through the shared `auditedWrite` (deny-by-default RBAC → mut
 hash-chained audit row), so the new verbs are governed and audited exactly like
 create. 5 control-api integration tests (round-trip update+delete, 404s, empty-
 patch 422, provider + workspace delete).
+
+## D — Published OpenAPI + typed client ✅
+
+`@gulley/control-client` — a dependency-free, typed client for the control-plane
+admin API, and the published OpenAPI 3.1 document that describes it:
+
+- **`controlApiOpenApi`** (`src/openapi.ts`) is the single source of truth — 32
+  paths across tenancy / providers / keys / config collections / the prompt
+  registry / GitOps apply / audit verify, each operation tagged, uniquely
+  `operationId`'d, and bearer-secured (`/health` public). `scripts/emit-openapi.ts`
+  serializes it to `docs/openapi/control-api.json` (manual/idempotent, per the
+  no-scheduled-automation rule) for distribution + codegen.
+- **`ControlClient`** — a typed `fetch` wrapper: `createOrg`, `createWorkspace`,
+  `mintKey`/`rotateKey`/`disableKey`, the generic collection CRUD, the full prompt
+  registry (`createPrompt`/`addPromptVersion`/`renderPrompt`/`verifyPromptChain`),
+  `applyConfig`, `verifyAudit`. Sends the admin bearer token, encodes path/query
+  params, omits a body+content-type on GET/DELETE (so it never trips the server's
+  empty-JSON-body 400), and throws `ControlApiError{status, body}` on non-2xx.
+
+8 package tests: the client's verb/path/header/encoding/error behavior (mock
+fetch) and the OpenAPI document's structural invariants (unique operationIds, all
+tags declared, path params match `{…}`, collection CRUD + prompt registry covered,
+public-vs-secured split).

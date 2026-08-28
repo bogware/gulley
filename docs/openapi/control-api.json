@@ -1,0 +1,1713 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Gulley Control API",
+    "version": "1.0.0",
+    "description": "Admin control-plane for the Gulley LLM gateway: orgs/workspaces/providers, virtual keys, workspace-scoped config collections, the governed prompt registry, GitOps config apply, and audit-chain verification. Every write is hash-chain audited."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8081",
+      "description": "local dev"
+    }
+  ],
+  "tags": [
+    {
+      "name": "system",
+      "description": "health/readiness"
+    },
+    {
+      "name": "tenancy",
+      "description": "orgs, workspaces, memberships"
+    },
+    {
+      "name": "providers",
+      "description": "upstream providers + secret-ref credentials"
+    },
+    {
+      "name": "keys",
+      "description": "virtual key lifecycle"
+    },
+    {
+      "name": "config",
+      "description": "workspace-scoped config collections"
+    },
+    {
+      "name": "prompts",
+      "description": "governed, versioned, hash-chained prompt registry"
+    },
+    {
+      "name": "gitops",
+      "description": "declarative config apply"
+    },
+    {
+      "name": "audit",
+      "description": "tamper-evident audit chain"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Admin session token (gses_) or bootstrap token (gadm_)."
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness probe",
+        "operationId": "health",
+        "tags": [
+          "system"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/orgs": {
+      "get": {
+        "summary": "List orgs",
+        "operationId": "list_orgs",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an org",
+        "operationId": "create_org",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      }
+    },
+    "/orgs/{id}": {
+      "delete": {
+        "summary": "Delete an org",
+        "operationId": "delete_org",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      }
+    },
+    "/workspaces": {
+      "get": {
+        "summary": "List workspaces",
+        "operationId": "list_workspaces",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a workspace",
+        "operationId": "create_workspace",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "org not found"
+          }
+        }
+      }
+    },
+    "/workspaces/{id}": {
+      "delete": {
+        "summary": "Delete a workspace",
+        "operationId": "delete_workspace",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/memberships": {
+      "post": {
+        "summary": "Grant a membership",
+        "operationId": "create_membership",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "403": {
+            "description": "no amplification"
+          }
+        }
+      }
+    },
+    "/providers": {
+      "get": {
+        "summary": "List providers",
+        "operationId": "list_providers",
+        "tags": [
+          "providers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Register a provider",
+        "operationId": "create_provider",
+        "tags": [
+          "providers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "workspace not found"
+          },
+          "422": {
+            "description": "egress blocked"
+          }
+        }
+      }
+    },
+    "/providers/{id}": {
+      "delete": {
+        "summary": "Delete a provider",
+        "operationId": "delete_provider",
+        "tags": [
+          "providers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/providers/{id}/credential": {
+      "post": {
+        "summary": "Set a provider credential (secret ARN only)",
+        "operationId": "set_provider_credential",
+        "tags": [
+          "providers"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "422": {
+            "description": "invalid ref"
+          }
+        }
+      }
+    },
+    "/keys": {
+      "get": {
+        "summary": "List a workspace’s keys",
+        "operationId": "list_keys",
+        "tags": [
+          "keys"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Mint a virtual key (token returned once)",
+        "operationId": "mint_key",
+        "tags": [
+          "keys"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "workspace not found"
+          }
+        }
+      }
+    },
+    "/keys/{id}": {
+      "get": {
+        "summary": "Get a key (secret-free view)",
+        "operationId": "get_key",
+        "tags": [
+          "keys"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/keys/{id}/disable": {
+      "post": {
+        "summary": "Revoke (disable) a key",
+        "operationId": "disable_key",
+        "tags": [
+          "keys"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "disabled"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/keys/{id}/rotate": {
+      "post": {
+        "summary": "Rotate a key’s secret (same id)",
+        "operationId": "rotate_key",
+        "tags": [
+          "keys"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "rotated"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/routes": {
+      "get": {
+        "summary": "List routes",
+        "operationId": "list_routes",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a routes entity",
+        "operationId": "create_routes",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      }
+    },
+    "/routes/{id}": {
+      "put": {
+        "summary": "Update a routes entity",
+        "operationId": "update_routes",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a routes entity",
+        "operationId": "delete_routes",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/policies": {
+      "get": {
+        "summary": "List policies",
+        "operationId": "list_policies",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a policies entity",
+        "operationId": "create_policies",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      }
+    },
+    "/policies/{id}": {
+      "put": {
+        "summary": "Update a policies entity",
+        "operationId": "update_policies",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a policies entity",
+        "operationId": "delete_policies",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/budgets": {
+      "get": {
+        "summary": "List budgets",
+        "operationId": "list_budgets",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a budgets entity",
+        "operationId": "create_budgets",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      }
+    },
+    "/budgets/{id}": {
+      "put": {
+        "summary": "Update a budgets entity",
+        "operationId": "update_budgets",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a budgets entity",
+        "operationId": "delete_budgets",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/rate-limits": {
+      "get": {
+        "summary": "List rate-limits",
+        "operationId": "list_rate-limits",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a rate-limits entity",
+        "operationId": "create_rate-limits",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      }
+    },
+    "/rate-limits/{id}": {
+      "put": {
+        "summary": "Update a rate-limits entity",
+        "operationId": "update_rate-limits",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a rate-limits entity",
+        "operationId": "delete_rate-limits",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/guardrails": {
+      "get": {
+        "summary": "List guardrails",
+        "operationId": "list_guardrails",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a guardrails entity",
+        "operationId": "create_guardrails",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      }
+    },
+    "/guardrails/{id}": {
+      "put": {
+        "summary": "Update a guardrails entity",
+        "operationId": "update_guardrails",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a guardrails entity",
+        "operationId": "delete_guardrails",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/model-aliases": {
+      "get": {
+        "summary": "List model-aliases",
+        "operationId": "list_model-aliases",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a model-aliases entity",
+        "operationId": "create_model-aliases",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      }
+    },
+    "/model-aliases/{id}": {
+      "put": {
+        "summary": "Update a model-aliases entity",
+        "operationId": "update_model-aliases",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a model-aliases entity",
+        "operationId": "delete_model-aliases",
+        "tags": [
+          "config"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/prompts": {
+      "get": {
+        "summary": "List prompt summaries",
+        "operationId": "list_prompts",
+        "tags": [
+          "prompts"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a prompt template (v1)",
+        "operationId": "create_prompt",
+        "tags": [
+          "prompts"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "409": {
+            "description": "name conflict"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      }
+    },
+    "/prompts/{id}": {
+      "get": {
+        "summary": "Get a prompt template with its version history",
+        "operationId": "get_prompt",
+        "tags": [
+          "prompts"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a prompt template",
+        "operationId": "delete_prompt",
+        "tags": [
+          "prompts"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/prompts/{id}/versions": {
+      "post": {
+        "summary": "Append a new version",
+        "operationId": "add_prompt_version",
+        "tags": [
+          "prompts"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/prompts/{id}/render": {
+      "post": {
+        "summary": "Render a version with variables",
+        "operationId": "render_prompt",
+        "tags": [
+          "prompts"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "422": {
+            "description": "missing variables"
+          }
+        }
+      }
+    },
+    "/prompts/{id}/verify": {
+      "get": {
+        "summary": "Verify a prompt’s hash chain",
+        "operationId": "verify_prompt_chain",
+        "tags": [
+          "prompts"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          }
+        }
+      }
+    },
+    "/config/apply": {
+      "post": {
+        "summary": "Apply a declarative config document (optimistic concurrency)",
+        "operationId": "apply_config",
+        "tags": [
+          "gitops"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "applied"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "409": {
+            "description": "stale baseVersion"
+          }
+        }
+      }
+    },
+    "/audit/verify": {
+      "get": {
+        "summary": "Verify the audit hash chain",
+        "operationId": "verify_audit",
+        "tags": [
+          "audit"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      }
+    }
+  }
+}

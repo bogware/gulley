@@ -8,3 +8,5 @@ pnpm-lock.yaml
 *.tfstate
 CHANGELOG.md
 packages/storage/migrations
+# Generated artifact (emitted by @gulley/control-client openapi:emit).
+docs/openapi/control-api.json
