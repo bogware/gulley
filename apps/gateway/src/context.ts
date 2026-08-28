@@ -238,6 +238,39 @@ export function buildCache(config: Config, db: Database): CacheEngine {
   return new CacheEngine({ exact, semantic, ttlSeconds: config.CACHE_TTL_SECONDS });
 }
 
+/** Parse `BUDGET_MODEL_CAPS` (JSON map of model id → cap) into a scope→Budget map
+ *  keyed by the `model:<model>` scope the hot path reserves against. Invalid entries
+ *  are dropped (a bad cap must never silently disable the workspace cap). */
+export function parseBudgetModelCaps(
+  raw: string | undefined,
+): Map<string, { capMicroUsd: number; periodSeconds?: number }> {
+  const out = new Map<string, { capMicroUsd: number; periodSeconds?: number }>();
+  if (!raw) return out;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('BUDGET_MODEL_CAPS is not valid JSON');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('BUDGET_MODEL_CAPS must be a JSON object of model → { capMicroUsd }');
+  }
+  for (const [model, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof v !== 'object' || v === null) continue;
+    const cap = (v as Record<string, unknown>)['capMicroUsd'];
+    const period = (v as Record<string, unknown>)['periodSeconds'];
+    if (typeof cap !== 'number' || !Number.isFinite(cap) || cap <= 0) {
+      throw new Error(`BUDGET_MODEL_CAPS["${model}"].capMicroUsd must be a positive number`);
+    }
+    const entry: { capMicroUsd: number; periodSeconds?: number } = { capMicroUsd: cap };
+    if (typeof period === 'number' && Number.isFinite(period) && period > 0) {
+      entry.periodSeconds = period;
+    }
+    out.set(`model:${model}`, entry);
+  }
+  return out;
+}
+
 function anthropicCredential(key: string): UpstreamCredential {
   // sk-ant-... API keys use x-api-key; OAuth / enterprise tokens use bearer.
   return key.startsWith('sk-ant-')
@@ -555,13 +588,25 @@ export function createProductionContext(config: Config): GatewayContext {
   const basicAuth = buildBasicAuth(config);
 
   const db = createDatabase(config.DATABASE_URL);
-  // Budgets need Redis counters; without them, enforcement is simply disabled.
+  // Per-model budget caps (multi-level enforcement) keyed by their `model:<model>`
+  // scope. The set of governed models is what the hot path checks before reserving
+  // the extra scope; the map is the cap source (config, not the DB budget table).
+  const modelCaps = parseBudgetModelCaps(config.BUDGET_MODEL_CAPS);
+  const budgetModelCaps: ReadonlySet<string> = new Set(
+    [...modelCaps.keys()].map((k) => k.slice('model:'.length)),
+  );
+  // Budgets need Redis counters; without them, enforcement is simply disabled —
+  // except for the in-memory store, which we seed with the model caps so multi-level
+  // enforcement still works in the counter-less (single-node/dev) path.
+  const dbCapResolver = createBudgetCapResolver(db);
   const budgets = config.REDIS_COUNTERS_URL
-    ? new RedisBudgetStore(
-        createRedisClient(config.REDIS_COUNTERS_URL),
-        createBudgetCapResolver(db),
+    ? new RedisBudgetStore(createRedisClient(config.REDIS_COUNTERS_URL), (scopeKey) =>
+        // Compose: `model:` scopes resolve from config; everything else from the DB.
+        scopeKey.startsWith('model:')
+          ? Promise.resolve(modelCaps.get(scopeKey) ?? null)
+          : dbCapResolver(scopeKey),
       )
-    : new InMemoryBudgetStore(new Map());
+    : new InMemoryBudgetStore(new Map(modelCaps));
   const otel = initTelemetry({
     endpoint: config.OTEL_EXPORTER_OTLP_ENDPOINT,
     serviceName: config.OTEL_SERVICE_NAME,
@@ -673,6 +718,7 @@ export function createProductionContext(config: Config): GatewayContext {
       config.BUDGET_DOWNSHIFT_MODEL && config.BUDGET_DOWNSHIFT_THRESHOLD > 0
         ? { threshold: config.BUDGET_DOWNSHIFT_THRESHOLD, model: config.BUDGET_DOWNSHIFT_MODEL }
         : undefined,
+    budgetModelCaps: budgetModelCaps.size > 0 ? budgetModelCaps : undefined,
     telemetry,
     guardrails: buildGuardrails(config),
     cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,

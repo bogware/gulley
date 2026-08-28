@@ -119,6 +119,10 @@ const Env = z.object({
   // can still serve) so the workspace degrades gracefully instead of hitting the 402.
   BUDGET_DOWNSHIFT_THRESHOLD: z.coerce.number().min(0).max(1).default(0),
   BUDGET_DOWNSHIFT_MODEL: z.string().optional(),
+  // Per-model budget caps (multi-level enforcement, checked in addition to the
+  // workspace cap; all applicable caps must admit). JSON map of model id to a cap:
+  // {"claude-opus-4-8":{"capMicroUsd":10000000,"periodSeconds":86400}}
+  BUDGET_MODEL_CAPS: z.string().optional(),
   // Redis for the exact cache / Redis Stack vector index (when selected).
   REDIS_CACHE_URL: z.string().url().optional(),
   REDIS_VECTOR_URL: z.string().url().optional(),

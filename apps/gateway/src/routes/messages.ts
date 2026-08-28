@@ -8,7 +8,7 @@ import {
   scopeAllowsProvider,
   scopeGroups,
 } from '@gulley/auth';
-import { type BudgetStore, estimateWorstCaseMicroUsd } from '@gulley/budget';
+import { type BudgetDecision, type BudgetStore, estimateWorstCaseMicroUsd } from '@gulley/budget';
 import {
   type CacheableRequest,
   type CacheEngine,
@@ -124,6 +124,9 @@ export interface GatewayContext {
   /** Budget-aware downshift: at/above `threshold` utilization, rewrite the request
    *  model to the cheaper `model` (must be servable by the route's candidates). */
   budgetDownshift?: { threshold: number; model: string };
+  /** Models that carry their own budget cap (multi-level enforcement). When the
+   *  requested model is in this set, its `model:<model>` scope is reserved too. */
+  budgetModelCaps?: ReadonlySet<string>;
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */
   guardrails?: GuardrailEngine;
@@ -806,51 +809,67 @@ async function handleProxy(
     maxOutput,
     ctx.rateResolver, // price admission identically to commit (no reserve/commit disagreement)
   );
-  let reserved = false;
-  let admittedUtilization = 0; // used/cap from the admission reserve (for budget-aware downshift)
+  // Every budget scope reserved for THIS request (workspace + any per-model cap),
+  // so teardown commits the actual spend to each and a rejection rolls the rest back.
+  const reservedScopes: string[] = [];
+  let admittedUtilization = 0; // used/cap from the workspace reserve (drives downshift)
+
+  // Reject: release any scopes already reserved for this request, then 402.
+  const rejectBudget = async (scope: string, decision: BudgetDecision): Promise<void> => {
+    for (const s of reservedScopes) {
+      try {
+        await ctx.budgets.commit(s, requestId, 0); // release the reservation (spend 0)
+      } catch {
+        /* best-effort rollback */
+      }
+    }
+    reservedScopes.length = 0;
+    request.log.info(
+      { scope, cap: decision.capMicroUsd, used: decision.usedMicroUsd },
+      'budget exceeded',
+    );
+    await ctx.audit.append({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'budget.rejected',
+      target: provider0,
+      payload: {
+        scope,
+        model: requestedModel,
+        capMicroUsd: decision.capMicroUsd,
+        usedMicroUsd: decision.usedMicroUsd,
+        worstCaseMicroUsd: worstCase,
+      },
+    });
+    ctx.telemetry.recordRequest({
+      provider: provider0,
+      requestModel: requestedModel,
+      responseModel: requestedModel,
+      route: candidates[0]?.upstreamPath ?? '',
+      statusCode: 402,
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      streamed: false,
+      startedAtMs: started,
+      guardrailInputFindings: engine ? inputFindings : undefined,
+    });
+    await reply
+      .code(402)
+      .send({ type: 'error', error: { type: 'budget_exceeded', message: 'budget exceeded' } });
+  };
+
+  // Workspace budget: reserve worst-case at admission (hard cap, TOCTOU-safe).
   if (worstCase > 0) {
     const decision = await ctx.budgets.reserve(principal.scope.workspaceId, requestId, worstCase);
     if (decision && !decision.allowed) {
-      request.log.info(
-        { cap: decision.capMicroUsd, used: decision.usedMicroUsd },
-        'budget exceeded',
-      );
-      await ctx.audit.append({
-        orgId: principal.scope.orgId,
-        actor: principal.id,
-        action: 'budget.rejected',
-        target: provider0,
-        payload: {
-          model: requestedModel,
-          capMicroUsd: decision.capMicroUsd,
-          usedMicroUsd: decision.usedMicroUsd,
-          worstCaseMicroUsd: worstCase,
-        },
-      });
-      ctx.telemetry.recordRequest({
-        provider: provider0,
-        requestModel: requestedModel,
-        responseModel: requestedModel,
-        route: candidates[0]?.upstreamPath ?? '',
-        statusCode: 402,
-        status: 'error',
-        inputTokens: 0,
-        outputTokens: 0,
-        costMicroUsd: 0,
-        streamed: false,
-        startedAtMs: started,
-        guardrailInputFindings: engine ? inputFindings : undefined,
-      });
-      await reply
-        .code(402)
-        .send({ type: 'error', error: { type: 'budget_exceeded', message: 'budget exceeded' } });
+      await rejectBudget(principal.scope.workspaceId, decision);
       return;
     }
-    reserved = decision !== null && decision.allowed;
+    if (decision?.allowed) reservedScopes.push(principal.scope.workspaceId);
     if (decision && decision.capMicroUsd > 0) {
       admittedUtilization = decision.usedMicroUsd / decision.capMicroUsd;
-      // Soft-threshold alert on the admitted utilization (fire-and-forget, off the
-      // hot path; the alerter dedups so this is once per level per period).
       try {
         ctx.budgetAlerter?.check(
           principal.scope.workspaceId,
@@ -863,11 +882,9 @@ async function handleProxy(
     }
   }
 
-  // Budget-aware downshift: near the cap, switch to the configured cheaper model so
-  // the workspace degrades gracefully instead of hitting the hard 402. The model
-  // must be servable by this route's candidates (typically a cheaper model on the
-  // same provider). The worst-case reserve stays (over-reserved, released in
-  // teardown); commit prices the actual downshifted model.
+  // Budget-aware downshift: near the cap, switch to the cheaper configured model
+  // (must be servable by this route's candidates). Done BEFORE the per-model reserve
+  // so the model budget is charged for the model actually used.
   const downshift = ctx.budgetDownshift;
   if (
     downshift &&
@@ -881,6 +898,19 @@ async function handleProxy(
     requestedModel = downshift.model;
     parsed['model'] = downshift.model;
     body = Buffer.from(JSON.stringify(parsed), 'utf8');
+  }
+
+  // Per-model budget (multi-level): the model's own cap must also admit. On
+  // rejection the workspace reservation is rolled back so no scope is left holding a
+  // reservation for a request that won't run.
+  if (worstCase > 0 && ctx.budgetModelCaps?.has(requestedModel)) {
+    const modelScope = `model:${requestedModel}`;
+    const md = await ctx.budgets.reserve(modelScope, requestId, worstCase);
+    if (md && !md.allowed) {
+      await rejectBudget(modelScope, md);
+      return;
+    }
+    if (md?.allowed) reservedScopes.push(modelScope);
   }
 
   const controller = new AbortController();
@@ -1323,12 +1353,13 @@ async function handleProxy(
 
     // Release the reservation FIRST and independently of the best-effort durable
     // sinks below — a failed ledger/requestLog/audit write must never leak the
-    // reservation (which would accumulate and DoS the workspace budget).
-    if (reserved) {
+    // reservation (which would accumulate and DoS the budget). Commit the actual
+    // spend to EVERY scope reserved at admission (workspace + any per-model cap).
+    for (const scope of reservedScopes) {
       try {
-        await ctx.budgets.commit(principal.scope.workspaceId, requestId, costMicroUsd);
+        await ctx.budgets.commit(scope, requestId, costMicroUsd);
       } catch (err) {
-        request.log.error({ err }, 'budget commit failed');
+        request.log.error({ err, scope }, 'budget commit failed');
       }
     }
 

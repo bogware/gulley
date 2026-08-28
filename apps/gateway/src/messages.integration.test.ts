@@ -1044,6 +1044,77 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
   });
 
+  it('multi-level: a per-model cap rejects with the workspace reservation rolled back', async () => {
+    const { store, token } = seededStore();
+    // Workspace cap is generous (admits), but the per-model cap for opus is tiny —
+    // max_tokens=1000 reserves well over 500 microUSD against `model:…`, so the
+    // model level rejects even though the workspace level admitted.
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        ['ws_1', { capMicroUsd: 10_000_000 }],
+        ['model:claude-opus-4-8', { capMicroUsd: 500 }],
+      ]),
+    );
+    const { ctx, requestLog } = buildContext(store, budgets);
+    ctx.budgetModelCaps = new Set(['claude-opus-4-8']);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        stream: true,
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    expect(res.status).toBe(402);
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe('budget_exceeded');
+    expect(requestLog.entries).toHaveLength(0); // never dispatched
+
+    // The workspace reservation must have been released on the model-level rejection:
+    // a probe reserving the FULL workspace cap succeeds only if nothing is leaked.
+    const probe = await budgets.reserve('ws_1', 'probe', 10_000_000);
+    expect(probe?.allowed).toBe(true);
+    await app.close();
+  });
+
+  it('multi-level: within both caps, teardown commits the actual to workspace AND model', async () => {
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        ['ws_1', { capMicroUsd: 10_000_000 }],
+        ['model:claude-opus-4-8', { capMicroUsd: 10_000_000 }],
+      ]),
+    );
+    const { ctx } = buildContext(store, budgets);
+    ctx.budgetModelCaps = new Set(['claude-opus-4-8']);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text(); // drain so teardown runs
+
+    const wsSpend = budgets.committed('ws_1');
+    const modelSpend = budgets.committed('model:claude-opus-4-8');
+    expect(wsSpend).toBeGreaterThan(0);
+    expect(modelSpend).toBe(wsSpend); // same actual charged to every reserved scope
+    await app.close();
+  });
+
   it('enforces an RPM limit: 429 with x-ratelimit headers, no upstream call', async () => {
     const { store, token } = seededStore();
     const limiter = new RateLimiter({
