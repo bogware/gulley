@@ -40,6 +40,7 @@ import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulle
 import { OidcProvider } from '@gulley/oidc';
 import { readFileSync } from 'node:fs';
 import type { JwtAuthConfig } from './jwt-auth';
+import { applyRouteGroups, parseRouteGroups } from './route-groups';
 import { buildSecretResolver } from './secrets';
 import { DbTenantCredentialResolver } from './tenant';
 import { RequestTracer } from './tracer';
@@ -441,7 +442,7 @@ export function createProductionContext(config: Config): GatewayContext {
   if (!config.DATABASE_URL) throw new Error('DATABASE_URL is required to run the data plane');
   if (!config.GULLEY_KEY_PEPPER) throw new Error('GULLEY_KEY_PEPPER is required to validate keys');
 
-  const routes = buildRoutes(config);
+  let routes = buildRoutes(config);
   const custom = buildCustomProviders(config);
   routes.push(...custom.routes);
 
@@ -459,6 +460,10 @@ export function createProductionContext(config: Config): GatewayContext {
       strategy: first.strategy,
     });
   }
+
+  // M19: fold ROUTE_GROUPS into multi-target routes so the resilience library
+  // (fallback/loadbalance/breaker/outlier/P2C/HRW/hedge) has >=2 targets to work on.
+  routes = applyRouteGroups(routes, parseRouteGroups(config.ROUTE_GROUPS), config.HEDGE_DELAY_MS);
 
   // In DB config mode the route table is loaded from Postgres by the reload
   // watcher AFTER boot, so an empty env route set is expected — the gateway boots
@@ -660,6 +665,7 @@ export function createProductionContext(config: Config): GatewayContext {
     responseBufferLimit: config.RESPONSE_BUFFER_LIMIT_BYTES,
     bufferFailClosed: config.BUFFER_FAIL_CLOSED,
     chargeOnMissingUsage: config.METER_CHARGE_ON_MISSING_USAGE,
+    hedgeDelayMs: config.HEDGE_DELAY_MS > 0 ? config.HEDGE_DELAY_MS : undefined,
     streamEnforce: config.STREAMING_ENFORCE,
     streamEnforceWindowChars: config.STREAMING_ENFORCE_WINDOW_CHARS,
     headerModifier: config.HEADER_MODIFIER

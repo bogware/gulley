@@ -214,6 +214,16 @@ const Env = z.object({
   // error degrades to in-process embedding, never blocking a reconcile.
   SMART_ROUTING_PERSIST_CENTROIDS: envBool(true),
 
+  // Multi-target routing overlay (M19): a JSON array of route groups that combine
+  // configured single-target provider routes into fallback/loadbalance routes,
+  // turning on the breaker/outlier/P2C/HRW/hedge machinery. See route-groups.ts.
+  // e.g. ROUTE_GROUPS='[{"clientPath":"/v1/messages","mode":"fallback",
+  //   "providers":["anthropic","bedrock"],"onStatusCodes":[429,529]}]'
+  ROUTE_GROUPS: z.string().optional(),
+  // Global pre-first-byte hedge delay (ms) for multi-target routes; 0 = off. A
+  // route group's own hedgeDelayMs overrides this.
+  HEDGE_DELAY_MS: z.coerce.number().int().nonnegative().default(0),
+
   // Load balancing across a loadbalance strategy's targets. When affinity is off
   // (default) the primary pick uses power-of-two-choices least-load over in-flight
   // counts. Setting LB_SESSION_AFFINITY_HEADER pins a session (that header's
