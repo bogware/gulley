@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { Database } from './db';
 import { classifierCentroid } from './schema';
 
@@ -74,6 +74,11 @@ export class PostgresCentroidStore implements CentroidStore {
       model,
       exemplarSha: centroidSha(r.exemplar),
       embedding: r.embedding,
+      // Dual-write the pgvector column so the ANN index (PostgresCentroidIndex) is
+      // populated. save() is the ONLY writer of this table, so the two columns can
+      // never drift. On PGlite (no pgvector) the column degrades to text and the
+      // literal is stored harmlessly.
+      embeddingVec: r.embedding,
     }));
     await this.db
       .insert(classifierCentroid)
@@ -86,5 +91,44 @@ export class PostgresCentroidStore implements CentroidStore {
           classifierCentroid.exemplarSha,
         ],
       });
+  }
+}
+
+/**
+ * pgvector-backed nearest-exemplar index (M22 C). Request-time `nearest` is an
+ * indexed ANN query (`<=>` cosine distance + the HNSW index from migration 0012)
+ * over `classifier_centroid.embedding_vec`, filtered by scope AND embedding model —
+ * O(log N) instead of the {@link InMemoryCentroidIndex}'s O(N) in-JS cosine, so it
+ * scales to large exemplar sets without shipping every vector to every replica.
+ *
+ * Structurally a `CentroidIndex` (the smart router consumes it as one). Fail-open:
+ * any DB error returns `[]`, so `classifyRequest` abstains (→ model router) rather
+ * than erroring — the same never-throw contract as the in-memory path.
+ */
+export class PostgresCentroidIndex {
+  constructor(
+    private readonly db: Database,
+    private readonly model: string,
+  ) {}
+
+  async nearest(
+    scope: string,
+    embedding: number[],
+    topK: number,
+  ): Promise<Array<{ label: string; score: number }>> {
+    try {
+      const literal = `[${embedding.join(',')}]`;
+      const result = await this.db.execute(sql`
+        SELECT label, 1 - (embedding_vec <=> ${literal}::vector) AS score
+        FROM classifier_centroid
+        WHERE scope = ${scope} AND model = ${this.model} AND embedding_vec IS NOT NULL
+        ORDER BY embedding_vec <=> ${literal}::vector
+        LIMIT ${topK}
+      `);
+      const rows = result as unknown as Array<{ label: string; score: number }>;
+      return rows.map((r) => ({ label: r.label, score: Number(r.score) }));
+    } catch {
+      return []; // fail open — classifyRequest abstains rather than throwing
+    }
   }
 }

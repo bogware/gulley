@@ -204,9 +204,17 @@ export const semanticVector = pgTable(
 // for `embedding-nearest-label` smart routing. One row per (policy scope, category
 // label, embedding model, exemplar). The reconciler loads all rows for the active
 // policies once — so a fresh replica reuses these instead of re-embedding every
-// exemplar on boot — and computes cosine nearest-label in memory. The embedding is
-// jsonb (a number[]), not pgvector: no SQL ANN is needed (load-all + in-JS cosine),
-// so it works at any embedding dimension and needs no hand-edited migration.
+// exemplar on boot. The canonical embedding is jsonb (a number[]), which works at
+// any dimension and is the in-memory (load-all + in-JS cosine) fallback.
+//
+// `embeddingVec` (M22 C) is the same vector in a pgvector `vector(256)` column, so
+// request-time nearest-label can be an indexed ANN query (`PostgresCentroidIndex`)
+// instead of an O(N) in-JS scan — the scale win for large exemplar sets. It is
+// fixed at 256 dims (matching the semantic tier + the EMBEDDINGS_DIMENSIONS
+// default); the ANN path is opt-in and guarded off for other dims. Like the
+// semantic tier, the pgvector column + its HNSW cosine index + a backfill are
+// hand-written in migration 0012 (drizzle-kit can't emit the HNSW opclass), and
+// PGlite (no pgvector) simply skips them.
 export const classifierCentroid = pgTable(
   'classifier_centroid',
   {
@@ -216,11 +224,13 @@ export const classifierCentroid = pgTable(
     model: text('model').notNull(),
     exemplarSha: text('exemplar_sha').notNull(),
     embedding: jsonb('embedding').$type<number[]>().notNull(),
+    embeddingVec: vector('embedding_vec', { dimensions: 256 }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     uniqueIndex('classifier_centroid_uniq').on(t.scope, t.label, t.model, t.exemplarSha),
     index('classifier_centroid_scope_idx').on(t.scope),
+    index('classifier_centroid_scope_model_idx').on(t.scope, t.model),
   ],
 );
 

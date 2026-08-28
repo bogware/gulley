@@ -4,6 +4,7 @@ import {
   createClosableDatabase,
   createListenConnection,
   newOriginId,
+  PostgresCentroidIndex,
   PostgresCentroidStore,
   PostgresConfigBus,
   PostgresConfigStore,
@@ -57,6 +58,21 @@ export function buildConfigWatcher(
   // the embedding model, so a model change transparently re-embeds.
   const persistCentroids =
     config.SMART_ROUTING_ENABLED && embedder && config.SMART_ROUTING_PERSIST_CENTROIDS;
+  // pgvector centroid ANN (M22 C): serve request-time nearest-label from an indexed
+  // SQL query instead of an in-memory scan. Requires persistence (the ANN table is
+  // populated by the same save) and pins the embedding dimension to the migration's
+  // vector(256) — a different EMBEDDINGS_DIMENSIONS falls back to the in-memory scan.
+  const annEligible =
+    persistCentroids && config.SMART_ROUTING_CENTROID_ANN && config.EMBEDDINGS_DIMENSIONS === 256;
+  if (
+    persistCentroids &&
+    config.SMART_ROUTING_CENTROID_ANN &&
+    config.EMBEDDINGS_DIMENSIONS !== 256
+  ) {
+    log.info(
+      `centroid ANN disabled: EMBEDDINGS_DIMENSIONS=${config.EMBEDDINGS_DIMENSIONS} != 256 (vector column dim); using in-memory scan`,
+    );
+  }
   const reconciler = new GatewayReconciler(holder, store, resolver, log, {
     enabled: config.SMART_ROUTING_ENABLED,
     embedder,
@@ -64,6 +80,7 @@ export function buildConfigWatcher(
     similarityThreshold: config.SMART_ROUTING_SIMILARITY_THRESHOLD,
     store: persistCentroids ? new PostgresCentroidStore(db) : undefined,
     model: persistCentroids ? config.EMBEDDINGS_MODEL : undefined,
+    annIndex: annEligible ? new PostgresCentroidIndex(db, config.EMBEDDINGS_MODEL) : undefined,
   });
 
   const listen = createListenConnection(config.DATABASE_URL);

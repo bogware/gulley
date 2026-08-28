@@ -1,6 +1,6 @@
 import type { ConfigStore, ConfigVersionStore } from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
-import type { ClassifierBreaker, ClassifierEmbedder } from '@gulley/routing';
+import type { CentroidIndex, ClassifierBreaker, ClassifierEmbedder } from '@gulley/routing';
 import { type CentroidStore, type ConfigSubscriber, SignalGate } from '@gulley/storage';
 import { buildModelRouterFromDocument, buildRoutesFromDocument } from './config-builder';
 import type { RouteHolder } from './routes/messages';
@@ -28,6 +28,9 @@ export interface SmartRoutingReconcile {
   store?: CentroidStore;
   /** Embedding model id keying persisted centroids (a model change re-embeds). */
   model?: string;
+  /** pgvector ANN index (M22 C); present ⇒ request-time nearest-label is an indexed
+   *  SQL query instead of an in-memory scan (requires `store` + `model`). */
+  annIndex?: CentroidIndex;
 }
 
 export interface ReconcileLog {
@@ -82,10 +85,10 @@ export class GatewayReconciler {
       let smartRouter;
       if (this.smartRouting?.enabled) {
         const policies = parseSmartRoutingPolicies(doc);
-        const { embedder, store, model } = this.smartRouting;
+        const { embedder, store, model, annIndex } = this.smartRouting;
         const centroids = embedder
           ? store && model
-            ? await buildPersistentCentroids(policies, embedder, store, model)
+            ? await buildPersistentCentroids(policies, embedder, store, model, annIndex)
             : await buildEmbeddingCentroids(policies, embedder, this.embedCache)
           : undefined;
         smartRouter = buildSmartRouter(policies, routes, {

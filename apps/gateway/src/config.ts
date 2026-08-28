@@ -236,6 +236,11 @@ const Env = z.object({
   // fresh replica reuses them instead of re-embedding on boot. Fail-open: a store
   // error degrades to in-process embedding, never blocking a reconcile.
   SMART_ROUTING_PERSIST_CENTROIDS: envBool(true),
+  // Serve request-time nearest-label from a pgvector ANN index (HNSW, migration
+  // 0012) instead of an in-memory cosine scan — scales to large exemplar sets.
+  // Requires SMART_ROUTING_PERSIST_CENTROIDS and pins EMBEDDINGS_DIMENSIONS to 256
+  // (the vector column dim); any other dim falls back to the in-memory scan.
+  SMART_ROUTING_CENTROID_ANN: envBool(false),
 
   // Multi-target routing overlay (M19): a JSON array of route groups that combine
   // configured single-target provider routes into fallback/loadbalance routes,

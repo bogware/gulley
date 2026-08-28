@@ -32,4 +32,33 @@ tool-calls and base64 images:
   downstream guardrails are unaffected — the adapter still emits canonical Anthropic
   SSE. 12 provider tests.
   | **B** | **`/v1/responses` streaming enforcement** + a durable, encrypted **vault-reversal** path. | ⏳ |
-  | **C** | **pgvector-backed centroid ANN** (M18 persists jsonb + in-JS cosine; scale to large exemplar sets). | ⏳ |
+  | **C** | **pgvector-backed centroid ANN** (M18 persists jsonb + in-JS cosine; scale to large exemplar sets). | ✅ |
+
+## C — pgvector-backed centroid ANN ✅
+
+M16/M18 persisted classifier exemplars as jsonb and ranked nearest-label by an O(N)
+in-JS cosine scan (every vector shipped to every replica). C adds an indexed ANN
+path, mirroring the semantic-cache pgvector tier exactly:
+
+- **Schema + migration**: `classifier_centroid` gains a `embedding_vec vector(256)`
+  column and an HNSW `vector_cosine_ops` index (migration 0012, hand-written like
+  0003 — drizzle-kit can't emit the opclass), plus a `(scope, model)` btree for the
+  ANN filter and a one-time backfill of existing jsonb rows. The jsonb `embedding`
+  stays as the canonical value + in-memory fallback.
+- **Dual-write, single writer**: `save()` (the table's only writer, so the columns
+  can't drift) writes both `embedding` and `embedding_vec`. On PGlite (no pgvector)
+  the column degrades to `text` and the literal stores harmlessly; the pg-test
+  sanitizers skip the `CREATE EXTENSION` / `USING hnsw` / `::vector` backfill.
+- **`PostgresCentroidIndex`**: request-time `nearest` is a `<=>` cosine ANN query
+  filtered by scope AND embedding model, structurally a `CentroidIndex`. **Fail-open**
+  (any DB error → `[]`, so `classifyRequest` abstains → model router — the same
+  never-throw contract as the in-memory path).
+- **Wiring**: `buildPersistentCentroids` (overloaded) still embeds + persists but
+  returns the ANN index when one is supplied; `config-reload` builds it under
+  `SMART_ROUTING_CENTROID_ANN` (opt-in) **only when `EMBEDDINGS_DIMENSIONS === 256`**
+  (the vector column dim) — any other dim logs and falls back to the in-memory scan.
+
+3 storage unit tests (row mapping, score coercion, fail-open) + the ANN-index build
+path + the existing jsonb pg-test (dual-write confirmed working under PGlite). The
+`<=>` distance itself is validated in prod/live, like the semantic tier (PGlite has
+no pgvector).

@@ -195,4 +195,25 @@ describe('buildPersistentCentroids', () => {
     const idx = await buildPersistentCentroids([embPolicy({ code: ['x'] })], { embed }, store, 'm');
     expect(idx.size('p')).toBe(1);
   });
+
+  it('returns the ANN index (not the in-memory one) but still embeds + persists', async () => {
+    const embed = vi.fn(async () => [1, 0]);
+    const store = new FakeCentroidStore();
+    const annIndex = {
+      nearest: vi.fn(async () => [{ label: 'from-ann', score: 0.99 }]),
+    };
+    const idx = await buildPersistentCentroids(
+      [embPolicy({ code: ['write a function'] })],
+      { embed },
+      store,
+      'm1',
+      annIndex,
+    );
+    // The embed+persist work still ran (the ANN table is populated by save)...
+    expect(embed).toHaveBeenCalledTimes(1);
+    expect(store.rows).toHaveLength(1);
+    // ...but the SERVED index is the ANN one, not an InMemoryCentroidIndex.
+    expect(idx).toBe(annIndex);
+    expect((await idx.nearest('p', [1, 0], 1))[0]?.label).toBe('from-ann');
+  });
 });

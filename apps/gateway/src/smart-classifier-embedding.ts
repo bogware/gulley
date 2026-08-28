@@ -94,7 +94,24 @@ export async function buildPersistentCentroids(
   embedder: ClassifierEmbedder,
   store: CentroidStore,
   model: string,
-): Promise<InMemoryCentroidIndex> {
+): Promise<InMemoryCentroidIndex>;
+export async function buildPersistentCentroids(
+  policies: readonly SmartRoutingPolicy<string>[],
+  embedder: ClassifierEmbedder,
+  store: CentroidStore,
+  model: string,
+  annIndex: CentroidIndex | undefined,
+): Promise<CentroidIndex>;
+export async function buildPersistentCentroids(
+  policies: readonly SmartRoutingPolicy<string>[],
+  embedder: ClassifierEmbedder,
+  store: CentroidStore,
+  model: string,
+  /** When provided (M22 C), request-time nearest is served by this pgvector ANN
+   *  index instead of the in-memory scan. The embed-and-persist work below still
+   *  runs (it populates the ANN table); only the RETURNED index differs. */
+  annIndex?: CentroidIndex,
+): Promise<CentroidIndex> {
   const index = new InMemoryCentroidIndex();
   const embeddingPolicies = policies.filter(
     (p) => p.classifier.mode === 'embedding-nearest-label' && p.classifier.exemplars,
@@ -145,5 +162,8 @@ export async function buildPersistentCentroids(
       /* best-effort persist — the in-memory index is already complete */
     }
   }
-  return index;
+  // With an ANN index, request-time nearest queries pgvector (populated by the
+  // save above); the in-memory index we built is discarded. Without one, the
+  // in-memory index is the served path (the M18 behavior).
+  return annIndex ?? index;
 }

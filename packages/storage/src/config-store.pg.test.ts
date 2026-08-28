@@ -69,6 +69,7 @@ async function applyMigrations(pg: PGlite): Promise<void> {
       if (!stmt) continue;
       if (/create extension.*vector/i.test(stmt)) continue; // no pgvector in pglite
       if (/using hnsw/i.test(stmt)) continue; // vector index — not needed here
+      if (/::vector/i.test(stmt)) continue; // pglite has no ::vector cast (0012 backfill)
       stmt = stmt.replace(/vector\(\d+\)/gi, 'text'); // embedding col → text
       await pg.exec(stmt);
     }
