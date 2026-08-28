@@ -121,6 +121,9 @@ export interface GatewayContext {
   budgets: BudgetStore;
   /** Soft-threshold budget alerter (metric + webhook); absent = no alerts. */
   budgetAlerter?: { check(workspaceId: string, usedMicroUsd: number, capMicroUsd: number): void };
+  /** Budget-aware downshift: at/above `threshold` utilization, rewrite the request
+   *  model to the cheaper `model` (must be servable by the route's candidates). */
+  budgetDownshift?: { threshold: number; model: string };
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */
   guardrails?: GuardrailEngine;
@@ -804,6 +807,7 @@ async function handleProxy(
     ctx.rateResolver, // price admission identically to commit (no reserve/commit disagreement)
   );
   let reserved = false;
+  let admittedUtilization = 0; // used/cap from the admission reserve (for budget-aware downshift)
   if (worstCase > 0) {
     const decision = await ctx.budgets.reserve(principal.scope.workspaceId, requestId, worstCase);
     if (decision && !decision.allowed) {
@@ -843,9 +847,10 @@ async function handleProxy(
       return;
     }
     reserved = decision !== null && decision.allowed;
-    // Soft-threshold alert on the admitted utilization (fire-and-forget, off the
-    // hot path; the alerter dedups so this is once per level per period).
-    if (decision) {
+    if (decision && decision.capMicroUsd > 0) {
+      admittedUtilization = decision.usedMicroUsd / decision.capMicroUsd;
+      // Soft-threshold alert on the admitted utilization (fire-and-forget, off the
+      // hot path; the alerter dedups so this is once per level per period).
       try {
         ctx.budgetAlerter?.check(
           principal.scope.workspaceId,
@@ -856,6 +861,26 @@ async function handleProxy(
         /* never let an alert affect a request */
       }
     }
+  }
+
+  // Budget-aware downshift: near the cap, switch to the configured cheaper model so
+  // the workspace degrades gracefully instead of hitting the hard 402. The model
+  // must be servable by this route's candidates (typically a cheaper model on the
+  // same provider). The worst-case reserve stays (over-reserved, released in
+  // teardown); commit prices the actual downshifted model.
+  const downshift = ctx.budgetDownshift;
+  if (
+    downshift &&
+    admittedUtilization >= downshift.threshold &&
+    requestedModel !== downshift.model
+  ) {
+    request.log.info(
+      { from: requestedModel, to: downshift.model, utilization: admittedUtilization },
+      'budget-aware model downshift',
+    );
+    requestedModel = downshift.model;
+    parsed['model'] = downshift.model;
+    body = Buffer.from(JSON.stringify(parsed), 'utf8');
   }
 
   const controller = new AbortController();

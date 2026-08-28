@@ -114,6 +114,11 @@ const Env = z.object({
   // before the hard 402. Absent webhook = metric only.
   BUDGET_ALERT_WEBHOOK_URL: z.string().url().optional(),
   BUDGET_ALERT_THRESHOLDS: z.string().default('0.8,0.9'),
+  // Budget-aware routing downshift: at/above this utilization (0..1, 0 = off) the
+  // request model is rewritten to BUDGET_DOWNSHIFT_MODEL (a cheaper model the route
+  // can still serve) so the workspace degrades gracefully instead of hitting the 402.
+  BUDGET_DOWNSHIFT_THRESHOLD: z.coerce.number().min(0).max(1).default(0),
+  BUDGET_DOWNSHIFT_MODEL: z.string().optional(),
   // Redis for the exact cache / Redis Stack vector index (when selected).
   REDIS_CACHE_URL: z.string().url().optional(),
   REDIS_VECTOR_URL: z.string().url().optional(),

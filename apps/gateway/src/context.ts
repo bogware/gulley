@@ -669,6 +669,10 @@ export function createProductionContext(config: Config): GatewayContext {
       : undefined,
     budgets,
     budgetAlerter,
+    budgetDownshift:
+      config.BUDGET_DOWNSHIFT_MODEL && config.BUDGET_DOWNSHIFT_THRESHOLD > 0
+        ? { threshold: config.BUDGET_DOWNSHIFT_THRESHOLD, model: config.BUDGET_DOWNSHIFT_MODEL }
+        : undefined,
     telemetry,
     guardrails: buildGuardrails(config),
     cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,

@@ -779,6 +779,30 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     return { store, token: gen.token };
   };
 
+  it('downshifts the model to a cheaper one near the budget cap', async () => {
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+    await budgets.reserve('ws_1', 'seed', 8_200_000);
+    await budgets.commit('ws_1', 'seed', 8_200_000); // 82% used — above the 0.8 threshold
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).then((r) => r.text());
+    // Near the cap, the expensive model is rewritten to the cheaper one upstream.
+    expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5');
+    await app.close();
+  });
+
   const openaiRoute = (): ProviderRoute => ({
     clientPaths: ['/v1/chat/completions'],
     createExtractor: () => new OpenAIUsageExtractor(),
