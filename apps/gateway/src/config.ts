@@ -285,6 +285,9 @@ const Env = z.object({
   // Two-tier response cache. Off by default; opt in per deployment.
   CACHE_ENABLED: envBool(false),
   CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+  // Reclaim expired Postgres exact-cache rows (semantic_vector cascades) so the
+  // table + pgvector index don't grow unbounded. 0 disables the sweeper.
+  CACHE_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(300),
   CACHE_SEMANTIC_ENABLED: envBool(false),
   CACHE_SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.92),
   // Vector index backing the semantic tier: pgvector (default), in-memory, or

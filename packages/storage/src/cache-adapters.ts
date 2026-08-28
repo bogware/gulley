@@ -1,5 +1,5 @@
 import type { CachedResponse, ExactCacheStore, VectorIndex, VectorMatch } from '@gulley/cache';
-import { and, eq, gt, sql } from 'drizzle-orm';
+import { and, eq, gt, lt, sql } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import type { Database } from './db';
 import { cacheEntry, semanticVector } from './schema';
@@ -9,9 +9,18 @@ function scopeOf(key: string): string {
 }
 
 /** Postgres exact cache — the durable, multi-node default. Body is base64 so
- *  binary SSE survives; reads filter out expired rows (a sweeper reclaims them). */
+ *  binary SSE survives; reads filter out expired rows, and {@link sweepExpired}
+ *  reclaims them (without it, unique/expired keys grow the table + pgvector index
+ *  unbounded — only the Redis tier's native TTL reclaims otherwise). */
 export class PostgresExactCache implements ExactCacheStore {
   constructor(private readonly db: Database) {}
+
+  /** Delete expired rows (semantic_vector rows cascade). Returns rows removed.
+   *  Call periodically from a maintenance loop. */
+  async sweepExpired(now: Date = new Date()): Promise<number> {
+    const res = await this.db.delete(cacheEntry).where(lt(cacheEntry.expiresAt, now));
+    return (res as { rowCount?: number }).rowCount ?? 0;
+  }
 
   async get(key: string): Promise<CachedResponse | null> {
     const rows = await this.db

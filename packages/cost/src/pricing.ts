@@ -38,6 +38,17 @@ export const OPENAI_PRICING: Readonly<Record<string, ModelRate>> = {
   'gpt-4.1-nano': { input: 0.1, output: 0.4 },
 };
 
+// --- Google Gemini / Vertex (flat per-model seeds; context-length tiers are a
+// separate follow-on, and the models.dev catalog resolver overrides these). ---
+export const GEMINI_PRICING: Readonly<Record<string, ModelRate>> = {
+  'gemini-2.5-pro': { input: 1.25, output: 10 },
+  'gemini-2.5-flash': { input: 0.3, output: 2.5 },
+  'gemini-2.5-flash-lite': { input: 0.1, output: 0.4 },
+  'gemini-2.0-flash': { input: 0.1, output: 0.4 },
+  'gemini-1.5-pro': { input: 1.25, output: 5 },
+  'gemini-1.5-flash': { input: 0.075, output: 0.3 },
+};
+
 export const CACHE_MULTIPLIERS = {
   read: 0.1,
   write5m: 1.25,
@@ -67,6 +78,16 @@ function normalizeBedrockModel(model: string): string {
     .replace(/^anthropic\./, '')
     .replace(/-v\d+:\d+$/, '')
     .replace(/-\d{8}$/, '');
+}
+
+/** Gemini/Vertex model ids may carry a `models/` or `publishers/google/models/`
+ *  prefix and a `-latest` or `-NNN` snapshot suffix; pricing is keyed by alias. */
+function normalizeGeminiModel(model: string): string {
+  return model
+    .replace(/^publishers\/google\/models\//, '')
+    .replace(/^models\//, '')
+    .replace(/-latest$/, '')
+    .replace(/-\d{3,}$/, '');
 }
 
 export function lookupRate(model: string): ModelRate | undefined {
@@ -112,5 +133,18 @@ export const PROVIDER_PRICING: Readonly<Record<string, ProviderPricing>> = {
     rates: OPENAI_PRICING,
     cache: { read: 0.5, write5m: 1.0, write1h: 1.0 },
     normalize: normalizeOpenAIModel,
+  },
+  gemini: {
+    // Gemini context caching bills cached input at ~0.25x; no separate write charge.
+    rates: GEMINI_PRICING,
+    cache: { read: 0.25, write5m: 1.0, write1h: 1.0 },
+    normalize: normalizeGeminiModel,
+  },
+  vertex: {
+    // Gemini-on-Vertex uses the same rates (Claude-on-Vertex would fall through to
+    // the unknown floor until seeded — safe, never $0).
+    rates: GEMINI_PRICING,
+    cache: { read: 0.25, write5m: 1.0, write1h: 1.0 },
+    normalize: normalizeGeminiModel,
   },
 };

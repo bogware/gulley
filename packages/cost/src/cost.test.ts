@@ -103,6 +103,24 @@ describe('computeCost (provider-generic)', () => {
     expect(c.totalInputTokens).toBe(2_000_000);
   });
 
+  it('prices Gemini and Vertex from the seed (no longer $0)', () => {
+    const usage = {
+      inputTokens: 1_000_000,
+      cacheReadTokens: 0,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      outputTokens: 1_000_000,
+      seen: true,
+    };
+    const g = computeCost('gemini', 'gemini-2.5-flash', usage); // $0.30 in / $2.50 out
+    expect(g.priced).toBe(true);
+    expect(g.totalUsd).toBeCloseTo(2.8, 6);
+    // Vertex shares the Gemini rates, and a models/ prefix normalizes to the alias.
+    const v = computeCost('vertex', 'models/gemini-2.5-pro', usage); // $1.25 / $10
+    expect(v.priced).toBe(true);
+    expect(v.totalUsd).toBeCloseTo(11.25, 6);
+  });
+
   it('normalizes OpenAI dated snapshots to the alias', () => {
     const c = computeCost('openai', 'gpt-4o-mini-2024-07-18', {
       inputTokens: 1_000_000,

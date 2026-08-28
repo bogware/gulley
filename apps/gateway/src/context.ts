@@ -184,8 +184,17 @@ export function buildCache(config: Config, db: Database): CacheEngine {
         throw new Error('REDIS_CACHE_URL required for the redis exact cache');
       exact = new RedisExactCache(createRedisClient(config.REDIS_CACHE_URL));
       break;
-    default:
-      exact = new PostgresExactCache(db);
+    default: {
+      const pg = new PostgresExactCache(db);
+      exact = pg;
+      if (config.CACHE_SWEEP_INTERVAL_SECONDS > 0) {
+        const timer = setInterval(
+          () => void pg.sweepExpired().catch(() => {}),
+          config.CACHE_SWEEP_INTERVAL_SECONDS * 1000,
+        );
+        timer.unref?.(); // best-effort maintenance; never keeps the process alive
+      }
+    }
   }
 
   let semantic: { embed: EmbeddingProvider; index: VectorIndex; threshold: number } | undefined;
