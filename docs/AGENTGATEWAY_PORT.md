@@ -244,11 +244,16 @@ Two Tier-1 follow-ons, completing M16/M17's asterisks.
   keyed by embedding model, fail-open at every layer
   (`SMART_ROUTING_PERSIST_CENTROIDS`).
 
-## M19 — Wave 1 "Make it real" (from the killer-feature review) — 🚧 IN PROGRESS
+## M19 — Wave 1 "Make it real" (from the killer-feature review) — 🚧 CORE LANDED
 
 The Aug-2026 principal review found the engine is world-class but several headline
 features are built-but-unwired. Wave 1 turns them on + clears the P0/P1 correctness
-backlog. See `docs/M19_WAVE1.md` for the landed-vs-remaining tracker.
+backlog. **Slices A–H are on `main`** (correctness, working analytics, cache/cost
+durability, docs truth pass, multi-target routing overlay + hedging, durable
+virtual-key list/revoke/rotate, DB model aliases, native input-guardrail + reversible
+vault). The remaining follow-ons are infra-heavy (native Gemini/Vertex config-schema,
+`request_log`/`spend_ledger` partitioning+rollups, budget self-heal, doc-native
+routing/guardrail forms, TTFT metric). See `docs/M19_WAVE1.md` for the tracker.
 
 - **M19 A — correctness (✅):** reserve/commit price parity (admission now uses the
   catalog resolver — no spurious 402s on Gemini/Vertex/Groq); Anthropic multi-block
