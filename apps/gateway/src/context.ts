@@ -45,7 +45,6 @@ import { buildSecretResolver } from './secrets';
 import { DbTenantCredentialResolver } from './tenant';
 import { RequestTracer } from './tracer';
 import {
-  auditOnlyPolicies,
   AzureContentSafetyPlugin,
   composePlugins,
   GuardrailEngine,
@@ -162,7 +161,10 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
   return new GuardrailEngine(
     [new NativeDetector({ entropy: config.GUARDRAILS_ENTROPY })],
     {
-      input: auditOnlyPolicies().input,
+      input: {
+        action: config.GUARDRAILS_INPUT_ACTION,
+        minConfidence: config.GUARDRAILS_INPUT_MIN_CONFIDENCE,
+      },
       output: {
         action: config.GUARDRAILS_OUTPUT_ACTION,
         minConfidence: config.GUARDRAILS_OUTPUT_MIN_CONFIDENCE,

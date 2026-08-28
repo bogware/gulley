@@ -133,6 +133,11 @@ const Env = z.object({
   // (holdStreamedOutput) or STREAMING_ENFORCE (windowed in-stream redaction, M17).
   GUARDRAILS_OUTPUT_ACTION: z.enum(['audit', 'block', 'mask', 'redact']).default('audit'),
   GUARDRAILS_OUTPUT_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
+  // Input-direction native enforcement: `mask` reversibly tokenizes PII/secrets to
+  // the provider and detokenizes on the way back (the reversible vault round-trip);
+  // `block` rejects; `redact` irreversibly replaces. Default `audit` (record only).
+  GUARDRAILS_INPUT_ACTION: z.enum(['audit', 'block', 'mask', 'redact']).default('audit'),
+  GUARDRAILS_INPUT_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
   // M17: windowed in-stream enforcement of the output policy on Anthropic-canonical
   // streamed responses (redact matched spans / block on first violation), trading
   // raw-byte-fidelity + a bounded delay for enforcement. Off by default.

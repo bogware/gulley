@@ -1636,6 +1636,71 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       })
       .join('');
 
+  it('masks input PII to the provider and detokenizes it back to the client (input vault)', async () => {
+    // Upstream echoes the (masked) prompt text back so the response-side detok can
+    // restore it — proving the full mask→provider→detokenize→client round-trip.
+    let upstreamBody = '';
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        upstreamBody = Buffer.concat(chunks).toString('utf8');
+        const body = JSON.parse(upstreamBody) as { messages?: Array<{ content?: string }> };
+        const echoed = body.messages?.[0]?.content ?? '';
+        const sse =
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5}}}\n\n' +
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n' +
+          'event: content_block_delta\ndata: ' +
+          JSON.stringify({
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: echoed },
+          }) +
+          '\n\n' +
+          'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"output_tokens":5}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(sse);
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('mask', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'contact jane@example.com please' }],
+      }),
+    });
+    const text = await res.text();
+
+    // The provider saw the masked token, not the raw email; the client sees it restored.
+    expect(upstreamBody).not.toContain('jane@example.com');
+    expect(upstreamBody).toContain('<<GULLEY_EMAIL_');
+    expect(clientText(text)).toContain('jane@example.com');
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
   it('charges worst-case when a 2xx stream emits no usage and the knob is on', async () => {
     // An OpenAI-compatible stream with NO usage chunk (the backend didn't set
     // stream_options.include_usage). seen stays false → without the knob this bills
