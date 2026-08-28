@@ -128,6 +128,7 @@ function buildContext(
       audit,
       breaker,
       budgets,
+      playgroundEnabled: true,
       telemetry: initTelemetry({}),
     },
     ledger,
@@ -2546,6 +2547,176 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       expect(r.headers.get('x-gulley-target')).toBe(pinned); // sticky
     }
 
+    await app.close();
+  });
+});
+
+function restrictedStore(allowedModels: readonly string[] | '*'): {
+  store: InMemoryKeyStore;
+  token: string;
+} {
+  const store = new InMemoryKeyStore();
+  const gen = generateVirtualKey(PEPPER);
+  store.add({
+    id: 'vk_1',
+    keyPrefix: gen.keyPrefix,
+    keyHash: gen.keyHash,
+    orgId: 'org_1',
+    workspaceId: 'ws_1',
+    displayName: 'restricted',
+    epoch: 0,
+    disabled: false,
+    expiresAt: null,
+    allowedProviders: '*',
+    allowedModels,
+  });
+  return { store, token: gen.token };
+}
+
+interface PlaygroundResult {
+  ok: boolean;
+  model: { requested: string; resolved: string };
+  authz: { modelAllowed: boolean; providerAllowed: boolean; provider?: string };
+  route: { target: string; provider: string; upstreamPath: string } | null;
+  guardrails:
+    | { enabled: false }
+    | { enabled: true; findings: number; categories: Record<string, number>; wouldBlock: boolean };
+  cost: { estimatedWorstCaseMicroUsd: number };
+  budget: { checked: boolean; allowed?: boolean; capMicroUsd?: number; usedMicroUsd?: number };
+}
+
+describe('POST /v1/playground/verify (preflight, no upstream spend)', () => {
+  const verify = async (
+    base: string,
+    token: string | undefined,
+    body: unknown,
+  ): Promise<Response> =>
+    fetch(`${base}/v1/playground/verify`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(token ? { 'x-api-key': token } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+
+  it('reports a working key/route/model without calling upstream', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await verify(base, token, {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as PlaygroundResult;
+    expect(json.ok).toBe(true);
+    expect(json.authz.modelAllowed).toBe(true);
+    expect(json.authz.providerAllowed).toBe(true);
+    expect(json.route).toEqual({
+      target: 'anthropic',
+      provider: 'anthropic',
+      upstreamPath: '/v1/messages',
+    });
+    expect(json.cost.estimatedWorstCaseMicroUsd).toBeGreaterThan(0);
+    expect(requestLog.entries).toHaveLength(0); // never proxied
+    await app.close();
+  });
+
+  it('401s an invalid key', async () => {
+    const { store } = seededStore();
+    const { ctx } = buildContext(store);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await verify(base, 'gk_not_a_real_key', {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(res.status).toBe(401);
+    await app.close();
+  });
+
+  it('reports ok:false when the model is out of the key scope', async () => {
+    const { store, token } = restrictedStore(['claude-haiku-4-5']);
+    const { ctx } = buildContext(store);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await verify(base, token, {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const json = (await res.json()) as PlaygroundResult;
+    expect(res.status).toBe(200);
+    expect(json.ok).toBe(false);
+    expect(json.authz.modelAllowed).toBe(false);
+    expect(json.route).toBeNull();
+    await app.close();
+  });
+
+  it('peeks the budget and rolls the reservation back (no net spend)', async () => {
+    const { store, token } = seededStore();
+    // Tiny cap so the worst-case can't fit: budget.allowed must be false.
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 500 }]]));
+    const { ctx } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await verify(base, token, {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const json = (await res.json()) as PlaygroundResult;
+    expect(json.budget.checked).toBe(true);
+    expect(json.budget.allowed).toBe(false);
+    expect(json.ok).toBe(false);
+
+    // The peek must not have leaked a reservation: committed stays 0 and a fresh
+    // reserve of the whole cap still succeeds.
+    expect(budgets.committed('ws_1')).toBe(0);
+    const probe = await budgets.reserve('ws_1', 'probe', 500);
+    expect(probe?.allowed).toBe(true);
+    await app.close();
+  });
+
+  it('surfaces a would-block guardrail verdict', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.guardrails = new GuardrailEngine([new NativeDetector({})], {
+      input: { action: 'block' },
+      output: { action: 'audit' },
+    });
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await verify(base, token, {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'my email is test@example.com and SSN 123-45-6789' }],
+    });
+    const json = (await res.json()) as PlaygroundResult;
+    expect(json.guardrails.enabled).toBe(true);
+    if (json.guardrails.enabled) {
+      expect(json.guardrails.findings).toBeGreaterThan(0);
+      expect(json.guardrails.wouldBlock).toBe(true);
+    }
+    expect(json.ok).toBe(false);
+    await app.close();
+  });
+
+  it('404s when the playground is disabled', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.playgroundEnabled = false;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await verify(base, token, {
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(res.status).toBe(404);
     await app.close();
   });
 });

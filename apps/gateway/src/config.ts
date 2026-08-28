@@ -303,6 +303,11 @@ const Env = z.object({
   DEBUG_TRACE_TOKEN: z.string().optional(),
   DEBUG_TRACE_BUFFER: z.coerce.number().int().positive().default(200),
 
+  // Playground preflight (POST /v1/playground/verify): the first-run "does my
+  // key/route/model work?" check. Authenticates the caller's virtual key and
+  // reports authz/route/guardrail/cost/budget WITHOUT any upstream call or spend.
+  PLAYGROUND_ENABLED: envBool(true),
+
   // Request-log batching — buffer operational log writes off the hot-path
   // teardown and flush in bulk. The durable spend ledger stays synchronous.
   LOG_BATCH_MAX: z.coerce.number().int().positive().default(100),

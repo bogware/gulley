@@ -719,6 +719,7 @@ export function createProductionContext(config: Config): GatewayContext {
         ? { threshold: config.BUDGET_DOWNSHIFT_THRESHOLD, model: config.BUDGET_DOWNSHIFT_MODEL }
         : undefined,
     budgetModelCaps: budgetModelCaps.size > 0 ? budgetModelCaps : undefined,
+    playgroundEnabled: config.PLAYGROUND_ENABLED,
     telemetry,
     guardrails: buildGuardrails(config),
     cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,

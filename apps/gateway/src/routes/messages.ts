@@ -70,6 +70,7 @@ import {
   type TraceContext,
 } from '@gulley/telemetry';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { handlePlaygroundVerify } from './playground';
 import type { Readable, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
@@ -202,6 +203,9 @@ export interface GatewayContext {
   /** Multi-tenant upstream credentials — resolves a tenant's own provider key by
    *  workspace; absent = every tenant uses the gateway's default credential. */
   tenantCredentials?: TenantCredentialResolver;
+  /** Serve the POST /v1/playground/verify preflight (no upstream call, no spend).
+   *  Off leaves the endpoint 404 so it can be disabled in locked-down deployments. */
+  playgroundEnabled?: boolean;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -286,6 +290,12 @@ export function registerRoutes(app: FastifyInstance, holder: RouteHolder): void 
   const modelsHandler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
     handleModels(holder.ctx, req, reply);
   for (const path of ['/v1/models', '/openai/v1/models']) app.get(path, modelsHandler);
+
+  // Playground preflight — a static POST route, so it wins over the `/*` proxy
+  // dispatcher. Reuses the real pipeline components but never proxies or spends.
+  app.post('/v1/playground/verify', (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
+    handlePlaygroundVerify(holder, req, reply),
+  );
 
   // Live request tracer over SSE — only when enabled + token-guarded.
   if (holder.ctx.tracer && holder.ctx.debugTraceToken) {
