@@ -392,7 +392,100 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         return reply.send({ entities });
       }),
     );
+    // Update (name and/or config) — scope resolved from the stored entity's
+    // workspace, never the request body, so a caller can't forge an orgId.
+    app.put(
+      `/${c.path}/:id`,
+      adminRoute(ctx, async (request, reply, admin) => {
+        const id = paramId(request);
+        const existing = ctx.collections[c.kind].get(id);
+        if (!existing) return notFound(reply, c.resource);
+        const at = scopeForWorkspace(ctx, existing.workspaceId);
+        if (!at) return notFound(reply, 'workspace');
+        const b = body(request);
+        const patch: { name?: string; config?: Record<string, unknown> } = {};
+        const name = str(b['name']);
+        if (name) patch.name = name;
+        if (b['config'] && typeof b['config'] === 'object') {
+          const config = b['config'] as Record<string, unknown>;
+          try {
+            assertNoInlineSecret(config);
+          } catch (e) {
+            return reply
+              .code(422)
+              .send({ error: { type: 'inline_secret', message: (e as Error).message } });
+          }
+          patch.config = config;
+        }
+        if (patch.name === undefined && patch.config === undefined)
+          return invalid(reply, 'name or config required');
+        const r = await auditedWrite(ctx, admin, {
+          perm: `${c.resource}:update` as Permission,
+          at,
+          action: `${c.kind}.update`,
+          target: id,
+          diff: { name: patch.name ?? existing.name },
+          mutate: () => ctx.collections[c.kind].update(id, patch),
+        });
+        return r.ok ? reply.send({ entity: r.value }) : forbidden(reply);
+      }),
+    );
+    app.delete(
+      `/${c.path}/:id`,
+      adminRoute(ctx, async (request, reply, admin) => {
+        const id = paramId(request);
+        const existing = ctx.collections[c.kind].get(id);
+        if (!existing) return notFound(reply, c.resource);
+        const at = scopeForWorkspace(ctx, existing.workspaceId);
+        if (!at) return notFound(reply, 'workspace');
+        const r = await auditedWrite(ctx, admin, {
+          perm: `${c.resource}:delete` as Permission,
+          at,
+          action: `${c.kind}.delete`,
+          target: id,
+          diff: { id, name: existing.name },
+          mutate: () => ctx.collections[c.kind].delete(id),
+        });
+        return r.ok ? reply.send({ deleted: r.value }) : forbidden(reply);
+      }),
+    );
   }
+
+  // --- provider + workspace deletion (create/read existed; close the lifecycle) ---
+  app.delete(
+    '/providers/:id',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      const at = scopeForProvider(ctx, id);
+      if (!at) return notFound(reply, 'provider');
+      const r = await auditedWrite(ctx, admin, {
+        perm: 'provider:delete',
+        at,
+        action: 'provider.delete',
+        target: id,
+        diff: { id },
+        mutate: () => ctx.providers.delete(id),
+      });
+      return r.ok ? reply.send({ deleted: r.value }) : forbidden(reply);
+    }),
+  );
+  app.delete(
+    '/workspaces/:id',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      const at = scopeForWorkspace(ctx, id);
+      if (!at) return notFound(reply, 'workspace');
+      const r = await auditedWrite(ctx, admin, {
+        perm: 'workspace:delete',
+        at,
+        action: 'workspace.delete',
+        target: id,
+        diff: { id },
+        mutate: () => ctx.workspaces.delete(id),
+      });
+      return r.ok ? reply.send({ deleted: r.value }) : forbidden(reply);
+    }),
+  );
 
   // --- governed prompt registry (versioned, hash-chained templates) ---
   const promptScope = (id: string): { at: ReturnType<typeof scopeForWorkspace>; wsId?: string } => {

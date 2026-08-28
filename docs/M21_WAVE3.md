@@ -10,7 +10,7 @@ Scope (from `docs/AGENTGATEWAY_PORT.md` "Wave 3 — DX & adoption"):
 | ----- | ---------------------------------------------------------------------------------------------------------- | ------ |
 | **A** | In-console **playground preflight API** — "does my key/route/model work?" with no upstream call/spend.     | ✅     |
 | **B** | Governed **prompt registry** — versioned, audited, hash-chained prompt templates on the GitOps/RBAC rails. | ✅     |
-| **C** | Full **admin CRUD** — PUT/DELETE for the config resources that were create/read-only.                      | ⏳     |
+| **C** | Full **admin CRUD** — PUT/DELETE for the config resources that were create/read-only.                      | ✅     |
 | **D** | Published **OpenAPI** spec + a typed control-API client package.                                           | ⏳     |
 | **E** | **Helm chart / one-command deploy** — the one image running either plane.                                  | ⏳     |
 | **F** | **Compliance-as-a-product** — the audit-verify CLI + an auditor attestation export.                        | ⏳     |
@@ -67,3 +67,21 @@ resource in `@gulley/rbac`) + audit rails: `POST /prompts` (v1),
 `prompt.version.create` / `prompt.delete`) with the version hash in the payload.
 10 package tests + 5 control-api integration tests. _Follow-up: a Postgres adapter
 plus GitOps export/import on the config document (in-memory registry today)._
+
+## C — Full admin CRUD ✅
+
+The workspace-scoped config collections (routes / policies / budgets / rate-limits
+/ guardrails / model-aliases) were create + read only; the key-lifecycle endpoints
+(disable/rotate) landed in M19 F. This slice closes the lifecycle:
+
+- `PUT /{collection}/:id` — update name and/or config (the same inline-secret guard
+  as create), scope resolved from the **stored** entity's workspace (never the
+  request body, so an orgId can't be forged); `422` when no fields are supplied.
+- `DELETE /{collection}/:id` — delete on `resource:delete`.
+- `DELETE /providers/:id` and `DELETE /workspaces/:id` — providers and workspaces
+  had create + read but no delete; the lifecycle is now complete.
+
+Every write goes through the shared `auditedWrite` (deny-by-default RBAC → mutate →
+hash-chained audit row), so the new verbs are governed and audited exactly like
+create. 5 control-api integration tests (round-trip update+delete, 404s, empty-
+patch 422, provider + workspace delete).
