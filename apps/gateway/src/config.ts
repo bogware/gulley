@@ -126,6 +126,10 @@ const Env = z.object({
   // findings + telemetry, never mutates payloads); block/mask/redact are set
   // per-route in code. Detection runs on request and response text.
   GUARDRAILS_ENABLED: envBool(true),
+  // Native prompt-injection / jailbreak detector (local, no egress). Adds
+  // prompt_injection / jailbreak findings the input policy can block/audit — e.g.
+  // GUARDRAILS_INPUT_ACTION=block with categories scoped to those two.
+  GUARDRAILS_INJECTION_ENABLED: envBool(false),
   GUARDRAILS_ENTROPY: envBool(true),
   // Output guardrail policy. `audit` (default) records findings only; block /
   // mask / redact enforce. Enforcement on a NON-streamed body is always exact;

@@ -47,8 +47,10 @@ import { RequestTracer } from './tracer';
 import {
   AzureContentSafetyPlugin,
   composePlugins,
+  type Detector,
   GuardrailEngine,
   type GuardrailPlugin,
+  InjectionDetector,
   ModelArmorPlugin,
   NativeDetector,
   OpenAIModerationPlugin,
@@ -158,8 +160,11 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
     );
   }
 
+  const detectors: Detector[] = [new NativeDetector({ entropy: config.GUARDRAILS_ENTROPY })];
+  if (config.GUARDRAILS_INJECTION_ENABLED) detectors.push(new InjectionDetector());
+
   return new GuardrailEngine(
-    [new NativeDetector({ entropy: config.GUARDRAILS_ENTROPY })],
+    detectors,
     {
       input: {
         action: config.GUARDRAILS_INPUT_ACTION,
