@@ -17,6 +17,7 @@ import {
   PostgresAuditSink,
   PostgresConfigStore,
   PostgresConfigVersionStore,
+  PostgresRequestLogQuery,
 } from '@gulley/storage';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
@@ -161,7 +162,8 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     configVersions,
     configStore,
     configAtomic,
-    requestLogQuery: opts.requestLogQuery ?? new InMemoryRequestLog(),
+    requestLogQuery:
+      opts.requestLogQuery ?? (db ? new PostgresRequestLogQuery(db) : new InMemoryRequestLog()),
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,
       bootstrapTokenSha256: opts.bootstrapTokenSha256,

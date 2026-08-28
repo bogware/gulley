@@ -96,6 +96,10 @@ export interface UsageBucket {
   inputTokens: number;
   outputTokens: number;
   costMicroUsd: number;
+  /** Fraction (0..1) of the bucket's requests with statusCode ≥ 400. */
+  errorRate: number;
+  /** p95 of latencyMs across the bucket's requests (0 when empty). */
+  p95LatencyMs: number;
 }
 
 /** Read side of the request log: a filtered/paginated browser plus time-bucketed

@@ -78,6 +78,8 @@ export class InMemoryRequestLog implements RequestLogSink, RequestLogQuery {
     const ws =
       query.workspaceIds && query.workspaceIds.length ? new Set(query.workspaceIds) : undefined;
     const buckets = new Map<string, UsageBucket>();
+    const errors = new Map<string, number>();
+    const latencies = new Map<string, number[]>();
     for (const e of this.entries) {
       if (e.createdAt < query.from || e.createdAt >= query.to) continue;
       if (ws && !ws.has(e.workspaceId)) continue;
@@ -100,6 +102,8 @@ export class InMemoryRequestLog implements RequestLogSink, RequestLogQuery {
           inputTokens: 0,
           outputTokens: 0,
           costMicroUsd: 0,
+          errorRate: 0,
+          p95LatencyMs: 0,
         };
         buckets.set(key, b);
       }
@@ -107,11 +111,26 @@ export class InMemoryRequestLog implements RequestLogSink, RequestLogQuery {
       b.inputTokens += e.inputTokens;
       b.outputTokens += e.outputTokens;
       b.costMicroUsd += e.costMicroUsd;
+      if (e.statusCode >= 400) errors.set(key, (errors.get(key) ?? 0) + 1);
+      (latencies.get(key) ?? latencies.set(key, []).get(key)!).push(e.latencyMs);
+    }
+    for (const [key, b] of buckets) {
+      b.errorRate = b.requests ? (errors.get(key) ?? 0) / b.requests : 0;
+      b.p95LatencyMs = percentile(latencies.get(key) ?? [], 0.95);
     }
     return [...buckets.values()].sort(
       (a, b) => cmp(a.bucketStart, b.bucketStart) || cmp(a.group ?? '', b.group ?? ''),
     );
   }
+}
+
+/** Nearest-rank p95 over a sample (matches Postgres percentile_disc closely enough
+ *  for an operational latency stat). Returns 0 for an empty sample. */
+function percentile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const rank = Math.ceil(p * sorted.length);
+  return sorted[Math.min(rank, sorted.length) - 1] ?? 0;
 }
 
 function cmp(a: string, b: string): number {

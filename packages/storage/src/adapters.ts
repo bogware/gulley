@@ -4,13 +4,22 @@ import {
   type AuditRow,
   type AuditSink,
   computeRowHash,
+  decodeLogCursor,
+  encodeLogCursor,
   type Ledger,
   type RequestLogEntry,
+  type RequestLogFilter,
+  type RequestLogPage,
+  type RequestLogQuery,
   type RequestLogSink,
+  type RequestStatus,
   rowContent,
   type SpendRecord,
+  type StoredRequestLog,
+  type UsageBucket,
+  type UsageQuery,
 } from '@gulley/pipeline';
-import { desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, lt, type SQL, sql } from 'drizzle-orm';
 import type { Database } from './db';
 import {
   auditLog,
@@ -126,6 +135,135 @@ export class PostgresRequestLog implements RequestLogSink {
   async writeBatch(entries: RequestLogEntry[]): Promise<void> {
     if (entries.length === 0) return;
     await this.db.insert(requestLog).values(entries.map(requestLogRow));
+  }
+}
+
+function toStoredLog(r: typeof requestLog.$inferSelect): StoredRequestLog {
+  return {
+    id: r.id,
+    requestId: r.requestId,
+    principalId: r.principalId,
+    workspaceId: r.workspaceId ?? '',
+    provider: r.provider,
+    model: r.model,
+    route: r.route,
+    statusCode: r.statusCode,
+    status: r.status as RequestStatus,
+    streamed: r.streamed,
+    inputTokens: r.inputTokens,
+    outputTokens: r.outputTokens,
+    costMicroUsd: r.costMicroUsd,
+    latencyMs: r.latencyMs,
+    createdAt: r.createdAt,
+    attributes: (r.attributes as Record<string, unknown> | null) ?? undefined,
+  };
+}
+
+/**
+ * Durable READ side of the request log — the admin browser + usage analytics. The
+ * gateway writes {@link PostgresRequestLog}; without this the control-api falls back
+ * to an empty in-memory store, so the log browser and every cost/usage chart return
+ * nothing against real traffic. Search is a keyset page over the
+ * `request_log_ws_created_idx` index; usage is a `date_trunc` rollup with error-rate
+ * and p95 latency. Mirrors {@link InMemoryRequestLog}'s ordering + bucketing.
+ */
+export class PostgresRequestLogQuery implements RequestLogQuery {
+  constructor(private readonly db: Database) {}
+
+  async search(filter: RequestLogFilter): Promise<RequestLogPage> {
+    const limit = Math.min(Math.max(filter.limit ?? 50, 1), 200);
+    const conds: SQL[] = [];
+    if (filter.workspaceIds?.length)
+      conds.push(inArray(requestLog.workspaceId, [...filter.workspaceIds]));
+    if (filter.provider) conds.push(eq(requestLog.provider, filter.provider));
+    if (filter.model) conds.push(eq(requestLog.model, filter.model));
+    if (filter.status) conds.push(eq(requestLog.status, filter.status));
+    if (filter.minStatusCode !== undefined)
+      conds.push(gte(requestLog.statusCode, filter.minStatusCode));
+    if (filter.from) conds.push(gte(requestLog.createdAt, filter.from));
+    if (filter.to) conds.push(lt(requestLog.createdAt, filter.to));
+    if (filter.cursor) {
+      const c = decodeLogCursor(filter.cursor);
+      // Keyset under (created_at desc, id desc); id compared as text so it agrees
+      // with the uuid ordering and never mis-casts a foreign cursor.
+      if (c)
+        conds.push(
+          sql`(${requestLog.createdAt} < ${c.createdAt} OR (${requestLog.createdAt} = ${c.createdAt} AND ${requestLog.id}::text < ${c.id}))`,
+        );
+    }
+    const rows = await this.db
+      .select()
+      .from(requestLog)
+      .where(conds.length ? and(...conds) : undefined)
+      .orderBy(desc(requestLog.createdAt), desc(requestLog.id))
+      .limit(limit + 1);
+    const page = rows.slice(0, limit).map(toStoredLog);
+    const last = page[page.length - 1];
+    const nextCursor =
+      rows.length > limit && last ? encodeLogCursor(last.createdAt, last.id) : undefined;
+    return { entries: page, nextCursor };
+  }
+
+  async get(requestId: string): Promise<StoredRequestLog | null> {
+    const rows = await this.db
+      .select()
+      .from(requestLog)
+      .where(eq(requestLog.requestId, requestId))
+      .orderBy(desc(requestLog.createdAt))
+      .limit(1);
+    return rows[0] ? toStoredLog(rows[0]) : null;
+  }
+
+  async usage(query: UsageQuery): Promise<UsageBucket[]> {
+    // A NULL group means "no split" (all rows collapse into one group) — keeps a
+    // single fixed query shape regardless of groupBy.
+    const groupExpr: SQL =
+      query.groupBy === 'provider'
+        ? sql`${requestLog.provider}`
+        : query.groupBy === 'model'
+          ? sql`${requestLog.model}`
+          : query.groupBy === 'workspace'
+            ? sql`${requestLog.workspaceId}::text`
+            : sql`NULL::text`;
+    // date_trunc in UTC, formatted to match InMemory's truncate().toISOString().
+    const bucketExpr = sql<string>`to_char(date_trunc(${query.bucket}, ${requestLog.createdAt} AT TIME ZONE 'UTC'), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
+    const conds: SQL[] = [
+      gte(requestLog.createdAt, query.from),
+      lt(requestLog.createdAt, query.to),
+    ];
+    if (query.workspaceIds?.length)
+      conds.push(inArray(requestLog.workspaceId, [...query.workspaceIds]));
+    const rows = await this.db
+      .select({
+        bucketStart: bucketExpr,
+        group: groupExpr,
+        requests: sql<number>`count(*)::int`,
+        inputTokens: sql<number>`coalesce(sum(${requestLog.inputTokens}),0)::bigint`,
+        outputTokens: sql<number>`coalesce(sum(${requestLog.outputTokens}),0)::bigint`,
+        costMicroUsd: sql<number>`coalesce(sum(${requestLog.costMicroUsd}),0)::bigint`,
+        errors: sql<number>`count(*) FILTER (WHERE ${requestLog.statusCode} >= 400)`,
+        p95: sql<number>`coalesce(percentile_disc(0.95) WITHIN GROUP (ORDER BY ${requestLog.latencyMs}), 0)::int`,
+      })
+      .from(requestLog)
+      .where(and(...conds))
+      // Group/order by SELECT position — the bucket expression carries a bound
+      // parameter (the trunc unit), so re-stating it in GROUP BY would not match it.
+      .groupBy(sql`1`, sql`2`)
+      .orderBy(sql`1`, sql`2`);
+    return rows.map((r) => {
+      const requests = Number(r.requests);
+      const group = r.group == null ? undefined : String(r.group);
+      return {
+        bucketStart: String(r.bucketStart),
+        ...(group !== undefined ? { group } : {}),
+        requests,
+        inputTokens: Number(r.inputTokens),
+        outputTokens: Number(r.outputTokens),
+        costMicroUsd: Number(r.costMicroUsd),
+        errorRate: requests ? Number(r.errors) / requests : 0,
+        p95LatencyMs: Number(r.p95),
+      };
+    });
   }
 }
 
