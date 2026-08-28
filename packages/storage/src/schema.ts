@@ -6,6 +6,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -231,6 +232,32 @@ export const classifierCentroid = pgTable(
     uniqueIndex('classifier_centroid_uniq').on(t.scope, t.label, t.model, t.exemplarSha),
     index('classifier_centroid_scope_idx').on(t.scope),
     index('classifier_centroid_scope_model_idx').on(t.scope, t.model),
+  ],
+);
+
+// Durable reversal store for guardrail `mask` (M22 D). When a request masks
+// PII/secrets, the reversible token↔original map (TokenVault.entries()) is
+// envelope-encrypted (@gulley/crypto, AAD-bound to request+workspace+direction) and
+// stored here so an authorized admin can de-tokenize a masked response later. The
+// `ciphertext` column holds ONLY the EnvelopeCiphertext — NEVER a plaintext original;
+// encrypt/decrypt happen in the app layer, so this adapter never touches cleartext.
+// Rows carry a short TTL (`expiresAt`) with an expiry sweep, like the exact cache.
+export const maskVault = pgTable(
+  'mask_vault',
+  {
+    requestId: text('request_id').notNull(),
+    direction: text('direction').notNull(), // 'input' | 'output'
+    workspaceId: uuid('workspace_id').notNull(),
+    orgId: uuid('org_id'),
+    ciphertext: jsonb('ciphertext').notNull(), // EnvelopeCiphertext (encrypted-at-rest)
+    tokenCount: integer('token_count').notNull().default(0),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.requestId, t.direction] }),
+    index('mask_vault_workspace_idx').on(t.workspaceId),
+    index('mask_vault_expires_idx').on(t.expiresAt),
   ],
 );
 

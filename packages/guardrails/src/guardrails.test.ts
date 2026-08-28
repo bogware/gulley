@@ -92,6 +92,15 @@ describe('TokenVault', () => {
     expect(vault.detokenize(masked)).toBe(body); // fully reversible
   });
 
+  it('reconstructs from persisted entries and detokenizes identically (M22 D)', () => {
+    const vault = new TokenVault();
+    const body = JSON.stringify({ msg: 'email jane@example.com and jane@example.com again' });
+    const masked = vault.tokenize(body, det.detect(body));
+    // Persist entries() (as the durable store would), then rebuild + detokenize.
+    const rebuilt = TokenVault.fromEntries(vault.entries());
+    expect(rebuilt.detokenize(masked)).toBe(body);
+  });
+
   it('gives identical originals the same token', () => {
     const vault = new TokenVault();
     const text = 'a@b.com then a@b.com again';

@@ -45,6 +45,8 @@ import {
   type TextTransform,
   type UsageExtractor,
 } from '@gulley/providers';
+import type { Encryptor } from '@gulley/crypto';
+import type { MaskDirection, MaskVaultStore } from '@gulley/storage';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
 import {
   allTargets,
@@ -207,9 +209,20 @@ export interface GatewayContext {
   /** Serve the POST /v1/playground/verify preflight (no upstream call, no spend).
    *  Off leaves the endpoint 404 so it can be disabled in locked-down deployments. */
   playgroundEnabled?: boolean;
+  /** Durable mask-reversal store (M22 D): when set (with an encryptor), the mask
+   *  token↔original map is envelope-encrypted and persisted in teardown so an
+   *  authorized admin can de-tokenize a masked response later. */
+  maskVault?: MaskVaultStore;
+  /** Envelope encryptor for the mask vault; REQUIRED whenever `maskVault` is set —
+   *  the store never receives plaintext. */
+  maskVaultEncryptor?: Encryptor;
+  /** Retention for a persisted mask-vault record. */
+  maskVaultTtlSeconds?: number;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
+/** Cap the best-effort mask-vault persist so a stalled KMS can't hang teardown. */
+const MASK_VAULT_PERSIST_TIMEOUT_MS = 5_000;
 /** Abort a proxied stream after this long with no upstream activity — provider
  *  adapters disable undici's bodyTimeout for long SSE, so this is the only guard
  *  against a half-open upstream that would otherwise pin a budget reservation. */
@@ -1513,6 +1526,50 @@ async function handleProxy(
           );
         }
       }
+
+      // Durable mask-reversal store (M22 D): persist each non-empty mask vault's
+      // token↔original map, envelope-encrypted (AAD-bound to request+workspace+
+      // direction), so an authorized admin can de-tokenize a masked response later.
+      // Encrypt-at-rest only — the store never sees plaintext. Best-effort; the
+      // reservation was already released, so a failure here can't leak it.
+      const maskStore = ctx.maskVault;
+      const maskEncryptor = ctx.maskVaultEncryptor;
+      if (maskStore && maskEncryptor) {
+        const persistVault = async (
+          v: TokenVault | undefined,
+          direction: MaskDirection,
+        ): Promise<void> => {
+          if (!v || v.size === 0) return;
+          const ct = await maskEncryptor.encrypt(Buffer.from(JSON.stringify(v.entries()), 'utf8'), {
+            keyClass: 'mask-vault',
+            aad: `${requestId}:${principal.scope.workspaceId}:${direction}`,
+          });
+          await maskStore.put({
+            requestId,
+            direction,
+            workspaceId: principal.scope.workspaceId,
+            orgId: principal.scope.orgId,
+            ciphertext: ct,
+            tokenCount: v.size,
+            ttlSeconds: ctx.maskVaultTtlSeconds ?? 604_800,
+          });
+        };
+        // Bound the whole persist: a stalled KMS `encrypt` has no request deadline,
+        // and teardown is fire-and-forget, so an unbounded hang would leave the
+        // teardown promise pending forever (retaining buffers, skipping the
+        // telemetry/tracer emit below). The timeout REJECTS so the outer catch runs
+        // and teardown always settles; the abandoned encrypt is harmless best-effort.
+        await withTimeout(
+          (async () => {
+            await persistVault(vault, 'input');
+            // The buffered-output vault and the stream-output vault are mutually
+            // exclusive (a response either buffers or streams enforcement).
+            await persistVault(outputEnforced?.vault ?? redactor?.vault, 'output');
+          })(),
+          MASK_VAULT_PERSIST_TIMEOUT_MS,
+          'mask-vault persist',
+        );
+      }
     } catch (err) {
       request.log.error({ err }, 'metering/audit teardown failed');
     }
@@ -2062,6 +2119,26 @@ function buildAuthzActivation(
       workspaceId: principal.scope.workspaceId,
     },
   };
+}
+
+/** Reject after `ms` if `p` hasn't settled — bounds a best-effort teardown sink so
+ *  a stalled dependency can never leave the fire-and-forget teardown promise
+ *  pending. The abandoned `p` runs on harmlessly; only the wait is bounded. */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err as Error);
+      },
+    );
+  });
 }
 
 function numField(v: unknown): number | undefined {

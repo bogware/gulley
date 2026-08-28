@@ -6,6 +6,7 @@ import type { ControlContext } from './context';
 import { registerDebugRoutes } from './debug-routes';
 import { registerHttpEdge } from './http-edge';
 import { registerLogRoutes } from './log-routes';
+import { registerMaskVaultRoutes } from './mask-vault-routes';
 import { registerOidcRoutes } from './oidc-routes';
 import { registerAdminRoutes } from './routes';
 
@@ -46,6 +47,7 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     registerAdminRoutes(app, ctx);
     registerConfigRoutes(app, ctx);
     registerLogRoutes(app, ctx);
+    registerMaskVaultRoutes(app, ctx);
     registerOidcRoutes(app, ctx);
     registerDebugRoutes(app, ctx, config);
   }

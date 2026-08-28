@@ -19,9 +19,14 @@ export type Resource =
 export type Action = 'read' | 'create' | 'update' | 'delete';
 
 /** A permission is `resource:action`, plus a few named capabilities that don't
- *  fit the CRUD grid (owner-only grants, config apply, audit verification). */
+ *  fit the CRUD grid (owner-only grants, config apply, audit verification, and the
+ *  high-privilege de-mask reveal that exposes raw secret/PII values). */
 export type Permission =
-  `${Resource}:${Action}` | 'membership:grant_owner' | 'config:apply' | 'audit:verify';
+  | `${Resource}:${Action}`
+  | 'membership:grant_owner'
+  | 'config:apply'
+  | 'audit:verify'
+  | 'guardrail:reveal';
 
 const READABLE: Resource[] = [
   'org',
@@ -75,6 +80,8 @@ const owner = new Set<Permission>([
   'org:delete',
   'membership:grant_owner',
   'config:apply',
+  // De-masking exposes raw secret/PII values — owner-only, above admin.
+  'guardrail:reveal',
 ]);
 
 /** Permission set granted by each role. Higher roles strictly include lower. */

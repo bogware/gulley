@@ -138,6 +138,9 @@ importers:
       '@gulley/cost':
         specifier: workspace:*
         version: link:../../packages/cost
+      '@gulley/crypto':
+        specifier: workspace:*
+        version: link:../../packages/crypto
       '@gulley/egress':
         specifier: workspace:*
         version: link:../../packages/egress

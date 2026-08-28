@@ -40,6 +40,14 @@ const Env = z.object({
   // Optional label stamped on the attestation (deployment / environment / org).
   AUDIT_ATTESTATION_SUBJECT: z.string().optional(),
 
+  // Mask-vault reveal (M22 D): serve GET /admin/mask-vault/:requestId, which
+  // decrypts + returns the token↔original map for a masked request. Needs the SAME
+  // envelope key the gateway used (KMS ARN in prod; the in-memory dev cipher can only
+  // decrypt records written in the same process). Absent ⇒ the endpoint 501s.
+  MASK_VAULT_ENABLED: envBool(false),
+  GULLEY_KMS_KEY_ARN: z.string().optional(),
+  GULLEY_KMS_REGION: z.string().default('us-east-1'),
+
   // Durable config store. When set, POST /config/apply persists to Postgres (the
   // tables the gateway reads) via PostgresConfigStore + PostgresConfigVersionStore,
   // instead of the in-memory ControlConfigStore. Enables M13 config hot-reload.

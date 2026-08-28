@@ -4,6 +4,8 @@ import zlib from 'node:zlib';
 import { generateVirtualKey, InMemoryKeyStore, parseHtpasswd } from '@gulley/auth';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
+import { InMemoryAesCipher } from '@gulley/crypto';
+import type { MaskVaultRecord } from '@gulley/storage';
 import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
 import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { RequestMirror } from '@gulley/http-edge';
@@ -1922,6 +1924,136 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(upstreamBody).not.toContain('jane@example.com');
     expect(upstreamBody).toContain('<<GULLEY_EMAIL_');
     expect(clientText(text)).toContain('jane@example.com');
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('persists an encrypted mask-vault record in teardown (never plaintext) (M22 D)', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5}}}\n\n' +
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n' +
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n' +
+          'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"output_tokens":2}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      );
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    const cipher = new InMemoryAesCipher();
+    const records: MaskVaultRecord[] = [];
+    ctx.maskVault = {
+      put: async (r) => {
+        records.push(r);
+      },
+      get: async () => undefined,
+      list: async () => [],
+      sweepExpired: async () => 0,
+    };
+    ctx.maskVaultEncryptor = cipher;
+    ctx.maskVaultTtlSeconds = 3600;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('mask', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const requestId = 'itest-mask-req';
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token, 'request-id': requestId },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'contact jane@example.com please' }],
+      }),
+    }).then((r) => r.text());
+
+    // Exactly one input-direction record, encrypted (envelope shape, no plaintext).
+    expect(records).toHaveLength(1);
+    const rec = records[0]!;
+    expect(rec.direction).toBe('input');
+    expect(rec.tokenCount).toBeGreaterThan(0);
+    expect(rec.workspaceId).toBe('ws_1');
+    expect(JSON.stringify(rec.ciphertext)).not.toContain('jane@example.com'); // never plaintext
+    // Decrypt with the same key + AAD → the original token↔value map is recovered.
+    const bytes = await cipher.decrypt(rec.ciphertext as Parameters<typeof cipher.decrypt>[0], {
+      aad: `${rec.requestId}:${rec.workspaceId}:input`,
+    });
+    const entries = JSON.parse(Buffer.from(bytes).toString('utf8')) as Array<[string, string]>;
+    expect(entries.some(([, original]) => original === 'jane@example.com')).toBe(true);
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('swallows a mask-vault persist failure — the request still succeeds + meters (M22 D)', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5}}}\n\n' +
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n' +
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n' +
+          'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"output_tokens":2}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      );
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    // An encryptor that always throws — the persist must fail-open (best-effort).
+    ctx.maskVault = {
+      put: async () => {},
+      get: async () => undefined,
+      list: async () => [],
+      sweepExpired: async () => 0,
+    };
+    ctx.maskVaultEncryptor = {
+      encrypt: async () => {
+        throw new Error('kms unavailable');
+      },
+      decrypt: async () => new Uint8Array(),
+    };
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('mask', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        messages: [{ role: 'user', content: 'contact jane@example.com please' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    // Teardown completed despite the persist throw: the request was metered.
+    expect(ledger.entries).toHaveLength(1);
 
     await app.close();
     await new Promise<void>((r) => server.close(() => r()));

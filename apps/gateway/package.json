@@ -34,6 +34,7 @@
     "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
+    "@gulley/crypto": "workspace:*",
     "@gulley/egress": "workspace:*",
     "@gulley/guardrails": "workspace:*",
     "@gulley/http-edge": "workspace:*",

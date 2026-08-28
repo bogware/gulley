@@ -161,6 +161,15 @@ const Env = z.object({
   // raw-byte-fidelity + a bounded delay for enforcement. Off by default.
   STREAMING_ENFORCE: envBool(false),
   STREAMING_ENFORCE_WINDOW_CHARS: z.coerce.number().int().positive().default(512),
+  // Durable mask-reversal store (M22 D): persist the guardrail-mask token↔original
+  // map, envelope-encrypted at rest, so an authorized admin can de-tokenize a masked
+  // response later. Off by default; when on it REQUIRES an encryptor (GULLEY_KMS_KEY_ARN
+  // in prod, else the in-memory dev cipher) and refuses to store cleartext.
+  MASK_VAULT_PERSIST: envBool(false),
+  MASK_VAULT_TTL_SECONDS: z.coerce.number().int().positive().default(604_800), // 7 days
+  // KMS key ARN that wraps the mask-vault data keys (ARN only, never a value). Absent
+  // in dev ⇒ the in-memory AES cipher (same envelope shape). Region = BEDROCK_REGION.
+  GULLEY_KMS_KEY_ARN: z.string().optional(),
   // Optional bring-your-own-DLP webhook guardrail (runs on request input). A
   // block/mask verdict is authoritative even under the audit-only default.
   GUARDRAILS_WEBHOOK_URL: z.string().url().optional(),

@@ -18,9 +18,12 @@ import {
   PostgresConfigStore,
   PostgresConfigVersionStore,
   PostgresKeyAdminStore,
+  PostgresMaskVaultStore,
   PostgresRequestLogQuery,
   readAuditRows,
+  type MaskVaultStore,
 } from '@gulley/storage';
+import type { Encryptor } from '@gulley/crypto';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
 import type { OidcRoleRule } from './oidc-gate';
@@ -80,6 +83,11 @@ export interface ControlContext {
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
   attestationSubject?: string;
+  /** Durable mask-reversal store (M22 D); present (with an encryptor) ⇒ the reveal
+   *  endpoint is served. */
+  maskVault?: MaskVaultStore;
+  /** Envelope decryptor for the mask vault — the SAME key the gateway encrypted with. */
+  maskVaultEncryptor?: Encryptor;
   /** Hosts a provider base URL may egress to; empty = any non-blocked host. */
   outboundAllowlist: ReadonlySet<string>;
   /** OIDC session gate config; absent = OIDC login disabled (token-paste only). */
@@ -127,6 +135,10 @@ export interface InMemoryContextOptions {
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
   attestationSubject?: string;
+  /** Durable mask-reversal store (tests inject one). */
+  maskVault?: MaskVaultStore;
+  /** Envelope decryptor for the mask vault (tests inject a shared cipher). */
+  maskVaultEncryptor?: Encryptor;
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -197,6 +209,12 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     auditRows: db ? () => readAuditRows(db) : async () => inner.rows,
     attestationKey: opts.attestationKey,
     attestationSubject: opts.attestationSubject,
+    // Only served when an encryptor is present (the store never sees plaintext, and
+    // reveal must decrypt) — so a DB alone doesn't turn the reveal endpoint on.
+    maskVault:
+      opts.maskVault ??
+      (db && opts.maskVaultEncryptor ? new PostgresMaskVaultStore(db) : undefined),
+    maskVaultEncryptor: opts.maskVaultEncryptor,
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
     oidc: opts.oidc,
     notifier: opts.notifier,

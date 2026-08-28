@@ -1,3 +1,4 @@
+import { InMemoryAesCipher, KmsEnvelopeEncryptor } from '@gulley/crypto';
 import { OidcProvider } from '@gulley/oidc';
 import { type Config, loadConfig, outboundAllowlist, sessionSecrets } from './config';
 import {
@@ -44,6 +45,13 @@ function buildContext(config: Config): ControlContext | undefined {
     databaseUrl: config.DATABASE_URL,
     attestationKey: config.AUDIT_ATTESTATION_KEY,
     attestationSubject: config.AUDIT_ATTESTATION_SUBJECT,
+    // Mask-vault reveal decryptor — the SAME envelope key the gateway used (KMS in
+    // prod; the in-memory dev cipher only decrypts records written in-process).
+    maskVaultEncryptor: config.MASK_VAULT_ENABLED
+      ? config.GULLEY_KMS_KEY_ARN
+        ? new KmsEnvelopeEncryptor(config.GULLEY_KMS_KEY_ARN, config.GULLEY_KMS_REGION)
+        : new InMemoryAesCipher()
+      : undefined,
   });
 }
 

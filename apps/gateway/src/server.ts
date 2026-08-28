@@ -1,4 +1,5 @@
 import { GULLEY_VERSION } from '@gulley/core';
+import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { type GatewayContext, registerRoutes, RouteHolder } from './routes/messages';
@@ -10,6 +11,12 @@ export type GatewayServer = FastifyInstance & { routeHolder?: RouteHolder };
 export function buildServer(config: Config, context?: GatewayContext): GatewayServer {
   const app = Fastify({
     trustProxy: true,
+    // Fastify's default request id is a per-process counter (`req-1`, ...) that
+    // resets on restart and repeats across tasks — NOT unique across a multi-task
+    // fleet over one Postgres. requestId keys the ledger, request log, audit rows,
+    // and the mask-vault (whose reversal record is an upsert + AAD component), so a
+    // collision would cross-attribute or overwrite. Mint a globally-unique id.
+    genReqId: () => `req_${randomUUID()}`,
     logger: {
       level: config.LOG_LEVEL,
       redact: {

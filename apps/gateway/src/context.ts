@@ -86,11 +86,13 @@ import {
   PostgresExactCache,
   PostgresKeyStore,
   PostgresLedger,
+  PostgresMaskVaultStore,
   PostgresRequestLog,
   PostgresVectorIndex,
   RedisExactCache,
   RedisVectorIndex,
 } from '@gulley/storage';
+import { type Encryptor, InMemoryAesCipher, KmsEnvelopeEncryptor } from '@gulley/crypto';
 import {
   type AccessLogConfig,
   AccessLogFieldEngine,
@@ -588,6 +590,17 @@ export function createProductionContext(config: Config): GatewayContext {
   const basicAuth = buildBasicAuth(config);
 
   const db = createDatabase(config.DATABASE_URL);
+  // Durable mask-reversal store (M22 D): only wired when MASK_VAULT_PERSIST is on, and
+  // ALWAYS with an encryptor (KMS in prod, the in-memory dev twin otherwise) — the
+  // store never receives plaintext. Reveal (control-api) must use the same key, so
+  // prod requires the shared KMS key; the in-memory cipher is per-process (dev/tests).
+  const maskVaultEncryptor: Encryptor | undefined = config.MASK_VAULT_PERSIST
+    ? config.GULLEY_KMS_KEY_ARN
+      ? new KmsEnvelopeEncryptor(config.GULLEY_KMS_KEY_ARN, config.BEDROCK_REGION)
+      : new InMemoryAesCipher()
+    : undefined;
+  const maskVault =
+    config.MASK_VAULT_PERSIST && maskVaultEncryptor ? new PostgresMaskVaultStore(db) : undefined;
   // Per-model budget caps (multi-level enforcement) keyed by their `model:<model>`
   // scope. The set of governed models is what the hot path checks before reserving
   // the extra scope; the map is the cap source (config, not the DB budget table).
@@ -720,6 +733,9 @@ export function createProductionContext(config: Config): GatewayContext {
         : undefined,
     budgetModelCaps: budgetModelCaps.size > 0 ? budgetModelCaps : undefined,
     playgroundEnabled: config.PLAYGROUND_ENABLED,
+    maskVault,
+    maskVaultEncryptor,
+    maskVaultTtlSeconds: config.MASK_VAULT_TTL_SECONDS,
     telemetry,
     guardrails: buildGuardrails(config),
     cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,

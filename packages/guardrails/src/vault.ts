@@ -48,12 +48,26 @@ export class TokenVault {
     return out;
   }
 
+  /** The token→original map — the ONLY state needed to reverse a mask later. The
+   *  `original` values are the RAW detected secrets/PII, so a caller that persists
+   *  this MUST envelope-encrypt it first (never store or log it in cleartext). */
   entries(): Array<[string, string]> {
     return [...this.byToken];
   }
 
   get size(): number {
     return this.byToken.size;
+  }
+
+  /** Reconstruct a vault from a persisted (decrypted) {@link entries} map so a
+   *  masked response can be de-tokenized later by an authorized consumer. */
+  static fromEntries(entries: ReadonlyArray<readonly [string, string]>): TokenVault {
+    const v = new TokenVault();
+    for (const [token, original] of entries) {
+      v.byToken.set(token, original);
+      v.byOriginal.set(original, token);
+    }
+    return v;
   }
 }
 
