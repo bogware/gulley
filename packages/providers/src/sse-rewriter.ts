@@ -141,7 +141,9 @@ type ChunkEnvelope = Partial<Record<'id' | 'object' | 'created' | 'model', unkno
  * lost or reordered. Usage lives in a `choices:[]` frame (no `delta.content`), so
  * metering — which reads the pre-rewrite bytes via a separate parser — is
  * untouched. `reasoning_content` and other non-`content` delta fields pass through
- * unmodified (like Anthropic thinking). Single-choice (`n=1`) only: a stream that
+ * unmodified (like Anthropic thinking); per-token `logprobs` (which echo the RAW
+ * text token-by-token) are STRIPPED so they can't reconstruct the redacted text.
+ * Single-choice (`n=1`) only: a stream that
  * carries content on a second choice index sets {@link failClosed} (a single
  * windowed transform cannot enforce interleaved choices without misattributing
  * text), and the caller terminates rather than emit corrupted output.
@@ -204,6 +206,9 @@ export class OpenAiSseRewriter {
       if (!c || typeof c !== 'object') continue;
       const choice = c as Record<string, unknown>;
       if (choice['finish_reason'] != null) hasFinish = true;
+      // Per-token logprobs (`logprobs.content[].token` / `top_logprobs`) echo the RAW
+      // assistant text token-by-token — an enforcement bypass. Strip them.
+      delete choice['logprobs'];
       const delta = choice['delta'];
       if (!delta || typeof delta !== 'object') continue;
       const d = delta as Record<string, unknown>;
@@ -266,5 +271,198 @@ export class OpenAiSseRewriter {
       choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
     };
     return `data: ${JSON.stringify(chunk)}\n\n`;
+  }
+}
+
+/** The item envelope of a Responses `output_text` part, captured so a synthetic
+ *  tail delta looks native. */
+type ResponsesEnvelope = Partial<Record<'item_id' | 'output_index' | 'content_index', unknown>>;
+
+/**
+ * The OpenAI `/v1/responses` analogue of {@link OpenAiSseRewriter} (M22 B). It
+ * applies the injected transform to the assistant TEXT of a Responses stream —
+ * carried in `response.output_text.delta` `delta` fields — and, crucially, keeps
+ * EVERY echo consistent. The full assistant text is re-emitted in
+ * `response.output_text.done` (`text`), `response.content_part.done` (`part.text`),
+ * `response.output_item.done` (`item.content[].text`), and the terminal
+ * `response.completed`/`.incomplete`/`.failed` (`response.output[].content[].text`) —
+ * most SDKs build the final message from one of these, so a rewriter that redacted
+ * only the deltas would LEAK the un-redacted text. Because the windowed transform is
+ * stateful, the echoes CANNOT be re-transformed; instead this substitutes the
+ * ALREADY-transformed accumulator (`acc`) into every echo field. Per-token
+ * `logprobs` (which spell out the RAW text token-by-token) are STRIPPED from every
+ * rewritten frame — they cannot be redacted and would otherwise reconstruct the
+ * secret verbatim.
+ *
+ * All non-text events — `response.created`/`in_progress`, `output_item`/`content_part`
+ * `.added`, `response.reasoning_summary_text.delta` (thinking),
+ * `response.function_call_arguments.delta`/`.done` (tool args), `error`, and any
+ * non-JSON — pass through verbatim. Usage lives in `response.completed.response.usage`,
+ * left byte-untouched (metering reads it via a separate parser). Single output_text
+ * part only: a second `(output_index, content_index)` output_text pair sets
+ * {@link failClosed} and the caller terminates.
+ */
+export class ResponsesSseRewriter {
+  private readonly parser = new SSEParser();
+  private acc = ''; // the transformed text emitted so far, for echo substitution
+  private envelope: ResponsesEnvelope = {};
+  private firstPart: string | undefined; // `${output_index}:${content_index}` of the 1st part
+  private _failClosed = false;
+
+  constructor(private readonly transform: TextTransform) {}
+
+  /** Set when a second output_text part appears — a single windowed transform can't
+   *  enforce two without mis-attributing its held tail; the caller terminates. */
+  get failClosed(): boolean {
+    return this._failClosed;
+  }
+
+  push(chunk: string): string {
+    if (this._failClosed) return '';
+    let out = '';
+    for (const ev of this.parser.push(chunk)) {
+      out += this.rewrite(ev);
+      if (this._failClosed) break;
+    }
+    return out;
+  }
+
+  /** Flush the transform's held tail at stream end (covers a truncated stream that
+   *  never delivered output_text.done / response.completed). */
+  flush(): string {
+    if (this._failClosed) return '';
+    const tail = this.transform.flush();
+    if (!tail) return '';
+    this.acc += tail;
+    return this.synthDelta(tail);
+  }
+
+  private rewrite(ev: SSEEvent): string {
+    let parsed: Record<string, unknown> | undefined;
+    try {
+      parsed = JSON.parse(ev.data) as Record<string, unknown>;
+    } catch {
+      return reframe(ev); // non-JSON (rare) — pass through
+    }
+    const type = parsed['type'];
+
+    if (type === 'response.output_text.delta') {
+      const key = `${parsed['output_index']}:${parsed['content_index']}`;
+      if (this.firstPart === undefined) {
+        this.firstPart = key;
+        for (const k of ['item_id', 'output_index', 'content_index'] as const)
+          if (parsed[k] !== undefined) this.envelope[k] = parsed[k];
+      } else if (key !== this.firstPart) {
+        this._failClosed = true; // a second output_text part — refuse rather than mis-attribute
+        return '';
+      }
+      const delta = typeof parsed['delta'] === 'string' ? (parsed['delta'] as string) : '';
+      const emitted = this.transform.push(delta);
+      this.acc += emitted;
+      delete parsed['logprobs']; // per-token logprobs echo the RAW text — strip them
+      if (!emitted) return ''; // held back this window — drop the frame
+      parsed['delta'] = emitted;
+      return reframe({ event: ev.event, data: JSON.stringify(parsed) });
+    }
+
+    // Terminal echo of the part text: flush the held tail (emit it as a synthetic
+    // delta for delta-only consumers), then substitute the full accumulator. If we
+    // never saw a delta for this part, the enforcer never windowed this text, so
+    // substituting the (empty) accumulator would blank it and passing it through
+    // would bypass enforcement — fail closed instead (a non-conformant upstream).
+    if (type === 'response.output_text.done') {
+      if (this.firstPart === undefined && String(parsed['text'] ?? '') !== '')
+        return this.failClose();
+      const pre = this.drainTail();
+      parsed['text'] = this.acc;
+      delete parsed['logprobs'];
+      return pre + reframe({ event: ev.event, data: JSON.stringify(parsed) });
+    }
+
+    if (type === 'response.content_part.done') {
+      const part = parsed['part'] as Record<string, unknown> | undefined;
+      if (part && part['type'] === 'output_text') {
+        if (this.firstPart === undefined && String(part['text'] ?? '') !== '')
+          return this.failClose();
+        part['text'] = this.acc;
+        delete part['logprobs'];
+      }
+      return reframe({ event: ev.event, data: JSON.stringify(parsed) });
+    }
+
+    // The fully-materialized message item, echoed just before response.completed —
+    // its content[].text carries the whole assistant text (the official SDK builds
+    // response.output from it), so it must be scrubbed like the other echoes.
+    if (type === 'response.output_item.done') {
+      const pre = this.drainTail();
+      const item = parsed['item'] as Record<string, unknown> | undefined;
+      if (!this.substituteContent(item?.['content'])) return this.failClose();
+      return pre + reframe({ event: ev.event, data: JSON.stringify(parsed) });
+    }
+
+    if (
+      type === 'response.completed' ||
+      type === 'response.incomplete' ||
+      type === 'response.failed'
+    ) {
+      const pre = this.drainTail(); // in case there was no output_text.done
+      if (!this.substituteCompleted(parsed)) return this.failClose();
+      return pre + reframe({ event: ev.event, data: JSON.stringify(parsed) });
+    }
+
+    return reframe(ev); // every other event passes through verbatim
+  }
+
+  private failClose(): string {
+    this._failClosed = true;
+    return '';
+  }
+
+  /** Flush the transform tail once, folding it into the accumulator and emitting it
+   *  as a synthetic delta (idempotent — empty once drained). */
+  private drainTail(): string {
+    const tail = this.transform.flush();
+    if (!tail) return '';
+    this.acc += tail;
+    return this.synthDelta(tail);
+  }
+
+  /** Overwrite every output_text `.text` in a terminal response object with the
+   *  accumulator (and strip its logprobs), leaving usage + every sibling byte-intact.
+   *  Returns false (→ fail closed) if an echo carries text we never windowed. */
+  private substituteCompleted(parsed: Record<string, unknown>): boolean {
+    const response = parsed['response'];
+    if (!response || typeof response !== 'object') return true;
+    const output = (response as Record<string, unknown>)['output'];
+    if (!Array.isArray(output)) return true;
+    for (const item of output) {
+      if (!this.substituteContent((item as Record<string, unknown>)?.['content'])) return false;
+    }
+    return true;
+  }
+
+  /** Scrub one item's content[] blocks: each output_text block's `text` becomes the
+   *  accumulator and its per-token `logprobs` are stripped. Returns false if a block
+   *  carries text that was never windowed via a delta (→ the caller fails closed). */
+  private substituteContent(content: unknown): boolean {
+    if (!Array.isArray(content)) return true;
+    for (const c of content) {
+      const block = c as Record<string, unknown>;
+      if (block?.['type'] !== 'output_text') continue;
+      if (this.firstPart === undefined && String(block['text'] ?? '') !== '') return false;
+      block['text'] = this.acc;
+      delete block['logprobs'];
+    }
+    return true;
+  }
+
+  /** A synthetic, event-named `response.output_text.delta` carrying `text`. */
+  private synthDelta(text: string): string {
+    const frame: Record<string, unknown> = {
+      type: 'response.output_text.delta',
+      ...this.envelope,
+      delta: text,
+    };
+    return `event: response.output_text.delta\ndata: ${JSON.stringify(frame)}\n\n`;
   }
 }

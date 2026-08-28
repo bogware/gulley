@@ -40,6 +40,7 @@ import {
   AnthropicSseRewriter,
   OpenAiSseRewriter,
   parseRetryAfterMs,
+  ResponsesSseRewriter,
   SSEParser,
   type TextTransform,
   type UsageExtractor,
@@ -1264,22 +1265,28 @@ async function handleProxy(
   // reversibly masks, or blocks on the first violation via a delayed-emit window,
   // trading raw-byte-fidelity + a bounded delay for enforcement. Enabled for the two
   // text-stream shapes we can re-frame — the Anthropic Messages stream
-  // (content_block_delta) and the OpenAI chat.completions stream (choices[].delta.
-  // content). Skipped for a hold-then-flush route (it buffers-and-withholds) and for
-  // any other client dialect (e.g. /v1/responses, /v1/embeddings — left audit-only).
+  // (content_block_delta), the OpenAI chat.completions stream (choices[].delta.
+  // content), and the OpenAI Responses stream (response.output_text.delta + its
+  // echoes, M22 B). Skipped for a hold-then-flush route (it buffers-and-withholds)
+  // and for any other client dialect (e.g. /v1/embeddings — left audit-only).
   const anthropicClient = route.clientPaths.some((p) => p.endsWith('/v1/messages'));
   const openaiChatClient = route.clientPaths.some((p) => p.endsWith('/v1/chat/completions'));
+  const responsesClient = route.clientPaths.some((p) => p.endsWith('/v1/responses'));
   // Terminal error frames are client-bound, so their SSE shape follows the client's
   // dialect, not the upstream provider (an OpenAI-compatible backend may not be
   // literally "openai").
-  const clientDialect: 'openai' | 'anthropic' = anthropicClient ? 'anthropic' : 'openai';
+  const clientDialect: 'openai' | 'anthropic' | 'responses' = anthropicClient
+    ? 'anthropic'
+    : responsesClient
+      ? 'responses'
+      : 'openai';
   const streamEnforce =
     streamed &&
     outputEnforcing &&
     ctx.streamEnforce === true &&
     !holdStreamed &&
     statusCode < 400 &&
-    (anthropicClient || openaiChatClient);
+    (anthropicClient || openaiChatClient || responsesClient);
   const redactor =
     streamEnforce && engine
       ? new StreamingRedactor(
@@ -1303,9 +1310,11 @@ async function handleProxy(
   const enforcer =
     enforceTransform === undefined
       ? undefined
-      : openaiChatClient
-        ? new OpenAiSseRewriter(enforceTransform)
-        : new AnthropicSseRewriter(enforceTransform);
+      : responsesClient
+        ? new ResponsesSseRewriter(enforceTransform)
+        : openaiChatClient
+          ? new OpenAiSseRewriter(enforceTransform)
+          : new AnthropicSseRewriter(enforceTransform);
 
   // Capture the full response when we need it whole: non-streamed metering,
   // buffered enforcement, or a cacheable miss we intend to store.
@@ -1878,6 +1887,11 @@ async function handleProxy(
  *  since the frame is client-bound: Anthropic-canonical by default; the OpenAI
  *  family uses the `data: {error}` shape their SDKs expect. */
 function providerErrorFrame(dialect: string, message: string): string {
+  if (dialect === 'responses') {
+    // The Responses stream's top-level error event (analogue of chat's data:{error}
+    // and Anthropic's event: error).
+    return `event: error\ndata: ${JSON.stringify({ type: 'error', code: null, message, param: null, sequence_number: 0 })}\n\n`;
+  }
   if (dialect === 'openai' || dialect === 'azure') {
     return `data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`;
   }

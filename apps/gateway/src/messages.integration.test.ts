@@ -1732,6 +1732,136 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       })
       .join('');
 
+  it('enforces output guardrails on a /v1/responses stream — deltas AND echoes redacted', async () => {
+    // A Responses stream: text deltas, then the echoing output_text.done +
+    // content_part.done + response.completed frames that most SDKs read the final
+    // message from. Enforcement must redact the email in ALL of them (echo-leak guard).
+    const rframe = (event: string, obj: unknown): string =>
+      `event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`;
+    const full = 'email me at leak@example.com please';
+    const body =
+      rframe('response.created', { type: 'response.created', response: { id: 'resp_1' } }) +
+      rframe('response.output_text.delta', {
+        type: 'response.output_text.delta',
+        item_id: 'msg_1',
+        output_index: 0,
+        content_index: 0,
+        delta: full,
+        // per-token logprobs echo the raw text — must be stripped under enforcement
+        logprobs: [
+          { token: 'leak@example', logprob: -0.1 },
+          { token: '.com', logprob: -0.2 },
+        ],
+      }) +
+      rframe('response.output_text.done', {
+        type: 'response.output_text.done',
+        item_id: 'msg_1',
+        output_index: 0,
+        content_index: 0,
+        text: full,
+        logprobs: [{ token: 'leak@example.com', logprob: -0.1 }],
+      }) +
+      rframe('response.content_part.done', {
+        type: 'response.content_part.done',
+        item_id: 'msg_1',
+        output_index: 0,
+        content_index: 0,
+        part: { type: 'output_text', text: full, annotations: [] },
+      }) +
+      // The materialized item echo — the frame that leaked before the fix.
+      rframe('response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: full, annotations: [] }],
+        },
+      }) +
+      rframe('response.completed', {
+        type: 'response.completed',
+        response: {
+          id: 'resp_1',
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: full, annotations: [] }],
+            },
+          ],
+          usage: { input_tokens: 5, output_tokens: 8 },
+        },
+      });
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(body);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.streamEnforce = true;
+    ctx.streamEnforceWindowChars = 32;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/responses'],
+        createExtractor: () => new OpenAIUsageExtractor(),
+        strategy: {
+          mode: 'single',
+          target: {
+            name: 'responses',
+            provider: 'openai',
+            adapter: new AnthropicAdapter({ baseUrl: url }),
+            credential: { scheme: 'bearer', value: UPSTREAM_KEY },
+            upstreamPath: '/v1/responses',
+          },
+        },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action: 'redact', minConfidence: 0.5 },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const out = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({ model: 'gpt-5', stream: true, input: 'hi' }),
+    }).then((r) => r.text());
+
+    const evs = new SSEParser().push(out).map((e) => JSON.parse(e.data) as Record<string, unknown>);
+    // No frame — delta OR echo — may leak the raw email.
+    expect(out).not.toContain('leak@example.com');
+    // deltas were redacted (some output_text.delta emitted, redacted)
+    const deltaText = evs
+      .filter((e) => e['type'] === 'response.output_text.delta')
+      .map((e) => e['delta'])
+      .join('');
+    expect(deltaText).not.toContain('leak@example.com');
+    expect(deltaText.length).toBeGreaterThan(0);
+    // the completed echo carries the SAME redacted text, and usage is intact
+    const completed = evs.find((e) => e['type'] === 'response.completed');
+    const resp = completed?.['response'] as Record<string, unknown>;
+    const block = (
+      (resp['output'] as Record<string, unknown>[])[0]!['content'] as Record<string, unknown>[]
+    )[0]!;
+    expect(String(block['text'])).toBe(deltaText); // echo == accumulator
+    expect(resp['usage']).toEqual({ input_tokens: 5, output_tokens: 8 });
+    // the output_item.done item echo is scrubbed too (the frame that leaked pre-fix)
+    const item = evs.find((e) => e['type'] === 'response.output_item.done');
+    const itemBlock = (
+      (item?.['item'] as Record<string, unknown>)['content'] as Record<string, unknown>[]
+    )[0]!;
+    expect(String(itemBlock['text'])).toBe(deltaText);
+    // per-token logprobs (which spell out the raw text) are stripped from the stream
+    expect(out).not.toContain('logprobs');
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
   it('masks input PII to the provider and detokenizes it back to the client (input vault)', async () => {
     // Upstream echoes the (masked) prompt text back so the response-side detok can
     // restore it — proving the full mask→provider→detokenize→client round-trip.
