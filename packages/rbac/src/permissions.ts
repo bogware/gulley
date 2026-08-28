@@ -11,6 +11,7 @@ export type Resource =
   | 'budget'
   | 'ratelimit'
   | 'guardrail'
+  | 'prompt'
   | 'membership'
   | 'config'
   | 'audit';
@@ -33,6 +34,7 @@ const READABLE: Resource[] = [
   'budget',
   'ratelimit',
   'guardrail',
+  'prompt',
   'membership',
   'config',
   'audit',
@@ -49,6 +51,7 @@ const EDITABLE: Resource[] = [
   'key',
   'ratelimit',
   'guardrail',
+  'prompt',
 ];
 
 function reads(): Permission[] {

@@ -1,5 +1,6 @@
 import { type AdminSessionClaims, signAdminSession } from '@gulley/auth';
 import { assertNoInlineSecret } from '@gulley/pipeline';
+import { MissingVariablesError, PromptNameConflictError, renderPrompt } from '@gulley/prompts';
 import { secretRef } from '@gulley/core';
 import { assertEgressAllowed } from '@gulley/egress';
 import {
@@ -392,6 +393,159 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       }),
     );
   }
+
+  // --- governed prompt registry (versioned, hash-chained templates) ---
+  const promptScope = (id: string): { at: ReturnType<typeof scopeForWorkspace>; wsId?: string } => {
+    const t = ctx.prompts.get(id);
+    if (!t) return { at: undefined };
+    return { at: scopeForWorkspace(ctx, t.workspaceId), wsId: t.workspaceId };
+  };
+
+  app.post(
+    '/prompts',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const b = body(request);
+      const workspaceId = str(b['workspaceId']);
+      const name = str(b['name']);
+      const promptBody = typeof b['body'] === 'string' ? b['body'] : undefined;
+      const message = str(b['message']);
+      if (!workspaceId || !name || promptBody === undefined)
+        return invalid(reply, 'workspaceId, name and body required');
+      const at = scopeForWorkspace(ctx, workspaceId);
+      if (!at) return notFound(reply, 'workspace');
+      if (!(await ctx.access.can(admin, 'prompt:create', at))) return forbidden(reply);
+      let created;
+      try {
+        created = ctx.prompts.create(workspaceId, name, {
+          body: promptBody,
+          createdBy: admin.subject,
+          ...(message !== undefined ? { message } : {}),
+        });
+      } catch (e) {
+        if (e instanceof PromptNameConflictError)
+          return reply.code(409).send({ error: { type: 'conflict', message: e.message } });
+        throw e;
+      }
+      const head = created.versions[created.versions.length - 1]!;
+      await ctx.audit.append({
+        orgId: at.orgId ?? null,
+        actor: admin.subject,
+        action: 'prompt.create',
+        target: created.id,
+        payload: { name, version: head.version, hash: head.hash, variables: head.variables },
+      });
+      return reply.code(201).send({ prompt: created });
+    }),
+  );
+
+  app.post(
+    '/prompts/:id/versions',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      const { at } = promptScope(id);
+      if (!at) return notFound(reply, 'prompt');
+      const b = body(request);
+      const promptBody = typeof b['body'] === 'string' ? b['body'] : undefined;
+      const message = str(b['message']);
+      if (promptBody === undefined) return invalid(reply, 'body required');
+      if (!(await ctx.access.can(admin, 'prompt:update', at))) return forbidden(reply);
+      const v = ctx.prompts.addVersion(id, {
+        body: promptBody,
+        createdBy: admin.subject,
+        ...(message !== undefined ? { message } : {}),
+      });
+      if (!v) return notFound(reply, 'prompt');
+      await ctx.audit.append({
+        orgId: at.orgId ?? null,
+        actor: admin.subject,
+        action: 'prompt.version.create',
+        target: id,
+        payload: { version: v.version, hash: v.hash, prevHash: v.prevHash, variables: v.variables },
+      });
+      return reply.code(201).send({ version: v });
+    }),
+  );
+
+  app.get(
+    '/prompts',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      const visible = visibleWorkspaceIds(ctx, admin);
+      return reply.send({ prompts: ctx.prompts.list([...visible]) });
+    }),
+  );
+
+  app.get(
+    '/prompts/:id',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      const t = ctx.prompts.get(id);
+      if (!t) return notFound(reply, 'prompt');
+      const at = scopeForWorkspace(ctx, t.workspaceId) ?? {};
+      if (!(await ctx.access.can(admin, 'prompt:read', at))) return forbidden(reply);
+      return reply.send({ prompt: t });
+    }),
+  );
+
+  app.get(
+    '/prompts/:id/verify',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      const t = ctx.prompts.get(id);
+      if (!t) return notFound(reply, 'prompt');
+      const at = scopeForWorkspace(ctx, t.workspaceId) ?? {};
+      if (!(await ctx.access.can(admin, 'prompt:read', at))) return forbidden(reply);
+      return reply.send(ctx.prompts.verifyChain(id));
+    }),
+  );
+
+  // Render a version (head by default) with caller-supplied variables. A read op
+  // that takes a body, so POST — but gated on prompt:read, never a write.
+  app.post(
+    '/prompts/:id/render',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      const t = ctx.prompts.get(id);
+      if (!t) return notFound(reply, 'prompt');
+      const at = scopeForWorkspace(ctx, t.workspaceId) ?? {};
+      if (!(await ctx.access.can(admin, 'prompt:read', at))) return forbidden(reply);
+      const b = body(request);
+      const versionNum = typeof b['version'] === 'number' ? b['version'] : undefined;
+      const vars =
+        b['variables'] && typeof b['variables'] === 'object'
+          ? (b['variables'] as Record<string, unknown>)
+          : {};
+      const v = versionNum ? ctx.prompts.version(id, versionNum) : ctx.prompts.head(id);
+      if (!v) return notFound(reply, 'version');
+      try {
+        return reply.send({ version: v.version, rendered: renderPrompt(v.body, vars) });
+      } catch (e) {
+        if (e instanceof MissingVariablesError)
+          return reply
+            .code(422)
+            .send({ error: { type: 'missing_variables', message: e.message, missing: e.missing } });
+        throw e;
+      }
+    }),
+  );
+
+  app.delete(
+    '/prompts/:id',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      const { at } = promptScope(id);
+      if (!at) return notFound(reply, 'prompt');
+      if (!(await ctx.access.can(admin, 'prompt:delete', at))) return forbidden(reply);
+      const deleted = ctx.prompts.delete(id);
+      await ctx.audit.append({
+        orgId: at.orgId ?? null,
+        actor: admin.subject,
+        action: 'prompt.delete',
+        target: id,
+        payload: { id },
+      });
+      return reply.send({ deleted });
+    }),
+  );
 
   // --- audit chain verification (platform admin) ---
   app.get(

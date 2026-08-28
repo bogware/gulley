@@ -59,6 +59,9 @@ importers:
       '@gulley/pipeline':
         specifier: workspace:*
         version: link:../../packages/pipeline
+      '@gulley/prompts':
+        specifier: workspace:*
+        version: link:../../packages/prompts
       '@gulley/rbac':
         specifier: workspace:*
         version: link:../../packages/rbac
@@ -466,6 +469,22 @@ importers:
       '@gulley/cost':
         specifier: workspace:*
         version: link:../cost
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)
+
+  packages/prompts:
+    dependencies:
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

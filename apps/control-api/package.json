@@ -28,6 +28,7 @@
     "@gulley/oauth": "workspace:*",
     "@gulley/oidc": "workspace:*",
     "@gulley/pipeline": "workspace:*",
+    "@gulley/prompts": "workspace:*",
     "@gulley/rbac": "workspace:*",
     "@gulley/redact": "workspace:*",
     "@gulley/storage": "workspace:*",

@@ -30,6 +30,7 @@ import {
   InMemoryRequestLog,
   type RequestLogQuery,
 } from '@gulley/pipeline';
+import { InMemoryPromptRegistry, type PromptRegistry } from '@gulley/prompts';
 import { type AccessControl, InMemoryAccessControl } from '@gulley/rbac';
 import type { CollectionKind, KeyAdmin } from './domain';
 import { COLLECTION_KINDS } from './domain';
@@ -52,6 +53,8 @@ export interface ControlContext {
   providers: ProviderStore;
   credentials: ProviderCredentialStore;
   collections: Record<CollectionKind, ScopedCollection>;
+  /** Governed prompt registry — versioned, hash-chained prompt templates. */
+  prompts: PromptRegistry;
   keys: KeyAdmin;
   keyStore: InMemoryKeyStore;
   audit: AuditSink;
@@ -155,6 +158,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     providers: new ProviderStore(),
     credentials: new ProviderCredentialStore(),
     collections,
+    prompts: new InMemoryPromptRegistry(),
     keys: db
       ? new PostgresKeyAdminStore(db, opts.pepper)
       : new KeyAdminStore(keyStore, opts.pepper),
