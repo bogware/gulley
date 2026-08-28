@@ -40,6 +40,7 @@ export class GatewayMetrics {
   private readonly guardrail: Counter;
   private readonly failovers: Counter;
   private readonly saved: Counter;
+  private readonly budgetAlerts: Counter;
   private readonly duration: Histogram;
 
   constructor(private readonly now: () => number = Date.now) {
@@ -70,6 +71,10 @@ export class GatewayMetrics {
     this.saved = this.registry.counter(
       'gulley_cost_saved_micro_usd_total',
       'Cost avoided in micro-USD by source (prompt_cache).',
+    );
+    this.budgetAlerts = this.registry.counter(
+      'gulley_budget_alerts_total',
+      'Soft-threshold budget alerts fired, by threshold.',
     );
     this.duration = this.registry.histogram(
       'gulley_request_duration_seconds',
@@ -102,6 +107,10 @@ export class GatewayMetrics {
 
   recordFailover(target: string): void {
     this.failovers.inc({ target });
+  }
+
+  recordBudgetAlert(threshold: number): void {
+    this.budgetAlerts.inc({ threshold: String(threshold) });
   }
 
   render(): string {

@@ -109,6 +109,11 @@ const Env = z.object({
   SECRETS_REGION: z.string().optional(),
   // Redis counters (budget reserve/commit). Absent = budgets disabled.
   REDIS_COUNTERS_URL: z.string().url().optional(),
+  // Soft-threshold budget alerts: fire a webhook + gulley_budget_alerts_total metric
+  // as a workspace's utilization crosses each level (once per level per period),
+  // before the hard 402. Absent webhook = metric only.
+  BUDGET_ALERT_WEBHOOK_URL: z.string().url().optional(),
+  BUDGET_ALERT_THRESHOLDS: z.string().default('0.8,0.9'),
   // Redis for the exact cache / Redis Stack vector index (when selected).
   REDIS_CACHE_URL: z.string().url().optional(),
   REDIS_VECTOR_URL: z.string().url().optional(),

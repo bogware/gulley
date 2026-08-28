@@ -39,6 +39,7 @@ import type { RateResolver } from '@gulley/cost';
 import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulley/auth';
 import { OidcProvider } from '@gulley/oidc';
 import { readFileSync } from 'node:fs';
+import { BudgetAlerter } from './budget-alerts';
 import type { JwtAuthConfig } from './jwt-auth';
 import { applyRouteGroups, parseRouteGroups } from './route-groups';
 import { buildSecretResolver } from './secrets';
@@ -580,6 +581,32 @@ export function createProductionContext(config: Config): GatewayContext {
       }
     : otel;
 
+  // Soft-threshold budget alerts (metric + optional webhook), fired fire-and-forget
+  // off the hot path so a slow/failing alert never affects a request.
+  const alertThresholds = config.BUDGET_ALERT_THRESHOLDS.split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0 && n <= 1);
+  const alertUrl = config.BUDGET_ALERT_WEBHOOK_URL;
+  const budgetAlerter =
+    alertThresholds.length > 0
+      ? new BudgetAlerter(alertThresholds, (e) => {
+          metrics?.recordBudgetAlert(e.threshold);
+          if (alertUrl) {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 3000);
+            t.unref?.();
+            void fetch(alertUrl, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ type: 'budget.threshold', ...e }),
+              signal: ctrl.signal,
+            })
+              .catch(() => {})
+              .finally(() => clearTimeout(t));
+          }
+        })
+      : undefined;
+
   // Rate limiting shares the counters Redis with budgets (global, cross-replica);
   // without it, limits fall back to per-replica in-memory counters.
   let rateLimiter: RateLimiter | undefined;
@@ -641,6 +668,7 @@ export function createProductionContext(config: Config): GatewayContext {
         })
       : undefined,
     budgets,
+    budgetAlerter,
     telemetry,
     guardrails: buildGuardrails(config),
     cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,

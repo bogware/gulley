@@ -119,6 +119,8 @@ export interface GatewayContext {
    *  after authn and only when no per-tenant override pins the request. */
   smartRouter?: SmartRouter;
   budgets: BudgetStore;
+  /** Soft-threshold budget alerter (metric + webhook); absent = no alerts. */
+  budgetAlerter?: { check(workspaceId: string, usedMicroUsd: number, capMicroUsd: number): void };
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */
   guardrails?: GuardrailEngine;
@@ -841,6 +843,19 @@ async function handleProxy(
       return;
     }
     reserved = decision !== null && decision.allowed;
+    // Soft-threshold alert on the admitted utilization (fire-and-forget, off the
+    // hot path; the alerter dedups so this is once per level per period).
+    if (decision) {
+      try {
+        ctx.budgetAlerter?.check(
+          principal.scope.workspaceId,
+          decision.usedMicroUsd,
+          decision.capMicroUsd,
+        );
+      } catch {
+        /* never let an alert affect a request */
+      }
+    }
   }
 
   const controller = new AbortController();
