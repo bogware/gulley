@@ -91,6 +91,51 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     }),
   );
 
+  // --- break-glass: audited, time-boxed emergency elevation ---
+  // The static bootstrap token is long-lived, unscoped-owner, and its use is not
+  // itself audited. Break-glass is the disciplined path: exchange the bootstrap token
+  // (bootstrap-ONLY — a regular session can't self-elevate) for a SHORT-lived
+  // owner@* session with a REQUIRED reason, recorded as a first-class audit event. The
+  // session auto-expires (and is revocable by jti), so emergency access is bounded
+  // and traceable rather than a permanent all-powerful credential.
+  app.post(
+    '/admin/break-glass',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (admin.source !== 'bootstrap') return forbidden(reply);
+      const b = body(request);
+      const reason = str(b['reason']);
+      if (!reason) return invalid(reply, 'reason required');
+      const secret = ctx.resolverDeps.sessionSecrets[0];
+      if (!secret)
+        return reply.code(500).send({ error: { type: 'config', message: 'no session secret' } });
+      const cap = ctx.resolverDeps.maxSessionTtlMs / 1000;
+      const ttlSeconds = Math.min(Number(b['ttlSeconds']) || 900, cap);
+      const now = ctx.resolverDeps.now ?? Date.now();
+      const iat = Math.floor(now / 1000);
+      const jti = randomUUID();
+      const claims: AdminSessionClaims = {
+        sub: `break-glass:${admin.subject}`,
+        name: 'break-glass',
+        jti,
+        memberships: [{ role: 'owner', orgId: '*' }],
+        iat,
+        exp: iat + ttlSeconds,
+        typ: 'admin-session',
+        ver: 1,
+      };
+      const token = signAdminSession(secret, claims);
+      const expiresAt = new Date(claims.exp * 1000).toISOString();
+      await ctx.audit.append({
+        orgId: null,
+        actor: admin.subject,
+        action: 'admin.break_glass',
+        target: jti,
+        payload: { reason, expiresAt, ttlSeconds },
+      });
+      return reply.code(201).send({ token, expiresAt });
+    }),
+  );
+
   // --- orgs ---
   app.get(
     '/orgs',

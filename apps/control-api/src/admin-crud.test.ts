@@ -195,3 +195,38 @@ describe('memberships (durable RBAC surface)', () => {
     expect(del.statusCode).toBe(501);
   });
 });
+
+describe('break-glass emergency elevation', () => {
+  it('exchanges the bootstrap token for a short-lived, usable owner session (with a reason)', async () => {
+    const res = await post('/admin/break-glass', { reason: 'incident-42', ttlSeconds: 300 });
+    expect(res.statusCode).toBe(201);
+    const { token, expiresAt } = res.json() as { token: string; expiresAt: string };
+    expect(token.startsWith('gses_')).toBe(true);
+    expect(new Date(expiresAt).getTime()).toBeGreaterThan(Date.now());
+    // The minted session is a real platform owner — it can create an org.
+    const org2 = await app.inject({
+      method: 'POST',
+      url: '/orgs',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'BG Org' }),
+    });
+    expect(org2.statusCode).toBe(201);
+  });
+
+  it('requires a reason and refuses a non-bootstrap caller (no self-elevation)', async () => {
+    expect((await post('/admin/break-glass', {})).statusCode).toBe(422);
+    // A regular (viewer) session cannot break-glass to owner.
+    const sess = await post('/admin/sessions', {
+      subject: 'viewer@x',
+      memberships: [{ role: 'viewer', orgId }],
+    });
+    const viewerToken = (sess.json() as { token: string }).token;
+    const res = await app.inject({
+      method: 'POST',
+      url: '/admin/break-glass',
+      headers: { authorization: `Bearer ${viewerToken}`, 'content-type': 'application/json' },
+      payload: JSON.stringify({ reason: 'nope' }),
+    });
+    expect(res.statusCode).toBe(403);
+  });
+});
