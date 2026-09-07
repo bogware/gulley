@@ -96,6 +96,74 @@ describe('admin log browser + usage analytics', () => {
     expect(buckets.find((b) => b.group === 'openai')?.requests).toBe(1);
   });
 
+  it('501s the shadow-spend route when no reconciliation backend is wired', async () => {
+    // The default ctx has no db and no injected shadowSpend port.
+    const res = await call('GET', '/admin/analytics/shadow-spend', gadm);
+    expect(res.statusCode).toBe(501);
+  });
+
+  it('returns the shadow-spend report, RBAC-scoped to visible workspaces', async () => {
+    const gadm2 = `gadm_${randomBytes(24).toString('base64url')}`;
+    let capturedScope: string[] | undefined;
+    const ctx = createInMemoryControlContext({
+      pepper: PEPPER,
+      bootstrapEnabled: true,
+      bootstrapTokenSha256: createHash('sha256').update(gadm2).digest('hex'),
+      sessionSecrets: [SESSION_SECRET],
+      maxSessionTtlMs: 900_000,
+      // Inject the port directly (no live provider calls).
+      shadowSpend: (o) => {
+        capturedScope = o.workspaceIds;
+        return Promise.resolve({
+          rows: [
+            {
+              provider: 'anthropic',
+              gatewayMicroUsd: 600_000,
+              providerMicroUsd: 1_000_000,
+              shadowMicroUsd: 400_000,
+              shadowRatio: 0.4,
+              flagged: true,
+            },
+          ],
+          gatewayTotalMicroUsd: 600_000,
+          providerTotalMicroUsd: 1_000_000,
+          shadowTotalMicroUsd: 400_000,
+          flagged: true,
+          reconciledProviders: ['anthropic'],
+        });
+      },
+    });
+    const app2 = buildServer(loadConfig({ LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv), ctx);
+    try {
+      const inject = (url: string) =>
+        app2.inject({ method: 'GET', url, headers: { authorization: `Bearer ${gadm2}` } });
+      // Give the admin a visible workspace so readScope resolves to a scope.
+      const org = await app2.inject({
+        method: 'POST',
+        url: '/orgs',
+        headers: { authorization: `Bearer ${gadm2}`, 'content-type': 'application/json' },
+        payload: JSON.stringify({ name: 'Acme' }),
+      });
+      const orgId = (org.json().org as { id: string }).id;
+      const ws = await app2.inject({
+        method: 'POST',
+        url: '/workspaces',
+        headers: { authorization: `Bearer ${gadm2}`, 'content-type': 'application/json' },
+        payload: JSON.stringify({ orgId, name: 'Default' }),
+      });
+      const wsId = (ws.json().workspace as { id: string }).id;
+
+      const res = await inject('/admin/analytics/shadow-spend');
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as { flagged: boolean; shadowTotalMicroUsd: number };
+      expect(body.flagged).toBe(true);
+      expect(body.shadowTotalMicroUsd).toBe(400_000);
+      expect(capturedScope).toContain(wsId); // the port was RBAC-scoped
+    } finally {
+      await app2.close();
+    }
+  });
+
   it('does not leak logs to an admin who cannot see the workspace', async () => {
     const org1 = await call('POST', '/orgs', gadm, { name: 'Acme' });
     const org1Id = (org1.json().org as { id: string }).id;

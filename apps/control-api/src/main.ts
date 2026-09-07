@@ -9,6 +9,11 @@ import {
 } from './context';
 import { parseRoleMap } from './oidc-gate';
 import { buildServer } from './server';
+import {
+  anthropicAdminUsageSource,
+  openAiUsageSource,
+  type ProviderUsageSource,
+} from './shadow-spend';
 
 /** The config-propagation emitter, if a durable config store is wired. A
  *  successful /config/apply emits a NOTIFY over this so gateway replicas reconcile
@@ -53,6 +58,19 @@ function buildContext(config: Config): ControlContext | undefined {
     );
   }
 
+  // Shadow-spend ingest: one usage/cost source per provider whose org Admin key is
+  // configured. Egress is guarded and constrained to the outbound allowlist.
+  const providerUsageSources: ProviderUsageSource[] = [];
+  const usageClientOpts = { allowlist: outboundAllowlist(config) };
+  if (config.ANTHROPIC_ADMIN_API_KEY) {
+    providerUsageSources.push(
+      anthropicAdminUsageSource(config.ANTHROPIC_ADMIN_API_KEY, usageClientOpts),
+    );
+  }
+  if (config.OPENAI_ADMIN_API_KEY) {
+    providerUsageSources.push(openAiUsageSource(config.OPENAI_ADMIN_API_KEY, usageClientOpts));
+  }
+
   return createInMemoryControlContext({
     pepper: config.GULLEY_KEY_PEPPER ?? '',
     bootstrapEnabled: config.CONTROL_API_BOOTSTRAP_ENABLED,
@@ -60,6 +78,8 @@ function buildContext(config: Config): ControlContext | undefined {
     sessionSecrets: secrets,
     maxSessionTtlMs: config.ADMIN_SESSION_MAX_MS,
     outboundAllowlist: outboundAllowlist(config),
+    providerUsageSources,
+    shadowSpendFlagBps: config.SHADOW_SPEND_FLAG_BPS,
     oidc,
     databaseUrl: config.DATABASE_URL,
     notifier: configBus,

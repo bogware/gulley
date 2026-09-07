@@ -106,4 +106,32 @@ export function registerLogRoutes(app: FastifyInstance, ctx: ControlContext): vo
       return reply.send({ rows });
     }),
   );
+
+  // Shadow-spend reconciliation: each provider's own billed spend (from its usage/
+  // cost API) vs what the gateway ledger mediated, over the window. A provider whose
+  // bypassed share crosses the threshold is `flagged` — the CISO bypass alert.
+  // RBAC-scoped to the caller's visible workspaces (the ledger side); the provider
+  // side is org-wide, so an org admin sees the true bypass, a scoped viewer sees a
+  // conservative (larger) apparent shadow for their slice.
+  app.get(
+    '/admin/analytics/shadow-spend',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!ctx.shadowSpend) {
+        return reply.code(501).send({
+          error: {
+            type: 'not_supported',
+            message: 'shadow-spend reconciliation requires a database',
+          },
+        });
+      }
+      const visible = visibleWorkspaceIds(ctx, admin);
+      const workspaceIds = readScope(request, visible);
+      if (!workspaceIds) return reply.send({ rows: [], flagged: false });
+      const to = parseDate(query(request)['to']) ?? new Date();
+      const from =
+        parseDate(query(request)['from']) ?? new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const report = await ctx.shadowSpend({ from, to, workspaceIds });
+      return reply.send(report);
+    }),
+  );
 }

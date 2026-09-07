@@ -15,6 +15,7 @@ import {
   type ChargebackRow,
   createDatabase,
   type Database,
+  ledgerSpendTotals,
   newOriginId,
   PostgresAuditSink,
   PostgresConfigStore,
@@ -28,6 +29,11 @@ import {
 import type { Encryptor } from '@gulley/crypto';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
+import {
+  type ProviderUsageSource,
+  runShadowSpendReconciliation,
+  type ShadowSpendReport,
+} from './shadow-spend';
 import type { OidcRoleRule } from './oidc-gate';
 import {
   type AuditRow,
@@ -84,6 +90,13 @@ export interface ControlContext {
     to?: Date;
     workspaceIds?: string[];
   }) => Promise<ChargebackRow[]>;
+  /** Shadow-spend reconciliation: provider usage/cost APIs vs the gateway ledger, to
+   *  surface spend that bypassed Gulley. Absent when no DB is wired. */
+  shadowSpend?: (opts: {
+    from?: Date;
+    to?: Date;
+    workspaceIds?: string[];
+  }) => Promise<ShadowSpendReport>;
   resolverDeps: AdminResolverDeps;
   /** Verify the underlying audit chain (the sink is guarded, so expose it). Async
    *  because the durable chain is read from Postgres when a DB is present. */
@@ -151,6 +164,15 @@ export interface InMemoryContextOptions {
   maskVault?: MaskVaultStore;
   /** Envelope decryptor for the mask vault (tests inject a shared cipher). */
   maskVaultEncryptor?: Encryptor;
+  /** Provider usage/cost ingest sources for shadow-spend reconciliation. Tests
+   *  inject fakes; prod wires Anthropic/OpenAI admin-API clients from config. */
+  providerUsageSources?: ProviderUsageSource[];
+  /** Shadow/provider spend ratio (basis points) at/above which a provider is
+   *  flagged for a bypass alert. Default 500 (5%). */
+  shadowSpendFlagBps?: number;
+  /** Inject the shadow-spend port directly (tests / a custom backend); overrides
+   *  the DB-derived default. */
+  shadowSpend?: ControlContext['shadowSpend'];
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -212,6 +234,26 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     requestLogQuery:
       opts.requestLogQuery ?? (db ? new PostgresRequestLogQuery(db) : new InMemoryRequestLog()),
     chargeback: db ? (o) => chargebackReport(db, o) : undefined,
+    shadowSpend:
+      opts.shadowSpend ??
+      (db
+        ? async (o) => {
+            const to = o.to ?? new Date();
+            const from = o.from ?? new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
+            const gateway = await ledgerSpendTotals(db, {
+              from,
+              to,
+              workspaceIds: o.workspaceIds,
+            });
+            return runShadowSpendReconciliation(
+              gateway.map((r) => ({ provider: r.provider, costMicroUsd: r.costMicroUsd })),
+              opts.providerUsageSources ?? [],
+              from,
+              to,
+              { flagRatioBps: opts.shadowSpendFlagBps },
+            );
+          }
+        : undefined),
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,
       bootstrapTokenSha256: opts.bootstrapTokenSha256,

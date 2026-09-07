@@ -33,6 +33,17 @@ const Env = z.object({
   // Provider base-URL egress allowlist (comma-separated hostnames).
   OUTBOUND_HOST_ALLOWLIST: z.string().default(''),
 
+  // Shadow-spend reconciliation (bypass detection): org-level ADMIN keys for the
+  // providers' own usage/cost APIs. When set, GET /admin/analytics/shadow-spend
+  // pulls each provider's billed spend and reconciles it against the gateway ledger
+  // to surface spend that bypassed Gulley. Absent for a provider = gateway-only
+  // (that provider can't be flagged). Org admin keys, not per-tenant secrets.
+  ANTHROPIC_ADMIN_API_KEY: z.string().optional(),
+  OPENAI_ADMIN_API_KEY: z.string().optional(),
+  // Flag a provider whose shadow (bypassed) share of its billed spend is at/above
+  // this many basis points. Default 500 bps = 5%.
+  SHADOW_SPEND_FLAG_BPS: z.coerce.number().int().min(0).max(10_000).default(500),
+
   // Compliance: an HMAC key that signs auditor attestations (GET /audit/attestation
   // and the audit:verify CLI). Absent = attestation export disabled (501). The
   // auditor holds the same key to verify the signature independently.

@@ -544,6 +544,51 @@ export async function chargebackReport(
   }));
 }
 
+export interface LedgerSpendTotal {
+  provider: string;
+  model: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  costMicroUsd: number;
+}
+
+/** Gateway-side spend totals per (provider, model) over the durable ledger — the
+ *  baseline for shadow-spend reconciliation (comparing what the gateway mediated
+ *  against what the provider's own usage/cost API reports it billed). Workspace-
+ *  scoped for RBAC, with the same empty-scope guard as chargebackReport. */
+export async function ledgerSpendTotals(
+  db: Database,
+  opts: { from?: Date; to?: Date; workspaceIds?: string[] } = {},
+): Promise<LedgerSpendTotal[]> {
+  if (opts.workspaceIds && opts.workspaceIds.length === 0) return [];
+  const conds: SQL[] = [];
+  if (opts.workspaceIds) conds.push(inArray(spendLedger.workspaceId, opts.workspaceIds));
+  if (opts.from) conds.push(gte(spendLedger.createdAt, opts.from));
+  if (opts.to) conds.push(lt(spendLedger.createdAt, opts.to));
+  const rows = await db
+    .select({
+      provider: spendLedger.provider,
+      model: spendLedger.model,
+      requests: sql<string>`count(*)`,
+      inputTokens: sql<string>`coalesce(sum(${spendLedger.inputTokens}), 0)`,
+      outputTokens: sql<string>`coalesce(sum(${spendLedger.outputTokens}), 0)`,
+      costMicroUsd: sql<string>`coalesce(sum(${spendLedger.costMicroUsd}), 0)`,
+    })
+    .from(spendLedger)
+    .where(conds.length ? and(...conds) : undefined)
+    .groupBy(spendLedger.provider, spendLedger.model)
+    .orderBy(sql`coalesce(sum(${spendLedger.costMicroUsd}), 0) desc`);
+  return rows.map((r) => ({
+    provider: r.provider,
+    model: r.model,
+    requests: Number(r.requests),
+    inputTokens: Number(r.inputTokens),
+    outputTokens: Number(r.outputTokens),
+    costMicroUsd: Number(r.costMicroUsd),
+  }));
+}
+
 /** Data to self-heal the Redis committed budget counters from the durable ledger:
  *  for each workspace with a ROLLING (period_seconds) cap, the ledger spend summed
  *  over the active window. Lifetime caps (null period) are skipped — their counter
