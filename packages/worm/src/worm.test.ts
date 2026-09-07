@@ -1,7 +1,13 @@
-import { InMemoryHmacSigner } from '@gulley/crypto';
+import { InMemoryHmacSigner, LocalKeypairSigner, verifyWithPublicKey } from '@gulley/crypto';
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { buildBatch, InMemoryAuditMirror, type MirroredRow, verifyMirrorChain } from './batch';
+import {
+  batchHash,
+  buildBatch,
+  InMemoryAuditMirror,
+  type MirroredRow,
+  verifyMirrorChain,
+} from './batch';
 
 /** Build a chained run of `n` mirrored rows (rowHash = H(prevHash‖seq)). */
 function chain(n: number): MirroredRow[] {
@@ -71,5 +77,25 @@ describe('WORM mirror chain', () => {
     const attacker = new InMemoryHmacSigner();
     const mirror = await shipWindows(chain(3), 5, attacker);
     expect((await verifyMirrorChain(mirror, signer)).ok).toBe(false);
+  });
+
+  it('supports an asymmetric signer — auditor verifies batches with only the public key', async () => {
+    const signer = new LocalKeypairSigner();
+    const mirror = new InMemoryAuditMirror();
+    const rows = chain(6);
+    for (let i = 0; i < rows.length; i += 4) {
+      await mirror.put(await buildBatch(rows.slice(i, i + 4), signer));
+    }
+    // In-process verify (the shipper's own /verify) passes.
+    expect((await verifyMirrorChain(mirror, signer)).ok).toBe(true);
+
+    // An external auditor with ONLY the published public key verifies every batch
+    // signature offline — no KMS, no shared secret.
+    const pem = await signer.publicKeyPem();
+    for (const ref of await mirror.list()) {
+      const batch = await mirror.get(ref);
+      expect(batchHash(batch.rows)).toBe(batch.batchHash); // hash recomputes
+      expect(verifyWithPublicKey(pem, Buffer.from(batch.batchHash), batch.signature)).toBe(true);
+    }
   });
 });

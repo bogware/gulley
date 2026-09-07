@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { InMemoryAesCipher } from './envelope';
-import { InMemoryHmacSigner } from './sign';
+import { InMemoryHmacSigner, LocalKeypairSigner, verifyWithPublicKey } from './sign';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -39,5 +39,49 @@ describe('InMemoryHmacSigner', () => {
     expect(await s.verify(data, sig)).toBe(true);
     expect(await s.verify(enc.encode('tampered'), sig)).toBe(false);
     expect(await s.verify(data, sig.slice(0, -2) + 'aa')).toBe(false);
+  });
+});
+
+describe('LocalKeypairSigner / verifyWithPublicKey (asymmetric, offline-verifiable)', () => {
+  it('signs, self-verifies, and is verifiable offline with only the public key', async () => {
+    const s = new LocalKeypairSigner();
+    const data = enc.encode('worm-batch-hash');
+    const sig = await s.sign(data);
+    expect(await s.verify(data, sig)).toBe(true);
+
+    // An external auditor holds only the SPKI public-key PEM — no KMS, no secret.
+    const pem = await s.publicKeyPem();
+    expect(pem).toContain('BEGIN PUBLIC KEY');
+    expect(verifyWithPublicKey(pem, data, sig)).toBe(true);
+    expect(verifyWithPublicKey(pem, enc.encode('tampered'), sig)).toBe(false);
+  });
+
+  it('a signature does not verify under a different key', async () => {
+    const a = new LocalKeypairSigner();
+    const b = new LocalKeypairSigner();
+    const data = enc.encode('x');
+    const sig = await a.sign(data);
+    expect(verifyWithPublicKey(await b.publicKeyPem(), data, sig)).toBe(false);
+    expect(await b.verify(data, sig)).toBe(false);
+  });
+
+  it('a supplied private key gives a STABLE published public key across instances', async () => {
+    const seed = new LocalKeypairSigner();
+    // Reconstruct another signer from the same key material (exported PKCS#8 PEM).
+    const privateKeyPem = (
+      seed as unknown as { privateKey: { export(o: unknown): string | Buffer } }
+    ).privateKey
+      .export({ format: 'pem', type: 'pkcs8' })
+      .toString();
+    const s1 = new LocalKeypairSigner({ privateKeyPem });
+    const s2 = new LocalKeypairSigner({ privateKeyPem });
+    expect(await s1.publicKeyPem()).toBe(await s2.publicKeyPem());
+    // A signature from one verifies under the other's (identical) public key.
+    const sig = await s1.sign(enc.encode('stable'));
+    expect(verifyWithPublicKey(await s2.publicKeyPem(), enc.encode('stable'), sig)).toBe(true);
+  });
+
+  it('verifyWithPublicKey fails closed on a malformed key or signature', () => {
+    expect(verifyWithPublicKey('not-a-pem', enc.encode('x'), 'AAAA')).toBe(false);
   });
 });
