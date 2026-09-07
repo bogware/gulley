@@ -74,8 +74,7 @@ if (process.argv[1] && /onboarding-cli\.(ts|js)$/.test(process.argv[1])) {
   const io: CliIo = {
     readText: (p) => readFileSync(p, 'utf8'),
     writeText: (p, c) => writeFileSync(p, c),
-    // eslint-disable-next-line no-console
-    log: (l) => console.log(l),
+    log: (l) => process.stdout.write(`${l}\n`),
   };
   process.exit(runOnboardingCli(process.argv.slice(2), io));
 }

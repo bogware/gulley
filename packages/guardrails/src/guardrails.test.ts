@@ -437,9 +437,8 @@ describe('GuardrailEngine.layerOver', () => {
     // A base with a plugin that blocks everything; ws has no plugin.
     const blockingPlugin: GuardrailPlugin = {
       name: 'floor-dlp',
-      // eslint-disable-next-line @typescript-eslint/require-await
-      async inspect() {
-        return { action: 'blocked' as const, findings: [] };
+      inspect() {
+        return Promise.resolve({ action: 'blocked' as const, findings: [] });
       },
     };
     const floor = new GuardrailEngine([det], auditOnlyPolicies(), blockingPlugin);
