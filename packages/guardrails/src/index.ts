@@ -5,6 +5,7 @@ export * from './detector';
 export * from './injection';
 export * from './vault';
 export * from './streaming';
+export * from './spotlight';
 export * from './engine';
 export * from './plugin';
 export * from './webhook';

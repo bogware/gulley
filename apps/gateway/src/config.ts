@@ -187,6 +187,15 @@ const Env = z.object({
   // `block` rejects; `redact` irreversibly replaces. Default `audit` (record only).
   GUARDRAILS_INPUT_ACTION: z.enum(['audit', 'block', 'mask', 'redact']).default('audit'),
   GUARDRAILS_INPUT_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.5),
+  // Indirect-injection spotlighting: wrap UNTRUSTED request spans — Anthropic
+  // `tool_result` blocks and OpenAI `role:"tool"` messages (external tool/document
+  // output, the classic indirect-injection vector) — in trust-tag delimiters so the
+  // model can tell external data from instructions. Deterministic + structure-
+  // preserving (cache-safe), off by default. GUARDRAILS_SPOTLIGHT_DIRECTIVE also
+  // prepends a system directive explaining the tags (maximizes efficacy, but the
+  // added system prefix shifts Anthropic prompt-cache breakpoints — opt in).
+  GUARDRAILS_SPOTLIGHT: envBool(false),
+  GUARDRAILS_SPOTLIGHT_DIRECTIVE: envBool(false),
   // M17: windowed in-stream enforcement of the output policy on Anthropic-canonical
   // streamed responses (redact matched spans / block on first violation), trading
   // raw-byte-fidelity + a bounded delay for enforcement. Off by default.

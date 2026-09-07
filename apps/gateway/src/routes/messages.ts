@@ -21,6 +21,7 @@ import {
   filterByPolicy,
   type GuardrailEngine,
   type OutputInspection,
+  spotlightUntrusted,
   StreamingRedactor,
   StreamingReplacer,
   StreamingScanner,
@@ -206,6 +207,12 @@ export interface GatewayContext {
   /** Request header names whose values are captured as cost-attribution tags on the
    *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
   attributionHeaders?: string[];
+  /** Indirect-injection spotlighting: wrap untrusted request spans (tool_result /
+   *  role:"tool" output) in trust-tag delimiters before forwarding. Absent = off. */
+  spotlightUntrusted?: boolean;
+  /** When spotlighting, also prepend a system directive explaining the delimiters
+   *  (higher efficacy; shifts Anthropic prompt-cache breakpoints). Absent = off. */
+  spotlightDirective?: boolean;
   /** M17: windowed in-stream output enforcement (redact/block) on Anthropic-
    *  canonical streamed responses; absent/false = streamed output stays audit-only. */
   streamEnforce?: boolean;
@@ -751,6 +758,18 @@ async function handleProxy(
           error: { type: 'rate_limit_error', message: 'rate limit exceeded' },
         });
       return;
+    }
+  }
+
+  // --- spotlighting: delimit UNTRUSTED spans (tool output) before anything else ---
+  // Runs before the input guardrail (so a scan sees the delimited form) and before
+  // the cache lookup (so the key reflects what is forwarded). It is deterministic +
+  // structure-preserving, so cache hits are preserved — no `inputMasked` gate.
+  if (parseOk && ctx.spotlightUntrusted) {
+    const sl = spotlightUntrusted(parsed, { directive: ctx.spotlightDirective });
+    if (sl.marked > 0) {
+      parsed = sl.body as Record<string, unknown>;
+      body = Buffer.from(JSON.stringify(parsed), 'utf8');
     }
   }
 

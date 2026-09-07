@@ -872,6 +872,8 @@ export function createProductionContext(config: Config): GatewayContext {
           .filter(Boolean)
       : undefined,
     hedgeDelayMs: config.HEDGE_DELAY_MS > 0 ? config.HEDGE_DELAY_MS : undefined,
+    spotlightUntrusted: config.GUARDRAILS_SPOTLIGHT,
+    spotlightDirective: config.GUARDRAILS_SPOTLIGHT_DIRECTIVE,
     streamEnforce: config.STREAMING_ENFORCE,
     streamEnforceWindowChars: config.STREAMING_ENFORCE_WINDOW_CHARS,
     headerModifier: config.HEADER_MODIFIER
