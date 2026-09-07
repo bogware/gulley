@@ -95,6 +95,11 @@ export interface ProviderRoute {
   /** Opt in to hold-then-flush enforcement of the OUTPUT policy on streamed
    *  responses (buffers the stream, then blocks/withholds). Trades streaming. */
   holdStreamedOutput?: boolean;
+  /** Opt in to M17 windowed in-stream OUTPUT enforcement for THIS route (redact /
+   *  reversible-mask / block on a delayed-emit window), independent of the global
+   *  `ctx.streamEnforce`. Set per-workspace so a DLP policy enforces on streamed
+   *  responses instead of silently degrading to audit-only. */
+  streamEnforce?: boolean;
   /** Request hedging: if the primary candidate hasn't returned response headers
    *  within this many ms, dispatch the next candidate in parallel and serve
    *  whichever answers first (pre-first-byte only). Overrides the ctx default;
@@ -1380,7 +1385,8 @@ async function handleProxy(
   const streamEnforce =
     streamed &&
     outputEnforcing &&
-    ctx.streamEnforce === true &&
+    // Global toggle (M17) OR a per-route/per-workspace opt-in (DLP default-on).
+    (ctx.streamEnforce === true || route.streamEnforce === true) &&
     !holdStreamed &&
     statusCode < 400 &&
     (anthropicClient || openaiChatClient || responsesClient);

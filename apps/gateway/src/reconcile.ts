@@ -78,7 +78,11 @@ export class GatewayReconciler {
   private async run(): Promise<boolean> {
     try {
       const doc = await this.store.exportDocument('*');
-      const routes = await buildRoutesFromDocument(doc, this.resolver);
+      // Layer per-workspace guardrails over the env-configured global engine (the
+      // floor), so a DB policy can only add to it — never drop its output
+      // enforcement or managed DLP plugins. ctx is preserved by reference across
+      // reconciles, so the floor is stable.
+      const routes = await buildRoutesFromDocument(doc, this.resolver, this.holder.ctx.guardrails);
       // Build the smart router BEFORE swapping anything: a malformed policy throws
       // here and the catch keeps the CURRENT routes + smart router intact (never a
       // partial swap), matching the credential-resolution failure contract.

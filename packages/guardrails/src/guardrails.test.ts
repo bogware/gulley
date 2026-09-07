@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { NativeDetector, resolveOverlaps } from './detector';
-import { filterByPolicy, GuardrailEngine } from './engine';
+import { filterByPolicy, GuardrailEngine, strongerPolicy } from './engine';
 import { shannonEntropy } from './entropy';
 import { StreamingRedactor, StreamingReplacer, StreamingScanner } from './streaming';
 import { auditOnlyPolicies, type Detector, type GuardrailPlugin } from './types';
@@ -384,6 +384,86 @@ describe('GuardrailEngine', () => {
     const r = engine.inspectOutputText(text);
     expect(r.transformedText).toBe('contact <<REDACTED_EMAIL>> now');
     expect(r.vault).toBeUndefined();
+  });
+});
+
+describe('strongerPolicy', () => {
+  it('takes the higher-ranked action and the widest coverage', () => {
+    // audit < mask < redact < block; lowest minConfidence and unrestricted win.
+    expect(strongerPolicy({ action: 'audit' }, { action: 'block' }).action).toBe('block');
+    expect(strongerPolicy({ action: 'mask' }, { action: 'redact' }).action).toBe('redact');
+    expect(
+      strongerPolicy(
+        { action: 'block', minConfidence: 0.9 },
+        { action: 'audit', minConfidence: 0.3 },
+      ).minConfidence,
+    ).toBe(0.3);
+  });
+
+  it('keeps unrestricted coverage when either side is unrestricted, else unions', () => {
+    // One side unrestricted → result unrestricted (widest).
+    expect(
+      strongerPolicy({ action: 'block', categories: ['email'] }, { action: 'audit' }).categories,
+    ).toBeUndefined();
+    // Both restricted → union.
+    expect(
+      strongerPolicy(
+        { action: 'block', categories: ['email'] },
+        { action: 'audit', categories: ['us_ssn'] },
+      ).categories,
+    ).toEqual(['email', 'us_ssn']);
+  });
+});
+
+describe('GuardrailEngine.layerOver', () => {
+  const emailText = 'contact jane@example.com now';
+
+  it("keeps the base floor's stronger output action when this engine is weaker", () => {
+    const floor = new GuardrailEngine([det], {
+      input: { action: 'audit' },
+      output: { action: 'block' }, // the org floor blocks output
+    });
+    const ws = new GuardrailEngine([det], {
+      input: { action: 'block' },
+      output: { action: 'audit' }, // workspace only cares about input
+    });
+    const layered = ws.layerOver(floor);
+    // The floor's output block survives; input is at least as strong as either.
+    expect(layered.outputPolicy.action).toBe('block');
+    expect(layered.inputPolicy.action).toBe('block');
+  });
+
+  it("carries the base floor's plugin so managed DLP is never dropped", async () => {
+    // A base with a plugin that blocks everything; ws has no plugin.
+    const blockingPlugin: GuardrailPlugin = {
+      name: 'floor-dlp',
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async inspect() {
+        return { action: 'blocked' as const, findings: [] };
+      },
+    };
+    const floor = new GuardrailEngine([det], auditOnlyPolicies(), blockingPlugin);
+    const ws = new GuardrailEngine([det], {
+      input: { action: 'audit' },
+      output: { action: 'audit' },
+    });
+    const layered = ws.layerOver(floor);
+    // The plugin still runs on the layered engine → input is blocked.
+    expect((await layered.inspectInput(emailText)).blocked).toBe(true);
+  });
+
+  it('does not mutate either input engine', () => {
+    const floor = new GuardrailEngine([det], {
+      input: { action: 'audit' },
+      output: { action: 'redact' },
+    });
+    const ws = new GuardrailEngine([det], {
+      input: { action: 'audit' },
+      output: { action: 'audit' },
+    });
+    ws.layerOver(floor);
+    expect(ws.outputPolicy.action).toBe('audit'); // unchanged
+    expect(floor.outputPolicy.action).toBe('redact'); // unchanged
   });
 });
 

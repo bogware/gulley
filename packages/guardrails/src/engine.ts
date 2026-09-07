@@ -1,3 +1,4 @@
+import { composePlugins } from './composite';
 import { resolveOverlaps } from './detector';
 import type {
   Detector,
@@ -31,6 +32,29 @@ export function filterByPolicy(findings: Finding[], policy: GuardrailPolicy): Fi
   const min = policy.minConfidence ?? 0;
   const cats = policy.categories ? new Set(policy.categories) : undefined;
   return findings.filter((f) => f.confidence >= min && (!cats || cats.has(String(f.category))));
+}
+
+const ACTION_RANK: Record<GuardrailPolicy['action'], number> = {
+  audit: 0,
+  mask: 1,
+  redact: 2,
+  block: 3,
+};
+
+/** The stronger of two policies, used to layer one engine's policy over another's
+ *  without ever weakening enforcement: the higher-ranked action wins, and coverage
+ *  is widened, not narrowed — the lowest minConfidence (catches more) and the
+ *  category UNION, with an unrestricted side (no `categories`) staying unrestricted. */
+export function strongerPolicy(a: GuardrailPolicy, b: GuardrailPolicy): GuardrailPolicy {
+  const action = ACTION_RANK[a.action] >= ACTION_RANK[b.action] ? a.action : b.action;
+  const merged: GuardrailPolicy = { action };
+  const mins = [a.minConfidence, b.minConfidence].filter((n): n is number => typeof n === 'number');
+  if (mins.length === 2) merged.minConfidence = Math.min(...mins);
+  // Only when BOTH restrict to categories is the result restricted (to their union);
+  // if either is unrestricted, the widest coverage — unrestricted — is kept.
+  if (a.categories && b.categories)
+    merged.categories = [...new Set([...a.categories, ...b.categories])];
+  return merged;
 }
 
 export interface InputInspection {
@@ -70,6 +94,36 @@ export class GuardrailEngine {
 
   get outputPolicy(): GuardrailPolicy {
     return this.policies.output;
+  }
+
+  get inputPolicy(): GuardrailPolicy {
+    return this.policies.input;
+  }
+
+  /**
+   * Return a NEW engine that layers this engine over a `base` floor: the base's
+   * detectors and plugin are retained (this engine's detectors are added, deduped
+   * by name with the base first), and each direction's policy is the STRONGER of
+   * the two (see strongerPolicy). So a per-workspace engine can only ADD to — never
+   * weaken — the global floor it augments: an unspecified/weaker direction keeps the
+   * floor's enforcement, and the floor's external DLP plugins (webhook / moderation /
+   * Model Armor / …) are never silently dropped. Neither input engine is mutated.
+   */
+  layerOver(base: GuardrailEngine): GuardrailEngine {
+    const seen = new Set<string>();
+    const detectors: Detector[] = [];
+    for (const d of [...base.detectors, ...this.detectors]) {
+      if (seen.has(d.name)) continue;
+      seen.add(d.name);
+      detectors.push(d);
+    }
+    const policies: GuardrailPolicies = {
+      input: strongerPolicy(base.policies.input, this.policies.input),
+      output: strongerPolicy(base.policies.output, this.policies.output),
+    };
+    const plugins = [base.plugin, this.plugin].filter((p): p is GuardrailPlugin => p !== undefined);
+    const plugin = plugins.length > 1 ? composePlugins(plugins) : plugins[0];
+    return new GuardrailEngine(detectors, policies, plugin);
   }
 
   /** A single Detector that fans out to all configured detectors and resolves

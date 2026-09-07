@@ -2645,6 +2645,52 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await new Promise<void>((r) => server.close(() => r()));
   });
 
+  it('enforces in-stream via a per-route streamEnforce flag (DLP default-on, global toggle off)', async () => {
+    // Same windowed redaction, but driven by route.streamEnforce (what the
+    // per-workspace guardrail wiring sets) with the GLOBAL ctx.streamEnforce OFF —
+    // so a DB-configured DLP policy enforces on streamed responses by default
+    // instead of silently degrading to audit-only.
+    const body = anthropicSse([
+      'Here is a long clean intro with nothing sensitive at all. The key is AKIA',
+      'IOSFODNN7EXAMPLE and here is clean trailing text continuing well past the window.',
+    ]);
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(body);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    expect(ctx.streamEnforce).not.toBe(true); // the GLOBAL toggle is off
+    ctx.streamEnforceWindowChars = 32;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('enforce', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action: 'redact', minConfidence: 0.5 },
+        }),
+        streamEnforce: true, // per-route opt-in (set by the per-workspace wiring)
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamReqBody,
+    });
+    const ct = clientText(await res.text());
+    expect(res.headers.get('x-gulley-guardrail')).toBe('stream-enforce');
+    expect(ct).not.toContain('AKIAIOSFODNN7EXAMPLE'); // redacted mid-stream despite global off
+    expect(ct).toContain('<<REDACTED_AWS_ACCESS_KEY_ID>>');
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
   it('blocks a streamed response at the first violation (terminal error, secret withheld)', async () => {
     const { app, base, server, ledger, token } = await streamEnforceRoute(
       [
