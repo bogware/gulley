@@ -288,7 +288,11 @@ export const adminUser = pgTable(
 );
 
 // A role granted at a scope. org_id NULL + workspace_id NULL is a platform grant;
-// the in-memory '*' sentinel is never persisted here.
+// the in-memory '*' sentinel is never persisted here. org_id / workspace_id are
+// plain scope IDENTIFIERS (matched by RBAC), NOT foreign keys: the admin org/
+// workspace directory is in-memory in v1 while these rows are durable, so an FK to
+// the Postgres org/workspace tables would reject a grant for an admin-created scope.
+// The user_id FK stays — deprovisioning a user must cascade its grants.
 export const membership = pgTable(
   'membership',
   {
@@ -297,8 +301,8 @@ export const membership = pgTable(
       .notNull()
       .references(() => adminUser.id, { onDelete: 'cascade' }),
     role: text('role').notNull(),
-    orgId: uuid('org_id').references(() => org.id, { onDelete: 'cascade' }),
-    workspaceId: uuid('workspace_id').references(() => workspace.id, { onDelete: 'cascade' }),
+    orgId: uuid('org_id'),
+    workspaceId: uuid('workspace_id'),
   },
   (t) => [index('membership_user_idx').on(t.userId)],
 );

@@ -8,6 +8,7 @@ import { registerHttpEdge } from './http-edge';
 import { registerLogRoutes } from './log-routes';
 import { registerMaskVaultRoutes } from './mask-vault-routes';
 import { registerOidcRoutes } from './oidc-routes';
+import { registerScimRoutes } from './scim';
 import { registerAdminRoutes } from './routes';
 
 export function buildServer(config: Config, ctx?: ControlContext): FastifyInstance {
@@ -49,6 +50,7 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     registerLogRoutes(app, ctx);
     registerMaskVaultRoutes(app, ctx);
     registerOidcRoutes(app, ctx);
+    registerScimRoutes(app, ctx);
     registerDebugRoutes(app, ctx, config);
   }
 
