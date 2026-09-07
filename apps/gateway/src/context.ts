@@ -50,6 +50,7 @@ import { applyRouteGroups, parseRouteGroups } from './route-groups';
 import { buildSecretResolver } from './secrets';
 import { DbTenantCredentialResolver } from './tenant';
 import { parseToolPolicy } from './tool-governance';
+import { modelPolicyFromEnv } from './model-policy';
 import { RequestTracer } from './tracer';
 import {
   AzureContentSafetyPlugin,
@@ -844,6 +845,10 @@ export function createProductionContext(config: Config): GatewayContext {
     rateLimiter,
     metrics,
     modelRouter,
+    // Env model policy is a stable floor; DB mode reconcile unions the config
+    // document's `policies` OVER it (never dropping it) via envModelPolicy.
+    modelPolicy: modelPolicyFromEnv(config.MODEL_ALLOW, config.MODEL_DENY),
+    envModelPolicy: modelPolicyFromEnv(config.MODEL_ALLOW, config.MODEL_DENY),
     models: catalogModels,
     rateResolver,
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,

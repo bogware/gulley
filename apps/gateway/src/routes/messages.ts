@@ -34,6 +34,7 @@ import {
   governToolCalls,
   type ToolCall,
 } from '../tool-governance';
+import { type ModelPolicy, modelAllowedByPolicy } from '../model-policy';
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
@@ -134,6 +135,13 @@ export interface GatewayContext {
   /** Classification-driven smart routing (M15); absent = disabled. Consulted
    *  after authn and only when no per-tenant override pins the request. */
   smartRouter?: SmartRouter;
+  /** Central model allow/deny policy (deployment-wide in single-tenant v1), enforced
+   *  at authz on the RESOLVED model; absent = no model-access policy. Hot-swapped on
+   *  reconcile (config document ∪ envModelPolicy). */
+  modelPolicy?: ModelPolicy;
+  /** The env-configured model policy (MODEL_ALLOW/MODEL_DENY), a stable floor that
+   *  reconcile unions with the config document so a DB config never drops it. */
+  envModelPolicy?: ModelPolicy;
   budgets: BudgetStore;
   /** Soft-threshold budget alerter (metric + webhook); absent = no alerts. */
   budgetAlerter?: { check(workspaceId: string, usedMicroUsd: number, capMicroUsd: number): void };
@@ -314,6 +322,10 @@ export class RouteHolder {
   swapModelRouter(modelRouter: ModelRouter | undefined): void {
     this.ctx.modelRouter = modelRouter;
   }
+  /** Swap the central model allow/deny policy (config-derived) on reconcile. */
+  swapModelPolicy(modelPolicy: ModelPolicy | undefined): void {
+    this.ctx.modelPolicy = modelPolicy;
+  }
   /** Distinct provider names across the current routes (for /ready). */
   providers(): string[] {
     return [
@@ -417,7 +429,18 @@ async function handleModels(
   const principal = auth.value;
   const ids = new Set<string>([...(ctx.models ?? []), ...(ctx.modelRouter?.knownModels() ?? [])]);
   const data = [...ids]
-    .filter((id) => scopeAllowsModel(principal.scope, id))
+    // Advertise an id only if a request for it would actually be permitted. Both the
+    // per-key scope and the central policy are enforced on the RESOLVED model (after
+    // alias/pin rewrite), so resolve the advertised id the same way here — otherwise
+    // an alias whose target is denied would be advertised (then 403), or one whose
+    // target is allowed would be hidden.
+    .filter((id) => {
+      const resolved = ctx.modelRouter?.resolve(id)?.resolved ?? id;
+      return (
+        scopeAllowsModel(principal.scope, resolved) &&
+        (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, resolved))
+      );
+    })
     .sort()
     .map((id) => ({ id, object: 'model', owned_by: 'gulley' }));
   await reply.send({ object: 'list', data });
@@ -591,6 +614,23 @@ async function handleProxy(
     await reply
       .code(403)
       .send({ type: 'error', error: { type: 'permission_error', message: 'model not permitted' } });
+    return;
+  }
+  // Central model allow/deny policy (deployment-wide) on the RESOLVED model — a
+  // second, config-managed gate beyond the per-key scope, so an admin can deny a
+  // model org-wide without touching every key. Audited so a denial is traceable.
+  if (ctx.modelPolicy && !modelAllowedByPolicy(ctx.modelPolicy, requestedModel)) {
+    await ctx.audit.append({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'policy.model_denied',
+      target: requestedModel,
+      payload: { model: requestedModel },
+    });
+    await reply.code(403).send({
+      type: 'error',
+      error: { type: 'permission_error', message: 'model denied by policy' },
+    });
     return;
   }
   const sessionKey = ctx.sessionAffinityHeader
@@ -968,7 +1008,12 @@ async function handleProxy(
   if (
     downshift &&
     admittedUtilization >= downshift.threshold &&
-    requestedModel !== downshift.model
+    requestedModel !== downshift.model &&
+    // Never downshift TO a model the central policy denies — the downshift reassigns
+    // the model AFTER the authz gate, so an unchecked target would bypass the policy.
+    // If the cheaper model is denied, skip the downshift (keep the allowed model,
+    // subject to the budget it was about to breach).
+    (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, downshift.model))
   ) {
     request.log.info(
       { from: requestedModel, to: downshift.model, utilization: admittedUtilization },

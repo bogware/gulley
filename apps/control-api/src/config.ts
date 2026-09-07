@@ -33,6 +33,10 @@ const Env = z.object({
   // Provider base-URL egress allowlist (comma-separated hostnames).
   OUTBOUND_HOST_ALLOWLIST: z.string().default(''),
 
+  // The gateway's PUBLIC base URL, used to generate turnkey client configs
+  // (GET /admin/workspaces/:id/client-config). Absent ⇒ the endpoint 501s.
+  GATEWAY_PUBLIC_URL: z.string().url().optional(),
+
   // Shadow-spend reconciliation (bypass detection): org-level ADMIN keys for the
   // providers' own usage/cost APIs. When set, GET /admin/analytics/shadow-spend
   // pulls each provider's billed spend and reconciles it against the gateway ledger

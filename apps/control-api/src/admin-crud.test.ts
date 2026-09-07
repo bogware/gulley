@@ -97,3 +97,83 @@ describe('admin CRUD — update + delete on config collections', () => {
     expect((await del(`/workspaces/${workspaceId}`)).statusCode).toBe(200);
   });
 });
+
+describe('generated client config', () => {
+  it('501s when GATEWAY_PUBLIC_URL is not configured', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: `/admin/workspaces/${workspaceId}/client-config`,
+      headers: authNoBody(),
+    });
+    expect(res.statusCode).toBe(501);
+  });
+
+  it('generates a Claude Code / Codex config with the workspace allowed models', async () => {
+    const g = `gadm_${randomBytes(24).toString('base64url')}`;
+    const ctx = createInMemoryControlContext({
+      pepper: 'admin-crud-pepper-16chars!!!!!!!',
+      bootstrapEnabled: true,
+      bootstrapTokenSha256: createHash('sha256').update(g).digest('hex'),
+      sessionSecrets: ['admin-crud-session-secret-32bytes-long'],
+      maxSessionTtlMs: 900_000,
+      gatewayPublicUrl: 'https://gulley.acme.internal',
+    });
+    const app2 = buildServer(loadConfig({ LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv), ctx);
+    const h = { authorization: `Bearer ${g}`, 'content-type': 'application/json' };
+    const j = (r: { json: () => unknown }) => r.json();
+    try {
+      const oid = (
+        (await app2
+          .inject({
+            method: 'POST',
+            url: '/orgs',
+            headers: h,
+            payload: JSON.stringify({ name: 'Acme' }),
+          })
+          .then(j)) as { org: { id: string } }
+      ).org.id;
+      const wid = (
+        (await app2
+          .inject({
+            method: 'POST',
+            url: '/workspaces',
+            headers: h,
+            payload: JSON.stringify({ orgId: oid, name: 'prod' }),
+          })
+          .then(j)) as { workspace: { id: string } }
+      ).workspace.id;
+      await app2.inject({
+        method: 'POST',
+        url: '/policies',
+        headers: h,
+        payload: JSON.stringify({
+          workspaceId: wid,
+          name: 'model-access',
+          config: { allow: ['claude-*'] },
+        }),
+      });
+
+      const cc = await app2.inject({
+        method: 'GET',
+        url: `/admin/workspaces/${wid}/client-config?agent=claude-code`,
+        headers: { authorization: `Bearer ${g}` },
+      });
+      expect(cc.statusCode).toBe(200);
+      const claudeCfg = (cc.json() as { config: { content: string; path: string } }).config;
+      expect(claudeCfg.path).toBe('.claude/settings.json');
+      expect(claudeCfg.content).toContain('https://gulley.acme.internal');
+      expect(claudeCfg.content).toContain('claude-*'); // allowed models surfaced
+
+      const codex = await app2.inject({
+        method: 'GET',
+        url: `/admin/workspaces/${wid}/client-config?agent=codex`,
+        headers: { authorization: `Bearer ${g}` },
+      });
+      expect((codex.json() as { config: { content: string } }).config.content).toContain(
+        '/openai/v1',
+      );
+    } finally {
+      await app2.close();
+    }
+  });
+});

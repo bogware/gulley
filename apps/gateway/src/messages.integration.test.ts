@@ -808,6 +808,33 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
   });
 
+  it('does NOT downshift to a model the central policy denies', async () => {
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+    await budgets.reserve('ws_1', 'seed', 8_200_000);
+    await budgets.commit('ws_1', 'seed', 8_200_000); // 82% used — above the 0.8 threshold
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+    // The downshift target is denied by the central policy — the downshift reassigns
+    // the model AFTER the authz gate, so it must be skipped rather than serving it.
+    ctx.modelPolicy = { allow: [], deny: ['claude-haiku-4-5'] };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6', // allowed — passes the policy gate
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).then((r) => r.text());
+    // Served on the original ALLOWED model, never downshifted to the denied one.
+    expect(JSON.parse(received.body).model).toBe('claude-sonnet-4-6');
+    await app.close();
+  });
+
   it('reprices the worst-case for the downshifted model so its own cap admits', async () => {
     const { store, token } = seededStore();
     // Workspace 82% used (above the 0.8 downshift threshold). The CHEAP model's own
@@ -2559,6 +2586,66 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(received.body).toContain('"max_tokens":256'); // default (absent) applied
     expect(received.body).toContain('"top_p":0.1'); // override wins over client 0.9
 
+    await app.close();
+  });
+
+  it('central model policy: 403s a denied model (audited) and admits an allowed one', async () => {
+    const { store, token } = seededStore();
+    const { ctx, audit, requestLog } = buildContext(store);
+    // Deny opus org-wide; allow the rest.
+    ctx.modelPolicy = { allow: [], deny: ['claude-opus-*'] };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const denied = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(denied.status).toBe(403);
+    expect(((await denied.json()) as { error: { message: string } }).error.message).toBe(
+      'model denied by policy',
+    );
+    expect(requestLog.entries).toHaveLength(0); // never dispatched
+    expect(audit.rows.some((e) => e.action === 'policy.model_denied')).toBe(true);
+    // An allowed model on the same policy is admitted.
+    const ok = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(ok.status).toBe(200);
+    await app.close();
+  });
+
+  it('central model policy filters GET /v1/models on the RESOLVED alias target', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.models = ['claude-sonnet-4-6', 'claude-opus-4-8', 'gpt-4o'];
+    ctx.modelPolicy = { allow: ['claude-*'], deny: ['claude-opus-*'] };
+    // Aliases: `latest` → the DENIED opus target; `fast` → an ALLOWED sonnet target.
+    ctx.modelRouter = new ModelRouter([
+      { pattern: 'latest', target: 'claude-opus-4-8' },
+      { pattern: 'fast', target: 'claude-sonnet-4-6' },
+    ]);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/models`, { headers: { 'x-api-key': token } });
+    const ids = ((await res.json()) as { data: Array<{ id: string }> }).data.map((d) => d.id);
+    expect(ids).toContain('claude-sonnet-4-6'); // allowed
+    expect(ids).not.toContain('claude-opus-4-8'); // denied
+    expect(ids).not.toContain('gpt-4o'); // not in the allow-list
+    // Advertise matches enforcement on the RESOLVED target, not the alias name:
+    expect(ids).not.toContain('latest'); // resolves to the denied opus → hidden
+    expect(ids).toContain('fast'); // resolves to the allowed sonnet → advertised
     await app.close();
   });
 

@@ -24,6 +24,7 @@ import {
   str,
   visibleWorkspaceIds,
 } from './admin';
+import { type ClientAgent, generateClientConfig } from './client-config';
 import type { ControlContext } from './context';
 import type { CollectionKind } from './domain';
 import type { FastifyInstance, FastifyReply } from 'fastify';
@@ -302,6 +303,40 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         return forbidden(reply);
       const keys = (await ctx.keys.list([ws.orgId])).filter((k) => k.workspaceId === workspaceId);
       return reply.send({ keys });
+    }),
+  );
+  // Generate a turnkey client config (Claude Code / Codex) for a workspace: the
+  // gateway base URL + the team's allowed models (union of its model-access policy
+  // allow-lists). The gateway is the authority that enforces the policy; this just
+  // makes onboarding a base-URL change. The virtual-key SECRET is never emitted.
+  app.get(
+    '/admin/workspaces/:id/client-config',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!ctx.gatewayPublicUrl) {
+        return reply.code(501).send({
+          error: { type: 'not_supported', message: 'GATEWAY_PUBLIC_URL not configured' },
+        });
+      }
+      const workspaceId = paramId(request);
+      const ws = ctx.workspaces.get(workspaceId);
+      if (!ws) return notFound(reply, 'workspace');
+      if (!visibleWorkspaceIds(ctx, admin).has(workspaceId)) return forbidden(reply);
+      const agent: ClientAgent =
+        str((request.query as Record<string, unknown>)?.['agent']) === 'codex'
+          ? 'codex'
+          : 'claude-code';
+      const allow = new Set<string>();
+      for (const e of ctx.collections['policy'].all()) {
+        if (e.workspaceId !== workspaceId) continue;
+        const a = e.config['allow'];
+        if (Array.isArray(a)) for (const m of a) if (typeof m === 'string') allow.add(m);
+      }
+      const config = generateClientConfig({
+        agent,
+        gatewayUrl: ctx.gatewayPublicUrl,
+        allowedModels: [...allow],
+      });
+      return reply.send({ config });
     }),
   );
   // Revoke (disable) a key — effective on the gateway's next lookup.

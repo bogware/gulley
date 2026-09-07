@@ -81,6 +81,13 @@ const Env = z.object({
   BASIC_AUTH_DEFAULT_ALLOWED_PROVIDERS: z.string().optional(),
   BASIC_AUTH_DEFAULT_ALLOWED_MODELS: z.string().optional(),
 
+  // Central model allow/deny policy (deployment-wide), enforced at authz on the
+  // RESOLVED model + reflected in GET /v1/models. Comma-separated model patterns
+  // (`*` glob), deny-first: MODEL_DENY wins; if MODEL_ALLOW is non-empty a model must
+  // match one. e.g. MODEL_ALLOW=claude-*,gpt-4o-* MODEL_DENY=*-experimental. In DB
+  // config mode the document's `policies` entities (allow/deny) take over on reconcile.
+  MODEL_ALLOW: z.string().default(''),
+  MODEL_DENY: z.string().default(''),
   // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
   // Deny-first, then allow-list; expressions run over { request, principal }.
   // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]

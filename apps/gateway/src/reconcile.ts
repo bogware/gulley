@@ -3,6 +3,7 @@ import type { SecretResolver } from '@gulley/core';
 import type { CentroidIndex, ClassifierBreaker, ClassifierEmbedder } from '@gulley/routing';
 import { type CentroidStore, type ConfigSubscriber, SignalGate } from '@gulley/storage';
 import { buildModelRouterFromDocument, buildRoutesFromDocument } from './config-builder';
+import { buildModelPolicy, unionModelPolicy } from './model-policy';
 import type { RouteHolder } from './routes/messages';
 import {
   buildEmbeddingCentroids,
@@ -105,8 +106,13 @@ export class GatewayReconciler {
       // Build the model router from the document's aliases BEFORE swapping, so a
       // malformed alias throws here (caught → current config kept), never partial.
       const modelRouter = buildModelRouterFromDocument(doc);
+      // Central model allow/deny policy from the document's `policies` entities,
+      // UNIONED with the stable env floor (envModelPolicy) so a config document with
+      // no model policy never drops an env-set MODEL_DENY floor.
+      const modelPolicy = unionModelPolicy(this.holder.ctx.envModelPolicy, buildModelPolicy(doc));
       this.holder.swapRoutes(routes);
       this.holder.swapModelRouter(modelRouter);
+      this.holder.swapModelPolicy(modelPolicy);
       if (this.smartRouting?.enabled) this.holder.swapSmartRouter(smartRouter);
       this.log?.info(`config reconciled: ${routes.length} routes active`);
       return true;

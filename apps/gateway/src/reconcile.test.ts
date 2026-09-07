@@ -75,6 +75,36 @@ describe('GatewayReconciler', () => {
     expect(breaker.errorRate('anthropic')).toBeGreaterThan(0);
   });
 
+  it('unions the env model-policy floor with the document (env deny never dropped)', async () => {
+    const ctx = {
+      routes: [],
+      breaker: new CircuitBreaker(),
+      scoreboard: new LoadScoreboard(),
+      envModelPolicy: { allow: [], deny: ['claude-opus-*'] },
+      modelPolicy: { allow: [], deny: ['claude-opus-*'] },
+    } as unknown as GatewayContext;
+    const holder = new RouteHolder(ctx);
+    // Document carries NO model policy (policies: []) — the env deny must survive.
+    const reconciler = new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      new MapSecretResolver(new Map([[ARN, 'sk-ant-x']])),
+    );
+    await reconciler.reconcile();
+    expect(holder.ctx.modelPolicy?.deny).toContain('claude-opus-*');
+
+    // A document that DOES carry a model policy unions with the env floor.
+    const doc = docWith('anthropic');
+    doc.orgs[0]!.workspaces[0]!.policies = [{ name: 'access', config: { allow: ['claude-*'] } }];
+    await new GatewayReconciler(
+      holder,
+      storeReturning(doc),
+      new MapSecretResolver(new Map([[ARN, 'sk-ant-x']])),
+    ).reconcile();
+    expect(holder.ctx.modelPolicy?.allow).toContain('claude-*'); // from the document
+    expect(holder.ctx.modelPolicy?.deny).toContain('claude-opus-*'); // env floor retained
+  });
+
   it('reports success/failure so the watcher advances the cursor only on success', async () => {
     const { holder } = holderWithState();
     const ok = new GatewayReconciler(

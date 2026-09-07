@@ -115,6 +115,9 @@ export interface ControlContext {
   maskVaultEncryptor?: Encryptor;
   /** Hosts a provider base URL may egress to; empty = any non-blocked host. */
   outboundAllowlist: ReadonlySet<string>;
+  /** The gateway's public base URL for generated client configs; absent ⇒ the
+   *  client-config endpoint is not served. */
+  gatewayPublicUrl?: string;
   /** OIDC session gate config; absent = OIDC login disabled (token-paste only). */
   oidc?: OidcSessionConfig;
   /** Broadcasts a post-commit config signal to gateway replicas; absent = no
@@ -146,6 +149,8 @@ export interface InMemoryContextOptions {
   sessionSecrets: readonly string[];
   maxSessionTtlMs: number;
   outboundAllowlist?: ReadonlySet<string>;
+  /** Gateway public base URL for generated client configs. */
+  gatewayPublicUrl?: string;
   /** Inject a pre-seeded query backend (tests); defaults to a fresh in-memory log. */
   requestLogQuery?: RequestLogQuery;
   oidc?: OidcSessionConfig;
@@ -281,6 +286,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
       (db && opts.maskVaultEncryptor ? new PostgresMaskVaultStore(db) : undefined),
     maskVaultEncryptor: opts.maskVaultEncryptor,
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
+    gatewayPublicUrl: opts.gatewayPublicUrl,
     oidc: opts.oidc,
     notifier: opts.notifier,
     originId: newOriginId(),
