@@ -75,10 +75,14 @@ async function shutdown(signal: string): Promise<void> {
     await configWatcher?.stop(); // stop reloads before draining so none races the close
     context?.breakerSync?.stop(); // stop the cross-replica breaker refresh timer
     await app.close();
+    // Drain the upstream pool BEFORE flushing the log sinks: closeUpstreamPool()
+    // completes in-flight streams, and their single teardown writes the request/
+    // access-log/audit rows — so flushing first would drop those late teardowns.
+    await closeUpstreamPool();
     await context?.flushLogs?.(); // drain buffered request logs before exit
     await context?.accessLogSink?.shutdown(); // flush the OTLP access-log batch
+    await context?.telemetry?.shutdown(); // flush the OTel span pipeline (was dropped every deploy)
     await metricsServer?.close();
-    await closeUpstreamPool();
   } catch (err) {
     app.log.error({ err }, 'shutdown error');
   }
