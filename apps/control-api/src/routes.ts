@@ -1,10 +1,8 @@
 import { type AdminSessionClaims, signAdminSession } from '@gulley/auth';
 import {
   assertNoInlineSecret,
-  attestAuditChain,
-  attestAuditChainAsync,
-  type AuditRow,
-  type SignedAttestation,
+  verifyAttestation,
+  verifyAttestationWithPublicKey,
 } from '@gulley/pipeline';
 import { MissingVariablesError, PromptNameConflictError, renderPrompt } from '@gulley/prompts';
 import { GULLEY_VERSION, secretRef } from '@gulley/core';
@@ -30,6 +28,8 @@ import {
   str,
   visibleWorkspaceIds,
 } from './admin';
+import { detectChainRewrite } from './anchor';
+import { signCtxAttestation } from './audit-signing';
 import { type ClientAgent, generateClientConfig } from './client-config';
 import { buildEvidenceBundle } from './evidence-bundle';
 import { buildOnboardingManifest, publicKeyOf, signOnboardingPack } from './onboarding';
@@ -43,33 +43,6 @@ function invalid(reply: FastifyReply, message: string): FastifyReply {
 
 function paramId(request: { params: unknown }): string {
   return (request.params as { id: string }).id;
-}
-
-/** Sign an auditor attestation with the context's configured signer — the asymmetric
- *  (KMS) audit signer when present, else the shared-secret HMAC key. Returns undefined
- *  when neither is configured (the caller 501s). Shared by the attestation and
- *  evidence-bundle routes. */
-async function signCtxAttestation(
-  ctx: ControlContext,
-  rows: readonly AuditRow[],
-  generatedAt: string,
-): Promise<SignedAttestation | undefined> {
-  const common = {
-    toolVersion: GULLEY_VERSION,
-    generatedAt,
-    ...(ctx.attestationSubject !== undefined ? { subject: ctx.attestationSubject } : {}),
-  };
-  if (ctx.auditSigner) {
-    return attestAuditChainAsync(rows, {
-      signer: ctx.auditSigner,
-      algorithm: ctx.auditSigner.algorithm,
-      ...common,
-    });
-  }
-  if (ctx.attestationKey) {
-    return attestAuditChain(rows, { key: ctx.attestationKey, ...common });
-  }
-  return undefined;
 }
 
 export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): void {
@@ -1007,6 +980,61 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
       if (!ctx.wormShipper) return wormNotConfigured(reply);
       return reply.send(await ctx.wormShipper.verify());
+    }),
+  );
+
+  // --- Anchoring: publish signed chain-head checkpoints to an EXTERNAL append-only
+  // sink, so even the operator (who controls Postgres AND WORM) cannot rewrite history
+  // undetectably. 501 until an anchor sink + a signer are configured.
+  const anchorNotConfigured = (reply: FastifyReply): FastifyReply =>
+    reply
+      .code(501)
+      .send({ error: { type: 'not_configured', message: 'anchoring not configured' } });
+
+  // Anchor the current head now (also runs on a background timer). Idempotent by head
+  // seq, so an overlapping manual/timer publish is safe.
+  app.post(
+    '/audit/anchor',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.anchor || !ctx.auditRows) return anchorNotConfigured(reply);
+      const att = await signCtxAttestation(ctx, await ctx.auditRows(), new Date().toISOString());
+      if (!att) return anchorNotConfigured(reply);
+      return reply.send(await ctx.anchor.publish(att));
+    }),
+  );
+
+  // The anchored checkpoints read back from the external sink.
+  app.get(
+    '/audit/anchors',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.anchor) return anchorNotConfigured(reply);
+      return reply.send({ anchors: await ctx.anchor.list() });
+    }),
+  );
+
+  // Detect a rewrite: verify each anchored checkpoint's signature, then confirm every
+  // anchored head hash still appears at its seq in the CURRENT chain. A conflict is
+  // proof history was rewritten after it was anchored.
+  app.get(
+    '/audit/anchor/verify',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.anchor || !ctx.auditRows) return anchorNotConfigured(reply);
+      const anchored = await ctx.anchor.list();
+      const pem = ctx.auditSigner ? await ctx.auditSigner.publicKeyPem() : undefined;
+      // A tampered sink entry (bad signature) is not counted as rewrite evidence — but
+      // it IS reported, so the auditor sees the sink can't be trusted either way.
+      const signaturesValid = anchored.every((a) =>
+        pem
+          ? verifyAttestationWithPublicKey(a, pem)
+          : ctx.attestationKey
+            ? verifyAttestation(a, ctx.attestationKey)
+            : false,
+      );
+      const rewrite = detectChainRewrite(anchored, await ctx.auditRows());
+      return reply.send({ signaturesValid, ...rewrite });
     }),
   );
 }

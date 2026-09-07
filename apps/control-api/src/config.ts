@@ -78,6 +78,18 @@ const Env = z.object({
     ])
     .default('ECDSA_SHA_256'),
 
+  // Anchoring: publish periodic signed chain-head checkpoints to this external
+  // append-only sink (POST an attestation; GET the list back), so even the operator
+  // cannot rewrite history undetectably. The host must be on OUTBOUND_HOST_ALLOWLIST
+  // (SSRF-guarded). Absent ⇒ the /audit/anchor* endpoints 501.
+  AUDIT_ANCHOR_URL: z.string().url().optional(),
+  // Optional bearer/token header sent to the anchor sink (the value only, e.g.
+  // "Bearer xyz" → set the whole header via AUDIT_ANCHOR_AUTHZ). Secret ARNs only in
+  // prod configs; this is for a simple shared token to a self-hosted sink.
+  AUDIT_ANCHOR_AUTHZ: z.string().optional(),
+  // Background anchoring cadence. Default 1h.
+  AUDIT_ANCHOR_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
+
   // Mask-vault reveal (M22 D): serve GET /admin/mask-vault/:requestId, which
   // decrypts + returns the token↔original map for a masked request. Needs the SAME
   // envelope key the gateway used (KMS ARN in prod; the in-memory dev cipher can only

@@ -8,6 +8,8 @@ import {
 import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
 import { S3AuditMirror } from '@gulley/worm';
+import { type Anchor, HttpAnchor } from './anchor';
+import { signCtxAttestation } from './audit-signing';
 import { type Config, loadConfig, outboundAllowlist, sessionSecrets } from './config';
 import {
   type ControlContext,
@@ -62,6 +64,15 @@ function buildWorm(
 
 function signerFromHmac(key: string | undefined): InMemoryHmacSigner | undefined {
   return key ? new InMemoryHmacSigner(Buffer.from(key, 'utf8')) : undefined;
+}
+
+/** External anchor sink (SSRF-guarded HTTP), if AUDIT_ANCHOR_URL is set. */
+function buildAnchor(config: Config): Anchor | undefined {
+  if (!config.AUDIT_ANCHOR_URL) return undefined;
+  return new HttpAnchor(config.AUDIT_ANCHOR_URL, {
+    allowlist: outboundAllowlist(config),
+    ...(config.AUDIT_ANCHOR_AUTHZ ? { headers: { authorization: config.AUDIT_ANCHOR_AUTHZ } } : {}),
+  });
 }
 
 /**
@@ -144,6 +155,7 @@ function buildContext(config: Config): ControlContext | undefined {
     attestationSubject: config.AUDIT_ATTESTATION_SUBJECT,
     auditSigner,
     worm: buildWorm(config, auditSigner, (m) => process.stderr.write(`${m}\n`)),
+    anchor: buildAnchor(config),
     // Mask-vault reveal decryptor — the SAME envelope key the gateway used (KMS in
     // prod; the in-memory dev cipher only decrypts records written in-process).
     maskVaultEncryptor: config.MASK_VAULT_ENABLED
@@ -189,6 +201,28 @@ if (context?.wormShipper) {
   tick();
 }
 
+// Anchoring: publish a signed chain-head checkpoint to the external sink on a slow
+// cadence, so a later rewrite of history (even by the operator) is detectable. No-ops
+// when no signer is configured (signCtxAttestation returns undefined).
+let anchorTimer: NodeJS.Timeout | undefined;
+if (context?.anchor && context.auditRows) {
+  const anchor = context.anchor;
+  const rowsFn = context.auditRows;
+  const ctx = context;
+  const tick = (): void => {
+    void (async (): Promise<void> => {
+      const att = await signCtxAttestation(ctx, await rowsFn(), new Date().toISOString());
+      if (!att) return;
+      const ref = await anchor.publish(att);
+      app.log.info({ id: ref.id }, 'anchored audit head');
+    })().catch((err: unknown) => app.log.error({ err }, 'anchor publish failed'));
+  };
+  anchorTimer = setInterval(tick, config.AUDIT_ANCHOR_INTERVAL_MS);
+  anchorTimer.unref();
+  app.log.info({ intervalMs: config.AUDIT_ANCHOR_INTERVAL_MS }, 'audit anchoring started');
+  tick();
+}
+
 async function start(): Promise<void> {
   try {
     await app.listen({ host: config.CONTROL_API_HOST, port: config.CONTROL_API_PORT });
@@ -212,6 +246,7 @@ async function shutdown(signal: string): Promise<void> {
   const backstop = setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS);
   backstop.unref();
   if (wormTimer) clearInterval(wormTimer);
+  if (anchorTimer) clearInterval(anchorTimer);
   try {
     await app.close();
     await configBus?.close();

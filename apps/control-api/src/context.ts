@@ -30,6 +30,7 @@ import {
 } from '@gulley/storage';
 import type { AsymmetricSigner, BatchVerifier, Encryptor, Signer } from '@gulley/crypto';
 import type { AuditMirror } from '@gulley/worm';
+import type { Anchor } from './anchor';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
 import { WormShipper } from './worm-shipper';
@@ -124,6 +125,9 @@ export interface ControlContext {
   /** WORM-live shipper: mirrors the complete durable audit chain to S3 Object Lock
    *  in signed, contiguous batches. Absent = WORM not configured (endpoints 501). */
   wormShipper?: WormShipper;
+  /** External anchor sink for periodic signed chain-head checkpoints (rewrite
+   *  detection even against the operator). Absent = anchoring off (endpoints 501). */
+  anchor?: Anchor;
   /** Durable mask-reversal store (M22 D); present (with an encryptor) ⇒ the reveal
    *  endpoint is served. */
   maskVault?: MaskVaultStore;
@@ -199,6 +203,8 @@ export interface InMemoryContextOptions {
     verifier: BatchVerifier;
     batchMax?: number;
   };
+  /** External anchor sink (prod: an HttpAnchor; tests inject an InMemoryAnchor). */
+  anchor?: Anchor;
   /** Durable mask-reversal store (tests inject one). */
   maskVault?: MaskVaultStore;
   /** Envelope decryptor for the mask vault (tests inject a shared cipher). */
@@ -357,6 +363,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     attestationSubject: opts.attestationSubject,
     auditSigner: opts.auditSigner,
     wormShipper,
+    anchor: opts.anchor,
     // Only served when an encryptor is present (the store never sees plaintext, and
     // reveal must decrypt) — so a DB alone doesn't turn the reveal endpoint on.
     maskVault:
