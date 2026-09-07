@@ -867,4 +867,51 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       return reply.send(signed);
     }),
   );
+
+  // --- WORM-live: the retained S3 Object Lock (COMPLIANCE) system of record ---
+  // The audit chain is continuously mirrored to immutable storage in signed,
+  // contiguous batches, so the record survives a Postgres compromise and is provably
+  // un-tampered. All three endpoints 501 until WORM is configured.
+  const wormNotConfigured = (reply: FastifyReply): FastifyReply =>
+    reply.code(501).send({ error: { type: 'not_configured', message: 'WORM not configured' } });
+
+  // Shipper status: the last seq mirrored to WORM this process (0 until a ship runs;
+  // GET /audit/worm/verify gives the authoritative count from the mirror itself).
+  app.get(
+    '/audit/worm/status',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.wormShipper) return wormNotConfigured(reply);
+      return reply.send({ enabled: true, lastSeq: ctx.wormShipper.lastSeq });
+    }),
+  );
+
+  // Ship on demand (also runs on a background timer). Single-flight + idempotent, so
+  // an overlapping manual/timer trigger is safe. A broken existing WORM record makes
+  // this fail closed (409) rather than extend a compromised chain.
+  app.post(
+    '/audit/worm/ship',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.wormShipper) return wormNotConfigured(reply);
+      try {
+        return reply.send(await ctx.wormShipper.ship());
+      } catch (err) {
+        return reply
+          .code(409)
+          .send({ error: { type: 'worm_integrity', message: (err as Error).message } });
+      }
+    }),
+  );
+
+  // Independently verify the mirrored chain: every batch signature is authentic, its
+  // hash recomputes, the rowHash links join across batches, and the seq is gapless.
+  app.get(
+    '/audit/worm/verify',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.wormShipper) return wormNotConfigured(reply);
+      return reply.send(await ctx.wormShipper.verify());
+    }),
+  );
 }

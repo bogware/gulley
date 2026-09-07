@@ -1,10 +1,12 @@
-import { InMemoryAesCipher, KmsEnvelopeEncryptor } from '@gulley/crypto';
+import { InMemoryAesCipher, InMemoryHmacSigner, KmsEnvelopeEncryptor } from '@gulley/crypto';
 import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
+import { S3AuditMirror } from '@gulley/worm';
 import { type Config, loadConfig, outboundAllowlist, sessionSecrets } from './config';
 import {
   type ControlContext,
   createInMemoryControlContext,
+  type InMemoryContextOptions,
   type OidcSessionConfig,
 } from './context';
 import { parseRoleMap } from './oidc-gate';
@@ -19,6 +21,33 @@ import {
  *  successful /config/apply emits a NOTIFY over this so gateway replicas reconcile
  *  live; held here so the drain can close its connection. */
 let configBus: PostgresConfigBus | undefined;
+
+/**
+ * WORM-live wiring from env. Requires the mirror bucket, a batch signing key, AND a
+ * durable DB (the complete chain is read from Postgres — shipping an in-memory chain
+ * from a stateless replica would sign an incomplete artifact). Returns undefined when
+ * disabled; logs a warning when WORM_ENABLED is set but a prerequisite is missing so a
+ * misconfiguration doesn't fail silently.
+ */
+function buildWorm(config: Config, warn: (msg: string) => void): InMemoryContextOptions['worm'] {
+  if (!config.WORM_ENABLED) return undefined;
+  if (!config.WORM_BUCKET || !config.WORM_SIGNING_KEY || !config.DATABASE_URL) {
+    warn(
+      'WORM_ENABLED but WORM_BUCKET / WORM_SIGNING_KEY / DATABASE_URL incomplete — WORM disabled',
+    );
+    return undefined;
+  }
+  const mirror = new S3AuditMirror({
+    bucket: config.WORM_BUCKET,
+    region: config.WORM_REGION,
+    prefix: config.WORM_PREFIX,
+    retentionDays: config.WORM_RETENTION_DAYS,
+  });
+  // Symmetric HMAC batch signer (the auditor holds the same key). KMS-asymmetric
+  // signing — where the auditor needs only the public key — is the follow-up slice.
+  const signer = new InMemoryHmacSigner(Buffer.from(config.WORM_SIGNING_KEY, 'utf8'));
+  return { mirror, signer, verifier: signer, batchMax: config.WORM_BATCH_MAX };
+}
 
 /**
  * Build the control-plane context from env. In-memory stores are the current
@@ -87,6 +116,7 @@ function buildContext(config: Config): ControlContext | undefined {
     notifier: configBus,
     attestationKey: config.AUDIT_ATTESTATION_KEY,
     attestationSubject: config.AUDIT_ATTESTATION_SUBJECT,
+    worm: buildWorm(config, (m) => process.stderr.write(`${m}\n`)),
     // Mask-vault reveal decryptor — the SAME envelope key the gateway used (KMS in
     // prod; the in-memory dev cipher only decrypts records written in-process).
     maskVaultEncryptor: config.MASK_VAULT_ENABLED
@@ -111,6 +141,27 @@ if (!context) {
   );
 }
 
+// WORM-live: continuously ship the durable audit chain to the immutable mirror. Each
+// tick ships every row past the last mirrored seq; ship() is single-flight + idempotent
+// so an overlapping timer/manual trigger is safe. The timer is unref'd so it never
+// holds the process open, and an initial best-effort ship runs on boot.
+let wormTimer: NodeJS.Timeout | undefined;
+if (context?.wormShipper) {
+  const shipper = context.wormShipper;
+  const tick = (): void => {
+    shipper
+      .ship()
+      .then((r) => {
+        if (r.shipped > 0) app.log.info({ shipped: r.shipped, lastSeq: r.lastSeq }, 'WORM shipped');
+      })
+      .catch((err: unknown) => app.log.error({ err }, 'WORM ship failed'));
+  };
+  wormTimer = setInterval(tick, config.WORM_SHIP_INTERVAL_MS);
+  wormTimer.unref();
+  app.log.info({ intervalMs: config.WORM_SHIP_INTERVAL_MS }, 'WORM-live shipper started');
+  tick();
+}
+
 async function start(): Promise<void> {
   try {
     await app.listen({ host: config.CONTROL_API_HOST, port: config.CONTROL_API_PORT });
@@ -133,6 +184,7 @@ async function shutdown(signal: string): Promise<void> {
   app.log.info({ signal }, 'draining');
   const backstop = setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS);
   backstop.unref();
+  if (wormTimer) clearInterval(wormTimer);
   try {
     await app.close();
     await configBus?.close();

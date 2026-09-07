@@ -69,6 +69,29 @@ const Env = z.object({
   GULLEY_KMS_KEY_ARN: z.string().optional(),
   GULLEY_KMS_REGION: z.string().default('us-east-1'),
 
+  // WORM-live: continuously mirror the durable, hash-chained audit log to an S3
+  // Object Lock (COMPLIANCE) bucket — the retained, immutable system of record that
+  // survives a Postgres compromise. Enabled only with WORM_ENABLED + WORM_BUCKET +
+  // WORM_SIGNING_KEY + DATABASE_URL (the complete chain is read from Postgres);
+  // otherwise the /audit/worm/* endpoints 501. Only non-PII AuditRow metadata is
+  // shipped (payloads are already redacted upstream by GuardedAuditSink).
+  WORM_ENABLED: envBool(false),
+  WORM_BUCKET: z.string().optional(),
+  WORM_REGION: z.string().default('us-east-1'),
+  WORM_PREFIX: z.string().default('audit/'),
+  // Per-object COMPLIANCE retention. Default ~7 years (SOX/HIPAA-class window).
+  WORM_RETENTION_DAYS: z.coerce.number().int().positive().default(2555),
+  // Background ship cadence. Each tick ships every durable row past the last mirrored
+  // seq, in contiguous signed batches. Default 60s.
+  WORM_SHIP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  // Max audit rows per WORM object. Default 100.
+  WORM_BATCH_MAX: z.coerce.number().int().positive().default(100),
+  // HMAC key that signs each WORM batch preimage (base64(sha256(canonical(rows))));
+  // forging a batch needs this key, not just an S3 Put. The auditor holds the same
+  // key to verify independently. (KMS-asymmetric signing is the follow-up slice —
+  // then the auditor needs only the public key.) >=16 chars. Absent ⇒ WORM off.
+  WORM_SIGNING_KEY: z.string().min(16).optional(),
+
   // Durable config store. When set, POST /config/apply persists to Postgres (the
   // tables the gateway reads) via PostgresConfigStore + PostgresConfigVersionStore,
   // instead of the in-memory ControlConfigStore. Enables M13 config hot-reload.

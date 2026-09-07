@@ -28,9 +28,11 @@ import {
   readAuditRows,
   type MaskVaultStore,
 } from '@gulley/storage';
-import type { Encryptor } from '@gulley/crypto';
+import type { BatchVerifier, Encryptor, Signer } from '@gulley/crypto';
+import type { AuditMirror } from '@gulley/worm';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
+import { WormShipper } from './worm-shipper';
 import {
   type ProviderUsageSource,
   runShadowSpendReconciliation,
@@ -115,6 +117,9 @@ export interface ControlContext {
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
   attestationSubject?: string;
+  /** WORM-live shipper: mirrors the complete durable audit chain to S3 Object Lock
+   *  in signed, contiguous batches. Absent = WORM not configured (endpoints 501). */
+  wormShipper?: WormShipper;
   /** Durable mask-reversal store (M22 D); present (with an encryptor) ⇒ the reveal
    *  endpoint is served. */
   maskVault?: MaskVaultStore;
@@ -177,6 +182,15 @@ export interface InMemoryContextOptions {
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
   attestationSubject?: string;
+  /** WORM-live wiring: the retained mirror + the batch signer/verifier. Prod builds
+   *  an S3AuditMirror + HMAC signer from config; tests inject an InMemoryAuditMirror
+   *  + InMemoryHmacSigner. Absent = WORM off. */
+  worm?: {
+    mirror: AuditMirror;
+    signer: Signer;
+    verifier: BatchVerifier;
+    batchMax?: number;
+  };
   /** Durable mask-reversal store (tests inject one). */
   maskVault?: MaskVaultStore;
   /** Envelope decryptor for the mask vault (tests inject a shared cipher). */
@@ -225,6 +239,25 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
             workspaceId: r.workspaceId,
           }));
       }
+    : undefined;
+
+  // The authoritative, ordered audit chain source — durable Postgres rows when a DB
+  // is present (the auditor-facing source of truth), else the in-memory sink. Both
+  // attestation export AND the WORM shipper read from this single closure, so WORM
+  // ships the exact complete chain an attestation covers.
+  const auditRows: () => Promise<AuditRow[]> = db
+    ? () => readAuditRows(db)
+    : async () => inner.rows;
+
+  // WORM-live shipper: ships that complete durable chain to the immutable mirror.
+  const wormShipper = opts.worm
+    ? new WormShipper({
+        mirror: opts.worm.mirror,
+        signer: opts.worm.signer,
+        verifier: opts.worm.verifier,
+        readRows: auditRows,
+        ...(opts.worm.batchMax !== undefined ? { batchMax: opts.worm.batchMax } : {}),
+      })
     : undefined;
 
   const collections = Object.fromEntries(
@@ -311,9 +344,10 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     },
     // Attestation reads the durable chain when a DB is present (the auditor-facing
     // source of truth), else the in-memory sink (dev/test) — same core verifier.
-    auditRows: db ? () => readAuditRows(db) : async () => inner.rows,
+    auditRows,
     attestationKey: opts.attestationKey,
     attestationSubject: opts.attestationSubject,
+    wormShipper,
     // Only served when an encryptor is present (the store never sees plaintext, and
     // reveal must decrypt) — so a DB alone doesn't turn the reveal endpoint on.
     maskVault:
