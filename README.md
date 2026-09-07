@@ -10,20 +10,31 @@
 
 ---
 
-> **Status:** actively developed — **M1–M18 delivered** (data plane + pipeline, governance/RBAC/audit/WORM, budgets, caching, guardrails + in-stream enforcement, resilience/routing, config hot-reload, smart classification routing). See [`docs/ROADMAP.md`](docs/ROADMAP.md) and [`docs/AGENTGATEWAY_PORT.md`](docs/AGENTGATEWAY_PORT.md) for the real, current state.
+> **Status:** actively developed and Apache-2.0 open source. The core data plane,
+> governance/RBAC/audit/WORM, budgets, caching, guardrails + in-stream enforcement,
+> resilience/routing, config hot-reload, and smart classification routing are
+> delivered; work now focuses on the cross-vendor coding-agent control plane (see
+> [`docs/WAVE_A_PLAN.md`](docs/WAVE_A_PLAN.md)). [`docs/ROADMAP.md`](docs/ROADMAP.md)
+> and [`docs/AGENTGATEWAY_PORT.md`](docs/AGENTGATEWAY_PORT.md) are the source of truth
+> for the current state — don't trust milestone numbers in prose.
 
-Gulley is **Claude-first** (the Anthropic Messages schema is its canonical internal
-model) and **drop-in**: point Claude Code, Codex, or any custom harness at Gulley by
-changing a base URL and everything just works — while you gain a control plane over
-every request.
+**One control plane over both Claude Code _and_ Codex.** Anthropic's and OpenAI's own
+gateways each govern only their own agent, with after-the-fact, 30-day compliance
+logs. Gulley is the single **in-line, tamper-evident** plane over both (plus Bedrock,
+Vertex, and Azure) — cross-vendor DLP, tool-call policy, hard budgets, and a WORM
+audit no single-vendor tool can match. It is **Claude-first** (the Anthropic Messages
+schema is its canonical internal model) and **drop-in**: point Claude Code, Codex, or
+any custom harness at Gulley by changing a base URL and everything just works — while
+you gain governance, cost control, and audit over every request.
 
 ## Why Gulley
 
 - **Multi-provider** — Anthropic (API + Enterprise), OpenAI, AWS Bedrock, Azure AI Foundry, Google Gemini/Vertex, any OpenAI-compatible backend (Groq, Mistral, Together, …), and local runtimes (Ollama, vLLM, LM Studio, …), behind one surface.
 - **Native passthrough + normalized routing** — full-fidelity per-provider APIs _and_ a cross-provider layer for routing, load-balancing, and failover.
-- **Real governance** — RBAC, virtual keys, budgets with hard caps, PII/data masking, guardrails, and a tamper-evident audit trail. Governance is a core primitive, not an upsell.
+- **Real governance, all open** — RBAC, virtual keys, budgets with hard caps, PII/data masking, guardrails, and a tamper-evident (hash-chained + S3 Object Lock) audit trail. Every governance feature is in the Apache-2.0 core, not paywalled behind an "enterprise" edition.
+- **Coding-agent aware** — governs and attributes the traffic Claude Code and Codex actually generate; in-stream (not buffered) source-code / secret DLP; the prompt cache the big cacheable prefixes depend on is metered so you can see the dollars it saves.
 - **Observability without lock-in** — emits OpenTelemetry (GenAI semantic conventions) to _your_ backend; enforces cost/rate limits locally.
-- **Runs where you run** — a single container for AWS ECS Fargate, provisioned by Terraform.
+- **Runs where you run** — a single container for AWS ECS Fargate (Terraform) or Kubernetes (Helm); self-host it entirely.
 
 ## Architecture
 
