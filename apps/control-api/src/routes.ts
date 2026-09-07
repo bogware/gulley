@@ -1,5 +1,11 @@
 import { type AdminSessionClaims, signAdminSession } from '@gulley/auth';
-import { assertNoInlineSecret, attestAuditChain, attestAuditChainAsync } from '@gulley/pipeline';
+import {
+  assertNoInlineSecret,
+  attestAuditChain,
+  attestAuditChainAsync,
+  type AuditRow,
+  type SignedAttestation,
+} from '@gulley/pipeline';
 import { MissingVariablesError, PromptNameConflictError, renderPrompt } from '@gulley/prompts';
 import { GULLEY_VERSION, secretRef } from '@gulley/core';
 import { assertEgressAllowed } from '@gulley/egress';
@@ -25,6 +31,7 @@ import {
   visibleWorkspaceIds,
 } from './admin';
 import { type ClientAgent, generateClientConfig } from './client-config';
+import { buildEvidenceBundle } from './evidence-bundle';
 import { buildOnboardingManifest, publicKeyOf, signOnboardingPack } from './onboarding';
 import type { ControlContext } from './context';
 import type { CollectionKind } from './domain';
@@ -36,6 +43,33 @@ function invalid(reply: FastifyReply, message: string): FastifyReply {
 
 function paramId(request: { params: unknown }): string {
   return (request.params as { id: string }).id;
+}
+
+/** Sign an auditor attestation with the context's configured signer — the asymmetric
+ *  (KMS) audit signer when present, else the shared-secret HMAC key. Returns undefined
+ *  when neither is configured (the caller 501s). Shared by the attestation and
+ *  evidence-bundle routes. */
+async function signCtxAttestation(
+  ctx: ControlContext,
+  rows: readonly AuditRow[],
+  generatedAt: string,
+): Promise<SignedAttestation | undefined> {
+  const common = {
+    toolVersion: GULLEY_VERSION,
+    generatedAt,
+    ...(ctx.attestationSubject !== undefined ? { subject: ctx.attestationSubject } : {}),
+  };
+  if (ctx.auditSigner) {
+    return attestAuditChainAsync(rows, {
+      signer: ctx.auditSigner,
+      algorithm: ctx.auditSigner.algorithm,
+      ...common,
+    });
+  }
+  if (ctx.attestationKey) {
+    return attestAuditChain(rows, { key: ctx.attestationKey, ...common });
+  }
+  return undefined;
 }
 
 export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): void {
@@ -855,31 +889,63 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     '/audit/attestation',
     adminRoute(ctx, async (_req, reply, admin) => {
       if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
-      if (!ctx.auditRows || (!ctx.auditSigner && !ctx.attestationKey))
+      if (!ctx.auditRows)
         return reply.code(501).send({
           error: { type: 'not_configured', message: 'attestation signing not configured' },
         });
+      const signed = await signCtxAttestation(ctx, await ctx.auditRows(), new Date().toISOString());
+      if (!signed)
+        return reply.code(501).send({
+          error: { type: 'not_configured', message: 'attestation signing not configured' },
+        });
+      return reply.send(signed);
+    }),
+  );
+
+  // Evidence bundle: ONE downloadable, independently-verifiable compliance artifact —
+  // the signed attestation + the full ordered audit rows (for an independent re-walk) +
+  // the audit-export public key (asymmetric) + a WORM mirror-status snapshot. An auditor
+  // verifies it offline (verifyEvidenceBundle) with only the out-of-band public key.
+  // 501 until a signer is configured.
+  app.get(
+    '/audit/evidence-bundle',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.auditRows)
+        return reply
+          .code(501)
+          .send({ error: { type: 'not_configured', message: 'audit rows not available' } });
       const rows = await ctx.auditRows();
-      const common = {
+      const generatedAt = new Date().toISOString();
+      const attestation = await signCtxAttestation(ctx, rows, generatedAt);
+      if (!attestation)
+        return reply.code(501).send({
+          error: { type: 'not_configured', message: 'attestation signing not configured' },
+        });
+      const publicKey = ctx.auditSigner
+        ? { alg: ctx.auditSigner.algorithm, pem: await ctx.auditSigner.publicKeyPem() }
+        : undefined;
+      const wormResult = ctx.wormShipper ? await ctx.wormShipper.verify() : undefined;
+      const worm = wormResult
+        ? {
+            verified: wormResult.ok,
+            rows: wormResult.rows,
+            lastSeq: wormResult.lastSeq,
+            ...(wormResult.reason !== undefined ? { reason: wormResult.reason } : {}),
+          }
+        : undefined;
+      const bundle = buildEvidenceBundle({
+        rows,
+        attestation,
         toolVersion: GULLEY_VERSION,
-        generatedAt: new Date().toISOString(),
+        generatedAt,
         ...(ctx.attestationSubject !== undefined ? { subject: ctx.attestationSubject } : {}),
-      };
-      if (ctx.auditSigner) {
-        return reply.send(
-          await attestAuditChainAsync(rows, {
-            signer: ctx.auditSigner,
-            algorithm: ctx.auditSigner.algorithm,
-            ...common,
-          }),
-        );
-      }
-      if (ctx.attestationKey) {
-        return reply.send(attestAuditChain(rows, { key: ctx.attestationKey, ...common }));
-      }
+        ...(publicKey ? { publicKey } : {}),
+        ...(worm ? { worm } : {}),
+      });
       return reply
-        .code(501)
-        .send({ error: { type: 'not_configured', message: 'attestation signing not configured' } });
+        .header('content-disposition', 'attachment; filename="gulley-evidence-bundle.json"')
+        .send(bundle);
     }),
   );
 
