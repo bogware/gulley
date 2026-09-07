@@ -18,8 +18,11 @@ export interface RequestMetricData {
   startedAtMs: number;
   cacheStatus?: string;
   guardrailAction?: string;
-  /** Provider prompt-cache dollars saved on this request (micro-USD). */
+  /** Dollars saved on this request (micro-USD): provider prompt caching, or the
+   *  upstream cost avoided by a gateway response-cache hit. */
   cacheSavedMicroUsd?: number;
+  /** Source of the saving: 'prompt_cache' (default) | 'response_cache'. */
+  cacheSavedSource?: string;
 }
 
 // End-to-end proxied-request latency; wide upper buckets because streamed LLM
@@ -70,7 +73,7 @@ export class GatewayMetrics {
     );
     this.saved = this.registry.counter(
       'gulley_cost_saved_micro_usd_total',
-      'Cost avoided in micro-USD by source (prompt_cache).',
+      'Cost avoided in micro-USD by source (prompt_cache | response_cache).',
     );
     this.budgetAlerts = this.registry.counter(
       'gulley_budget_alerts_total',
@@ -98,7 +101,7 @@ export class GatewayMetrics {
     if (d.cacheStatus) this.cache.inc({ status: d.cacheStatus });
     if (d.guardrailAction) this.guardrail.inc({ action: d.guardrailAction });
     if (d.cacheSavedMicroUsd && d.cacheSavedMicroUsd > 0)
-      this.saved.inc({ source: 'prompt_cache' }, d.cacheSavedMicroUsd);
+      this.saved.inc({ source: d.cacheSavedSource ?? 'prompt_cache' }, d.cacheSavedMicroUsd);
     this.duration.observe(
       { provider: d.provider, status: d.status },
       Math.max(0, (this.now() - d.startedAtMs) / 1000),

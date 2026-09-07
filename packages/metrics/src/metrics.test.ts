@@ -77,6 +77,29 @@ describe('GatewayMetrics', () => {
     m.recordFailover('anthropic');
     expect(m.render()).toContain('gulley_failovers_total{target="anthropic"} 2');
   });
+
+  it('labels saved cost by source (prompt_cache default, response_cache on a hit)', () => {
+    const m = new GatewayMetrics();
+    const base = {
+      provider: 'anthropic',
+      requestModel: 'claude-sonnet-4-6',
+      responseModel: 'claude-sonnet-4-6',
+      status: 'ok',
+      statusCode: 200,
+      streamed: false,
+      inputTokens: 0,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      startedAtMs: 0,
+    };
+    // A provider prompt-cache saving (no explicit source → defaults to prompt_cache).
+    m.record({ ...base, cacheSavedMicroUsd: 300 });
+    // A gateway response-cache hit.
+    m.record({ ...base, cacheSavedMicroUsd: 700, cacheSavedSource: 'response_cache' });
+    const out = m.render();
+    expect(out).toContain('gulley_cost_saved_micro_usd_total{source="prompt_cache"} 300');
+    expect(out).toContain('gulley_cost_saved_micro_usd_total{source="response_cache"} 700');
+  });
 });
 
 describe('metrics server', () => {

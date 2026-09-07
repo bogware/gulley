@@ -15,7 +15,7 @@ import {
   type CacheLookup,
   semanticText,
 } from '@gulley/cache';
-import { computeCost, rankPrice, type RateResolver, toMicroUsd } from '@gulley/cost';
+import { computeCost, emptyUsage, rankPrice, type RateResolver, toMicroUsd } from '@gulley/cost';
 import { isErr } from '@gulley/core';
 import {
   filterByPolicy,
@@ -1476,25 +1476,33 @@ async function handleProxy(
           ctx.accessLogSink?.emit(record); // also ship to the OTLP logs backend
         }
       }
-      await ctx.audit.append({
-        orgId: principal.scope.orgId,
-        actor: principal.id,
-        action: 'proxy.request',
-        target: served?.name ?? provider,
-        payload: {
-          provider,
-          model: meteredModel,
-          status,
-          statusCode,
-          streamed,
-          inputTokens: cost.totalInputTokens,
-          outputTokens: cost.outputTokens,
-          costMicroUsd,
-          guardrailInputFindings: inputFindings,
-          guardrailOutputFindings: outFindings.length,
-          cache: cacheLookup?.status ?? 'bypass',
-        },
-      });
+      // Isolate the audit append: it shares this teardown block with the cache
+      // store and mask-vault persist below, so a failure here (a DB blip, or the
+      // now-serialized chain contending) must NOT cascade to skip those durable
+      // sinks. Log and continue; the reservation was already released above.
+      try {
+        await ctx.audit.append({
+          orgId: principal.scope.orgId,
+          actor: principal.id,
+          action: 'proxy.request',
+          target: served?.name ?? provider,
+          payload: {
+            provider,
+            model: meteredModel,
+            status,
+            statusCode,
+            streamed,
+            inputTokens: cost.totalInputTokens,
+            outputTokens: cost.outputTokens,
+            costMicroUsd,
+            guardrailInputFindings: inputFindings,
+            guardrailOutputFindings: outFindings.length,
+            cache: cacheLookup?.status ?? 'bypass',
+          },
+        });
+      } catch (err) {
+        request.log.error({ err }, 'audit append failed');
+      }
       // Persist to cache — only clean, non-sensitive, non-truncated 2xx bodies.
       if (
         storeCache &&
@@ -1503,6 +1511,9 @@ async function handleProxy(
         cacheLookup &&
         status === 'ok' &&
         statusCode < 400 &&
+        // A refusal is HTTP 200 with empty/partial content (stop_reason 'refusal');
+        // caching it would serve the refusal to every semantic-cache paraphrase.
+        n.stopReason !== 'refusal' &&
         !captureOverflow &&
         !outputSensitive &&
         !cacheControlHas(request, 'no-store') &&
@@ -1585,6 +1596,7 @@ async function handleProxy(
       outputTokens: cost.outputTokens,
       costMicroUsd,
       cacheSavedMicroUsd: cost.cacheSavedUsd > 0 ? toMicroUsd(cost.cacheSavedUsd) : undefined,
+      cacheSavedSource: cost.cacheSavedUsd > 0 ? 'prompt_cache' : undefined,
       streamed,
       stopReason: n.stopReason,
       startedAtMs: started,
@@ -2038,6 +2050,19 @@ async function serveFromCache(
     );
   }
 
+  // Dollars this gateway cache hit avoided: what the cached response's tokens would
+  // have cost at the model's full rate (a hit spends nothing upstream). This is the
+  // product's headline "cost avoided" number for its own two-tier cache — it was
+  // recorded as $0 before, making the savings invisible. Priced from the same
+  // catalog resolver as live metering; 0 for an unpriced model.
+  const savedUsd = computeCost(
+    provider,
+    cached.model,
+    { ...emptyUsage(), inputTokens: cached.inputTokens, outputTokens: cached.outputTokens },
+    ctx.rateResolver,
+  ).totalUsd;
+  const savedMicroUsd = savedUsd > 0 ? toMicroUsd(savedUsd) : undefined;
+
   const createdAt = new Date();
   try {
     await ctx.requestLog.write({
@@ -2055,7 +2080,11 @@ async function serveFromCache(
       costMicroUsd: 0,
       latencyMs: Date.now() - started,
       createdAt,
-      attributes: { cache: lookup.status, target: `cache:${lookup.status}` },
+      attributes: {
+        cache: lookup.status,
+        target: `cache:${lookup.status}`,
+        ...(savedMicroUsd ? { cacheSavedMicroUsd: savedMicroUsd } : {}),
+      },
     });
     await ctx.audit.append({
       orgId: principal.scope.orgId,
@@ -2067,6 +2096,7 @@ async function serveFromCache(
         model: cached.model,
         cache: lookup.status,
         statusCode: cached.statusCode,
+        ...(savedMicroUsd ? { cacheSavedMicroUsd: savedMicroUsd } : {}),
       },
     });
   } catch (err) {
@@ -2083,6 +2113,8 @@ async function serveFromCache(
     inputTokens: cached.inputTokens,
     outputTokens: cached.outputTokens,
     costMicroUsd: 0,
+    cacheSavedMicroUsd: savedMicroUsd,
+    cacheSavedSource: savedMicroUsd ? 'response_cache' : undefined,
     streamed: cached.streamed,
     startedAtMs: started,
     cacheStatus: lookup.status,

@@ -14,6 +14,21 @@ const Env = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   GATEWAY_HOST: z.string().default('0.0.0.0'),
   GATEWAY_PORT: z.coerce.number().int().positive().default(8080),
+  // Maximum inbound request body. Fastify's default is 1 MiB, which silently 413s
+  // real coding-agent requests (long-context repomaps, base64 images, long
+  // tool-result history — the payloads that carry the big cacheable prefixes). 32
+  // MiB by default; keep it >= the cache/enforcement buffering caps.
+  MAX_REQUEST_BYTES: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(32 * 1024 * 1024),
+  // Proxy-trust for X-Forwarded-For / client IP. Fastify accepts: "true"/"false",
+  // a hop COUNT (e.g. "1" = trust exactly the first proxy in front, an ALB), or a
+  // trusted CIDR / comma-separated list ("10.0.0.0/8,127.0.0.1"). Default "true"
+  // preserves prior behavior, but ANY CEL source-IP allowlist REQUIRES a hop count
+  // or CIDR here, else request.ip is spoofable via a forged X-Forwarded-For header.
+  TRUST_PROXY: z.string().default('true'),
 
   // Virtual-key pepper (KMS-held in prod). Optional so the server boots for
   // health checks; the proxy routes require it via the production context.
@@ -102,6 +117,12 @@ const Env = z.object({
   // Postgres and reconciles live when a control-plane apply broadcasts a change.
   CONFIG_SOURCE: z.enum(['env', 'db']).default('env'),
   CONFIG_NOTIFY_CHANNEL: z.string().default('gulley:config'),
+  // Steady-state convergence poll (DB config mode). The subscriber picks up an
+  // apply via NOTIFY or a listen-reconnect resync, but a healthy long-lived replica
+  // would otherwise never reconcile if a NOTIFY is missed or never emitted. This
+  // bounded poll compares the current config version to the last applied and
+  // reconciles if behind. 0 disables it (rely on NOTIFY only).
+  CONFIG_POLL_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(30),
   // Secret resolution for the DB config path (provider ARNs → values at reload).
   // SECRETS_LOCAL_MAP (JSON {arn:value}) selects the in-process resolver for
   // dev/tests; otherwise AWS Secrets Manager (SECRETS_REGION optional).

@@ -34,6 +34,7 @@ import {
   InMemoryAuditSink,
   InMemoryRequestLog,
   type RequestLogQuery,
+  verifyAuditChain,
 } from '@gulley/pipeline';
 import { InMemoryPromptRegistry, type PromptRegistry } from '@gulley/prompts';
 import { type AccessControl, InMemoryAccessControl } from '@gulley/rbac';
@@ -74,8 +75,9 @@ export interface ControlContext {
   /** Read side of the request log: admin log browser + usage analytics. */
   requestLogQuery: RequestLogQuery;
   resolverDeps: AdminResolverDeps;
-  /** Verify the underlying audit chain (the sink is guarded, so expose it). */
-  verifyAudit: () => { verified: boolean; count: number };
+  /** Verify the underlying audit chain (the sink is guarded, so expose it). Async
+   *  because the durable chain is read from Postgres when a DB is present. */
+  verifyAudit: () => Promise<{ verified: boolean; count: number }>;
   /** Read the full audit chain (ordered) for an attestation export; absent = not
    *  supported by this backend. */
   auditRows?: () => Promise<AuditRow[]>;
@@ -144,18 +146,21 @@ export interface InMemoryContextOptions {
 /** Build a fully in-memory control-plane context — used by tests and the live
  *  check. The Postgres-backed context is a documented seam (no Docker here). */
 export function createInMemoryControlContext(opts: InMemoryContextOptions): ControlContext {
+  // Durable config path (opt-in): when a DB is available, config apply persists
+  // to the Postgres tables the gateway reads, and versions are durable too.
+  const db = opts.db ?? (opts.databaseUrl ? createDatabase(opts.databaseUrl) : undefined);
+
   const inner = new InMemoryAuditSink();
-  const audit = new GuardedAuditSink(inner);
+  // Admin mutations AND mask-vault PII reveals audit through ctx.audit. With a DB,
+  // back it with the durable, hash-chained Postgres sink (was in-memory even when
+  // a DB was configured, so a restart wiped the record of who revealed which PII).
+  const audit = new GuardedAuditSink(db ? new PostgresAuditSink(db) : inner);
   const keyStore = new InMemoryKeyStore();
   const sessionStore = new InMemoryAdminSessionStore();
 
   const collections = Object.fromEntries(
     COLLECTION_KINDS.map((k) => [k, new ScopedCollection()]),
   ) as Record<CollectionKind, ScopedCollection>;
-
-  // Durable config path (opt-in): when a DB is available, config apply persists
-  // to the Postgres tables the gateway reads, and versions are durable too.
-  const db = opts.db ?? (opts.databaseUrl ? createDatabase(opts.databaseUrl) : undefined);
   const configStore = db ? new PostgresConfigStore(db) : undefined;
   const configVersions: ConfigVersionStore = db
     ? new PostgresConfigVersionStore(db)
@@ -203,7 +208,14 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
       sessionStore,
       maxSessionTtlMs: opts.maxSessionTtlMs,
     },
-    verifyAudit: () => ({ verified: inner.verify(), count: inner.rows.length }),
+    // Verify the durable chain when a DB is present (the same rows attestation
+    // reads), else the in-memory sink — so a DB-backed deploy no longer reports the
+    // empty in-memory chain while admin/PII-reveal audits land in Postgres.
+    verifyAudit: async () => {
+      const rows = db ? await readAuditRows(db) : inner.rows;
+      const r = verifyAuditChain(rows);
+      return { verified: r.verified, count: r.count };
+    },
     // Attestation reads the durable chain when a DB is present (the auditor-facing
     // source of truth), else the in-memory sink (dev/test) — same core verifier.
     auditRows: db ? () => readAuditRows(db) : async () => inner.rows,

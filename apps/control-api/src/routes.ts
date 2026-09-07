@@ -645,7 +645,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     '/audit/verify',
     adminRoute(ctx, async (_req, reply, admin) => {
       if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
-      return reply.send(ctx.verifyAudit());
+      return reply.send(await ctx.verifyAudit());
     }),
   );
 

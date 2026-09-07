@@ -8,9 +8,24 @@ import { type GatewayContext, registerRoutes, RouteHolder } from './routes/messa
  *  can swap the live route table. */
 export type GatewayServer = FastifyInstance & { routeHolder?: RouteHolder };
 
+/** Parse the TRUST_PROXY knob into Fastify's `trustProxy` shape: a boolean, a hop
+ *  count (numeric string), or a trusted CIDR / comma-separated list passed through
+ *  verbatim. A bare "true" trusts every hop (request.ip is then spoofable via a
+ *  forged X-Forwarded-For) — operators using a CEL source-IP rule set a hop count
+ *  or CIDR instead. */
+export function parseTrustProxy(value: string): boolean | number | string {
+  const v = value.trim();
+  if (/^(true|false)$/i.test(v)) return /^true$/i.test(v);
+  if (/^\d+$/.test(v)) return Number(v);
+  return v; // CIDR or comma-separated list
+}
+
 export function buildServer(config: Config, context?: GatewayContext): GatewayServer {
   const app = Fastify({
-    trustProxy: true,
+    // Cap the inbound body (Fastify defaults to 1 MiB, which 413s real coding-agent
+    // requests). The custom application/json buffer parser respects this limit.
+    bodyLimit: config.MAX_REQUEST_BYTES,
+    trustProxy: parseTrustProxy(config.TRUST_PROXY),
     // Fastify's default request id is a per-process counter (`req-1`, ...) that
     // resets on restart and repeats across tasks — NOT unique across a multi-task
     // fleet over one Postgres. requestId keys the ledger, request log, audit rows,

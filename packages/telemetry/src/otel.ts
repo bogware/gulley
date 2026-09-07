@@ -25,8 +25,12 @@ export interface RequestSpanData {
   guardrailOutputFindings?: number;
   /** The enforcing action taken, if any: block | mask | redact. */
   guardrailAction?: string;
-  /** Provider prompt-cache dollars saved on this request (micro-USD). */
+  /** Dollars saved on this request (micro-USD): provider prompt caching on a miss,
+   *  or the full upstream cost avoided on a gateway response-cache hit. */
   cacheSavedMicroUsd?: number;
+  /** Which cache avoided the cost: 'prompt_cache' (provider) | 'response_cache'
+   *  (this gateway's two-tier cache). Defaults to prompt_cache when unset. */
+  cacheSavedSource?: string;
   /** W3C trace id (32-hex) this request belongs to, for cross-system correlation. */
   traceId?: string;
   /** Per-stage timings (epoch ms), materialized as child spans under the request

@@ -353,17 +353,26 @@ export class PostgresRequestLogQuery implements RequestLogQuery {
   }
 }
 
+/** Fixed advisory-lock key serializing appends to the single audit hash chain.
+ *  A stable bigint (not derived at runtime) so every replica contends on the same
+ *  lock. */
+const AUDIT_CHAIN_LOCK = 5_138_008_617n;
+
 /**
- * Postgres audit sink. Reads the tail of the chain and appends the next row in
- * one transaction; the unique index on `seq` rejects a racing double-append
- * (caller retries). Full advisory-lock + S3 Object Lock WORM hardening is a
- * later milestone.
+ * Postgres audit sink. Reads the tail of the chain and appends the next row in one
+ * transaction, serialized by a transaction-scoped advisory lock so two concurrent
+ * appends can't read the same tail and have one silently dropped by the unique
+ * `seq` index (a SOC 2 audit-completeness hole). The lock auto-releases on
+ * commit/rollback and is held only for the brief read-tail + insert below, so it
+ * never gates the request (the append runs in the post-first-byte teardown).
+ * S3 Object Lock WORM mirroring of this chain is a later milestone.
  */
 export class PostgresAuditSink implements AuditSink {
   constructor(private readonly db: Database) {}
 
   async append(event: AuditEventInput): Promise<AuditRow> {
     return this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${AUDIT_CHAIN_LOCK})`);
       const prev = await tx
         .select({ seq: auditLog.seq, rowHash: auditLog.rowHash })
         .from(auditLog)
