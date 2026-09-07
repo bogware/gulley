@@ -52,6 +52,11 @@ const Env = z.object({
   // tables the gateway reads) via PostgresConfigStore + PostgresConfigVersionStore,
   // instead of the in-memory ControlConfigStore. Enables M13 config hot-reload.
   DATABASE_URL: z.string().url().optional(),
+  // Config-propagation channel. On a successful /config/apply the control plane
+  // emits a Postgres NOTIFY on this channel so every gateway replica reconciles
+  // live (without a redeploy). MUST match the gateway's CONFIG_NOTIFY_CHANNEL.
+  // Only active when DATABASE_URL is set; gateways also converge via their poll.
+  CONFIG_NOTIFY_CHANNEL: z.string().default('gulley:config'),
 
   // Admin-surface HTTP edge. CORS is credentials-safe: exact-origin allowlist
   // (comma-separated full origins), reflected with Allow-Credentials; empty =

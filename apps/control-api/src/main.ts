@@ -1,5 +1,6 @@
 import { InMemoryAesCipher, KmsEnvelopeEncryptor } from '@gulley/crypto';
 import { OidcProvider } from '@gulley/oidc';
+import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
 import { type Config, loadConfig, outboundAllowlist, sessionSecrets } from './config';
 import {
   type ControlContext,
@@ -8,6 +9,11 @@ import {
 } from './context';
 import { parseRoleMap } from './oidc-gate';
 import { buildServer } from './server';
+
+/** The config-propagation emitter, if a durable config store is wired. A
+ *  successful /config/apply emits a NOTIFY over this so gateway replicas reconcile
+ *  live; held here so the drain can close its connection. */
+let configBus: PostgresConfigBus | undefined;
 
 /**
  * Build the control-plane context from env. In-memory stores are the current
@@ -34,6 +40,19 @@ function buildContext(config: Config): ControlContext | undefined {
     };
   }
 
+  // Config propagation: emit a NOTIFY on a successful apply so gateway replicas
+  // reconcile live. Emit-only (never .start()); a dedicated connection just carries
+  // the NOTIFY. Only with a durable store — without a DB there is nothing to
+  // propagate. Gateways also converge via their version poll, so this is the
+  // latency upgrade, not the sole path; NOTIFY to a channel with no listeners is a
+  // no-op, so emitting unconditionally-with-a-DB is safe.
+  if (config.DATABASE_URL) {
+    configBus = new PostgresConfigBus(
+      createListenConnection(config.DATABASE_URL),
+      config.CONFIG_NOTIFY_CHANNEL,
+    );
+  }
+
   return createInMemoryControlContext({
     pepper: config.GULLEY_KEY_PEPPER ?? '',
     bootstrapEnabled: config.CONTROL_API_BOOTSTRAP_ENABLED,
@@ -43,6 +62,7 @@ function buildContext(config: Config): ControlContext | undefined {
     outboundAllowlist: outboundAllowlist(config),
     oidc,
     databaseUrl: config.DATABASE_URL,
+    notifier: configBus,
     attestationKey: config.AUDIT_ATTESTATION_KEY,
     attestationSubject: config.AUDIT_ATTESTATION_SUBJECT,
     // Mask-vault reveal decryptor — the SAME envelope key the gateway used (KMS in
@@ -93,6 +113,7 @@ async function shutdown(signal: string): Promise<void> {
   backstop.unref();
   try {
     await app.close();
+    await configBus?.close();
   } catch (err) {
     app.log.error({ err }, 'shutdown error');
   }
