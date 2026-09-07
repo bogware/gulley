@@ -40,6 +40,7 @@ import {
   type ResidencyPolicy,
   residencyAllowedRegions,
 } from '../residency-policy';
+import { type CascadePolicy, matchCascade, shouldEscalate } from '../cascade';
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
@@ -88,9 +89,17 @@ import {
 } from '@gulley/telemetry';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { handlePlaygroundVerify } from './playground';
-import type { Readable, Transform } from 'node:stream';
+import { Readable } from 'node:stream';
+import type { Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
-import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
+import {
+  brotliDecompressSync,
+  createBrotliDecompress,
+  createGunzip,
+  createInflate,
+  gunzipSync,
+  inflateSync,
+} from 'node:zlib';
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
@@ -153,6 +162,11 @@ export interface GatewayContext {
    *  residency restriction. Fail-closed: no compliant upstream ⇒ the request is
    *  refused, never served from a non-compliant region. */
   residencyPolicy?: ResidencyPolicy;
+  /** Cascade routing policies (deployment-wide in single-tenant v1). When the resolved
+   *  model matches a policy, tier-0 is buffered and — on an inadequate stop_reason —
+   *  the request is re-dispatched once to the stronger `escalateTo` model before any
+   *  client byte. Empty/absent = no cascade. */
+  cascade?: CascadePolicy[];
   budgets: BudgetStore;
   /** Soft-threshold budget alerter (metric + webhook); absent = no alerts. */
   budgetAlerter?: { check(workspaceId: string, usedMicroUsd: number, capMicroUsd: number): void };
@@ -457,6 +471,81 @@ async function handleModels(
   await reply.send({ object: 'list', data });
 }
 
+/** Drain a Readable fully into buffered chunks, capped at `limit` bytes. On overflow it
+ *  KEEPS draining to the end (so the socket is freed) but stops capturing and reports
+ *  overflow=true. Rejects if `signal` aborts. Used by cascade routing to buffer a
+ *  response leg so it can be evaluated + replayed. */
+async function readFully(
+  body: Readable,
+  limit: number,
+  signal: AbortSignal,
+): Promise<{ chunks: Buffer[]; bytes: number; overflow: boolean }> {
+  return await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let overflow = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = (): void => {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      body.off('data', onData);
+      body.off('end', onEnd);
+      body.off('error', onError);
+    };
+    const fail = (err: Error): void => {
+      cleanup();
+      body.destroy();
+      reject(err);
+    };
+    // Inactivity guard: a half-open upstream (2xx headers, then no bytes, no end/error)
+    // must NOT pin the budget reservation — mirror the streaming watchdog so a stall
+    // rejects and the caller fails closed. (The pre-first-byte deadline is already inert
+    // here, and undici's bodyTimeout is disabled for SSE.)
+    const arm = (): void => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => fail(new Error('cascade leg idle')), STREAM_INACTIVITY_MS);
+      timer.unref?.();
+    };
+    const onData = (chunk: Buffer): void => {
+      arm();
+      if (overflow) return; // still draining the tail; no longer capturing
+      if (bytes + chunk.length <= limit) {
+        chunks.push(chunk);
+        bytes += chunk.length;
+      } else {
+        overflow = true;
+      }
+    };
+    const onEnd = (): void => {
+      cleanup();
+      resolve({ chunks, bytes, overflow });
+    };
+    const onError = (err: Error): void => fail(err);
+    const onAbort = (): void => fail(new Error('aborted while buffering a cascade leg'));
+    if (signal.aborted) return onAbort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    body.on('data', onData);
+    body.once('end', onEnd);
+    body.once('error', onError);
+    arm();
+  });
+}
+
+/** Decompress a buffered body per its content-encoding, for cascade signal evaluation
+ *  ONLY — the raw bytes are replayed to the client unchanged, so this never has to be
+ *  byte-exact. Best-effort: an unknown or failing codec yields the raw bytes. */
+function decodeForEval(buf: Buffer, encoding: string | string[] | undefined): Buffer {
+  const enc = (Array.isArray(encoding) ? encoding[0] : encoding)?.toLowerCase();
+  try {
+    if (enc === 'gzip') return gunzipSync(buf);
+    if (enc === 'deflate') return inflateSync(buf);
+    if (enc === 'br') return brotliDecompressSync(buf);
+  } catch {
+    /* fall through to the raw bytes */
+  }
+  return buf;
+}
+
 async function handleProxy(
   ctx: GatewayContext,
   route: ProviderRoute,
@@ -704,6 +793,62 @@ async function handleProxy(
     return;
   }
   const provider0 = candidates[0]?.provider ?? 'unknown';
+
+  // --- cascade arming: if the resolved model matches a cascade policy, prepare the
+  // tier-1 (escalation) candidates + a model-swapped body so an inadequate tier-0 can
+  // be re-dispatched ONCE (post-buffer, pre-first-byte). Armed only when the escalation
+  // target itself clears the same authz gates (scope + model policy) AND has a
+  // residency/scope-compliant upstream — otherwise the cascade is disarmed and tier-0
+  // is served as-is (a valid, if weaker, answer). Requires a parseable body (the model
+  // field must be rewritable). ---
+  let cascade:
+    | {
+        policy: CascadePolicy;
+        candidates: RouteTarget[];
+        strategy: RoutingStrategy;
+        body: Buffer;
+        createExtractor: () => UsageExtractor;
+        model: string;
+        provider: string;
+      }
+    | undefined;
+  const cascadePolicy =
+    parseOk && ctx.cascade && ctx.cascade.length > 0
+      ? matchCascade(ctx.cascade, requestedModel)
+      : undefined;
+  if (cascadePolicy) {
+    const t1res = ctx.modelRouter?.resolve(cascadePolicy.escalateTo);
+    const t1Model = t1res?.resolved ?? cascadePolicy.escalateTo;
+    const t1Strategy = t1res?.strategy ?? strategy;
+    // Tier-1 shares the route's usage extractor (same clientPath) — matching how the
+    // model-router alias path already binds the extractor per route, not per model.
+    const t1Extractor = createExtractor;
+    const t1Allowed =
+      scopeAllowsModel(principal.scope, t1Model) &&
+      (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, t1Model));
+    const t1Candidates = t1Allowed
+      ? selectCandidates(t1Strategy, ctx.breaker, {
+          sessionKey,
+          scoreboard: ctx.scoreboard,
+          outlier: ctx.outlier,
+          costOf: (t) => rankPrice(t.provider, t1Model, ctx.rateResolver),
+          allowedRegions,
+          requireZdr,
+        }).filter((t) => scopeAllowsProvider(principal.scope, t.provider))
+      : [];
+    const t1First = t1Candidates[0];
+    if (t1First) {
+      cascade = {
+        policy: cascadePolicy,
+        candidates: t1Candidates,
+        strategy: t1Strategy,
+        body: Buffer.from(JSON.stringify({ ...parsed, model: t1Model }), 'utf8'),
+        createExtractor: t1Extractor,
+        model: t1Model,
+        provider: t1First.provider,
+      };
+    }
+  }
 
   // Build the CEL activation once, shared by authorization, transformation, and
   // the external policy hook.
@@ -994,6 +1139,25 @@ async function handleProxy(
     maxOutput,
     ctx.rateResolver, // price admission identically to commit (no reserve/commit disagreement)
   );
+  // The worst-case of the SERVED leg alone (tier-0 initially; tier-1 after an
+  // escalation) — the fail-closed teardown charge surrogate. Distinct from `worstCase`,
+  // which a cascade inflates to cover BOTH legs for the RESERVATION only; charging the
+  // combined figure as a single-leg surrogate would over-bill every scope.
+  let servedWorstCase = worstCase;
+  // A cascade may spend BOTH the cheap tier-0 attempt AND the escalated tier-1 call, so
+  // reserve worst-case for both up front (TOCTOU-safe); teardown commits the actual sum
+  // (and refunds the tier-1 portion when no escalation happens). Held separately so it
+  // survives a budget-downshift reprice below (which replaces the tier-0 term).
+  const cascadeReserveMicroUsd = cascade
+    ? estimateWorstCaseMicroUsd(
+        cascade.provider,
+        cascade.model,
+        cascade.body.length,
+        maxOutput,
+        ctx.rateResolver,
+      )
+    : 0;
+  worstCase += cascadeReserveMicroUsd;
   // Every budget scope reserved for THIS request (workspace + any per-model cap),
   // so teardown commits the actual spend to each and a rejection rolls the rest back.
   const reservedScopes: string[] = [];
@@ -1094,13 +1258,16 @@ async function handleProxy(
     // exists to keep flowing. Teardown's usage-missing charge also now bills the model
     // actually served. The workspace reservation above stays worst-case-conservative
     // (it admits before the downshift decision) and is corrected to actual at commit.
-    worstCase = estimateWorstCaseMicroUsd(
+    // Re-add the cascade tier-1 reserve — the reprice replaces only the tier-0 term, and
+    // the per-model / per-attribution caps reserved below must still cover both tiers.
+    servedWorstCase = estimateWorstCaseMicroUsd(
       provider0,
       requestedModel,
       body.length,
       maxOutput,
       ctx.rateResolver,
     );
+    worstCase = servedWorstCase + cascadeReserveMicroUsd;
   }
 
   // Per-model budget (multi-level): the model's own cap must also admit. On
@@ -1114,6 +1281,23 @@ async function handleProxy(
       return;
     }
     if (md?.allowed) reservedScopes.push(modelScope);
+  }
+  // The cascade escalation target has its OWN per-model cap (it will actually run on an
+  // escalation) — reserve it too, or tier-1 spend would bypass its cap entirely. Skip
+  // when it is the same model as tier-0 (already reserved above).
+  if (
+    cascade &&
+    worstCase > 0 &&
+    cascade.model !== requestedModel &&
+    ctx.budgetModelCaps?.has(cascade.model)
+  ) {
+    const t1ModelScope = `model:${cascade.model}`;
+    const t1md = await ctx.budgets.reserve(t1ModelScope, requestId, worstCase);
+    if (t1md && !t1md.allowed) {
+      await rejectBudget(t1ModelScope, t1md);
+      return;
+    }
+    if (t1md?.allowed) reservedScopes.push(t1ModelScope);
   }
 
   // Per-attribution caps (runaway-agent control): reserve an `attr:<key>:<value>`
@@ -1473,6 +1657,193 @@ async function handleProxy(
       break;
     }
 
+  // --- cascade escalation (buffered, pre-first-byte) ---
+  // If a cascade is armed and tier-0 returned a 2xx whose provider stop_reason marks it
+  // inadequate, meter the tier-0 leg, dispatch the stronger tier-1 model ONCE, and make
+  // tier-1 the served response — all before any client byte, so "failover is pre-first-
+  // byte only" holds. The chosen leg's bytes are buffered and REPLAYED as the served
+  // body, so the derivations + capture + teardown below run unchanged on the final tier.
+  // Every billed leg is metered (discarded/over-cap legs at worst-case, never $0, and
+  // committed to the reserved scopes). Degrades to serving tier-0 (a valid, weaker
+  // answer) on a tier-1 failure/over-cap; a tier-0 stall/error/over-cap fails CLOSED
+  // (its bytes can't be replayed byte-exact) but still charges its worst-case.
+  let cascadeExtraMicroUsd = 0; // spend on billed cascade legs other than the served one
+  const cascadeLedgerRows: Array<{
+    suffix: string;
+    provider: string;
+    model: string;
+    /** The model this leg was budget-RESERVED under (its `model:` cap scope), which can
+     *  differ from the response's reported model. */
+    capModel: string;
+    cost: ReturnType<typeof computeCost>;
+    micro: number;
+  }> = [];
+  let cascadeEscalatedFrom: string | undefined;
+  if (cascade && upstream && served && upstream.statusCode < 400) {
+    const capLimit = ctx.responseBufferLimit ?? JSON_PARSE_CAP;
+    const tier0Streamed = served.alwaysStream === true || parsed['stream'] === true;
+    // Charge a billed-but-discarded cascade leg at worst-case (never $0/refund) — the
+    // provider generated + billed it, and (unlike the served leg) its bytes are NOT
+    // replayed to the client, so nothing else meters it. Charged even on a client abort:
+    // dropping it would refund real provider spend (violating "always meter on abort").
+    const chargeDiscarded = (
+      suffix: string,
+      provider: string,
+      model: string,
+      bodyLen: number,
+    ): void => {
+      const micro = estimateWorstCaseMicroUsd(
+        provider,
+        model,
+        bodyLen,
+        maxOutput,
+        ctx.rateResolver,
+      );
+      cascadeExtraMicroUsd += micro;
+      cascadeLedgerRows.push({
+        suffix,
+        provider,
+        model,
+        capModel: model, // chargeDiscarded is always called with the reserved model
+        cost: computeCost(provider, model, emptyUsage(), ctx.rateResolver),
+        micro,
+      });
+    };
+    let t0raw: Awaited<ReturnType<typeof readFully>> | undefined;
+    try {
+      t0raw = await readFully(upstream.body, capLimit, controller.signal);
+    } catch {
+      t0raw = undefined; // read error / stall / abort → fail closed below
+    }
+    if (!t0raw || t0raw.overflow) {
+      // Tier-0 could not be buffered (stall/error) or exceeded the cap → fail CLOSED (a
+      // mid-body error must not surface as an implicit empty 200). It was billed, so
+      // charge its worst-case rather than refunding the reservation.
+      chargeDiscarded('cascade-tier0', served.provider, requestedModel, body.length);
+      upstream = {
+        statusCode: 502,
+        headers: { 'content-type': 'application/json' },
+        body: Readable.from([
+          Buffer.from(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'api_error',
+                message: 'cascade tier-0 response could not be buffered',
+              },
+            }),
+            'utf8',
+          ),
+        ]),
+      };
+    } else {
+      // Evaluate tier-0's stop_reason from a decoded COPY (the raw bytes replay as-is).
+      const t0text = decodeForEval(
+        Buffer.concat(t0raw.chunks),
+        upstream.headers['content-encoding'],
+      ).toString('utf8');
+      const t0ex = createExtractor();
+      try {
+        if (tier0Streamed) {
+          const p = new SSEParser();
+          t0ex.ingestSse(p.push(t0text));
+          t0ex.ingestSse(p.push('\n\n'));
+        } else if (t0text.length > 0) {
+          t0ex.ingestJson(JSON.parse(t0text) as Record<string, unknown>);
+        }
+      } catch {
+        /* unparseable → no stop_reason → no escalation */
+      }
+      const t0n = t0ex.normalized();
+      let finalStatus = upstream.statusCode;
+      let finalHeaders = upstream.headers;
+      let finalChunks = t0raw.chunks;
+      if (shouldEscalate(cascade.policy, t0n.stopReason)) {
+        const t1 = cascade.candidates[0]!;
+        let resp1: typeof upstream | undefined;
+        try {
+          resp1 = await t1.adapter.forward({
+            path: t1.upstreamPath,
+            body: cascade.body,
+            headers: forwardHeaders,
+            credential: await credentialFor(t1),
+            signal: controller.signal,
+          });
+        } catch {
+          resp1 = undefined;
+          // A genuine connection fault (not an abort) is a breaker fault — mirror the
+          // main failover loop, else tier-1's circuit never opens on a hard-down target.
+          if (!controller.signal.aborted) ctx.breaker.recordFailure(t1.name);
+        }
+        if (resp1 && resp1.statusCode < 400) {
+          ctx.breaker.recordSuccess(t1.name);
+          let t1raw: Awaited<ReturnType<typeof readFully>> | undefined;
+          try {
+            t1raw = await readFully(resp1.body, capLimit, controller.signal);
+          } catch {
+            t1raw = undefined;
+          }
+          if (t1raw && !t1raw.overflow) {
+            // Commit to escalation: meter tier-0, release its held slots, make tier-1
+            // the served leg.
+            const c0 = computeCost(
+              served.provider,
+              t0n.model ?? requestedModel,
+              t0n,
+              ctx.rateResolver,
+            );
+            const c0micro = toMicroUsd(c0.totalUsd);
+            cascadeExtraMicroUsd += c0micro;
+            cascadeLedgerRows.push({
+              suffix: 'cascade-tier0',
+              provider: served.provider,
+              model: t0n.model ?? requestedModel,
+              // requestedModel is still the tier-0 reserved model here (reassigned to
+              // the escalation target only below).
+              capModel: requestedModel,
+              cost: c0,
+              micro: c0micro,
+            });
+            cascadeEscalatedFrom = t0n.model ?? requestedModel;
+            if (scoreboardHeld) {
+              ctx.scoreboard?.end(served.name);
+              scoreboardHeld = false;
+            }
+            if (limiterHeld) {
+              ctx.limiter?.record(served.name, Date.now() - (dispatchMs ?? started), false);
+              limiterHeld = false;
+            }
+            served = t1;
+            servedRegion = t1.region;
+            createExtractor = cascade.createExtractor;
+            requestedModel = cascade.model;
+            // The served leg is now tier-1 — its worst-case is the fail-closed surrogate.
+            servedWorstCase = cascadeReserveMicroUsd;
+            finalStatus = resp1.statusCode;
+            finalHeaders = resp1.headers;
+            finalChunks = t1raw.chunks;
+          } else {
+            // Tier-1 was a billed 2xx but couldn't be buffered (stall/error/over-cap) →
+            // charge it at worst-case and fall back to serving tier-0.
+            chargeDiscarded('cascade-tier1', cascade.provider, cascade.model, cascade.body.length);
+          }
+        } else if (resp1) {
+          // Classify the status against TIER-1's own strategy (it selected this target).
+          if (isFailoverStatus(cascade.strategy, resp1.statusCode)) {
+            ctx.breaker.recordFailure(t1.name, parseRetryAfterMs(resp1.headers));
+          }
+          resp1.body.resume(); // tier-1 error → fall back to tier-0
+        }
+      }
+      // Replay the chosen leg's buffered bytes as the served body (raw; headers intact).
+      upstream = {
+        statusCode: finalStatus,
+        headers: finalHeaders,
+        body: Readable.from(finalChunks.length > 0 ? finalChunks : [Buffer.alloc(0)]),
+      };
+    }
+  }
+
   const streamed = served?.alwaysStream === true || parsed['stream'] === true;
   const provider = served?.provider ?? provider0;
 
@@ -1629,7 +2000,10 @@ async function handleProxy(
       );
     }
     const chargedWorstCase = meteringFailed || usageMissing || chargeUnpriced;
-    const costMicroUsd = chargedWorstCase ? worstCase : toMicroUsd(cost.totalUsd);
+    // Fail-closed charge is the SERVED leg's worst-case (not the combined cascade
+    // reservation) — a cascade's other-leg spend is billed separately via
+    // cascadeExtraMicroUsd, so charging the combined figure here would double-count it.
+    const costMicroUsd = chargedWorstCase ? servedWorstCase : toMicroUsd(cost.totalUsd);
     const createdAt = new Date();
 
     // Output guardrail findings: from the buffered enforcement pass, or the
@@ -1667,11 +2041,28 @@ async function handleProxy(
 
     // Release the reservation FIRST and independently of the best-effort durable
     // sinks below — a failed ledger/requestLog/audit write must never leak the
-    // reservation (which would accumulate and DoS the budget). Commit the actual
-    // spend to EVERY scope reserved at admission (workspace + any per-model cap).
+    // reservation (which would accumulate and DoS the budget).
+    // Per-model caps get ONLY their own model's spend (a cascade bills two different
+    // models — charging each model cap the combined total would drain the escalation
+    // model's cap with cheap-tier spend, and vice-versa). Workspace + attribution caps
+    // bound the whole request, so they get the full combined spend.
+    const totalMicroUsd = costMicroUsd + cascadeExtraMicroUsd;
+    const perModelSpend = new Map<string, number>();
+    const addModelSpend = (m: string, micro: number): void => {
+      perModelSpend.set(m, (perModelSpend.get(m) ?? 0) + micro);
+    };
+    // Key by the RESERVED model (what the `model:` scope was reserved under), not the
+    // response's reported model. `requestedModel` here is the served leg's reserved
+    // model (reassigned to the escalation target on an escalation); each discarded leg
+    // carries the model it was reserved under (`capModel`).
+    addModelSpend(requestedModel, costMicroUsd); // the served leg
+    for (const r of cascadeLedgerRows) addModelSpend(r.capModel, r.micro); // discarded legs
     for (const scope of reservedScopes) {
+      const amount = scope.startsWith('model:')
+        ? (perModelSpend.get(scope.slice('model:'.length)) ?? 0)
+        : totalMicroUsd;
       try {
-        await ctx.budgets.commit(scope, requestId, costMicroUsd);
+        await ctx.budgets.commit(scope, requestId, amount);
       } catch (err) {
         request.log.error({ err, scope }, 'budget commit failed');
       }
@@ -1701,6 +2092,23 @@ async function handleProxy(
           costMicroUsd,
           status,
           attributes: attribution,
+          createdAt,
+        });
+      }
+      // Discarded / over-cap cascade legs: each its own ledger row under a derived id so
+      // per-tier spend stays attributable (the budget was already committed above).
+      for (const r of cascadeLedgerRows) {
+        await ctx.ledger.record({
+          requestId: `${requestId}#${r.suffix}`,
+          principalId: principal.id,
+          orgId: principal.scope.orgId,
+          workspaceId: principal.scope.workspaceId,
+          provider: r.provider,
+          model: r.model,
+          cost: r.cost,
+          costMicroUsd: r.micro,
+          status: 'ok',
+          attributes: { ...attribution, cascade: r.suffix },
           createdAt,
         });
       }
@@ -1788,6 +2196,7 @@ async function handleProxy(
             guardrailOutputFindings: outFindings.length,
             cache: cacheLookup?.status ?? 'bypass',
             ...(served?.region ? { servedRegion: served.region } : {}),
+            ...(cascadeEscalatedFrom ? { cascadeEscalatedFrom } : {}),
             ...(unpriced ? { unpriced: true } : {}),
             ...(attribution ? { attribution } : {}),
           },
@@ -1817,6 +2226,11 @@ async function handleProxy(
         // A refusal is HTTP 200 with empty/partial content (stop_reason 'refusal');
         // caching it would serve the refusal to every semantic-cache paraphrase.
         n.stopReason !== 'refusal' &&
+        // Never cache an ESCALATED cascade response: cacheReq is keyed by the tier-0
+        // model/provider, but the body is the tier-1 model's output. Storing it under
+        // the tier-0 partition would serve higher-model content to a key scoped only for
+        // the tier-0 model on a later hit (a cross-authz-scope leak).
+        cascadeEscalatedFrom === undefined &&
         !captureOverflow &&
         !outputSensitive &&
         !cacheControlHas(request, 'no-store') &&

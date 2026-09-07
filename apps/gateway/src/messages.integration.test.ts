@@ -4501,6 +4501,358 @@ describe('data residency + ZDR', () => {
   });
 });
 
+describe('cascade routing', () => {
+  const REFUSAL_SSE = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"id":"msg_c","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1}}}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}',
+    '',
+    'event: message_stop',
+    'data: {"type":"message_stop"}',
+    '',
+    '',
+  ].join('\n');
+  const STRONG_SSE = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"id":"msg_s","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":1}}}',
+    '',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"STRONG-ANSWER"}}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}',
+    '',
+    'event: message_stop',
+    'data: {"type":"message_stop"}',
+    '',
+    '',
+  ].join('\n');
+
+  /** An upstream that answers by the requested model: the cheap model gets `cheapSse`,
+   *  anything else gets STRONG_SSE. Records the model of every request it receives. */
+  async function cascadeUpstream(cheapSse: string): Promise<{
+    url: string;
+    models: string[];
+    close: () => Promise<void>;
+  }> {
+    const models: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        const model = String((JSON.parse(b) as { model?: string }).model ?? '');
+        models.push(model);
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(model.includes('haiku') ? cheapSse : STRONG_SSE);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      models,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+    };
+  }
+
+  function armCascade(ctx: GatewayContext, url: string): void {
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', url) },
+      },
+    ];
+    ctx.cascade = [
+      { model: 'claude-haiku-*', escalateTo: 'claude-sonnet-4-6', stopReasons: ['refusal'] },
+    ];
+  }
+
+  it('escalates a refusing cheap model to the strong model, billing both legs', async () => {
+    const up = await cascadeUpstream(REFUSAL_SSE);
+    const { store, token } = seededStore();
+    const { ctx, ledger, audit } = buildContext(store);
+    armCascade(ctx, up.url);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hard question' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    // The client receives the STRONG model's answer, not the cheap refusal.
+    expect(text).toContain('STRONG-ANSWER');
+    expect(text).not.toContain('"stop_reason":"refusal"');
+    // Two upstream calls: the cheap tier-0 then the escalated tier-1.
+    expect(up.models).toEqual(['claude-haiku-4-5', 'claude-sonnet-4-6']);
+    // Both legs are billed: the served (sonnet) row + a discarded tier-0 (haiku) row.
+    expect(ledger.entries).toHaveLength(2);
+    expect(ledger.entries.map((e) => e.model).sort()).toEqual([
+      'claude-haiku-4-5',
+      'claude-sonnet-4-6',
+    ]);
+    const served = audit.rows.find((r) => r.action === 'proxy.request');
+    expect((served?.payload as { cascadeEscalatedFrom?: string })?.cascadeEscalatedFrom).toBe(
+      'claude-haiku-4-5',
+    );
+
+    await app.close();
+    await up.close();
+  });
+
+  it('does NOT escalate when the cheap model answers adequately', async () => {
+    const OK_SSE = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_c","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1}}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CHEAP-ANSWER"}}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+      '',
+    ].join('\n');
+    const up = await cascadeUpstream(OK_SSE);
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    armCascade(ctx, up.url);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'easy' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).toContain('CHEAP-ANSWER');
+    // Only the cheap model was called; no escalation, one ledger row.
+    expect(up.models).toEqual(['claude-haiku-4-5']);
+    expect(ledger.entries).toHaveLength(1);
+    expect(ledger.entries[0]?.model).toBe('claude-haiku-4-5');
+
+    await app.close();
+    await up.close();
+  });
+
+  it('fails CLOSED (502) when a tier-0 response exceeds the buffer cap', async () => {
+    const up = await cascadeUpstream(REFUSAL_SSE);
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    armCascade(ctx, up.url);
+    ctx.responseBufferLimit = 8; // tier-0 body far exceeds this → cannot be replayed
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'x' }],
+      }),
+    });
+    // Fail closed — never a fabricated empty 200.
+    expect(res.status).toBe(502);
+    await res.text();
+    await app.close();
+    await up.close();
+  });
+
+  it('falls back to serving tier-0 when the escalated tier-1 upstream errors', async () => {
+    const models: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        const model = String((JSON.parse(b) as { model?: string }).model ?? '');
+        models.push(model);
+        if (model.includes('haiku')) {
+          // Cheap tier-0: an identifiable refusal that triggers escalation.
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(
+            [
+              'event: message_start',
+              'data: {"type":"message_start","message":{"id":"m","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1}}}',
+              '',
+              'event: content_block_delta',
+              'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CHEAP-REFUSAL"}}',
+              '',
+              'event: message_delta',
+              'data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":2}}',
+              '',
+              'event: message_stop',
+              'data: {"type":"message_stop"}',
+              '',
+              '',
+            ].join('\n'),
+          );
+        } else {
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end('{"type":"error","error":{"type":"overloaded_error"}}');
+        }
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    armCascade(ctx, url);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'q' }],
+      }),
+    });
+    const text = await res.text();
+
+    // Both models were dialed (tier-0 then the failing tier-1), and the client got the
+    // cheap tier-0 answer as a graceful fallback rather than the tier-1 error.
+    expect(models).toEqual(['claude-haiku-4-5', 'claude-sonnet-4-6']);
+    expect(res.status).toBe(200);
+    expect(text).toContain('CHEAP-REFUSAL');
+
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('does NOT cache an escalated response under the tier-0 model (no cross-scope leak)', async () => {
+    // Non-streamed JSON upstream: haiku refuses, sonnet answers.
+    const models: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        const model = String((JSON.parse(b) as { model?: string }).model ?? '');
+        models.push(model);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          model.includes('haiku')
+            ? '{"model":"claude-haiku-4-5","stop_reason":"refusal","usage":{"input_tokens":10,"output_tokens":2},"content":[]}'
+            : '{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":9},"content":[{"type":"text","text":"STRONG-ANSWER"}]}',
+        );
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    armCascade(ctx, url);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'same question' }],
+    });
+    const post = (): Promise<Response> =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body,
+      });
+
+    const r1 = await post();
+    expect(await r1.text()).toContain('STRONG-ANSWER');
+    const r2 = await post();
+    expect(await r2.text()).toContain('STRONG-ANSWER');
+
+    // The escalated (sonnet) body was NOT cached under the haiku key, so the second
+    // identical request re-ran the whole cascade rather than replaying from cache.
+    expect(models).toEqual([
+      'claude-haiku-4-5',
+      'claude-sonnet-4-6',
+      'claude-haiku-4-5',
+      'claude-sonnet-4-6',
+    ]);
+
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('does not charge the escalation model cap for a non-escalating cheap request', async () => {
+    const OK_SSE = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"m","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1}}}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+      '',
+    ].join('\n');
+    const up = await cascadeUpstream(OK_SSE);
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        ['ws_1', { capMicroUsd: 100_000_000 }],
+        ['model:claude-sonnet-4-6', { capMicroUsd: 100_000_000 }],
+      ]),
+    );
+    const { ctx } = buildContext(store, budgets);
+    armCascade(ctx, up.url);
+    ctx.budgetModelCaps = new Set(['claude-sonnet-4-6']); // cap the escalation target
+
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'easy' }],
+      }),
+    });
+    await res.text();
+
+    // The cheap request never escalated, so the sonnet (escalation-target) cap must be
+    // untouched — cheap-tier traffic must not drain the stronger model's budget.
+    expect(up.models).toEqual(['claude-haiku-4-5']);
+    expect(budgets.committed('model:claude-sonnet-4-6')).toBe(0);
+
+    await app.close();
+    await up.close();
+  });
+});
+
 function single(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }

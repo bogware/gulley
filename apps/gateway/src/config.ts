@@ -110,6 +110,15 @@ const Env = z.object({
   // e.g. RESIDENCY_ALLOWED_REGIONS=eu-central-1,eu-west-1 RESIDENCY_REQUIRE_ZDR=true
   RESIDENCY_ALLOWED_REGIONS: z.string().default(''),
   RESIDENCY_REQUIRE_ZDR: envBool(false),
+
+  // Cascade routing — attempt a cheap model, escalate to a stronger one only when the
+  // cheap response`s provider stop_reason signals inadequacy. A JSON array of
+  // { model (glob matched against the resolved model = tier-0), escalateTo (the
+  // stronger tier-1 model), stopReasons? (defaults to refusal/max_tokens/
+  // model_context_window_exceeded) }. The tier-0 response is buffered so the escalation
+  // decision is made BEFORE any client byte; both legs are billed. Empty = off.
+  // e.g. CASCADE_POLICY=[{"model":"claude-haiku-*","escalateTo":"claude-sonnet-4-6"}]
+  CASCADE_POLICY: z.string().optional(),
   // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
   // Deny-first, then allow-list; expressions run over { request, principal }.
   // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]

@@ -52,6 +52,7 @@ import { DbTenantCredentialResolver } from './tenant';
 import { parseToolPolicy } from './tool-governance';
 import { modelPolicyFromEnv } from './model-policy';
 import { residencyPolicyFromEnv } from './residency-policy';
+import { parseCascadePolicy } from './cascade';
 import { RequestTracer } from './tracer';
 import {
   AzureContentSafetyPlugin,
@@ -871,6 +872,9 @@ export function createProductionContext(config: Config): GatewayContext {
       config.RESIDENCY_ALLOWED_REGIONS,
       config.RESIDENCY_REQUIRE_ZDR,
     ),
+    // Cascade routing policies (env-config). Empty = off. Parse THROWS on bad JSON so a
+    // malformed policy fails boot rather than silently disabling escalation.
+    cascade: parseCascadePolicy(config.CASCADE_POLICY),
     models: catalogModels,
     rateResolver,
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
