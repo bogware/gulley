@@ -275,6 +275,17 @@ export const maskVault = pgTable(
   ],
 );
 
+// Per-subject crypto-shred keys. Each subject's data-encryption key is held WRAPPED by
+// the deployment master (BYOK) in `wrapped_key`; a crypto-shred NULLs it (destroying the
+// key) so every ciphertext under that subject becomes permanently unreadable, with
+// `shredded_at` recording the erasure. A NULL wrapped_key = shredded/absent.
+export const subjectKey = pgTable('subject_key', {
+  subject: text('subject').primaryKey(),
+  wrappedKey: jsonb('wrapped_key'), // EnvelopeCiphertext of the raw key; NULL once shredded
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  shreddedAt: timestamp('shredded_at', { withTimezone: true }),
+});
+
 // --- M5.1 control-plane / RBAC ---------------------------------------------
 
 // Admin users (Entra oid, or a bootstrap subject). Distinct from data-plane keys.

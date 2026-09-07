@@ -258,6 +258,12 @@ const Env = z.object({
   // KMS key ARN that wraps the mask-vault data keys (ARN only, never a value). Absent
   // in dev ⇒ the in-memory AES cipher (same envelope shape). Region = BEDROCK_REGION.
   GULLEY_KMS_KEY_ARN: z.string().optional(),
+  // BYOK crypto-shred: when on (with MASK_VAULT_PERSIST + DATABASE_URL), each mask-vault
+  // record is encrypted under a per-subject key (subject = the virtual key's principal)
+  // held wrapped by GULLEY_KMS_KEY_ARN, so the control plane can crypto-shred one
+  // subject's PII irrecoverably. The gateway only WRITES under these keys; shredding is a
+  // control-plane admin action. Must match the control-api CRYPTO_SHRED_ENABLED setting.
+  CRYPTO_SHRED_ENABLED: envBool(false),
   // Optional bring-your-own-DLP webhook guardrail (runs on request input). A
   // block/mask verdict is authoritative even under the audit-only default.
   GUARDRAILS_WEBHOOK_URL: z.string().url().optional(),

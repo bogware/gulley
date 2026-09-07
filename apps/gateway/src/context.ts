@@ -98,11 +98,17 @@ import {
   PostgresLedger,
   PostgresMaskVaultStore,
   PostgresRequestLog,
+  PostgresSubjectKeyStore,
   PostgresVectorIndex,
   RedisExactCache,
   RedisVectorIndex,
 } from '@gulley/storage';
-import { type Encryptor, InMemoryAesCipher, KmsEnvelopeEncryptor } from '@gulley/crypto';
+import {
+  type Encryptor,
+  InMemoryAesCipher,
+  KmsEnvelopeEncryptor,
+  ShreddableCipher,
+} from '@gulley/crypto';
 import {
   type AccessLogConfig,
   AccessLogFieldEngine,
@@ -674,11 +680,22 @@ export function createProductionContext(config: Config): GatewayContext {
   // ALWAYS with an encryptor (KMS in prod, the in-memory dev twin otherwise) — the
   // store never receives plaintext. Reveal (control-api) must use the same key, so
   // prod requires the shared KMS key; the in-memory cipher is per-process (dev/tests).
-  const maskVaultEncryptor: Encryptor | undefined = config.MASK_VAULT_PERSIST
+  const masterMaskEncryptor: Encryptor | undefined = config.MASK_VAULT_PERSIST
     ? config.GULLEY_KMS_KEY_ARN
       ? new KmsEnvelopeEncryptor(config.GULLEY_KMS_KEY_ARN, config.BEDROCK_REGION)
       : new InMemoryAesCipher()
     : undefined;
+  // BYOK crypto-shred: when on, each mask-vault record is encrypted under a PER-SUBJECT
+  // key (the principal) held wrapped by the master encryptor above (the customer CMK), so
+  // the control plane can later crypto-shred one subject's PII irrecoverably. The gateway
+  // only WRITES here (getOrCreate on the subject key); shredding is a control-plane action.
+  const maskVaultEncryptor: Encryptor | undefined =
+    masterMaskEncryptor && config.CRYPTO_SHRED_ENABLED
+      ? new ShreddableCipher(
+          masterMaskEncryptor,
+          new PostgresSubjectKeyStore(db, masterMaskEncryptor),
+        )
+      : masterMaskEncryptor;
   const maskVault =
     config.MASK_VAULT_PERSIST && maskVaultEncryptor ? new PostgresMaskVaultStore(db) : undefined;
   // Per-model budget caps (multi-level enforcement) keyed by their `model:<model>`

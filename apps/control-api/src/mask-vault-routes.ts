@@ -59,7 +59,17 @@ export function registerMaskVaultRoutes(app: FastifyInstance, ctx: ControlContex
           // Parse INSIDE the guard so a post-decrypt error also fails closed with a
           // generic message (never echo a decrypted plaintext fragment to the client).
           entries = JSON.parse(Buffer.from(plaintext).toString('utf8')) as Array<[string, string]>;
-        } catch {
+        } catch (err) {
+          // A crypto-shred is a DELIBERATE, provable erasure — tell the (already
+          // authorized) owner so, rather than pretending the key was merely wrong.
+          if (err instanceof Error && err.message.startsWith('crypto-shredded')) {
+            return reply.code(410).send({
+              error: {
+                type: 'crypto_shredded',
+                message: "this subject's mask-vault data was crypto-shredded and is unrecoverable",
+              },
+            });
+          }
           // Decrypt/parse failure (wrong key / tampered / AAD mismatch) — fail closed.
           return reply
             .code(502)

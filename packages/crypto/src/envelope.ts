@@ -14,6 +14,10 @@ export interface EnvelopeCiphertext {
 export interface EncryptContext {
   keyClass: string;
   aad?: string;
+  /** Crypto-shred subject: when set (and a ShreddableCipher is in use), the payload is
+   *  encrypted under this subject's own key, so destroying that key makes it
+   *  permanently unrecoverable. Ignored by the base ciphers. */
+  subject?: string;
 }
 
 /** Split-key envelope encryptor. Fail-closed on decrypt (unknown version/class,

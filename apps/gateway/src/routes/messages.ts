@@ -2298,6 +2298,10 @@ async function handleProxy(
           const ct = await maskEncryptor.encrypt(Buffer.from(JSON.stringify(v.entries()), 'utf8'), {
             keyClass: 'mask-vault',
             aad: `${requestId}:${principal.scope.workspaceId}:${direction}`,
+            // Crypto-shred subject = the principal (virtual key). With a ShreddableCipher
+            // wired (CRYPTO_SHRED_ENABLED) this encrypts under the subject's own key so the
+            // control plane can erase it irrecoverably; the base cipher ignores `subject`.
+            subject: principal.id,
           });
           await maskStore.put({
             requestId,

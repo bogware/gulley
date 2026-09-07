@@ -192,6 +192,10 @@ function buildContext(config: Config): ControlContext | undefined {
         ? new KmsEnvelopeEncryptor(config.GULLEY_KMS_KEY_ARN, config.GULLEY_KMS_REGION)
         : new InMemoryAesCipher()
       : undefined,
+    // BYOK crypto-shred: wrap the mask encryptor in a per-subject ShreddableCipher (the
+    // per-subject keys are held wrapped by the mask encryptor above = the customer CMK).
+    // The context builds the PostgresSubjectKeyStore when a DB + mask encryptor are present.
+    cryptoShredEnabled: config.CRYPTO_SHRED_ENABLED,
   });
 }
 

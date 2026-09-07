@@ -24,11 +24,19 @@ import {
   PostgresConfigVersionStore,
   PostgresKeyAdminStore,
   PostgresMaskVaultStore,
+  PostgresSubjectKeyStore,
   PostgresRequestLogQuery,
   readAuditRows,
   type MaskVaultStore,
 } from '@gulley/storage';
-import type { AsymmetricSigner, BatchVerifier, Encryptor, Signer } from '@gulley/crypto';
+import {
+  type AsymmetricSigner,
+  type BatchVerifier,
+  type Encryptor,
+  ShreddableCipher,
+  type Signer,
+  type SubjectKeyStore,
+} from '@gulley/crypto';
 import type { AuditMirror } from '@gulley/worm';
 import type { Anchor } from './anchor';
 import { type SiemConnector, SiemExporter } from './siem';
@@ -135,8 +143,12 @@ export interface ControlContext {
   /** Durable mask-reversal store (M22 D); present (with an encryptor) ⇒ the reveal
    *  endpoint is served. */
   maskVault?: MaskVaultStore;
-  /** Envelope decryptor for the mask vault — the SAME key the gateway encrypted with. */
+  /** Envelope decryptor for the mask vault — the SAME key the gateway encrypted with.
+   *  When crypto-shred is on this is a ShreddableCipher (per-subject keys). */
   maskVaultEncryptor?: Encryptor;
+  /** Per-subject crypto-shred key registry; present ⇒ the /admin/crypto-shred endpoints
+   *  are served and mask-vault reveal of a shredded subject fails (data unrecoverable). */
+  subjectKeys?: SubjectKeyStore;
   /** Hosts a provider base URL may egress to; empty = any non-blocked host. */
   outboundAllowlist: ReadonlySet<string>;
   /** The gateway's public base URL for generated client configs; absent ⇒ the
@@ -216,6 +228,11 @@ export interface InMemoryContextOptions {
   maskVault?: MaskVaultStore;
   /** Envelope decryptor for the mask vault (tests inject a shared cipher). */
   maskVaultEncryptor?: Encryptor;
+  /** Enable BYOK crypto-shred: wrap the mask encryptor in a ShreddableCipher over a
+   *  per-subject key registry (durable when a DB is present; tests inject one directly). */
+  cryptoShredEnabled?: boolean;
+  /** Inject a SubjectKeyStore directly (tests); overrides the DB-derived default. */
+  subjectKeys?: SubjectKeyStore;
   /** Provider usage/cost ingest sources for shadow-spend reconciliation. Tests
    *  inject fakes; prod wires Anthropic/OpenAI admin-API clients from config. */
   providerUsageSources?: ProviderUsageSource[];
@@ -289,6 +306,19 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
         ...(opts.siem.batchMax !== undefined ? { batchMax: opts.siem.batchMax } : {}),
       })
     : undefined;
+
+  // BYOK crypto-shred: a per-subject key registry (subject keys wrapped by the master
+  // encryptor = the customer's BYOK key), and a ShreddableCipher wrapping the master so
+  // mask-vault records are encrypted per-subject and a shred makes them unrecoverable.
+  const subjectKeys: SubjectKeyStore | undefined =
+    opts.subjectKeys ??
+    (opts.cryptoShredEnabled && db && opts.maskVaultEncryptor
+      ? new PostgresSubjectKeyStore(db, opts.maskVaultEncryptor)
+      : undefined);
+  const maskEncryptor: Encryptor | undefined =
+    subjectKeys && opts.maskVaultEncryptor
+      ? new ShreddableCipher(opts.maskVaultEncryptor, subjectKeys)
+      : opts.maskVaultEncryptor;
 
   const collections = Object.fromEntries(
     COLLECTION_KINDS.map((k) => [k, new ScopedCollection()]),
@@ -386,7 +416,11 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     maskVault:
       opts.maskVault ??
       (db && opts.maskVaultEncryptor ? new PostgresMaskVaultStore(db) : undefined),
-    maskVaultEncryptor: opts.maskVaultEncryptor,
+    // The mask-vault encryptor is the crypto-shred cipher when a subject-key store is
+    // wired, so every vault record is encrypted under its subject's key and a shred
+    // makes it permanently unrecoverable; otherwise it's the raw master encryptor.
+    maskVaultEncryptor: maskEncryptor,
+    subjectKeys,
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
     gatewayPublicUrl: opts.gatewayPublicUrl,
     onboardingSigningKey: opts.onboardingSigningKey,

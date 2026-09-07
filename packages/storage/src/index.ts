@@ -7,4 +7,5 @@ export * from './adapters';
 export * from './cache-adapters';
 export * from './centroid-store';
 export * from './mask-vault-store';
+export * from './subject-key-store';
 export * from './config-store';

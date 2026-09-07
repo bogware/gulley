@@ -98,6 +98,13 @@ const Env = z.object({
   GULLEY_KMS_KEY_ARN: z.string().optional(),
   GULLEY_KMS_REGION: z.string().default('us-east-1'),
 
+  // BYOK crypto-shred (GDPR/CCPA erasure): encrypt each mask-vault record under a
+  // PER-SUBJECT key held wrapped by GULLEY_KMS_KEY_ARN (the customer's own CMK = BYOK).
+  // POST /admin/crypto-shred/:subject destroys that subject's key so its stored PII maps
+  // become permanently unrecoverable — provable erasure with no row deletion. Needs
+  // DATABASE_URL + MASK_VAULT_ENABLED (a mask encryptor); otherwise the endpoints 501.
+  CRYPTO_SHRED_ENABLED: envBool(false),
+
   // SIEM export: stream NEW audit-trail events (with their hash-chain provenance) to a
   // Splunk HEC, Microsoft Sentinel, or generic HTTP sink. Needs DATABASE_URL (reads the
   // durable chain) + the sink's egress host on OUTBOUND_HOST_ALLOWLIST. Off unless

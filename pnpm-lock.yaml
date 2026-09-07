@@ -622,6 +622,9 @@ importers:
       '@gulley/cost':
         specifier: workspace:*
         version: link:../cost
+      '@gulley/crypto':
+        specifier: workspace:*
+        version: link:../crypto
       '@gulley/pipeline':
         specifier: workspace:*
         version: link:../pipeline
