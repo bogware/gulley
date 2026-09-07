@@ -4853,6 +4853,98 @@ describe('cascade routing', () => {
   });
 });
 
+describe('same-model arbitrage', () => {
+  it('rewrites the outbound model to the target-specific upstream id (per-target modelMap)', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    // Stamp a per-target model map, as a cross-provider route group would for a Bedrock
+    // leg (client canonical id → the id that upstream expects).
+    (ctx.routes[0]!.strategy as { mode: 'single'; target: RouteTarget }).target.modelMap = {
+      'claude-sonnet-4-6': 'us.anthropic.claude-sonnet-4-6-v1:0',
+    };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).then((r) => r.text());
+
+    // The upstream received the mapped id, not the client's canonical id.
+    expect((JSON.parse(received.body) as { model: string }).model).toBe(
+      'us.anthropic.claude-sonnet-4-6-v1:0',
+    );
+    await app.close();
+  });
+
+  it('never routes a non-streamed request to a stream-only (alwaysStream) provider', async () => {
+    const hits = { bedrock: false, anthropic: false };
+    const mkServer = (which: 'bedrock' | 'anthropic', payload: string, ct: string): http.Server =>
+      http.createServer((req, res) => {
+        hits[which] = true;
+        req.on('data', () => {});
+        req.on('end', () => {
+          res.writeHead(200, { 'content-type': ct });
+          res.end(payload);
+        });
+      });
+    const bedrockJson =
+      '{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3},"content":[{"type":"text","text":"BEDROCK"}]}';
+    const anthropicJson =
+      '{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3},"content":[{"type":"text","text":"ANTHROPIC"}]}';
+    const bedrockSrv = mkServer('bedrock', bedrockJson, 'application/json');
+    const anthropicSrv = mkServer('anthropic', anthropicJson, 'application/json');
+    await new Promise<void>((r) => bedrockSrv.listen(0, '127.0.0.1', r));
+    await new Promise<void>((r) => anthropicSrv.listen(0, '127.0.0.1', r));
+    const bedrockUrl = `http://127.0.0.1:${(bedrockSrv.address() as AddressInfo).port}`;
+    const anthropicUrl = `http://127.0.0.1:${(anthropicSrv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    // Fallback group with the STREAM-ONLY (Bedrock) leg declared FIRST — without the
+    // guard it would serve; the guard must drop it for a non-streamed request.
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: {
+          mode: 'fallback',
+          targets: [
+            { ...anthropicTarget('bedrock', bedrockUrl), provider: 'bedrock', alwaysStream: true },
+            anthropicTarget('anthropic', anthropicUrl),
+          ],
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6', // NON-streamed (no stream:true)
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+
+    expect(hits.bedrock).toBe(false); // stream-only leg filtered out
+    expect(hits.anthropic).toBe(true);
+    expect(text).toContain('ANTHROPIC');
+
+    await app.close();
+    await new Promise<void>((r) => bedrockSrv.close(() => r()));
+    await new Promise<void>((r) => anthropicSrv.close(() => r()));
+  });
+});
+
 function single(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }

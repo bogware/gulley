@@ -743,7 +743,7 @@ async function handleProxy(
   const residencyActive = !isEmptyResidencyPolicy(ctx.residencyPolicy);
   const allowedRegions = residencyAllowedRegions(ctx.residencyPolicy);
   const requireZdr = ctx.residencyPolicy?.requireZdr ?? false;
-  const candidates = selectCandidates(strategy, ctx.breaker, {
+  let candidates = selectCandidates(strategy, ctx.breaker, {
     sessionKey,
     scoreboard: ctx.scoreboard,
     outlier: ctx.outlier,
@@ -753,6 +753,14 @@ async function handleProxy(
     allowedRegions,
     requireZdr,
   }).filter((t) => scopeAllowsProvider(principal.scope, t.provider));
+  // A stream-only upstream (alwaysStream, e.g. Bedrock) can't serve a NON-streamed
+  // request without flipping the client-visible response to SSE. In a multi-target
+  // (arbitrage/failover) group, drop such targets for a non-streamed request — but keep
+  // them if they are the only option (serving streamed beats failing the request).
+  if (parseOk && parsed['stream'] !== true && candidates.length > 1) {
+    const nonStreaming = candidates.filter((t) => t.alwaysStream !== true);
+    if (nonStreaming.length > 0) candidates = nonStreaming;
+  }
   if (candidates.length === 0) {
     // Attribute the refusal: if a scope-allowed target existed but none satisfied the
     // residency policy, it is a distinct, auditable residency denial (not a generic
@@ -1401,6 +1409,23 @@ async function handleProxy(
     (await ctx.tenantCredentials?.resolve(principal.scope.workspaceId, target.provider)) ??
     target.credential;
 
+  // Same-model arbitrage: rewrite the outbound body's model to the id THIS upstream
+  // expects (target.modelMap), so one cross-provider group can serve providers whose
+  // ids differ for the same logical model. Preserves every other body mutation
+  // (guardrail masks, shaping, CEL) by re-parsing the current body. No map / unmapped
+  // model / unparseable body ⇒ forwarded verbatim.
+  const bodyForTarget = (target: RouteTarget, srcBody: Buffer, clientModel: string): Buffer => {
+    const upstreamModel = target.modelMap?.[clientModel];
+    if (!upstreamModel) return srcBody;
+    try {
+      const obj = JSON.parse(srcBody.toString('utf8')) as Record<string, unknown>;
+      obj['model'] = upstreamModel;
+      return Buffer.from(JSON.stringify(obj), 'utf8');
+    } catch {
+      return srcBody;
+    }
+  };
+
   // --- request hedging (opt-in, pre-first-byte only) ---
   // One hedge branch = a SINGLE forward (no same-target retry — hedging is a
   // cross-target concern) with its own breaker/limiter accounting.
@@ -1430,7 +1455,7 @@ async function handleProxy(
     try {
       const resp = await target.adapter.forward({
         path: target.upstreamPath,
-        body,
+        body: bodyForTarget(target, body, requestedModel),
         headers: forwardHeaders,
         credential: await credentialFor(target),
         signal,
@@ -1597,7 +1622,7 @@ async function handleProxy(
           forwardStart = Date.now();
           const r = await target.adapter.forward({
             path: target.upstreamPath,
-            body,
+            body: bodyForTarget(target, body, requestedModel),
             headers: forwardHeaders,
             credential,
             signal: controller.signal,
@@ -1764,7 +1789,9 @@ async function handleProxy(
         try {
           resp1 = await t1.adapter.forward({
             path: t1.upstreamPath,
-            body: cascade.body,
+            // cascade.body already carries the escalation model; a per-target arbitrage
+            // map (keyed by that model) still rewrites it to the upstream's id.
+            body: bodyForTarget(t1, cascade.body, cascade.model),
             headers: forwardHeaders,
             credential: await credentialFor(t1),
             signal: controller.signal,

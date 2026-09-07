@@ -22,6 +22,13 @@ export interface RouteTarget {
    *  A `requireZdr` policy routes only to targets flagged `true`, failing closed
    *  otherwise. */
   zdr?: boolean;
+  /** Per-target model-id rewrite for same-model cross-provider ARBITRAGE: maps the
+   *  client's (canonical) model id to the id THIS upstream expects (e.g. the client's
+   *  `claude-sonnet-4-6` → Bedrock's `us.anthropic.claude-sonnet-4-6-v1:0`). Applied to
+   *  the outbound body just before this target's dispatch; absent/unmapped models are
+   *  forwarded verbatim. Lets a loadbalance/fallback group span providers whose ids
+   *  differ for the same logical model. */
+  modelMap?: Record<string, string>;
 }
 
 /**

@@ -26,6 +26,12 @@ export const routeGroupSchema = z.object({
   onStatusCodes: z.array(z.number().int()).optional(),
   /** Per-group hedge delay (ms); 0/absent falls back to the global `HEDGE_DELAY_MS`. */
   hedgeDelayMs: z.number().int().nonnegative().optional(),
+  /** Same-model ARBITRAGE across providers whose model ids differ: per-provider map of
+   *  the client (canonical) model → the id THAT provider expects. e.g.
+   *  `{ "bedrock": { "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6-v1:0" } }`.
+   *  A provider with no entry forwards the client model verbatim (correct for the
+   *  native provider). */
+  modelMap: z.record(z.string(), z.record(z.string(), z.string())).optional(),
 });
 export type RouteGroup = z.infer<typeof routeGroupSchema>;
 
@@ -71,7 +77,12 @@ export function applyRouteGroups(
     for (const name of g.providers) {
       const base = byProvider.get(name);
       if (!base) continue; // provider not configured — drop it from the group
-      targets.push({ ...base, weight: g.weights?.[name] ?? base.weight ?? 1 });
+      const modelMap = g.modelMap?.[name];
+      targets.push({
+        ...base,
+        weight: g.weights?.[name] ?? base.weight ?? 1,
+        ...(modelMap ? { modelMap } : {}),
+      });
     }
     if (targets.length < 2) continue;
     const strategy: RoutingStrategy =

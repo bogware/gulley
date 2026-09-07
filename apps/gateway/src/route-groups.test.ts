@@ -64,6 +64,31 @@ describe('applyRouteGroups', () => {
     expect(group.clientPaths).toContain('/v1/messages'); // inherits the template's paths
   });
 
+  it('stamps a per-provider modelMap for same-model arbitrage', () => {
+    const out = applyRouteGroups(
+      routes(),
+      parseRouteGroups(
+        JSON.stringify([
+          {
+            clientPath: '/v1/messages',
+            mode: 'loadbalance',
+            select: 'cheapest',
+            providers: ['anthropic', 'bedrock'],
+            modelMap: { bedrock: { 'claude-sonnet-4-6': 'us.anthropic.claude-sonnet-4-6-v1:0' } },
+          },
+        ]),
+      ),
+      0,
+    );
+    const group = out[out.length - 1]!;
+    const byProvider = Object.fromEntries(targetsOf(group).map((t) => [t.provider, t]));
+    // The mapped provider carries its upstream-id map; the native provider does not.
+    expect(byProvider['bedrock']?.modelMap).toEqual({
+      'claude-sonnet-4-6': 'us.anthropic.claude-sonnet-4-6-v1:0',
+    });
+    expect(byProvider['anthropic']?.modelMap).toBeUndefined();
+  });
+
   it('applies weights for loadbalance and the default hedge', () => {
     const out = applyRouteGroups(
       routes(),
