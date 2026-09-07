@@ -105,4 +105,21 @@ describe('InMemoryBudgetStore', () => {
     expect(s.committed('ws')).toBe(100);
     expect((await s.reserve('ws', 'r3', 800))?.allowed).toBe(true);
   });
+
+  it('accepts a resolver so dynamically-keyed scopes enforce without a seed map', async () => {
+    // Regression: on the counter-less path an `attr:<key>:<value>` scope (value
+    // known only at request time) must enforce exactly as it does against Redis.
+    // A resolver keyed by the attr key — mirroring the gateway's cap composition —
+    // caps EVERY distinct value under the same budget, so the store must consult
+    // the resolver rather than a static map.
+    const s = new InMemoryBudgetStore((scope) =>
+      scope.startsWith('attr:session:') ? { capMicroUsd: 1000, periodSeconds: 86_400 } : null,
+    );
+    // Two different session values both resolve to the cap and both enforce it.
+    expect((await s.reserve('attr:session:s1', 'r1', 600))?.allowed).toBe(true);
+    expect((await s.reserve('attr:session:s1', 'r2', 600))?.allowed).toBe(false); // 600+600>1000
+    expect((await s.reserve('attr:session:s2', 'r3', 900))?.allowed).toBe(true); // independent key
+    // A scope the resolver doesn't recognize is unenforced (null), as before.
+    expect(await s.reserve('ws:unknown', 'r4', 10)).toBeNull();
+  });
 });

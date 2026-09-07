@@ -144,6 +144,16 @@ const Env = z.object({
   // workspace cap; all applicable caps must admit). JSON map of model id to a cap:
   // {"claude-opus-4-8":{"capMicroUsd":10000000,"periodSeconds":86400}}
   BUDGET_MODEL_CAPS: z.string().optional(),
+  // Per-attribution budget caps (the runaway-agent control): a cap keyed by an
+  // attribution dimension (session/dev/repo/…, from ATTRIBUTION_HEADERS), enforced
+  // in addition to the workspace + model caps. A looping autonomous session or a
+  // heavy developer hits its OWN cap and is 402'd, independent of the workspace.
+  // JSON map of attribution key to a cap (periodSeconds e.g. 86400 for a daily cap):
+  // {"session":{"capMicroUsd":5000000,"periodSeconds":86400},"dev":{"capMicroUsd":50000000,"periodSeconds":86400}}
+  // periodSeconds is ALWAYS applied (defaults to 86400 / 24h when omitted): the key
+  // value is client-supplied, so every attr-cap counter must expire to keep the
+  // (noeviction) counters store bounded. Enforced on the counter-less path too.
+  BUDGET_ATTR_CAPS: z.string().optional(),
   // Redis for the exact cache / Redis Stack vector index (when selected).
   REDIS_CACHE_URL: z.string().url().optional(),
   REDIS_VECTOR_URL: z.string().url().optional(),

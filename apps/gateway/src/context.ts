@@ -11,7 +11,12 @@ import {
   resolveCustomProvider,
   type UpstreamCredential,
 } from '@gulley/providers';
-import { type BudgetStore, InMemoryBudgetStore, RedisBudgetStore } from '@gulley/budget';
+import {
+  type Budget,
+  type BudgetStore,
+  InMemoryBudgetStore,
+  RedisBudgetStore,
+} from '@gulley/budget';
 import {
   CacheEngine,
   type EmbeddingProvider,
@@ -270,6 +275,57 @@ export function parseBudgetModelCaps(
       entry.periodSeconds = period;
     }
     out.set(`model:${model}`, entry);
+  }
+  return out;
+}
+
+/** Default rolling window for a per-attribution cap when the operator omits
+ *  `periodSeconds`. Unlike a workspace/model scope (a bounded, server-assigned or
+ *  configured key set), the `attr:<key>:<value>` value comes from a client header,
+ *  so its key cardinality is client-controlled. The counters Redis is `noeviction`,
+ *  so a lifetime (TTL-less) attr cap would let distinct values accumulate keys that
+ *  never expire — a slow key-exhaustion DoS. A window is therefore always applied:
+ *  every attr-cap key gets an EXPIRE, bounding the working set and self-recovering. */
+const DEFAULT_ATTR_CAP_PERIOD_SECONDS = 86_400;
+
+/** Parse `BUDGET_ATTR_CAPS` (JSON map of attribution-key → cap) into an attrKey→Budget
+ *  map. A daily-ish cap keyed by an SDLC attribution dimension (session, dev, repo…)
+ *  — the runaway-agent control: a looping session or a heavy developer hits its own
+ *  cap independent of the workspace cap. Reserved against `attr:<key>:<value>`.
+ *  A rolling window is ALWAYS applied (see DEFAULT_ATTR_CAP_PERIOD_SECONDS): the
+ *  key value is client-controlled, so a TTL-less counter on the noeviction Redis
+ *  would grow unbounded. Invalid entries throw (a bad cap must never silently
+ *  disable enforcement). */
+export function parseBudgetAttrCaps(
+  raw: string | undefined,
+): Map<string, { capMicroUsd: number; periodSeconds?: number }> {
+  const out = new Map<string, { capMicroUsd: number; periodSeconds?: number }>();
+  if (!raw) return out;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('BUDGET_ATTR_CAPS is not valid JSON');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('BUDGET_ATTR_CAPS must be a JSON object of attrKey → { capMicroUsd }');
+  }
+  for (const [key, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof v !== 'object' || v === null) continue;
+    const cap = (v as Record<string, unknown>)['capMicroUsd'];
+    const period = (v as Record<string, unknown>)['periodSeconds'];
+    if (typeof cap !== 'number' || !Number.isFinite(cap) || cap <= 0) {
+      throw new Error(`BUDGET_ATTR_CAPS["${key}"].capMicroUsd must be a positive number`);
+    }
+    const entry: { capMicroUsd: number; periodSeconds?: number } = {
+      capMicroUsd: cap,
+      // Always windowed — never a lifetime cap (see DEFAULT_ATTR_CAP_PERIOD_SECONDS).
+      periodSeconds:
+        typeof period === 'number' && Number.isFinite(period) && period > 0
+          ? period
+          : DEFAULT_ATTR_CAP_PERIOD_SECONDS,
+    };
+    out.set(key, entry);
   }
   return out;
 }
@@ -609,18 +665,38 @@ export function createProductionContext(config: Config): GatewayContext {
   const budgetModelCaps: ReadonlySet<string> = new Set(
     [...modelCaps.keys()].map((k) => k.slice('model:'.length)),
   );
-  // Budgets need Redis counters; without them, enforcement is simply disabled —
-  // except for the in-memory store, which we seed with the model caps so multi-level
-  // enforcement still works in the counter-less (single-node/dev) path.
+  // Per-attribution caps (runaway-agent control) keyed by attribution dimension
+  // (session/dev/repo/…); reserved against `attr:<key>:<value>`.
+  const attrCaps = parseBudgetAttrCaps(config.BUDGET_ATTR_CAPS);
+  // `attr:<key>:<value>` scope → the cap configured for <key> (the value doesn't
+  // affect the cap, only the counter key). Key = the segment between the two colons.
+  const attrCapFor = (scopeKey: string): { capMicroUsd: number; periodSeconds?: number } | null => {
+    const rest = scopeKey.slice('attr:'.length);
+    const sep = rest.indexOf(':');
+    if (sep <= 0) return null;
+    return attrCaps.get(rest.slice(0, sep)) ?? null;
+  };
+  // Config-sourced caps (per-model + per-attribution) resolve from the parsed
+  // config for BOTH stores, so the counter-less (single-node/dev) path enforces
+  // them exactly as the Redis path does — otherwise an `attr:` cap would silently
+  // no-op in memory (its scope absent from any seed map) while enforcing under
+  // Redis. DB-backed workspace budgets still require Redis counters (disabled
+  // without them, unchanged).
+  const configCapResolver = (scopeKey: string): Budget | null =>
+    scopeKey.startsWith('model:')
+      ? (modelCaps.get(scopeKey) ?? null)
+      : scopeKey.startsWith('attr:')
+        ? attrCapFor(scopeKey)
+        : null;
   const dbCapResolver = createBudgetCapResolver(db);
   const budgets: BudgetStore = config.REDIS_COUNTERS_URL
     ? new RedisBudgetStore(createRedisClient(config.REDIS_COUNTERS_URL), (scopeKey) =>
-        // Compose: `model:` scopes resolve from config; everything else from the DB.
-        scopeKey.startsWith('model:')
-          ? Promise.resolve(modelCaps.get(scopeKey) ?? null)
+        // Compose: `model:` + `attr:` scopes resolve from config; else from the DB.
+        scopeKey.startsWith('model:') || scopeKey.startsWith('attr:')
+          ? Promise.resolve(configCapResolver(scopeKey))
           : dbCapResolver(scopeKey),
       )
-    : new InMemoryBudgetStore(new Map(modelCaps));
+    : new InMemoryBudgetStore(configCapResolver);
 
   // Self-heal LOST committed budget counters from the durable ledger on boot: a
   // counters-Redis flush resets them to 0 and would over-admit past the hard cap
@@ -752,6 +828,7 @@ export function createProductionContext(config: Config): GatewayContext {
         ? { threshold: config.BUDGET_DOWNSHIFT_THRESHOLD, model: config.BUDGET_DOWNSHIFT_MODEL }
         : undefined,
     budgetModelCaps: budgetModelCaps.size > 0 ? budgetModelCaps : undefined,
+    budgetAttrCaps: attrCaps.size > 0 ? new Set(attrCaps.keys()) : undefined,
     playgroundEnabled: config.PLAYGROUND_ENABLED,
     maskVault,
     maskVaultEncryptor,

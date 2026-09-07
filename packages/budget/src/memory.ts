@@ -14,8 +14,19 @@ interface Counters {
  */
 export class InMemoryBudgetStore implements BudgetStore {
   private readonly counters = new Map<string, Counters>();
+  private readonly capFor: (scope: string) => Budget | null;
 
-  constructor(private readonly caps: Map<string, Budget>) {}
+  /**
+   * Accepts either a static `scope → Budget` map or a resolver function. A
+   * resolver lets dynamically-keyed scopes (e.g. `attr:<key>:<value>`, whose
+   * value isn't known at boot) enforce on the counter-less path exactly as they
+   * do against Redis — otherwise a config-sourced cap would silently fall through
+   * to null (no enforcement) here while enforcing under Redis. The resolver stays
+   * synchronous so the reserve check + increment remain a single atomic step.
+   */
+  constructor(caps: Map<string, Budget> | ((scope: string) => Budget | null)) {
+    this.capFor = typeof caps === 'function' ? caps : (scope) => caps.get(scope) ?? null;
+  }
 
   private counter(ws: string): Counters {
     let c = this.counters.get(ws);
@@ -31,7 +42,7 @@ export class InMemoryBudgetStore implements BudgetStore {
     requestId: string,
     worstCaseMicroUsd: number,
   ): Promise<BudgetDecision | null> {
-    const budget = this.caps.get(workspaceId);
+    const budget = this.capFor(workspaceId);
     if (!budget) return null;
 
     const c = this.counter(workspaceId);

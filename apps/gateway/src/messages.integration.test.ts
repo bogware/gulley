@@ -904,6 +904,133 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     up.close();
   });
 
+  it('runaway-agent guardrail: a per-session cap 402s a session over its budget', async () => {
+    const { store, token } = seededStore();
+    // A tiny per-session cap; the request's worst-case reservation exceeds it.
+    const budgets = new InMemoryBudgetStore(
+      new Map([['attr:session:sess1', { capMicroUsd: 100, periodSeconds: 86400 }]]),
+    );
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.attributionHeaders = ['x-gulley-session'];
+    ctx.budgetAttrCaps = new Set(['session']);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': token,
+        'x-gulley-session': 'sess1',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'loop' }],
+      }),
+    });
+    expect(res.status).toBe(402);
+    await app.close();
+  });
+
+  it('runaway-agent guardrail: a session under its cap is admitted and charged to its scope', async () => {
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(
+      new Map([['attr:session:sess2', { capMicroUsd: 10_000_000, periodSeconds: 86400 }]]),
+    );
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.attributionHeaders = ['x-gulley-session'];
+    ctx.budgetAttrCaps = new Set(['session']);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': token,
+        'x-gulley-session': 'sess2',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    // The session's own scope carries the committed spend (the runaway control's meter).
+    expect(budgets.committed('attr:session:sess2')).toBeGreaterThan(0);
+    await app.close();
+  });
+
+  it('runaway-agent guardrail: enforces on the counter-less resolver path (no seed map)', async () => {
+    const { store, token } = seededStore();
+    // Mirror the gateway's counter-less wiring: a resolver keyed by the attr KEY,
+    // NOT a map pre-seeded with the full `attr:session:<value>` scope. Before the
+    // fix the in-memory store consulted only a model-cap map, so attr caps silently
+    // no-op'd here (fail-open) while enforcing under Redis.
+    const attrCap = { capMicroUsd: 100, periodSeconds: 86_400 };
+    const budgets = new InMemoryBudgetStore((scope) =>
+      scope.startsWith('attr:session:') ? attrCap : null,
+    );
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.attributionHeaders = ['x-gulley-session'];
+    ctx.budgetAttrCaps = new Set(['session']);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': token,
+        'x-gulley-session': 'looping-agent',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'loop' }],
+      }),
+    });
+    expect(res.status).toBe(402);
+    await app.close();
+  });
+
+  it('drops an over-long or key-unsafe attribution value while keeping valid tags', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.attributionHeaders = ['x-gulley-session', 'x-gulley-repo', 'x-gulley-dev'];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': token,
+        // Over the 128-char bound → dropped, so it can't mint a giant Redis key.
+        'x-gulley-session': 'x'.repeat(200),
+        // Contains a Redis hash-tag delimiter (`}`) → dropped, so it can't collide slots.
+        'x-gulley-repo': 'acme/api}evil',
+        // Valid and bounded → kept.
+        'x-gulley-dev': 'alice',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).then((r) => r.text());
+    // The hostile values are dropped (never attributed → never keyed as a counter);
+    // the valid tag survives, so the bound is selective, not a blanket disable.
+    const attrs = ledger.entries[0]?.attributes;
+    expect(attrs?.['session']).toBeUndefined();
+    expect(attrs?.['repo']).toBeUndefined();
+    expect(attrs?.['dev']).toBe('alice');
+    await app.close();
+  });
+
   it('captures attribution headers onto the ledger without shadowing built-in facets', async () => {
     const { store, token } = seededStore();
     const { ctx, ledger, requestLog } = buildContext(store);

@@ -131,6 +131,11 @@ export interface GatewayContext {
   /** Models that carry their own budget cap (multi-level enforcement). When the
    *  requested model is in this set, its `model:<model>` scope is reserved too. */
   budgetModelCaps?: ReadonlySet<string>;
+  /** Attribution keys (session/dev/repo/…) that carry their own budget cap — the
+   *  runaway-agent control. When the request's attribution has one of these keys, an
+   *  `attr:<key>:<value>` scope is reserved too, so a looping session or heavy
+   *  developer hits its own cap independent of the workspace. */
+  budgetAttrCaps?: ReadonlySet<string>;
   telemetry: Telemetry;
   /** Global guardrail engine (audit-only by default). */
   guardrails?: GuardrailEngine;
@@ -965,6 +970,25 @@ async function handleProxy(
       return;
     }
     if (md?.allowed) reservedScopes.push(modelScope);
+  }
+
+  // Per-attribution caps (runaway-agent control): reserve an `attr:<key>:<value>`
+  // scope for each configured attribution key the request carries — so a looping
+  // session or heavy developer hits its OWN cap and is 402'd, independent of the
+  // workspace. Every applicable cap must admit; a rejection rolls back all reserved
+  // scopes (rejectBudget). Deterministic order so the rejected scope is stable.
+  if (worstCase > 0 && ctx.budgetAttrCaps && attribution) {
+    for (const key of ctx.budgetAttrCaps) {
+      const value = attribution[key];
+      if (!value) continue;
+      const attrScope = `attr:${key}:${value}`;
+      const ad = await ctx.budgets.reserve(attrScope, requestId, worstCase);
+      if (ad && !ad.allowed) {
+        await rejectBudget(attrScope, ad);
+        return;
+      }
+      if (ad?.allowed) reservedScopes.push(attrScope);
+    }
   }
 
   const controller = new AbortController();
@@ -2235,10 +2259,22 @@ async function serveFromCache(
   });
 }
 
+/** Max characters for an attribution value. The value flows into the durable
+ *  ledger/audit AND becomes a budget counter-key segment (`attr:<key>:<value>`),
+ *  so an oversized client header must not be able to bloat a row or a Redis key. */
+const ATTRIBUTION_VALUE_MAX_LEN = 128;
+/** Reject a value that would corrupt the Redis hash-tag (`{`/`}` delimit the slot
+ *  tag) or carries ASCII control bytes — a client header must never be able to mint
+ *  pathological / slot-colliding counter keys on the noeviction counters store. */
+const ATTRIBUTION_VALUE_UNSAFE_RE = /[{}\p{Cc}]/u;
+
 /** Capture configured request headers as cost-attribution tags. The key is the
  *  header name with a leading `x-gulley-` (then `x-`) stripped and lowercased, so
- *  `X-Gulley-Repo: acme/api` becomes `{ repo: 'acme/api' }`. Only non-empty string
- *  values are captured; returns undefined when nothing matched. */
+ *  `X-Gulley-Repo: acme/api` becomes `{ repo: 'acme/api' }`. A value is captured
+ *  only when it is a non-empty string within the length bound and free of
+ *  key-unsafe bytes (see the constants above) — an over-long or hostile value is
+ *  dropped rather than attributed, since it also keys a budget counter. Returns
+ *  undefined when nothing matched. */
 function buildAttribution(
   request: FastifyRequest,
   headerNames: string[] | undefined,
@@ -2248,7 +2284,12 @@ function buildAttribution(
   for (const name of headerNames) {
     const raw = request.headers[name];
     const val = Array.isArray(raw) ? raw[0] : raw;
-    if (typeof val === 'string' && val.length > 0) {
+    if (
+      typeof val === 'string' &&
+      val.length > 0 &&
+      val.length <= ATTRIBUTION_VALUE_MAX_LEN &&
+      !ATTRIBUTION_VALUE_UNSAFE_RE.test(val)
+    ) {
       const key = name.replace(/^x-gulley-/, '').replace(/^x-/, '');
       if (key) out[key] = val;
     }
