@@ -1037,4 +1037,40 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       return reply.send({ signaturesValid, ...rewrite });
     }),
   );
+
+  // --- SIEM export: stream the audit trail to Splunk / Sentinel / a webhook ---
+  const siemNotConfigured = (reply: FastifyReply): FastifyReply =>
+    reply
+      .code(501)
+      .send({ error: { type: 'not_configured', message: 'SIEM export not configured' } });
+
+  app.get(
+    '/audit/siem/status',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.siemExporter) return siemNotConfigured(reply);
+      return reply.send({
+        enabled: true,
+        kind: ctx.siemExporter.kind,
+        lastSeq: ctx.siemExporter.lastExportedSeq,
+      });
+    }),
+  );
+
+  // Export new audit events now (also runs on a background timer). Single-flight;
+  // at-least-once (a failed batch retries from the last delivered seq).
+  app.post(
+    '/audit/siem/export',
+    adminRoute(ctx, async (_req, reply, admin) => {
+      if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
+      if (!ctx.siemExporter) return siemNotConfigured(reply);
+      try {
+        return reply.send(await ctx.siemExporter.export());
+      } catch (err) {
+        return reply
+          .code(502)
+          .send({ error: { type: 'siem_error', message: (err as Error).message } });
+      }
+    }),
+  );
 }

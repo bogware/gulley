@@ -98,6 +98,23 @@ const Env = z.object({
   GULLEY_KMS_KEY_ARN: z.string().optional(),
   GULLEY_KMS_REGION: z.string().default('us-east-1'),
 
+  // SIEM export: stream NEW audit-trail events (with their hash-chain provenance) to a
+  // Splunk HEC, Microsoft Sentinel, or generic HTTP sink. Needs DATABASE_URL (reads the
+  // durable chain) + the sink's egress host on OUTBOUND_HOST_ALLOWLIST. Off unless
+  // SIEM_KIND is set; then GET /audit/siem/status + POST /audit/siem/export are served.
+  // A live tail (seeded from the current head at startup); backfill via WORM / evidence
+  // bundle. splunk: SIEM_URL + SIEM_TOKEN. sentinel: SIEM_WORKSPACE_ID + SIEM_SHARED_KEY.
+  // webhook: SIEM_URL (+ optional SIEM_AUTHZ header). Secret ARNs only in prod configs.
+  SIEM_KIND: z.enum(['splunk', 'sentinel', 'webhook']).optional(),
+  SIEM_URL: z.string().url().optional(),
+  SIEM_TOKEN: z.string().optional(),
+  SIEM_WORKSPACE_ID: z.string().optional(),
+  SIEM_SHARED_KEY: z.string().optional(),
+  SIEM_AUTHZ: z.string().optional(),
+  SIEM_LOG_TYPE: z.string().optional(),
+  SIEM_EXPORT_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+  SIEM_BATCH_MAX: z.coerce.number().int().positive().default(200),
+
   // WORM-live: continuously mirror the durable, hash-chained audit log to an S3
   // Object Lock (COMPLIANCE) bucket — the retained, immutable system of record that
   // survives a Postgres compromise. Enabled only with WORM_ENABLED + WORM_BUCKET +

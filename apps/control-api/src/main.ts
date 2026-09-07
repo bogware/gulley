@@ -9,6 +9,7 @@ import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
 import { S3AuditMirror } from '@gulley/worm';
 import { type Anchor, HttpAnchor } from './anchor';
+import { buildSiemConnector, type SiemConnector } from './siem';
 import { signCtxAttestation } from './audit-signing';
 import { type Config, loadConfig, outboundAllowlist, sessionSecrets } from './config';
 import {
@@ -73,6 +74,33 @@ function buildAnchor(config: Config): Anchor | undefined {
     allowlist: outboundAllowlist(config),
     ...(config.AUDIT_ANCHOR_AUTHZ ? { headers: { authorization: config.AUDIT_ANCHOR_AUTHZ } } : {}),
   });
+}
+
+/** SIEM connector (SSRF-guarded), if SIEM_KIND is set. Requires DATABASE_URL — the
+ *  export reads the durable chain, not an in-memory replica. buildSiemConnector throws
+ *  on a missing credential so a misconfig fails boot. */
+function buildSiem(
+  config: Config,
+  warn: (msg: string) => void,
+): { connector: SiemConnector; batchMax: number } | undefined {
+  if (!config.SIEM_KIND) return undefined;
+  if (!config.DATABASE_URL) {
+    warn('SIEM_KIND set but DATABASE_URL missing — SIEM export disabled');
+    return undefined;
+  }
+  const connector = buildSiemConnector(
+    {
+      kind: config.SIEM_KIND,
+      url: config.SIEM_URL,
+      token: config.SIEM_TOKEN,
+      workspaceId: config.SIEM_WORKSPACE_ID,
+      sharedKey: config.SIEM_SHARED_KEY,
+      authorization: config.SIEM_AUTHZ,
+      logType: config.SIEM_LOG_TYPE,
+    },
+    { allowlist: outboundAllowlist(config) },
+  );
+  return connector ? { connector, batchMax: config.SIEM_BATCH_MAX } : undefined;
 }
 
 /**
@@ -156,6 +184,7 @@ function buildContext(config: Config): ControlContext | undefined {
     auditSigner,
     worm: buildWorm(config, auditSigner, (m) => process.stderr.write(`${m}\n`)),
     anchor: buildAnchor(config),
+    siem: buildSiem(config, (m) => process.stderr.write(`${m}\n`)),
     // Mask-vault reveal decryptor — the SAME envelope key the gateway used (KMS in
     // prod; the in-memory dev cipher only decrypts records written in-process).
     maskVaultEncryptor: config.MASK_VAULT_ENABLED
@@ -223,6 +252,33 @@ if (context?.anchor && context.auditRows) {
   tick();
 }
 
+// SIEM export: seed the cursor from the current audit head (tail-only, no backlog
+// storm on start), then export new events on a periodic tick.
+let siemTimer: NodeJS.Timeout | undefined;
+if (context?.siemExporter) {
+  const exporter = context.siemExporter;
+  const tick = (): void => {
+    exporter
+      .export()
+      .then((r) => {
+        if (r.exported > 0)
+          app.log.info({ exported: r.exported, lastSeq: r.lastSeq }, 'SIEM export');
+      })
+      .catch((err: unknown) => app.log.error({ err }, 'SIEM export failed'));
+  };
+  void exporter
+    .seedFromHead()
+    .then(() => {
+      siemTimer = setInterval(tick, config.SIEM_EXPORT_INTERVAL_MS);
+      siemTimer.unref();
+      app.log.info(
+        { kind: exporter.kind, intervalMs: config.SIEM_EXPORT_INTERVAL_MS },
+        'SIEM export started',
+      );
+    })
+    .catch((err: unknown) => app.log.error({ err }, 'SIEM seed failed'));
+}
+
 async function start(): Promise<void> {
   try {
     await app.listen({ host: config.CONTROL_API_HOST, port: config.CONTROL_API_PORT });
@@ -247,6 +303,7 @@ async function shutdown(signal: string): Promise<void> {
   backstop.unref();
   if (wormTimer) clearInterval(wormTimer);
   if (anchorTimer) clearInterval(anchorTimer);
+  if (siemTimer) clearInterval(siemTimer);
   try {
     await app.close();
     await configBus?.close();

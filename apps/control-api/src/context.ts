@@ -31,6 +31,7 @@ import {
 import type { AsymmetricSigner, BatchVerifier, Encryptor, Signer } from '@gulley/crypto';
 import type { AuditMirror } from '@gulley/worm';
 import type { Anchor } from './anchor';
+import { type SiemConnector, SiemExporter } from './siem';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
 import { WormShipper } from './worm-shipper';
@@ -128,6 +129,9 @@ export interface ControlContext {
   /** External anchor sink for periodic signed chain-head checkpoints (rewrite
    *  detection even against the operator). Absent = anchoring off (endpoints 501). */
   anchor?: Anchor;
+  /** SIEM exporter: tails new audit-trail events to Splunk/Sentinel/webhook. Absent =
+   *  SIEM export off (endpoints 501). */
+  siemExporter?: SiemExporter;
   /** Durable mask-reversal store (M22 D); present (with an encryptor) ⇒ the reveal
    *  endpoint is served. */
   maskVault?: MaskVaultStore;
@@ -205,6 +209,9 @@ export interface InMemoryContextOptions {
   };
   /** External anchor sink (prod: an HttpAnchor; tests inject an InMemoryAnchor). */
   anchor?: Anchor;
+  /** SIEM connector (prod: Splunk/Sentinel/webhook; tests inject a fake). Wrapped in a
+   *  SiemExporter over the durable audit chain. */
+  siem?: { connector: SiemConnector; batchMax?: number };
   /** Durable mask-reversal store (tests inject one). */
   maskVault?: MaskVaultStore;
   /** Envelope decryptor for the mask vault (tests inject a shared cipher). */
@@ -271,6 +278,15 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
         verifier: opts.worm.verifier,
         readRows: auditRows,
         ...(opts.worm.batchMax !== undefined ? { batchMax: opts.worm.batchMax } : {}),
+      })
+    : undefined;
+
+  // SIEM exporter: tails new audit events from the same complete durable chain.
+  const siemExporter = opts.siem
+    ? new SiemExporter({
+        connector: opts.siem.connector,
+        readRows: auditRows,
+        ...(opts.siem.batchMax !== undefined ? { batchMax: opts.siem.batchMax } : {}),
       })
     : undefined;
 
@@ -364,6 +380,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     auditSigner: opts.auditSigner,
     wormShipper,
     anchor: opts.anchor,
+    siemExporter,
     // Only served when an encryptor is present (the store never sees plaintext, and
     // reveal must decrypt) — so a DB alone doesn't turn the reveal endpoint on.
     maskVault:
