@@ -12,6 +12,16 @@ export interface RouteTarget {
   alwaysStream?: boolean;
   /** Relative weight for load-balancing (default 1). */
   weight?: number;
+  /** Operator-declared data-residency region this upstream serves from (e.g.
+   *  `us-east-1`, `eu-central-1`). Used to enforce a residency allowlist and to stamp
+   *  the served region on the response/audit. Absent = region unknown, which FAILS
+   *  CLOSED under an active residency allowlist. */
+  region?: string;
+  /** Operator-declared Zero-Data-Retention posture for this upstream (the account /
+   *  deployment is enrolled so the provider does not retain request/response data).
+   *  A `requireZdr` policy routes only to targets flagged `true`, failing closed
+   *  otherwise. */
+  zdr?: boolean;
 }
 
 /**

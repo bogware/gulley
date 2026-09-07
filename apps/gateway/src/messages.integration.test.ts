@@ -4386,6 +4386,121 @@ describe('POST /v1/playground/verify (preflight, no upstream spend)', () => {
   });
 });
 
+describe('data residency + ZDR', () => {
+  function singleTarget(ctx: GatewayContext): RouteTarget {
+    return (ctx.routes[0]!.strategy as { mode: 'single'; target: RouteTarget }).target;
+  }
+
+  it('refuses fail-closed (403 residency_denied) when no upstream is in an allowed region', async () => {
+    const { store, token } = seededStore();
+    const { ctx, audit, ledger } = buildContext(store);
+    // The only upstream declares no region; the policy demands eu-central-1.
+    ctx.residencyPolicy = { allowedRegions: ['eu-central-1'], requireZdr: false };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const body = (await res.json()) as { error?: { message?: string } };
+
+    expect(res.status).toBe(403);
+    expect(body.error?.message).toContain('data-residency');
+    // Audited as a distinct residency denial, and nothing was metered (fail-closed
+    // before any upstream dispatch).
+    expect(audit.rows.some((r) => r.action === 'policy.residency_denied')).toBe(true);
+    expect(ledger.entries).toHaveLength(0);
+
+    await app.close();
+  });
+
+  it('serves an in-region upstream and stamps the served region on the response + sinks', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog, audit } = buildContext(store);
+    singleTarget(ctx).region = 'eu-central-1';
+    ctx.residencyPolicy = { allowedRegions: ['eu-central-1'], requireZdr: false };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+
+    expect(res.status).toBe(200);
+    // Portable proof of where the request was processed.
+    expect(res.headers.get('x-gulley-served-region')).toBe('eu-central-1');
+    // Durable residency evidence in the request log + audit trail.
+    expect(requestLog.entries[0]?.servedRegion).toBe('eu-central-1');
+    const proxyRow = audit.rows.find((r) => r.action === 'proxy.request');
+    expect((proxyRow?.payload as { servedRegion?: string } | undefined)?.servedRegion).toBe(
+      'eu-central-1',
+    );
+
+    await app.close();
+  });
+
+  it('requireZdr refuses a non-ZDR upstream but serves a ZDR-flagged one', async () => {
+    // Non-ZDR upstream → refused.
+    {
+      const { store, token } = seededStore();
+      const { ctx } = buildContext(store);
+      singleTarget(ctx).region = 'us-east-1';
+      ctx.residencyPolicy = { allowedRegions: [], requireZdr: true };
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+      expect(res.status).toBe(403);
+      await app.close();
+    }
+    // ZDR-flagged upstream → served.
+    {
+      const { store, token } = seededStore();
+      const { ctx } = buildContext(store);
+      const t = singleTarget(ctx);
+      t.region = 'us-east-1';
+      t.zdr = true;
+      ctx.residencyPolicy = { allowedRegions: [], requireZdr: true };
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+      await res.text();
+      expect(res.status).toBe(200);
+      await app.close();
+    }
+  });
+});
+
 function single(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }

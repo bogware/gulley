@@ -38,6 +38,9 @@ export interface RequestLogEntry {
   costMicroUsd: number;
   latencyMs: number;
   createdAt: Date;
+  /** Data-residency region the upstream served from (a compliance-evidence facet);
+   *  absent = unknown / not stamped. */
+  servedRegion?: string;
   /** Open, low-cardinality facet bag (cache status, guardrail action, virtual-key
    *  prefix, custom tags…) for filtering/faceting without a schema change. */
   attributes?: Record<string, unknown>;

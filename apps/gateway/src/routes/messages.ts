@@ -35,6 +35,11 @@ import {
   type ToolCall,
 } from '../tool-governance';
 import { type ModelPolicy, modelAllowedByPolicy } from '../model-policy';
+import {
+  isEmptyResidencyPolicy,
+  type ResidencyPolicy,
+  residencyAllowedRegions,
+} from '../residency-policy';
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
@@ -70,6 +75,7 @@ import {
   type RequestShaping,
   type RouteTarget,
   type RoutingStrategy,
+  residencyCompliant,
   selectCandidates,
   shapeRequestBody,
 } from '@gulley/routing';
@@ -142,6 +148,11 @@ export interface GatewayContext {
   /** The env-configured model policy (MODEL_ALLOW/MODEL_DENY), a stable floor that
    *  reconcile unions with the config document so a DB config never drops it. */
   envModelPolicy?: ModelPolicy;
+  /** Data-residency / ZDR policy (deployment-wide in single-tenant v1), enforced at
+   *  candidate selection on each upstream's declared region/ZDR posture; absent = no
+   *  residency restriction. Fail-closed: no compliant upstream ⇒ the request is
+   *  refused, never served from a non-compliant region. */
+  residencyPolicy?: ResidencyPolicy;
   budgets: BudgetStore;
   /** Soft-threshold budget alerter (metric + webhook); absent = no alerts. */
   budgetAlerter?: { check(workspaceId: string, usedMicroUsd: number, capMicroUsd: number): void };
@@ -636,6 +647,13 @@ async function handleProxy(
   const sessionKey = ctx.sessionAffinityHeader
     ? (headerValue(request, ctx.sessionAffinityHeader) ?? principal.id)
     : undefined;
+  // Data-residency / ZDR: drop any upstream that does not satisfy the deployment
+  // policy BEFORE a target is chosen. Enforced inside selectCandidates so it gates the
+  // single-mode return and the all-open pool fallback (never re-admitting an
+  // out-of-region target); fail-closed when nothing qualifies.
+  const residencyActive = !isEmptyResidencyPolicy(ctx.residencyPolicy);
+  const allowedRegions = residencyAllowedRegions(ctx.residencyPolicy);
+  const requireZdr = ctx.residencyPolicy?.requireZdr ?? false;
   const candidates = selectCandidates(strategy, ctx.breaker, {
     sessionKey,
     scoreboard: ctx.scoreboard,
@@ -643,8 +661,43 @@ async function handleProxy(
     // Cost-aware primary pick (loadbalance select:'cheapest'): rank each target by
     // the catalog price of the resolved model for its provider.
     costOf: (t) => rankPrice(t.provider, requestedModel, ctx.rateResolver),
+    allowedRegions,
+    requireZdr,
   }).filter((t) => scopeAllowsProvider(principal.scope, t.provider));
   if (candidates.length === 0) {
+    // Attribute the refusal: if a scope-allowed target existed but none satisfied the
+    // residency policy, it is a distinct, auditable residency denial (not a generic
+    // no-permitted-provider 403).
+    if (residencyActive) {
+      const scoped = allTargets(strategy).filter((t) =>
+        scopeAllowsProvider(principal.scope, t.provider),
+      );
+      if (
+        scoped.length > 0 &&
+        !scoped.some((t) => residencyCompliant(t, allowedRegions, requireZdr))
+      ) {
+        await ctx.audit.append({
+          orgId: principal.scope.orgId,
+          actor: principal.id,
+          action: 'policy.residency_denied',
+          target: requestedModel,
+          payload: {
+            model: requestedModel,
+            allowedRegions: ctx.residencyPolicy?.allowedRegions ?? [],
+            requireZdr,
+            candidateRegions: scoped.map((t) => t.region ?? null),
+          },
+        });
+        await reply.code(403).send({
+          type: 'error',
+          error: {
+            type: 'permission_error',
+            message: 'no upstream satisfies the data-residency policy',
+          },
+        });
+        return;
+      }
+    }
     await reply
       .code(403)
       .send({ type: 'error', error: { type: 'permission_error', message: 'not permitted' } });
@@ -751,14 +804,26 @@ async function handleProxy(
     respHeaderChanges = ctx.transformer.responseHeaderChanges(activation);
   }
 
+  // The data-residency region of the upstream that actually served the request, set
+  // in commitServed. Stamped on the response (x-gulley-served-region) as portable
+  // proof of where the request was processed, and recorded in the durable sinks.
+  let servedRegion: string | undefined;
+
   // Apply static + CEL response-header changes to every response writeHead site
   // (the hijacked paths bypass Fastify onSend, and the buffered/hold-then-flush
   // paths previously missed the CEL response transform — this closes that gap).
+  // Also stamps the served region here so every proxy writeHead site inherits it.
   const finalizeResp = <T extends Record<string, string | string[]>>(h: T): T => {
     applyHeaderRules(h, ctx.headerModifier?.response);
     if (respHeaderChanges) {
       for (const [k, v] of Object.entries(respHeaderChanges.set)) h[k as keyof T] = v as T[keyof T];
       for (const k of respHeaderChanges.remove) delete h[k];
+    }
+    if (
+      servedRegion &&
+      (h as Record<string, string | string[]>)['x-gulley-served-region'] === undefined
+    ) {
+      (h as Record<string, string | string[]>)['x-gulley-served-region'] = servedRegion;
     }
     return h;
   };
@@ -911,6 +976,7 @@ async function handleProxy(
         rlRules,
         rlHeaders,
         attribution,
+        candidates[0]?.region,
       );
       return;
     }
@@ -1128,6 +1194,7 @@ async function handleProxy(
   ): void => {
     upstream = resp;
     served = target;
+    servedRegion = target.region;
     dispatchMs = fwdStart;
     firstByteMs = Date.now();
     ctx.outlier?.recordLatency(
@@ -1652,6 +1719,7 @@ async function handleProxy(
         costMicroUsd,
         latencyMs: Date.now() - started,
         createdAt,
+        ...(served?.region ? { servedRegion: served.region } : {}),
         attributes: {
           // Attribution tags FIRST so the authoritative built-in facets below always
           // win a key collision — a tag value is client-supplied and must never
@@ -1719,6 +1787,7 @@ async function handleProxy(
             guardrailInputFindings: inputFindings,
             guardrailOutputFindings: outFindings.length,
             cache: cacheLookup?.status ?? 'bypass',
+            ...(served?.region ? { servedRegion: served.region } : {}),
             ...(unpriced ? { unpriced: true } : {}),
             ...(attribution ? { attribution } : {}),
           },
@@ -1824,6 +1893,7 @@ async function handleProxy(
       requestModel: requestedModel,
       responseModel: meteredModel,
       route: served?.upstreamPath ?? route.clientPaths[0] ?? '',
+      servedRegion: served?.region,
       statusCode,
       status,
       inputTokens: cost.totalInputTokens,
@@ -2444,6 +2514,10 @@ async function serveFromCache(
   rlRules: RateLimit[],
   rlHeaders: Record<string, string>,
   attribution?: Record<string, string>,
+  // The region the request would have been served from (the residency-compliant
+  // primary candidate). A cached response is region-consistent under the
+  // deployment-wide residency policy, so this is the region the bytes originated in.
+  servedRegion?: string,
 ): Promise<void> {
   const cached = lookup.response;
   if (!cached) return;
@@ -2463,6 +2537,7 @@ async function serveFromCache(
       'x-gulley-target': `cache:${lookup.status}`,
       'x-gulley-cache': lookup.status,
       'cache-status': `Gulley; hit`,
+      ...(servedRegion ? { 'x-gulley-served-region': servedRegion } : {}),
     },
     ctx.headerModifier?.response,
   );
@@ -2512,6 +2587,7 @@ async function serveFromCache(
       costMicroUsd: 0,
       latencyMs: Date.now() - started,
       createdAt,
+      ...(servedRegion ? { servedRegion } : {}),
       attributes: {
         // Attribution tags FIRST so built-in facets below win a key collision.
         ...(attribution ?? {}),
@@ -2530,6 +2606,7 @@ async function serveFromCache(
         model: cached.model,
         cache: lookup.status,
         statusCode: cached.statusCode,
+        ...(servedRegion ? { servedRegion } : {}),
         ...(savedMicroUsd ? { cacheSavedMicroUsd: savedMicroUsd } : {}),
         ...(attribution ? { attribution } : {}),
       },
@@ -2543,6 +2620,7 @@ async function serveFromCache(
     requestModel,
     responseModel: cached.model,
     route: route.clientPaths[0] ?? '',
+    servedRegion,
     statusCode: cached.statusCode,
     status: 'ok',
     inputTokens: cached.inputTokens,

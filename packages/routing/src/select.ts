@@ -44,6 +44,30 @@ export interface SelectOptions {
   /** Relative price of a target for the requested model (cost-aware routing);
    *  undefined ranks the target last. Caller closes over the resolved model. */
   costOf?: (target: RouteTarget) => number | undefined;
+  /** Data-residency allowlist: when non-empty, ONLY targets whose `region` is in the
+   *  set are eligible. A target with an undefined region FAILS CLOSED (is dropped). */
+  allowedRegions?: ReadonlySet<string>;
+  /** When true, ONLY Zero-Data-Retention targets (`zdr === true`) are eligible. */
+  requireZdr?: boolean;
+}
+
+/**
+ * True when a target satisfies the residency constraints. No constraint (empty/absent
+ * allowlist and !requireZdr) ⇒ always true. FAIL-CLOSED: an active allowlist rejects a
+ * target with an unknown (undefined) region, and `requireZdr` rejects any target not
+ * explicitly flagged `zdr === true`. Exported so the gateway can attribute a
+ * residency-caused rejection distinctly at the call site.
+ */
+export function residencyCompliant(
+  t: RouteTarget,
+  allowedRegions?: ReadonlySet<string>,
+  requireZdr?: boolean,
+): boolean {
+  if (allowedRegions && allowedRegions.size > 0 && (!t.region || !allowedRegions.has(t.region))) {
+    return false;
+  }
+  if (requireZdr && t.zdr !== true) return false;
+  return true;
 }
 
 /** Stable ascending sort by a numeric key; ties keep declared order. */
@@ -111,14 +135,23 @@ export function selectCandidates(
 ): RouteTarget[] {
   const o: SelectOptions = typeof opts === 'function' ? { rand: opts } : opts;
   const rand = o.rand ?? Math.random;
-  if (strategy.mode === 'single') return [strategy.target];
+  // Residency is enforced FIRST, as the eligible base for every mode — it must gate
+  // the single-mode return (v1 registers each provider as a single-target strategy,
+  // so this is where enforcement actually bites) and it must be the base the
+  // health/pool fallback derives from, so the "all-open ⇒ return the full set"
+  // fallback below can never re-admit an out-of-region/non-ZDR target.
+  const eligible = (ts: readonly RouteTarget[]): RouteTarget[] =>
+    ts.filter((t) => residencyCompliant(t, o.allowedRegions, o.requireZdr));
 
-  const healthy = strategy.targets.filter(
-    (t) => !breaker.isOpen(t.name) && !o.outlier?.isEjected(t.name),
-  );
-  // If everything is open/ejected we still return the full set — a half-open
-  // probe beats a hard fail, and you must never latency-eject your last upstream.
-  const pool = healthy.length > 0 ? healthy : strategy.targets;
+  if (strategy.mode === 'single') return eligible([strategy.target]);
+
+  const base = eligible(strategy.targets);
+  const healthy = base.filter((t) => !breaker.isOpen(t.name) && !o.outlier?.isEjected(t.name));
+  // If everything is open/ejected we still return the full (residency-compliant) set
+  // — a half-open probe beats a hard fail, and you must never latency-eject your last
+  // upstream. `base` is already residency-filtered, so this never re-admits a
+  // non-compliant target.
+  const pool = healthy.length > 0 ? healthy : base;
   if (strategy.mode === 'fallback') return pool;
 
   // Cost/latency-aware primary pick (the rest stay as the failover order).

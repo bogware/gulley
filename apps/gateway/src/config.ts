@@ -36,15 +36,28 @@ const Env = z.object({
 
   // Upstream provider credentials held centrally by the gateway (v1). A provider
   // route is registered only when its key is present.
+  //
+  // Each provider also carries an OPTIONAL data-residency stamp: <PROVIDER>_REGION
+  // (the region this upstream serves from) and <PROVIDER>_ZDR (whether the account is
+  // Zero-Data-Retention enrolled). These are inert unless a residency policy
+  // (RESIDENCY_* below) is set; then a request is served ONLY by a target that
+  // satisfies the policy, failing closed. Bedrock reuses BEDROCK_REGION as its region.
   ANTHROPIC_UPSTREAM_API_KEY: z.string().min(1).optional(),
   ANTHROPIC_BASE_URL: z.string().url().default('https://api.anthropic.com'),
+  ANTHROPIC_REGION: z.string().default(''),
+  ANTHROPIC_ZDR: envBool(false),
   OPENAI_UPSTREAM_API_KEY: z.string().min(1).optional(),
   OPENAI_BASE_URL: z.string().url().default('https://api.openai.com'),
+  OPENAI_REGION: z.string().default(''),
+  OPENAI_ZDR: envBool(false),
   BEDROCK_UPSTREAM_API_KEY: z.string().min(1).optional(),
   BEDROCK_REGION: z.string().default('us-east-1'),
+  BEDROCK_ZDR: envBool(false),
   // Azure AI Foundry / Azure OpenAI: resource endpoint + api-key (Entra later).
   AZURE_ENDPOINT: z.string().url().optional(),
   AZURE_UPSTREAM_API_KEY: z.string().min(1).optional(),
+  AZURE_REGION: z.string().default(''),
+  AZURE_ZDR: envBool(false),
 
   // Model cost catalog — an operator-maintained JSON file (a CatalogEntry[])
   // loaded on boot to override/extend the in-tree seed prices. Regenerate it
@@ -88,6 +101,15 @@ const Env = z.object({
   // config mode the document's `policies` entities (allow/deny) take over on reconcile.
   MODEL_ALLOW: z.string().default(''),
   MODEL_DENY: z.string().default(''),
+  // Data-residency / ZDR policy (deployment-wide), enforced at candidate selection on
+  // the CHOSEN upstream's declared region/ZDR posture (the <PROVIDER>_REGION /
+  // <PROVIDER>_ZDR stamps above). Fail-CLOSED: if no eligible upstream satisfies the
+  // policy the request is refused (403 residency_denied) rather than served from a
+  // non-compliant region. RESIDENCY_ALLOWED_REGIONS is a comma-separated allowlist
+  // (empty = any region); RESIDENCY_REQUIRE_ZDR restricts to ZDR-enrolled upstreams.
+  // e.g. RESIDENCY_ALLOWED_REGIONS=eu-central-1,eu-west-1 RESIDENCY_REQUIRE_ZDR=true
+  RESIDENCY_ALLOWED_REGIONS: z.string().default(''),
+  RESIDENCY_REQUIRE_ZDR: envBool(false),
   // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
   // Deny-first, then allow-list; expressions run over { request, principal }.
   // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]

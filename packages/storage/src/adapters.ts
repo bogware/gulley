@@ -342,6 +342,7 @@ function requestLogRow(e: RequestLogEntry): typeof requestLog.$inferInsert {
     outputTokens: e.outputTokens,
     costMicroUsd: e.costMicroUsd,
     latencyMs: e.latencyMs,
+    servedRegion: e.servedRegion ?? null,
     attributes: e.attributes ?? null,
     createdAt: e.createdAt,
   };
@@ -378,6 +379,7 @@ function toStoredLog(r: typeof requestLog.$inferSelect): StoredRequestLog {
     costMicroUsd: r.costMicroUsd,
     latencyMs: r.latencyMs,
     createdAt: r.createdAt,
+    ...(r.servedRegion ? { servedRegion: r.servedRegion } : {}),
     attributes: (r.attributes as Record<string, unknown> | null) ?? undefined,
   };
 }

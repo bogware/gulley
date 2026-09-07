@@ -9,6 +9,8 @@ export interface RequestSpanData {
   requestModel: string;
   responseModel: string;
   route: string;
+  /** Data-residency region the upstream served from (omitted when unknown). */
+  servedRegion?: string;
   statusCode: number;
   status: string;
   inputTokens: number;
@@ -107,6 +109,7 @@ export function initTelemetry(opts: TelemetryOptions): Telemetry {
       if (data.stopReason) {
         span.setAttribute('gen_ai.response.finish_reasons', [data.stopReason]);
       }
+      if (data.servedRegion) span.setAttribute('gulley.served.region', data.servedRegion);
       if (data.cacheStatus) span.setAttribute('gulley.cache.status', data.cacheStatus);
       if (data.guardrailInputFindings !== undefined) {
         span.setAttribute('gulley.guardrail.input.findings', data.guardrailInputFindings);

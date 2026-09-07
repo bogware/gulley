@@ -51,6 +51,7 @@ import { buildSecretResolver } from './secrets';
 import { DbTenantCredentialResolver } from './tenant';
 import { parseToolPolicy } from './tool-governance';
 import { modelPolicyFromEnv } from './model-policy';
+import { residencyPolicyFromEnv } from './residency-policy';
 import { RequestTracer } from './tracer';
 import {
   AzureContentSafetyPlugin,
@@ -344,6 +345,14 @@ function anthropicCredential(key: string): UpstreamCredential {
 export function buildRoutes(config: Config): ProviderRoute[] {
   const routes: ProviderRoute[] = [];
 
+  // Per-upstream data-residency stamp (region + ZDR posture) spread into each target.
+  // A region is set only when declared; zdr only when true — an absent stamp fails
+  // closed under an active residency policy.
+  const stamp = (region: string, zdr: boolean): { region?: string; zdr?: boolean } => ({
+    ...(region ? { region } : {}),
+    ...(zdr ? { zdr: true } : {}),
+  });
+
   if (config.ANTHROPIC_UPSTREAM_API_KEY) {
     routes.push({
       clientPaths: ['/v1/messages', '/anthropic/v1/messages'],
@@ -356,6 +365,7 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           adapter: new AnthropicAdapter({ baseUrl: config.ANTHROPIC_BASE_URL }),
           credential: anthropicCredential(config.ANTHROPIC_UPSTREAM_API_KEY),
           upstreamPath: '/v1/messages',
+          ...stamp(config.ANTHROPIC_REGION, config.ANTHROPIC_ZDR),
         },
       },
     });
@@ -378,6 +388,7 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           adapter,
           credential,
           upstreamPath: '/v1/chat/completions',
+          ...stamp(config.OPENAI_REGION, config.OPENAI_ZDR),
         },
       },
     });
@@ -392,6 +403,7 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           adapter,
           credential,
           upstreamPath: '/v1/responses',
+          ...stamp(config.OPENAI_REGION, config.OPENAI_ZDR),
         },
       },
     });
@@ -406,6 +418,7 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           adapter,
           credential,
           upstreamPath: '/v1/embeddings',
+          ...stamp(config.OPENAI_REGION, config.OPENAI_ZDR),
         },
       },
       cacheable: false,
@@ -425,6 +438,7 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           credential: { scheme: 'bearer', value: config.BEDROCK_UPSTREAM_API_KEY },
           upstreamPath: '/v1/messages',
           alwaysStream: true,
+          ...stamp(config.BEDROCK_REGION, config.BEDROCK_ZDR),
         },
       },
     });
@@ -447,6 +461,7 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           adapter,
           credential,
           upstreamPath: '/openai/v1/chat/completions',
+          ...stamp(config.AZURE_REGION, config.AZURE_ZDR),
         },
       },
     });
@@ -461,6 +476,7 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           adapter,
           credential,
           upstreamPath: '/openai/v1/responses',
+          ...stamp(config.AZURE_REGION, config.AZURE_ZDR),
         },
       },
     });
@@ -849,6 +865,12 @@ export function createProductionContext(config: Config): GatewayContext {
     // document's `policies` OVER it (never dropping it) via envModelPolicy.
     modelPolicy: modelPolicyFromEnv(config.MODEL_ALLOW, config.MODEL_DENY),
     envModelPolicy: modelPolicyFromEnv(config.MODEL_ALLOW, config.MODEL_DENY),
+    // Deployment-wide data-residency / ZDR policy (env-config path). Enforced at
+    // candidate selection on each upstream's declared region/ZDR; fail-closed.
+    residencyPolicy: residencyPolicyFromEnv(
+      config.RESIDENCY_ALLOWED_REGIONS,
+      config.RESIDENCY_REQUIRE_ZDR,
+    ),
     models: catalogModels,
     rateResolver,
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,

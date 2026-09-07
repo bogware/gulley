@@ -235,6 +235,10 @@ export function routesForProvider(
               credential: { scheme: 'bearer', value },
               upstreamPath: '/v1/messages',
               alwaysStream: true,
+              // DB-config mode overloads the Bedrock baseUrl column as the region, so
+              // the residency region is that value (residency for other DB-mode
+              // providers awaits per-provider region/zdr columns).
+              region: baseUrl ?? 'us-east-1',
             },
           },
         },

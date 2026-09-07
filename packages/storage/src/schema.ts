@@ -156,6 +156,9 @@ export const requestLog = pgTable(
     outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
     costMicroUsd: bigint('cost_micro_usd', { mode: 'number' }).notNull().default(0),
     latencyMs: integer('latency_ms').notNull().default(0),
+    // Data-residency region the upstream served from (null = unknown / not stamped).
+    // First-class column so residency can be filtered/rolled-up in compliance queries.
+    servedRegion: text('served_region'),
     // Open, low-cardinality facet bag (cache status, guardrail action, tags…).
     attributes: jsonb('attributes'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

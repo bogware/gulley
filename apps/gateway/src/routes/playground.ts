@@ -3,6 +3,7 @@ import { estimateWorstCaseMicroUsd } from '@gulley/budget';
 import { rankPrice } from '@gulley/cost';
 import { isErr } from '@gulley/core';
 import { selectCandidates } from '@gulley/routing';
+import { residencyAllowedRegions } from '../residency-policy';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { RouteHolder } from './messages';
@@ -104,6 +105,10 @@ export async function handlePlaygroundVerify(
           scoreboard: ctx.scoreboard,
           outlier: ctx.outlier,
           costOf: (t) => rankPrice(t.provider, effectiveModel, ctx.rateResolver),
+          // Preview honors residency so "providerAllowed" matches what the hot path
+          // would actually serve/refuse under the policy.
+          allowedRegions: residencyAllowedRegions(ctx.residencyPolicy),
+          requireZdr: ctx.residencyPolicy?.requireZdr ?? false,
         }).filter((t) => scopeAllowsProvider(principal.scope, t.provider))
       : [];
   const target = candidates[0];

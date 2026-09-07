@@ -6,6 +6,7 @@ import {
   LoadScoreboard,
   orderByWeight,
   p2cOrder,
+  residencyCompliant,
   selectCandidates,
 } from './select';
 import type { RouteTarget, RoutingStrategy } from './types';
@@ -118,6 +119,88 @@ describe('selectCandidates', () => {
         (t) => t.name,
       ),
     ).toEqual(['a']);
+  });
+});
+
+const rt = (name: string, region?: string, zdr?: boolean): RouteTarget => ({
+  ...target(name),
+  ...(region ? { region } : {}),
+  ...(zdr !== undefined ? { zdr } : {}),
+});
+
+describe('residencyCompliant', () => {
+  it('allows any target when no constraint is set', () => {
+    expect(residencyCompliant(rt('a'))).toBe(true);
+    expect(residencyCompliant(rt('a'), new Set(), false)).toBe(true);
+  });
+
+  it('enforces the region allowlist and fails closed on an unknown region', () => {
+    const eu = new Set(['eu-central-1']);
+    expect(residencyCompliant(rt('a', 'eu-central-1'), eu)).toBe(true);
+    expect(residencyCompliant(rt('a', 'us-east-1'), eu)).toBe(false);
+    expect(residencyCompliant(rt('a'), eu)).toBe(false); // undefined region → closed
+  });
+
+  it('enforces requireZdr (only explicit zdr:true qualifies)', () => {
+    expect(residencyCompliant(rt('a', 'us', true), undefined, true)).toBe(true);
+    expect(residencyCompliant(rt('a', 'us', false), undefined, true)).toBe(false);
+    expect(residencyCompliant(rt('a', 'us'), undefined, true)).toBe(false); // undefined zdr → closed
+  });
+});
+
+describe('selectCandidates residency filtering', () => {
+  const eu = new Set(['eu-central-1']);
+
+  it('single mode fails closed when the sole target is out of region', () => {
+    const s: RoutingStrategy = { mode: 'single', target: rt('a', 'us-east-1') };
+    expect(selectCandidates(s, new CircuitBreaker(), { allowedRegions: eu })).toEqual([]);
+  });
+
+  it('single mode passes an in-region target', () => {
+    const s: RoutingStrategy = { mode: 'single', target: rt('a', 'eu-central-1') };
+    expect(
+      selectCandidates(s, new CircuitBreaker(), { allowedRegions: eu }).map((t) => t.name),
+    ).toEqual(['a']);
+  });
+
+  it('fallback drops out-of-region targets', () => {
+    const s: RoutingStrategy = {
+      mode: 'fallback',
+      targets: [rt('eu', 'eu-central-1'), rt('us', 'us-east-1')],
+    };
+    expect(
+      selectCandidates(s, new CircuitBreaker(), { allowedRegions: eu }).map((t) => t.name),
+    ).toEqual(['eu']);
+  });
+
+  it('the all-open fallback never re-admits a non-compliant target', () => {
+    // The only compliant target is circuit-open; the pool falls back to the compliant
+    // base (a half-open probe of `eu`), NOT the healthy-but-non-compliant `us`.
+    const cb = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 1000, now: () => 0 });
+    cb.recordFailure('eu');
+    const s: RoutingStrategy = {
+      mode: 'fallback',
+      targets: [rt('eu', 'eu-central-1'), rt('us', 'us-east-1')],
+    };
+    expect(selectCandidates(s, cb, { allowedRegions: eu }).map((t) => t.name)).toEqual(['eu']);
+  });
+
+  it('requireZdr keeps only ZDR-flagged targets', () => {
+    const s: RoutingStrategy = {
+      mode: 'fallback',
+      targets: [rt('z', 'us', true), rt('n', 'us', false)],
+    };
+    expect(
+      selectCandidates(s, new CircuitBreaker(), { requireZdr: true }).map((t) => t.name),
+    ).toEqual(['z']);
+  });
+
+  it('returns [] (fail closed) when no target satisfies the policy', () => {
+    const s: RoutingStrategy = {
+      mode: 'fallback',
+      targets: [rt('us', 'us-east-1'), rt('ap', 'ap-south-1')],
+    };
+    expect(selectCandidates(s, new CircuitBreaker(), { allowedRegions: eu })).toEqual([]);
   });
 });
 
