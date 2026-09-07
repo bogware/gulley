@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, createPublicKey, timingSafeEqual, verify as nodeVerify } from 'node:crypto';
 
 import { type AuditRow, canonicalize, computeRowHash, rowContent } from './audit';
 
@@ -60,11 +60,40 @@ export interface AuditAttestation {
   chain: AuditChainReport;
 }
 
+/** How a {@link SignedAttestation} was signed. HMAC-SHA256 is the shared-secret twin
+ *  (hex signature); the asymmetric algorithms are KMS-signed (base64 signature) and
+ *  verifiable offline with only the published public key. */
+export type AttestationAlgorithm =
+  | 'HMAC-SHA256'
+  | 'ECDSA_SHA_256'
+  | 'ECDSA_SHA_384'
+  | 'ECDSA_SHA_512'
+  | 'RSASSA_PKCS1_V1_5_SHA_256'
+  | 'RSASSA_PKCS1_V1_5_SHA_384'
+  | 'RSASSA_PKCS1_V1_5_SHA_512';
+
+const ASYM_HASH: Record<string, 'sha256' | 'sha384' | 'sha512'> = {
+  ECDSA_SHA_256: 'sha256',
+  ECDSA_SHA_384: 'sha384',
+  ECDSA_SHA_512: 'sha512',
+  RSASSA_PKCS1_V1_5_SHA_256: 'sha256',
+  RSASSA_PKCS1_V1_5_SHA_384: 'sha384',
+  RSASSA_PKCS1_V1_5_SHA_512: 'sha512',
+};
+
 export interface SignedAttestation {
   attestation: AuditAttestation;
-  algorithm: 'HMAC-SHA256';
-  /** Hex HMAC over the canonical attestation. */
+  algorithm: AttestationAlgorithm;
+  /** Hex HMAC (HMAC-SHA256) or base64 asymmetric signature over the canonical
+   *  attestation. */
   signature: string;
+}
+
+/** A structural async signer (e.g. @gulley/crypto's KmsSigner) — kept structural so
+ *  the pipeline package takes no dependency on the crypto/KMS SDK. Returns a base64
+ *  signature over the given bytes. */
+export interface AsyncAttestationSigner {
+  sign(data: Uint8Array): Promise<string>;
 }
 
 /** Sign an attestation with an operator-held key (HMAC-SHA256 over the canonical
@@ -97,4 +126,66 @@ export function attestAuditChain(
     chain,
   };
   return signAttestation(attestation, opts.key);
+}
+
+function buildAttestationDoc(
+  rows: readonly AuditRow[],
+  opts: { subject?: string; toolVersion: string; generatedAt: string },
+): AuditAttestation {
+  return {
+    tool: 'gulley-audit-verify',
+    toolVersion: opts.toolVersion,
+    generatedAt: opts.generatedAt,
+    ...(opts.subject !== undefined ? { subject: opts.subject } : {}),
+    chain: verifyAuditChain(rows),
+  };
+}
+
+/**
+ * Async twin of {@link attestAuditChain} for asymmetric (KMS) signing. The signature
+ * is over the SAME canonical attestation bytes, so an auditor verifies it offline with
+ * only the published public key ({@link verifyAttestationWithPublicKey}) — no shared
+ * secret. `algorithm` must be an asymmetric one (HMAC uses the sync path).
+ */
+export async function attestAuditChainAsync(
+  rows: readonly AuditRow[],
+  opts: {
+    signer: AsyncAttestationSigner;
+    algorithm: AttestationAlgorithm;
+    subject?: string;
+    toolVersion: string;
+    generatedAt: string;
+  },
+): Promise<SignedAttestation> {
+  if (opts.algorithm === 'HMAC-SHA256') {
+    throw new Error(
+      'attestAuditChainAsync is for asymmetric signing; use attestAuditChain for HMAC',
+    );
+  }
+  const attestation = buildAttestationDoc(rows, opts);
+  const signature = await opts.signer.sign(Buffer.from(canonicalize(attestation)));
+  return { attestation, algorithm: opts.algorithm, signature };
+}
+
+/**
+ * Verify an asymmetric (KMS-signed) attestation OFFLINE with only the SPKI public-key
+ * PEM. Fail-closed: an HMAC doc (wrong verifier), an unknown algorithm, or any bad
+ * key/signature returns false rather than throwing.
+ */
+export function verifyAttestationWithPublicKey(
+  doc: SignedAttestation,
+  publicKeyPem: string,
+): boolean {
+  const hash = ASYM_HASH[doc.algorithm];
+  if (!hash) return false; // HMAC-SHA256 or unknown — not an asymmetric doc
+  try {
+    return nodeVerify(
+      hash,
+      Buffer.from(canonicalize(doc.attestation)),
+      createPublicKey(publicKeyPem),
+      Buffer.from(doc.signature, 'base64'),
+    );
+  } catch {
+    return false;
+  }
 }

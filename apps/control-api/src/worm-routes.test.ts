@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { InMemoryHmacSigner } from '@gulley/crypto';
+import { InMemoryHmacSigner, LocalKeypairSigner, verifyWithPublicKey } from '@gulley/crypto';
 import { InMemoryAuditMirror } from '@gulley/worm';
 import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -14,21 +14,24 @@ afterEach(async () => {
   app = undefined;
 });
 
-function build(withWorm: boolean): {
+function build(opts: { worm?: boolean; asymmetric?: boolean } = {}): {
   app: FastifyInstance;
   gadm: string;
   mirror: InMemoryAuditMirror;
 } {
   const gadm = `gadm_${randomBytes(24).toString('base64url')}`;
   const mirror = new InMemoryAuditMirror();
-  const signer = new InMemoryHmacSigner();
+  // Asymmetric (KMS twin) or shared-secret HMAC batch signer.
+  const auditSigner = opts.asymmetric ? new LocalKeypairSigner() : undefined;
+  const signer = auditSigner ?? new InMemoryHmacSigner();
   const ctx = createInMemoryControlContext({
     pepper: 'worm-routes-pepper-16chars!!!!!!',
     bootstrapEnabled: true,
     bootstrapTokenSha256: createHash('sha256').update(gadm).digest('hex'),
     sessionSecrets: ['worm-routes-session-secret-32bytes-long'],
     maxSessionTtlMs: 900_000,
-    ...(withWorm ? { worm: { mirror, signer, verifier: signer } } : {}),
+    ...(auditSigner ? { auditSigner } : {}),
+    ...(opts.worm ? { worm: { mirror, signer, verifier: signer } } : {}),
   });
   return {
     app: buildServer(loadConfig({ LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv), ctx),
@@ -50,7 +53,7 @@ async function seedAudit(a: FastifyInstance, gadm: string, name: string): Promis
 
 describe('WORM routes (not configured)', () => {
   it('501s on status / ship / verify when WORM is off', async () => {
-    const built = build(false);
+    const built = build();
     app = built.app;
     const h = { authorization: `Bearer ${built.gadm}` };
     for (const [method, url] of [
@@ -62,18 +65,25 @@ describe('WORM routes (not configured)', () => {
       expect(res.statusCode, `${method} ${url}`).toBe(501);
     }
   });
+
+  it('404s on the audit public key when no asymmetric signer is configured', async () => {
+    const built = build({ worm: true }); // HMAC signer → no public key
+    app = built.app;
+    const res = await app.inject({ method: 'GET', url: '/.well-known/gulley-audit-key' });
+    expect(res.statusCode).toBe(404);
+  });
 });
 
 describe('WORM routes (configured)', () => {
   it('401s without an admin token', async () => {
-    const built = build(true);
+    const built = build({ worm: true });
     app = built.app;
     const res = await app.inject({ method: 'GET', url: '/audit/worm/status' });
     expect(res.statusCode).toBe(401);
   });
 
   it('ships the durable chain, verifies it, and is idempotent', async () => {
-    const built = build(true);
+    const built = build({ worm: true });
     app = built.app;
     const h = { authorization: `Bearer ${built.gadm}` };
 
@@ -108,7 +118,7 @@ describe('WORM routes (configured)', () => {
   });
 
   it('ships only newly-appended rows on the next tick', async () => {
-    const built = build(true);
+    const built = build({ worm: true });
     app = built.app;
     const h = { authorization: `Bearer ${built.gadm}` };
 
@@ -127,5 +137,42 @@ describe('WORM routes (configured)', () => {
 
     const verified = await app.inject({ method: 'GET', url: '/audit/worm/verify', headers: h });
     expect(verified.json()).toMatchObject({ ok: true, lastSeq: second.lastSeq });
+  });
+});
+
+describe('WORM routes (asymmetric audit signer)', () => {
+  it('ships, publishes the public key, and batches verify offline with only that key', async () => {
+    const built = build({ worm: true, asymmetric: true });
+    app = built.app;
+    const h = { authorization: `Bearer ${built.gadm}` };
+
+    await seedAudit(app, built.gadm, 'Acme');
+    await seedAudit(app, built.gadm, 'Globex');
+
+    const shipped = (
+      await app.inject({ method: 'POST', url: '/audit/worm/ship', headers: h })
+    ).json() as { shipped: number };
+    expect(shipped.shipped).toBeGreaterThan(0);
+
+    // In-process verify (local check against the same key) passes.
+    const verified = await app.inject({ method: 'GET', url: '/audit/worm/verify', headers: h });
+    expect(verified.json()).toMatchObject({ ok: true });
+
+    // The public key is served UNAUTHENTICATED (an auditor fetches it out-of-band).
+    const keyRes = await app.inject({ method: 'GET', url: '/.well-known/gulley-audit-key' });
+    expect(keyRes.statusCode).toBe(200);
+    const { alg, publicKey } = keyRes.json() as { alg: string; publicKey: string };
+    expect(alg).toBe('ECDSA_SHA_256');
+    expect(publicKey).toContain('BEGIN PUBLIC KEY');
+
+    // An external auditor verifies every mirrored batch offline with ONLY that key.
+    const refs = await built.mirror.list();
+    expect(refs.length).toBeGreaterThan(0);
+    for (const ref of refs) {
+      const batch = await built.mirror.get(ref);
+      expect(verifyWithPublicKey(publicKey, Buffer.from(batch.batchHash), batch.signature)).toBe(
+        true,
+      );
+    }
   });
 });

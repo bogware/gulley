@@ -1,5 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { InMemoryAuditSink, type SignedAttestation, verifyAttestation } from '@gulley/pipeline';
+import { type AsymmetricSigner, LocalKeypairSigner } from '@gulley/crypto';
+import {
+  InMemoryAuditSink,
+  type SignedAttestation,
+  verifyAttestation,
+  verifyAttestationWithPublicKey,
+} from '@gulley/pipeline';
 import type { FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildAttestation, reviveRows } from './audit-verify';
@@ -15,7 +21,13 @@ afterEach(async () => {
   app = undefined;
 });
 
-function build(attestationKey?: string): { app: FastifyInstance; gadm: string } {
+function build(
+  attestationKey?: string,
+  auditSigner?: AsymmetricSigner,
+): {
+  app: FastifyInstance;
+  gadm: string;
+} {
   const gadm = `gadm_${randomBytes(24).toString('base64url')}`;
   const ctx = createInMemoryControlContext({
     pepper: 'attestation-pepper-16chars!!!!!!',
@@ -24,6 +36,7 @@ function build(attestationKey?: string): { app: FastifyInstance; gadm: string } 
     sessionSecrets: ['attestation-session-secret-32bytes-long'],
     maxSessionTtlMs: 900_000,
     ...(attestationKey !== undefined ? { attestationKey } : {}),
+    ...(auditSigner ? { auditSigner } : {}),
   });
   return { app: buildServer(loadConfig({ LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv), ctx), gadm };
 }
@@ -71,6 +84,41 @@ describe('GET /audit/attestation', () => {
     app = built.app;
     const res = await app.inject({ method: 'GET', url: '/audit/attestation' });
     expect(res.statusCode).toBe(401);
+  });
+});
+
+describe('GET /audit/attestation (asymmetric KMS signer)', () => {
+  it('signs with the audit CMK; the auditor verifies offline via the published key', async () => {
+    const signer = new LocalKeypairSigner(); // the KmsSigner twin
+    const built = build(undefined, signer);
+    app = built.app;
+    await app.inject({
+      method: 'POST',
+      url: '/orgs',
+      headers: { authorization: `Bearer ${built.gadm}`, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'Acme' }),
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/audit/attestation',
+      headers: { authorization: `Bearer ${built.gadm}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const signed = res.json() as SignedAttestation;
+    expect(signed.algorithm).toBe('ECDSA_SHA_256');
+    expect(signed.attestation.chain.verified).toBe(true);
+
+    // The public key is served UNAUTHENTICATED.
+    const keyRes = await app.inject({ method: 'GET', url: '/.well-known/gulley-audit-key' });
+    expect(keyRes.statusCode).toBe(200);
+    const { publicKey } = keyRes.json() as { publicKey: string };
+
+    // An auditor verifies the attestation offline with ONLY that key.
+    expect(verifyAttestationWithPublicKey(signed, publicKey)).toBe(true);
+    // A tampered claim fails.
+    signed.attestation.chain.count = 424242;
+    expect(verifyAttestationWithPublicKey(signed, publicKey)).toBe(false);
   });
 });
 

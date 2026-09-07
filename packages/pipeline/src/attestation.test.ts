@@ -1,9 +1,12 @@
+import { generateKeyPairSync, sign as nodeSign } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 
 import {
   attestAuditChain,
+  attestAuditChainAsync,
   signAttestation,
   verifyAttestation,
+  verifyAttestationWithPublicKey,
   verifyAuditChain,
 } from './attestation';
 import { InMemoryAuditSink } from './memory';
@@ -90,5 +93,59 @@ describe('attestation signing', () => {
     });
     signed.attestation.chain.verified = false; // forge a "broken" claim
     expect(verifyAttestation(signed, KEY)).toBe(false);
+  });
+});
+
+describe('asymmetric attestation (KMS-signable, offline-verifiable)', () => {
+  // A structural async signer backed by a local EC key stands in for KmsSigner.
+  const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const pem = publicKey.export({ format: 'pem', type: 'spki' }).toString();
+  const signer = {
+    sign: (data: Uint8Array): Promise<string> =>
+      Promise.resolve(nodeSign('sha256', Buffer.from(data), privateKey).toString('base64')),
+  };
+
+  it('signs asynchronously and verifies offline with only the public key', async () => {
+    const sink = await seededSink(4);
+    const signed = await attestAuditChainAsync(sink.rows, {
+      signer,
+      algorithm: 'ECDSA_SHA_256',
+      toolVersion: '9.9.9',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      subject: 'prod-eu',
+    });
+    expect(signed.algorithm).toBe('ECDSA_SHA_256');
+    expect(signed.attestation.subject).toBe('prod-eu');
+    expect(signed.attestation.chain.verified).toBe(true);
+    expect(verifyAttestationWithPublicKey(signed, pem)).toBe(true);
+  });
+
+  it('fails offline verification if the body is altered after signing', async () => {
+    const sink = await seededSink(2);
+    const signed = await attestAuditChainAsync(sink.rows, {
+      signer,
+      algorithm: 'ECDSA_SHA_256',
+      toolVersion: '1.0.0',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    signed.attestation.chain.count = 999;
+    expect(verifyAttestationWithPublicKey(signed, pem)).toBe(false);
+  });
+
+  it('rejects the HMAC path and refuses HMAC docs / bad keys', async () => {
+    await expect(
+      attestAuditChainAsync([], {
+        signer,
+        algorithm: 'HMAC-SHA256',
+        toolVersion: '1',
+        generatedAt: '2026-01-01T00:00:00.000Z',
+      }),
+    ).rejects.toThrow();
+    const hmac = attestAuditChain([], {
+      key: 'compliance-hmac-key-please-change',
+      toolVersion: '1',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    expect(verifyAttestationWithPublicKey(hmac, pem)).toBe(false); // wrong verifier
   });
 });

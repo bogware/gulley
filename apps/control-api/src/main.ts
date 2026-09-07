@@ -1,4 +1,10 @@
-import { InMemoryAesCipher, InMemoryHmacSigner, KmsEnvelopeEncryptor } from '@gulley/crypto';
+import {
+  type AsymmetricSigner,
+  InMemoryAesCipher,
+  InMemoryHmacSigner,
+  KmsEnvelopeEncryptor,
+  KmsSigner,
+} from '@gulley/crypto';
 import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
 import { S3AuditMirror } from '@gulley/worm';
@@ -29,11 +35,19 @@ let configBus: PostgresConfigBus | undefined;
  * disabled; logs a warning when WORM_ENABLED is set but a prerequisite is missing so a
  * misconfiguration doesn't fail silently.
  */
-function buildWorm(config: Config, warn: (msg: string) => void): InMemoryContextOptions['worm'] {
+function buildWorm(
+  config: Config,
+  auditSigner: AsymmetricSigner | undefined,
+  warn: (msg: string) => void,
+): InMemoryContextOptions['worm'] {
   if (!config.WORM_ENABLED) return undefined;
-  if (!config.WORM_BUCKET || !config.WORM_SIGNING_KEY || !config.DATABASE_URL) {
+  // A batch signer is required: prefer the audit-export asymmetric CMK (auditor
+  // verifies offline with the public key), else the shared-secret HMAC key.
+  const signer = auditSigner ?? signerFromHmac(config.WORM_SIGNING_KEY);
+  if (!config.WORM_BUCKET || !signer || !config.DATABASE_URL) {
     warn(
-      'WORM_ENABLED but WORM_BUCKET / WORM_SIGNING_KEY / DATABASE_URL incomplete — WORM disabled',
+      'WORM_ENABLED but WORM_BUCKET / a signing key (GULLEY_AUDIT_SIGNING_KMS_ARN or ' +
+        'WORM_SIGNING_KEY) / DATABASE_URL incomplete — WORM disabled',
     );
     return undefined;
   }
@@ -43,10 +57,11 @@ function buildWorm(config: Config, warn: (msg: string) => void): InMemoryContext
     prefix: config.WORM_PREFIX,
     retentionDays: config.WORM_RETENTION_DAYS,
   });
-  // Symmetric HMAC batch signer (the auditor holds the same key). KMS-asymmetric
-  // signing — where the auditor needs only the public key — is the follow-up slice.
-  const signer = new InMemoryHmacSigner(Buffer.from(config.WORM_SIGNING_KEY, 'utf8'));
   return { mirror, signer, verifier: signer, batchMax: config.WORM_BATCH_MAX };
+}
+
+function signerFromHmac(key: string | undefined): InMemoryHmacSigner | undefined {
+  return key ? new InMemoryHmacSigner(Buffer.from(key, 'utf8')) : undefined;
 }
 
 /**
@@ -100,6 +115,17 @@ function buildContext(config: Config): ControlContext | undefined {
     providerUsageSources.push(openAiUsageSource(config.OPENAI_ADMIN_API_KEY, usageClientOpts));
   }
 
+  // Audit-export asymmetric signer (KMS). When configured it signs the auditor
+  // attestation AND the WORM batches, and its public key is published so an auditor
+  // verifies both offline. Region from GULLEY_KMS_REGION (shared with the mask vault).
+  const auditSigner: AsymmetricSigner | undefined = config.GULLEY_AUDIT_SIGNING_KMS_ARN
+    ? new KmsSigner(
+        config.GULLEY_AUDIT_SIGNING_KMS_ARN,
+        config.GULLEY_KMS_REGION,
+        config.GULLEY_AUDIT_SIGNING_ALG,
+      )
+    : undefined;
+
   return createInMemoryControlContext({
     pepper: config.GULLEY_KEY_PEPPER ?? '',
     bootstrapEnabled: config.CONTROL_API_BOOTSTRAP_ENABLED,
@@ -116,7 +142,8 @@ function buildContext(config: Config): ControlContext | undefined {
     notifier: configBus,
     attestationKey: config.AUDIT_ATTESTATION_KEY,
     attestationSubject: config.AUDIT_ATTESTATION_SUBJECT,
-    worm: buildWorm(config, (m) => process.stderr.write(`${m}\n`)),
+    auditSigner,
+    worm: buildWorm(config, auditSigner, (m) => process.stderr.write(`${m}\n`)),
     // Mask-vault reveal decryptor — the SAME envelope key the gateway used (KMS in
     // prod; the in-memory dev cipher only decrypts records written in-process).
     maskVaultEncryptor: config.MASK_VAULT_ENABLED

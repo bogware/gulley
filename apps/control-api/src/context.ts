@@ -28,7 +28,7 @@ import {
   readAuditRows,
   type MaskVaultStore,
 } from '@gulley/storage';
-import type { BatchVerifier, Encryptor, Signer } from '@gulley/crypto';
+import type { AsymmetricSigner, BatchVerifier, Encryptor, Signer } from '@gulley/crypto';
 import type { AuditMirror } from '@gulley/worm';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
@@ -117,6 +117,10 @@ export interface ControlContext {
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
   attestationSubject?: string;
+  /** Audit-export ASYMMETRIC signer (KMS). When present it signs the attestation and
+   *  the WORM batches, and its public key is served at GET /audit/public-key so an
+   *  auditor verifies both offline. Absent = HMAC/shared-secret signing only. */
+  auditSigner?: AsymmetricSigner;
   /** WORM-live shipper: mirrors the complete durable audit chain to S3 Object Lock
    *  in signed, contiguous batches. Absent = WORM not configured (endpoints 501). */
   wormShipper?: WormShipper;
@@ -182,6 +186,10 @@ export interface InMemoryContextOptions {
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
   attestationSubject?: string;
+  /** Audit-export asymmetric signer (KMS in prod; a LocalKeypairSigner twin in tests).
+   *  Signs the attestation + WORM batches; its public key is served for offline
+   *  verification. */
+  auditSigner?: AsymmetricSigner;
   /** WORM-live wiring: the retained mirror + the batch signer/verifier. Prod builds
    *  an S3AuditMirror + HMAC signer from config; tests inject an InMemoryAuditMirror
    *  + InMemoryHmacSigner. Absent = WORM off. */
@@ -347,6 +355,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     auditRows,
     attestationKey: opts.attestationKey,
     attestationSubject: opts.attestationSubject,
+    auditSigner: opts.auditSigner,
     wormShipper,
     // Only served when an encryptor is present (the store never sees plaintext, and
     // reveal must decrypt) — so a DB alone doesn't turn the reveal endpoint on.

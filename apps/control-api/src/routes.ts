@@ -1,5 +1,5 @@
 import { type AdminSessionClaims, signAdminSession } from '@gulley/auth';
-import { assertNoInlineSecret, attestAuditChain } from '@gulley/pipeline';
+import { assertNoInlineSecret, attestAuditChain, attestAuditChainAsync } from '@gulley/pipeline';
 import { MissingVariablesError, PromptNameConflictError, renderPrompt } from '@gulley/prompts';
 import { GULLEY_VERSION, secretRef } from '@gulley/core';
 import { assertEgressAllowed } from '@gulley/egress';
@@ -847,26 +847,55 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   );
 
   // Auditor attestation export: an independently-signed statement over the audit
-  // chain (verified status + row count + first/last hash + time range). 501 until an
-  // attestation key is configured. The auditor holds the same key to verify it.
+  // chain (verified status + row count + first/last hash + time range). 501 until a
+  // signer is configured. With an asymmetric (KMS) audit signer the auditor verifies
+  // OFFLINE with only the published public key (GET /.well-known/gulley-audit-key);
+  // the HMAC key is the shared-secret fallback.
   app.get(
     '/audit/attestation',
     adminRoute(ctx, async (_req, reply, admin) => {
       if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
-      if (!ctx.attestationKey || !ctx.auditRows)
-        return reply
-          .code(501)
-          .send({ error: { type: 'not_configured', message: 'attestation key not set' } });
+      if (!ctx.auditRows || (!ctx.auditSigner && !ctx.attestationKey))
+        return reply.code(501).send({
+          error: { type: 'not_configured', message: 'attestation signing not configured' },
+        });
       const rows = await ctx.auditRows();
-      const signed = attestAuditChain(rows, {
-        key: ctx.attestationKey,
+      const common = {
         toolVersion: GULLEY_VERSION,
         generatedAt: new Date().toISOString(),
         ...(ctx.attestationSubject !== undefined ? { subject: ctx.attestationSubject } : {}),
-      });
-      return reply.send(signed);
+      };
+      if (ctx.auditSigner) {
+        return reply.send(
+          await attestAuditChainAsync(rows, {
+            signer: ctx.auditSigner,
+            algorithm: ctx.auditSigner.algorithm,
+            ...common,
+          }),
+        );
+      }
+      if (ctx.attestationKey) {
+        return reply.send(attestAuditChain(rows, { key: ctx.attestationKey, ...common }));
+      }
+      return reply
+        .code(501)
+        .send({ error: { type: 'not_configured', message: 'attestation signing not configured' } });
     }),
   );
+
+  // The audit-export public key — PUBLIC (no auth), so an auditor can fetch it
+  // out-of-band and verify BOTH the attestation and the WORM batch signatures offline.
+  // 404 until an asymmetric (KMS) audit signer is configured (HMAC has no public key).
+  app.get('/.well-known/gulley-audit-key', async (_request, reply) => {
+    if (!ctx.auditSigner)
+      return reply
+        .code(404)
+        .send({ error: { type: 'not_found', message: 'no asymmetric audit signer' } });
+    return reply.send({
+      alg: ctx.auditSigner.algorithm,
+      publicKey: await ctx.auditSigner.publicKeyPem(),
+    });
+  });
 
   // --- WORM-live: the retained S3 Object Lock (COMPLIANCE) system of record ---
   // The audit chain is continuously mirrored to immutable storage in signed,

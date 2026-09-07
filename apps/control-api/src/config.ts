@@ -61,6 +61,23 @@ const Env = z.object({
   // Optional label stamped on the attestation (deployment / environment / org).
   AUDIT_ATTESTATION_SUBJECT: z.string().optional(),
 
+  // Audit-export ASYMMETRIC signing key (KMS). When set, the audit attestation and
+  // the WORM batch signatures are signed under this asymmetric CMK, and the auditor
+  // verifies them OFFLINE with only the published public key (GET /audit/public-key)
+  // — no shared secret. Takes precedence over the HMAC keys (AUDIT_ATTESTATION_KEY /
+  // WORM_SIGNING_KEY) for their respective signatures. Region from GULLEY_KMS_REGION.
+  GULLEY_AUDIT_SIGNING_KMS_ARN: z.string().optional(),
+  GULLEY_AUDIT_SIGNING_ALG: z
+    .enum([
+      'ECDSA_SHA_256',
+      'ECDSA_SHA_384',
+      'ECDSA_SHA_512',
+      'RSASSA_PKCS1_V1_5_SHA_256',
+      'RSASSA_PKCS1_V1_5_SHA_384',
+      'RSASSA_PKCS1_V1_5_SHA_512',
+    ])
+    .default('ECDSA_SHA_256'),
+
   // Mask-vault reveal (M22 D): serve GET /admin/mask-vault/:requestId, which
   // decrypts + returns the token↔original map for a masked request. Needs the SAME
   // envelope key the gateway used (KMS ARN in prod; the in-memory dev cipher can only
@@ -72,7 +89,7 @@ const Env = z.object({
   // WORM-live: continuously mirror the durable, hash-chained audit log to an S3
   // Object Lock (COMPLIANCE) bucket — the retained, immutable system of record that
   // survives a Postgres compromise. Enabled only with WORM_ENABLED + WORM_BUCKET +
-  // WORM_SIGNING_KEY + DATABASE_URL (the complete chain is read from Postgres);
+  // DATABASE_URL + a signing key (GULLEY_AUDIT_SIGNING_KMS_ARN or WORM_SIGNING_KEY);
   // otherwise the /audit/worm/* endpoints 501. Only non-PII AuditRow metadata is
   // shipped (payloads are already redacted upstream by GuardedAuditSink).
   WORM_ENABLED: envBool(false),
@@ -88,8 +105,9 @@ const Env = z.object({
   WORM_BATCH_MAX: z.coerce.number().int().positive().default(100),
   // HMAC key that signs each WORM batch preimage (base64(sha256(canonical(rows))));
   // forging a batch needs this key, not just an S3 Put. The auditor holds the same
-  // key to verify independently. (KMS-asymmetric signing is the follow-up slice —
-  // then the auditor needs only the public key.) >=16 chars. Absent ⇒ WORM off.
+  // key to verify. Shared-secret FALLBACK, used only when GULLEY_AUDIT_SIGNING_KMS_ARN
+  // is unset (asymmetric signing lets the auditor verify with just the public key).
+  // >=16 chars.
   WORM_SIGNING_KEY: z.string().min(16).optional(),
 
   // Durable config store. When set, POST /config/apply persists to Postgres (the
