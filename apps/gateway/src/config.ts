@@ -321,6 +321,12 @@ const Env = z.object({
   // Opt-in: charge the worst-case reservation instead so the cap still bites.
   METER_CHARGE_ON_MISSING_USAGE: envBool(false),
 
+  // A served model absent from the price catalog meters $0 (priced:false), silently
+  // bypassing the budget. Off-catalog requests are always observed (a warn log +
+  // gulley_unpriced_requests_total + a request-log/audit attribute); opt in here to
+  // ALSO fail closed by charging the worst-case reservation so it can't slip the cap.
+  METER_FAIL_CLOSED_ON_UNPRICED: envBool(false),
+
   // Static request/response header set/remove applied to every proxied request
   // (the non-CEL sibling of CEL_TRANSFORM). JSON:
   // {"request":{"set":{"x-tenant":"acme"}},"response":{"remove":["x-internal"]}}

@@ -100,6 +100,26 @@ describe('GatewayMetrics', () => {
     expect(out).toContain('gulley_cost_saved_micro_usd_total{source="prompt_cache"} 300');
     expect(out).toContain('gulley_cost_saved_micro_usd_total{source="response_cache"} 700');
   });
+
+  it('counts served requests whose model has no catalog price', () => {
+    const m = new GatewayMetrics();
+    m.record({
+      provider: 'openai',
+      requestModel: 'mystery-9',
+      responseModel: 'mystery-9',
+      status: 'ok',
+      statusCode: 200,
+      streamed: false,
+      inputTokens: 10,
+      outputTokens: 5,
+      costMicroUsd: 0,
+      startedAtMs: 0,
+      unpriced: true,
+    });
+    expect(m.render()).toContain(
+      'gulley_unpriced_requests_total{model="mystery-9",provider="openai"} 1',
+    );
+  });
 });
 
 describe('metrics server', () => {

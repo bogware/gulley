@@ -184,6 +184,11 @@ export interface GatewayContext {
    *  (rather than billing $0 + refunding), so budgets stay enforced on backends that
    *  omit stream usage. Default false. */
   chargeOnMissingUsage?: boolean;
+  /** Charge the worst-case reservation when a served 2xx model is absent from the
+   *  price catalog (priced:false, so it would otherwise meter $0 and slip the
+   *  budget). Off-catalog requests are always observed; this makes them fail closed.
+   *  Default false. */
+  meterFailClosedOnUnpriced?: boolean;
   /** M17: windowed in-stream output enforcement (redact/block) on Anthropic-
    *  canonical streamed responses; absent/false = streamed output stays audit-only. */
   streamEnforce?: boolean;
@@ -826,7 +831,7 @@ async function handleProxy(
     numField(parsed['max_tokens']) ??
     numField(parsed['max_output_tokens']) ??
     DEFAULT_MAX_OUTPUT_TOKENS;
-  const worstCase = estimateWorstCaseMicroUsd(
+  let worstCase = estimateWorstCaseMicroUsd(
     provider0,
     requestedModel,
     body.length,
@@ -922,6 +927,19 @@ async function handleProxy(
     requestedModel = downshift.model;
     parsed['model'] = downshift.model;
     body = Buffer.from(JSON.stringify(parsed), 'utf8');
+    // Reprice the worst-case for the CHEAPER model before the per-model reserve below.
+    // worstCase was computed for the original (expensive) model; reserving THAT against
+    // the downshifted model's own cap spuriously 402s the exact traffic the downshift
+    // exists to keep flowing. Teardown's usage-missing charge also now bills the model
+    // actually served. The workspace reservation above stays worst-case-conservative
+    // (it admits before the downshift decision) and is corrected to actual at commit.
+    worstCase = estimateWorstCaseMicroUsd(
+      provider0,
+      requestedModel,
+      body.length,
+      maxOutput,
+      ctx.rateResolver,
+    );
   }
 
   // Per-model budget (multi-level): the model's own cap must also admit. On
@@ -1368,7 +1386,19 @@ async function handleProxy(
     // backend can't slip the budget (mirrors the buffered-overflow charge).
     const usageMissing =
       !n.seen && !meteringFailed && ctx.chargeOnMissingUsage === true && statusCode < 400;
-    const chargedWorstCase = meteringFailed || usageMissing;
+    // A served model absent from the price catalog meters $0 by definition
+    // (priced:false), silently bypassing the budget. Always observe it (metric +
+    // durable attribute); optionally fail closed by charging the worst-case reserve
+    // so an off-catalog model can't be used to drive real spend past the cap.
+    const unpriced = n.seen && !cost.priced && statusCode < 400;
+    const chargeUnpriced = unpriced && ctx.meterFailClosedOnUnpriced === true;
+    if (unpriced) {
+      request.log.warn(
+        { provider, model: meteredModel, failClosed: chargeUnpriced },
+        'served a model with no catalog price — metering $0 unless fail-closed',
+      );
+    }
+    const chargedWorstCase = meteringFailed || usageMissing || chargeUnpriced;
     const costMicroUsd = chargedWorstCase ? worstCase : toMicroUsd(cost.totalUsd);
     const createdAt = new Date();
 
@@ -1441,6 +1471,7 @@ async function handleProxy(
           target: served?.name ?? provider,
           ...(guardrailAction ? { guardrailAction } : {}),
           ...(outFindings.length > 0 ? { guardrailOutputFindings: outFindings.length } : {}),
+          ...(unpriced ? { unpriced: true } : {}),
         },
       });
       // Operator-configurable access log (credential-free record → CEL field
@@ -1498,6 +1529,7 @@ async function handleProxy(
             guardrailInputFindings: inputFindings,
             guardrailOutputFindings: outFindings.length,
             cache: cacheLookup?.status ?? 'bypass',
+            ...(unpriced ? { unpriced: true } : {}),
           },
         });
       } catch (err) {
@@ -1597,6 +1629,7 @@ async function handleProxy(
       costMicroUsd,
       cacheSavedMicroUsd: cost.cacheSavedUsd > 0 ? toMicroUsd(cost.cacheSavedUsd) : undefined,
       cacheSavedSource: cost.cacheSavedUsd > 0 ? 'prompt_cache' : undefined,
+      unpriced: unpriced || undefined,
       streamed,
       stopReason: n.stopReason,
       startedAtMs: started,

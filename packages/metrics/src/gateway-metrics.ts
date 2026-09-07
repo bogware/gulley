@@ -23,6 +23,8 @@ export interface RequestMetricData {
   cacheSavedMicroUsd?: number;
   /** Source of the saving: 'prompt_cache' (default) | 'response_cache'. */
   cacheSavedSource?: string;
+  /** True when the served model had no catalog price (a cost-metering blind spot). */
+  unpriced?: boolean;
 }
 
 // End-to-end proxied-request latency; wide upper buckets because streamed LLM
@@ -43,6 +45,7 @@ export class GatewayMetrics {
   private readonly guardrail: Counter;
   private readonly failovers: Counter;
   private readonly saved: Counter;
+  private readonly unpriced: Counter;
   private readonly budgetAlerts: Counter;
   private readonly duration: Histogram;
 
@@ -75,6 +78,10 @@ export class GatewayMetrics {
       'gulley_cost_saved_micro_usd_total',
       'Cost avoided in micro-USD by source (prompt_cache | response_cache).',
     );
+    this.unpriced = this.registry.counter(
+      'gulley_unpriced_requests_total',
+      'Served requests whose model had no catalog price (metered $0 unless fail-closed), by provider and model.',
+    );
     this.budgetAlerts = this.registry.counter(
       'gulley_budget_alerts_total',
       'Soft-threshold budget alerts fired, by threshold.',
@@ -102,6 +109,7 @@ export class GatewayMetrics {
     if (d.guardrailAction) this.guardrail.inc({ action: d.guardrailAction });
     if (d.cacheSavedMicroUsd && d.cacheSavedMicroUsd > 0)
       this.saved.inc({ source: d.cacheSavedSource ?? 'prompt_cache' }, d.cacheSavedMicroUsd);
+    if (d.unpriced) this.unpriced.inc(base);
     this.duration.observe(
       { provider: d.provider, status: d.status },
       Math.max(0, (this.now() - d.startedAtMs) / 1000),

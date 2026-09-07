@@ -806,6 +806,103 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
   });
 
+  it('reprices the worst-case for the downshifted model so its own cap admits', async () => {
+    const { store, token } = seededStore();
+    // Workspace 82% used (above the 0.8 downshift threshold). The CHEAP model's own
+    // cap (1500 µUSD) admits haiku's worst-case (~528) but would REJECT opus's
+    // worst-case (~2640). Pre-fix the per-model reserve used the stale opus worst-case
+    // and 402'd exactly the traffic the downshift exists to keep flowing.
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        ['ws_1', { capMicroUsd: 10_000_000 }],
+        ['model:claude-haiku-4-5', { capMicroUsd: 1_500 }],
+      ]),
+    );
+    await budgets.reserve('ws_1', 'seed', 8_200_000);
+    await budgets.commit('ws_1', 'seed', 8_200_000);
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+    ctx.budgetModelCaps = new Set(['claude-haiku-4-5']);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    // Admitted (not 402 on the cheap model's cap) AND downshifted upstream.
+    expect(res.status).not.toBe(402);
+    expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5');
+    await app.close();
+  });
+
+  it('flags an off-catalog model and (fail-closed) charges the worst-case', async () => {
+    // A served model with no catalog price meters $0 by default — a silent budget
+    // bypass. It is always observed (unpriced attribute); fail-closed charges the
+    // worst-case reserve so it cannot slip the cap.
+    const UNPRICED_SSE = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_u","model":"mystery-model-9","usage":{"input_tokens":50,"output_tokens":1}}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+      '',
+    ].join('\n');
+    const up = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        void b;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(UNPRICED_SSE);
+      });
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const upUrl = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, ledger, requestLog } = buildContext(store);
+    ctx.meterFailClosedOnUnpriced = true;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', upUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'mystery-model-9',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).then((r) => r.text());
+
+    // Observed: the unpriced attribute is on the request log regardless of the knob.
+    expect(requestLog.entries[0]?.attributes?.['unpriced']).toBe(true);
+    // Fail-closed: charged the worst-case reserve, not $0.
+    expect(ledger.entries[0]?.costMicroUsd).toBeGreaterThan(0);
+    await app.close();
+    up.close();
+  });
+
   const openaiRoute = (): ProviderRoute => ({
     clientPaths: ['/v1/chat/completions'],
     createExtractor: () => new OpenAIUsageExtractor(),

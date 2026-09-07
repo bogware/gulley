@@ -767,6 +767,7 @@ export function createProductionContext(config: Config): GatewayContext {
     responseBufferLimit: config.RESPONSE_BUFFER_LIMIT_BYTES,
     bufferFailClosed: config.BUFFER_FAIL_CLOSED,
     chargeOnMissingUsage: config.METER_CHARGE_ON_MISSING_USAGE,
+    meterFailClosedOnUnpriced: config.METER_FAIL_CLOSED_ON_UNPRICED,
     hedgeDelayMs: config.HEDGE_DELAY_MS > 0 ? config.HEDGE_DELAY_MS : undefined,
     streamEnforce: config.STREAMING_ENFORCE,
     streamEnforceWindowChars: config.STREAMING_ENFORCE_WINDOW_CHARS,

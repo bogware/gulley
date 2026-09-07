@@ -31,6 +31,9 @@ export interface RequestSpanData {
   /** Which cache avoided the cost: 'prompt_cache' (provider) | 'response_cache'
    *  (this gateway's two-tier cache). Defaults to prompt_cache when unset. */
   cacheSavedSource?: string;
+  /** True when the served model had no catalog price (metered $0 unless fail-closed)
+   *  — a cost-governance blind spot worth surfacing. */
+  unpriced?: boolean;
   /** W3C trace id (32-hex) this request belongs to, for cross-system correlation. */
   traceId?: string;
   /** Per-stage timings (epoch ms), materialized as child spans under the request
