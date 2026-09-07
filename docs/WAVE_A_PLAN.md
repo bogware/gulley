@@ -13,6 +13,28 @@ floor, then build.
 
 ---
 
+## Delivered (on `agentgateway-port`)
+
+Each hot-path commit passed the adversarial `hotpath-review` (0 confirmed findings) and carries the
+`Hotpath-Reviewed:` trailer; the full local gate is green (format + lint + typecheck + test + build).
+
+- **Slice 1** — Tier-0 trust fixes + cache-cost visibility (audit-append advisory lock + teardown
+  isolation; durable admin/PII-reveal audit; refusal-cache guard; gateway cache-hit dollars-avoided
+  metered under `response_cache`; body-size limit + trust-proxy knobs); config-convergence poll;
+  `gulley doctor`; cross-vendor positioning refresh.
+- **Slice 2** — config-propagation emit wire (control plane); budget-downshift worst-case reprice;
+  off-catalog model metering (observe always + opt-in fail-closed).
+- **Wave B opener** — cache ↔ output-enforcement coexistence (a clean, no-transform response is now
+  cacheable under DLP enforcement; masked/redacted/blocked/sensitive/plugin-masked never cached).
+
+**Deferred (own designed PR):** hedge/failover **loser** metering. The loser branch's body is drained
+(`resume()`) without parsing usage, so metering it needs either a reserve-2×-on-fire path or parsing
+a discarded stream — both touch the metering invariants and warrant a dedicated hot-path-reviewed
+change rather than a rushed addition. Off-catalog metering (its sibling in the original slice-2 item)
+is delivered.
+
+---
+
 ## Landing in this PR (Wave A · slice 1)
 
 Weighted to the caching / cost-saving focus and the trust floor; all off the raw-byte streaming
