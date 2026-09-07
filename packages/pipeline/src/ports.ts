@@ -14,6 +14,8 @@ export interface SpendRecord {
   cost: CostBreakdown;
   costMicroUsd: number;
   status: RequestStatus;
+  /** Cost-attribution tags (repo/branch/PR/session/developer/…) for chargeback. */
+  attributes?: Record<string, unknown>;
   createdAt: Date;
 }
 

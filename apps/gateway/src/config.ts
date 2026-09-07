@@ -322,6 +322,14 @@ const Env = z.object({
     .default(8 * 1024 * 1024),
   BUFFER_FAIL_CLOSED: envBool(true),
 
+  // Cost-attribution headers: a comma-separated list of request header names whose
+  // values are captured onto the spend ledger / request-log / audit as attribution
+  // tags, so spend rolls up by any SDLC dimension for chargeback. Coding agents (or
+  // an org's wrapper) inject e.g. repo/branch/PR/session/developer. The captured key
+  // is the header name lowercased with a leading `x-`/`x-gulley-` stripped
+  // (`X-Gulley-Repo` -> `repo`). e.g. ATTRIBUTION_HEADERS=x-gulley-repo,x-gulley-dev
+  ATTRIBUTION_HEADERS: z.string().optional(),
+
   // When a successful (2xx) response emits NO provider usage (some OpenAI-compatible
   // and local backends omit stream usage), the request would otherwise bill $0 and
   // fully refund its reservation — leaving budgets unenforced for that backend.

@@ -116,8 +116,19 @@ export const spendLedger = pgTable(
     status: text('status').notNull(),
     inputTokens: bigint('input_tokens', { mode: 'number' }).notNull().default(0),
     outputTokens: bigint('output_tokens', { mode: 'number' }).notNull().default(0),
+    // Cost-breakdown detail (computed on the hot path, previously discarded): the
+    // cache-read/write token split and the provider-prompt-cache dollars saved, so
+    // chargeback + savings reporting reads the durable ledger rather than the
+    // best-effort request_log.
+    cacheReadTokens: bigint('cache_read_tokens', { mode: 'number' }).notNull().default(0),
+    cacheWriteTokens: bigint('cache_write_tokens', { mode: 'number' }).notNull().default(0),
+    cacheSavedMicroUsd: bigint('cache_saved_micro_usd', { mode: 'number' }).notNull().default(0),
     costMicroUsd: bigint('cost_micro_usd', { mode: 'number' }).notNull().default(0),
     priced: boolean('priced').notNull().default(false),
+    // Coding-agent / cost-attribution tags (repo, branch, PR, session, developer,
+    // subagent, human-vs-agent, cost-center…), captured from configured request
+    // headers so spend rolls up to any SDLC dimension for chargeback.
+    attributes: jsonb('attributes'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

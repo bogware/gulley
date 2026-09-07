@@ -11,6 +11,8 @@ import {
 } from '@gulley/config';
 import {
   type ConfigNotifier,
+  chargebackReport,
+  type ChargebackRow,
   createDatabase,
   type Database,
   newOriginId,
@@ -74,6 +76,14 @@ export interface ControlContext {
   configAtomic?: <T>(fn: (deps: ApplyCommitDeps) => Promise<T>) => Promise<T>;
   /** Read side of the request log: admin log browser + usage analytics. */
   requestLogQuery: RequestLogQuery;
+  /** Chargeback/showback over the durable spend ledger (grouped by workspace / model
+   *  / provider / attr:<tag>). Absent when no DB is wired. */
+  chargeback?: (opts: {
+    groupBy: string;
+    from?: Date;
+    to?: Date;
+    workspaceIds?: string[];
+  }) => Promise<ChargebackRow[]>;
   resolverDeps: AdminResolverDeps;
   /** Verify the underlying audit chain (the sink is guarded, so expose it). Async
    *  because the durable chain is read from Postgres when a DB is present. */
@@ -201,6 +211,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     configAtomic,
     requestLogQuery:
       opts.requestLogQuery ?? (db ? new PostgresRequestLogQuery(db) : new InMemoryRequestLog()),
+    chargeback: db ? (o) => chargebackReport(db, o) : undefined,
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,
       bootstrapTokenSha256: opts.bootstrapTokenSha256,

@@ -789,6 +789,11 @@ export function createProductionContext(config: Config): GatewayContext {
     chargeOnMissingUsage: config.METER_CHARGE_ON_MISSING_USAGE,
     meterFailClosedOnUnpriced: config.METER_FAIL_CLOSED_ON_UNPRICED,
     requestDeadlineMs: config.REQUEST_DEADLINE_MS > 0 ? config.REQUEST_DEADLINE_MS : undefined,
+    attributionHeaders: config.ATTRIBUTION_HEADERS
+      ? config.ATTRIBUTION_HEADERS.split(',')
+          .map((h) => h.trim().toLowerCase())
+          .filter(Boolean)
+      : undefined,
     hedgeDelayMs: config.HEDGE_DELAY_MS > 0 ? config.HEDGE_DELAY_MS : undefined,
     streamEnforce: config.STREAMING_ENFORCE,
     streamEnforceWindowChars: config.STREAMING_ENFORCE_WINDOW_CHARS,

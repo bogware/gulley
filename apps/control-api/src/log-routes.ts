@@ -81,4 +81,29 @@ export function registerLogRoutes(app: FastifyInstance, ctx: ControlContext): vo
       return reply.send({ buckets });
     }),
   );
+
+  // Chargeback/showback over the DURABLE spend ledger, grouped by a dimension:
+  // workspace | model | provider | attr:<tag> (a cost-attribution tag such as
+  // repo/branch/developer/session). RBAC-scoped to the caller's visible workspaces.
+  app.get(
+    '/admin/analytics/chargeback',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!ctx.chargeback) {
+        return reply
+          .code(501)
+          .send({ error: { type: 'not_supported', message: 'chargeback requires a database' } });
+      }
+      const visible = visibleWorkspaceIds(ctx, admin);
+      const workspaceIds = readScope(request, visible);
+      if (!workspaceIds) return reply.send({ rows: [] });
+      const gb = query(request)['groupBy'];
+      const groupBy =
+        gb === 'workspace' || gb === 'provider' || (gb && gb.startsWith('attr:')) ? gb : 'model';
+      const to = parseDate(query(request)['to']) ?? new Date();
+      const from =
+        parseDate(query(request)['from']) ?? new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const rows = await ctx.chargeback({ groupBy, from, to, workspaceIds });
+      return reply.send({ rows });
+    }),
+  );
 }

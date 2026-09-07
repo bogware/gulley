@@ -193,6 +193,9 @@ export interface GatewayContext {
    *  dispatch/failover/retry phase; on breach the request aborts with a 504. Absent
    *  = off (only the post-first-byte inactivity watchdog applies). */
   requestDeadlineMs?: number;
+  /** Request header names whose values are captured as cost-attribution tags on the
+   *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
+  attributionHeaders?: string[];
   /** M17: windowed in-stream output enforcement (redact/block) on Anthropic-
    *  canonical streamed responses; absent/false = streamed output stays audit-only. */
   streamEnforce?: boolean;
@@ -402,6 +405,10 @@ async function handleProxy(
 ): Promise<void> {
   const started = Date.now();
   const requestId = request.id;
+  // Cost-attribution tags from configured request headers (repo/branch/PR/session/
+  // developer/…), captured once and threaded onto the ledger, request-log, and audit
+  // so spend rolls up by any SDLC dimension for chargeback.
+  const attribution = buildAttribution(request, ctx.attributionHeaders);
   let body = (request.body as Buffer | undefined) ?? Buffer.alloc(0);
 
   let parsed: Record<string, unknown> = {};
@@ -825,6 +832,7 @@ async function handleProxy(
         started,
         rlRules,
         rlHeaders,
+        attribution,
       );
       return;
     }
@@ -1505,6 +1513,7 @@ async function handleProxy(
           cost,
           costMicroUsd,
           status,
+          attributes: attribution,
           createdAt,
         });
       }
@@ -1524,6 +1533,10 @@ async function handleProxy(
         latencyMs: Date.now() - started,
         createdAt,
         attributes: {
+          // Attribution tags FIRST so the authoritative built-in facets below always
+          // win a key collision — a tag value is client-supplied and must never
+          // shadow the real routing target / cache status.
+          ...(attribution ?? {}),
           cache: cacheLookup?.status ?? 'bypass',
           target: served?.name ?? provider,
           ...(guardrailAction ? { guardrailAction } : {}),
@@ -1587,6 +1600,7 @@ async function handleProxy(
             guardrailOutputFindings: outFindings.length,
             cache: cacheLookup?.status ?? 'bypass',
             ...(unpriced ? { unpriced: true } : {}),
+            ...(attribution ? { attribution } : {}),
           },
         });
       } catch (err) {
@@ -2108,6 +2122,7 @@ async function serveFromCache(
   started: number,
   rlRules: RateLimit[],
   rlHeaders: Record<string, string>,
+  attribution?: Record<string, string>,
 ): Promise<void> {
   const cached = lookup.response;
   if (!cached) return;
@@ -2177,6 +2192,8 @@ async function serveFromCache(
       latencyMs: Date.now() - started,
       createdAt,
       attributes: {
+        // Attribution tags FIRST so built-in facets below win a key collision.
+        ...(attribution ?? {}),
         cache: lookup.status,
         target: `cache:${lookup.status}`,
         ...(savedMicroUsd ? { cacheSavedMicroUsd: savedMicroUsd } : {}),
@@ -2193,6 +2210,7 @@ async function serveFromCache(
         cache: lookup.status,
         statusCode: cached.statusCode,
         ...(savedMicroUsd ? { cacheSavedMicroUsd: savedMicroUsd } : {}),
+        ...(attribution ? { attribution } : {}),
       },
     });
   } catch (err) {
@@ -2215,6 +2233,27 @@ async function serveFromCache(
     startedAtMs: started,
     cacheStatus: lookup.status,
   });
+}
+
+/** Capture configured request headers as cost-attribution tags. The key is the
+ *  header name with a leading `x-gulley-` (then `x-`) stripped and lowercased, so
+ *  `X-Gulley-Repo: acme/api` becomes `{ repo: 'acme/api' }`. Only non-empty string
+ *  values are captured; returns undefined when nothing matched. */
+function buildAttribution(
+  request: FastifyRequest,
+  headerNames: string[] | undefined,
+): Record<string, string> | undefined {
+  if (!headerNames || headerNames.length === 0) return undefined;
+  const out: Record<string, string> = {};
+  for (const name of headerNames) {
+    const raw = request.headers[name];
+    const val = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof val === 'string' && val.length > 0) {
+      const key = name.replace(/^x-gulley-/, '').replace(/^x-/, '');
+      if (key) out[key] = val;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** The LLM-aware attribute surface CEL policies evaluate against. */

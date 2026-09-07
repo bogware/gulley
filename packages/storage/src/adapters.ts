@@ -183,8 +183,12 @@ export class PostgresLedger implements Ledger {
       status: e.status,
       inputTokens: e.cost.totalInputTokens,
       outputTokens: e.cost.outputTokens,
+      cacheReadTokens: e.cost.cacheReadTokens,
+      cacheWriteTokens: e.cost.cacheWriteTokens,
+      cacheSavedMicroUsd: Math.round(e.cost.cacheSavedUsd * 1_000_000),
       costMicroUsd: e.costMicroUsd,
       priced: e.cost.priced,
+      attributes: e.attributes ?? null,
       createdAt: e.createdAt,
     });
   }
@@ -480,6 +484,64 @@ export function createBudgetCapResolver(
       ? { capMicroUsd: b.cap, periodSeconds: b.period }
       : { capMicroUsd: b.cap };
   };
+}
+
+export interface ChargebackRow {
+  key: string | null;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  costMicroUsd: number;
+  cacheSavedMicroUsd: number;
+}
+
+/** Chargeback/showback over the DURABLE spend ledger (not the best-effort request
+ *  log), grouped by a dimension: 'workspace' | 'model' | 'provider' | 'attr:<tag>'
+ *  (a cost-attribution tag such as repo/branch/developer/session). Highest spend
+ *  first. `attr:<tag>` binds the tag as a parameter (no SQL injection). */
+export async function chargebackReport(
+  db: Database,
+  opts: { groupBy: string; from?: Date; to?: Date; workspaceIds?: string[] },
+): Promise<ChargebackRow[]> {
+  // An explicit empty scope means "nothing visible" — never fall through to an
+  // unscoped (RBAC-leaky) aggregate.
+  if (opts.workspaceIds && opts.workspaceIds.length === 0) return [];
+  const groupExpr: SQL<string | null> =
+    opts.groupBy === 'workspace'
+      ? sql<string | null>`${spendLedger.workspaceId}::text`
+      : opts.groupBy === 'provider'
+        ? sql<string | null>`${spendLedger.provider}`
+        : opts.groupBy.startsWith('attr:')
+          ? sql<string | null>`${spendLedger.attributes} ->> ${opts.groupBy.slice(5)}`
+          : sql<string | null>`${spendLedger.model}`;
+  const conds: SQL[] = [];
+  if (opts.workspaceIds) conds.push(inArray(spendLedger.workspaceId, opts.workspaceIds));
+  if (opts.from) conds.push(gte(spendLedger.createdAt, opts.from));
+  if (opts.to) conds.push(lt(spendLedger.createdAt, opts.to));
+  const rows = await db
+    .select({
+      key: groupExpr,
+      requests: sql<string>`count(*)`,
+      inputTokens: sql<string>`coalesce(sum(${spendLedger.inputTokens}), 0)`,
+      outputTokens: sql<string>`coalesce(sum(${spendLedger.outputTokens}), 0)`,
+      costMicroUsd: sql<string>`coalesce(sum(${spendLedger.costMicroUsd}), 0)`,
+      cacheSavedMicroUsd: sql<string>`coalesce(sum(${spendLedger.cacheSavedMicroUsd}), 0)`,
+    })
+    .from(spendLedger)
+    .where(conds.length ? and(...conds) : undefined)
+    // Group by the first select column (the key expression) by ordinal — a
+    // parameterized key expr repeated in GROUP BY would bind a second placeholder and
+    // not match the SELECT.
+    .groupBy(sql`1`)
+    .orderBy(sql`coalesce(sum(${spendLedger.costMicroUsd}), 0) desc`);
+  return rows.map((r) => ({
+    key: r.key,
+    requests: Number(r.requests),
+    inputTokens: Number(r.inputTokens),
+    outputTokens: Number(r.outputTokens),
+    costMicroUsd: Number(r.costMicroUsd),
+    cacheSavedMicroUsd: Number(r.cacheSavedMicroUsd),
+  }));
 }
 
 /** Data to self-heal the Redis committed budget counters from the durable ledger:

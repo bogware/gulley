@@ -904,6 +904,43 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     up.close();
   });
 
+  it('captures attribution headers onto the ledger without shadowing built-in facets', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger, requestLog } = buildContext(store);
+    // Include a tag whose key COLLIDES with a built-in request-log facet (`target`).
+    ctx.attributionHeaders = ['x-gulley-repo', 'x-gulley-dev', 'x-gulley-target'];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': token,
+        'x-gulley-repo': 'acme/api',
+        'x-gulley-dev': 'alice',
+        'x-gulley-target': 'staging', // a client value that must NOT shadow the real target
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).then((r) => r.text());
+    // The x-gulley- prefix is stripped; spend rolls up by these SDLC tags (ledger has
+    // its own isolated attributes column, so all tags land verbatim).
+    expect(ledger.entries[0]?.attributes).toEqual({
+      repo: 'acme/api',
+      dev: 'alice',
+      target: 'staging',
+    });
+    // But in the flat request-log attributes, the authoritative built-in `target`
+    // facet (the real upstream) wins over the colliding client tag.
+    expect(requestLog.entries[0]?.attributes?.['target']).toBe('anthropic');
+    expect(requestLog.entries[0]?.attributes?.['repo']).toBe('acme/api');
+    await app.close();
+  });
+
   it('caches a clean response even when output enforcement is on (coexistence)', async () => {
     // With an enforcing output policy, a CLEAN response (nothing to redact) is now
     // cacheable — the raw body IS the enforced body, so replay is safe. Previously
