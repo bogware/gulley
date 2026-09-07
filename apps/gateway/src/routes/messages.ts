@@ -189,6 +189,10 @@ export interface GatewayContext {
    *  budget). Off-catalog requests are always observed; this makes them fail closed.
    *  Default false. */
   meterFailClosedOnUnpriced?: boolean;
+  /** Total pre-first-byte deadline (ms), measured from request entry. Bounds the
+   *  dispatch/failover/retry phase; on breach the request aborts with a 504. Absent
+   *  = off (only the post-first-byte inactivity watchdog applies). */
+  requestDeadlineMs?: number;
   /** M17: windowed in-stream output enforcement (redact/block) on Anthropic-
    *  canonical streamed responses; absent/false = streamed output stays audit-only. */
   streamEnforce?: boolean;
@@ -980,6 +984,26 @@ async function handleProxy(
   let dispatchMs: number | undefined; // when we dispatched to the serving target
   let firstByteMs: number | undefined; // when its response headers arrived
 
+  // Total pre-first-byte deadline: abort the dispatch/failover/retry phase if the
+  // first byte hasn't arrived within REQUEST_DEADLINE_MS of request entry, so a slow
+  // or serially-failing candidate set can't pin the request for N x the per-attempt
+  // header timeout. The abort propagates through the abort-aware forward/backoff; the
+  // guard on firstByteMs means a fire after first byte is a no-op (the watchdog owns
+  // the post-first-byte phase). Relative to `started`, so it is a total budget even
+  // though the timer arms here (pre-dispatch stages carry their own timeouts).
+  let deadlineExceeded = false;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  if (ctx.requestDeadlineMs && ctx.requestDeadlineMs > 0) {
+    const remaining = Math.max(0, ctx.requestDeadlineMs - (Date.now() - started));
+    deadlineTimer = setTimeout(() => {
+      if (firstByteMs === undefined && !controller.signal.aborted) {
+        deadlineExceeded = true;
+        controller.abort();
+      }
+    }, remaining);
+    deadlineTimer.unref?.();
+  }
+
   type UpstreamResp = Awaited<ReturnType<RouteTarget['adapter']['forward']>>;
 
   // Commit a chosen (pre-first-byte) upstream response as the one we serve: record
@@ -1242,11 +1266,19 @@ async function handleProxy(
       }
 
       if (!resp) {
-        // All attempts on this target hard-failed (connection errors) or aborted.
+        // An abort — client disconnect OR the pre-first-byte deadline — is NOT an
+        // upstream fault: free the limiter slot without adapting the limit and do
+        // not blame the breaker (mirrors the hedge path). Attributing a gateway/
+        // client-side abort to the target would open its circuit and shrink its
+        // concurrency ceiling on a healthy upstream. Only a genuine hard failure
+        // (connection error, no abort) records a fault + a concurrency drop.
+        if (controller.signal.aborted) {
+          if (limiterAcquired) ctx.limiter?.release(target.name);
+          break;
+        }
         ctx.breaker.recordFailure(target.name);
         if (limiterAcquired)
           ctx.limiter?.record(target.name, forwardStart ? Date.now() - forwardStart : 0, true);
-        if (controller.signal.aborted) break; // client gone — stop trying
         continue; // fail over to the next candidate
       }
 
@@ -1269,7 +1301,9 @@ async function handleProxy(
 
   const parserSse = new SSEParser();
   const usage = createExtractor();
-  let statusCode = upstream?.statusCode ?? 502;
+  // A pre-first-byte deadline breach (no upstream served, we aborted) is a 504
+  // Gateway Timeout, distinct from a generic 502 no-usable-upstream.
+  let statusCode = upstream?.statusCode ?? (deadlineExceeded ? 504 : 502);
   let status: RequestStatus = controller.signal.aborted
     ? 'aborted'
     : statusCode < 400
@@ -1362,6 +1396,7 @@ async function handleProxy(
   const teardown = async (): Promise<void> => {
     if (settled) return;
     settled = true;
+    if (deadlineTimer) clearTimeout(deadlineTimer);
     if (scoreboardHeld && served) {
       scoreboardHeld = false;
       ctx.scoreboard?.end(served.name);
@@ -1695,7 +1730,7 @@ async function handleProxy(
   if (!upstream || !served) {
     const shed = anySaturation && !anyRealAttempt;
     status = controller.signal.aborted ? 'aborted' : 'error';
-    statusCode = shed ? 503 : 502;
+    statusCode = shed ? 503 : deadlineExceeded ? 504 : 502;
     await teardown();
     if (!reply.sent) {
       if (shed) {
@@ -1706,6 +1741,11 @@ async function handleProxy(
             type: 'error',
             error: { type: 'overloaded_error', message: 'all upstreams at capacity' },
           });
+      } else if (deadlineExceeded) {
+        await reply.code(504).send({
+          type: 'error',
+          error: { type: 'timeout_error', message: 'request deadline exceeded before first byte' },
+        });
       } else {
         await reply
           .code(502)

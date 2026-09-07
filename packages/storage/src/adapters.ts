@@ -19,7 +19,7 @@ import {
   type UsageBucket,
   type UsageQuery,
 } from '@gulley/pipeline';
-import { and, asc, desc, eq, gte, inArray, lt, type SQL, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, isNotNull, lt, type SQL, sql } from 'drizzle-orm';
 import type { Database } from './db';
 import {
   auditLog,
@@ -480,4 +480,34 @@ export function createBudgetCapResolver(
       ? { capMicroUsd: b.cap, periodSeconds: b.period }
       : { capMicroUsd: b.cap };
   };
+}
+
+/** Data to self-heal the Redis committed budget counters from the durable ledger:
+ *  for each workspace with a ROLLING (period_seconds) cap, the ledger spend summed
+ *  over the active window. Lifetime caps (null period) are skipped — their counter
+ *  never rolls, so a full-ledger heal would be needed and is out of scope here.
+ *  `nowMs` is injected so callers/tests control the window. */
+export async function loadBudgetHealData(
+  db: Database,
+  nowMs: number = Date.now(),
+): Promise<Array<{ workspaceId: string; ledgerMicroUsd: number; periodSeconds: number }>> {
+  const budgets = await db
+    .select({ workspaceId: budget.workspaceId, period: budget.periodSeconds })
+    .from(budget)
+    .where(isNotNull(budget.periodSeconds));
+  const out: Array<{ workspaceId: string; ledgerMicroUsd: number; periodSeconds: number }> = [];
+  for (const b of budgets) {
+    if (b.period == null) continue;
+    const since = new Date(nowMs - b.period * 1000);
+    const rows = await db
+      .select({ sum: sql<string>`coalesce(sum(${spendLedger.costMicroUsd}), 0)` })
+      .from(spendLedger)
+      .where(and(eq(spendLedger.workspaceId, b.workspaceId), gte(spendLedger.createdAt, since)));
+    out.push({
+      workspaceId: b.workspaceId,
+      ledgerMicroUsd: Number(rows[0]?.sum ?? 0),
+      periodSeconds: b.period,
+    });
+  }
+  return out;
 }

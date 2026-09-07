@@ -77,6 +77,30 @@ end
 return redis.call('GET', committedKey)
 `;
 
+// Self-heal a LOST committed counter from the durable ledger. A live counter is
+// AUTHORITATIVE for its fixed window and is never overwritten: the ledger sum is
+// taken over a sliding window that would include prior-window spend and thus
+// OVER-enforce a healthy counter. So this only rebuilds an ABSENT counter (a
+// counters-Redis flush, where committed was reset to 0) — flush recovery, not an
+// every-boot rewrite. On rebuild it seeds the ledger sum and a fresh window TTL
+// (the original window start isn't durable; the sliding sum is a conservative,
+// never-under-enforcing approximation). Raise-only: a heal can only restore
+// enforcement, never weaken it.
+const HEAL_LUA = `
+local committedKey = KEYS[1]
+local ledgerSum = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+if redis.call('EXISTS', committedKey) == 1 then
+  return {0, tonumber(redis.call('GET', committedKey) or '0')}
+end
+if ledgerSum > 0 then
+  redis.call('SET', committedKey, ledgerSum)
+  if ttl > 0 then redis.call('EXPIRE', committedKey, ttl) end
+  return {1, ledgerSum}
+end
+return {0, 0}
+`;
+
 export class RedisBudgetStore implements BudgetStore {
   constructor(
     private readonly redis: EvalRedis,
@@ -127,5 +151,21 @@ export class RedisBudgetStore implements BudgetStore {
       String(actualMicroUsd),
       String(ttl),
     );
+  }
+
+  async healCommitted(
+    workspaceId: string,
+    ledgerMicroUsd: number,
+    periodSeconds: number,
+  ): Promise<{ healed: boolean; committedMicroUsd: number }> {
+    const [, committedKey] = this.keys(workspaceId);
+    const res = (await this.redis.eval(
+      HEAL_LUA,
+      1,
+      committedKey,
+      String(Math.max(0, Math.round(ledgerMicroUsd))),
+      String(periodSeconds),
+    )) as [number, number];
+    return { healed: res[0] === 1, committedMicroUsd: res[1] };
   }
 }

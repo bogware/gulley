@@ -11,7 +11,7 @@ import {
   resolveCustomProvider,
   type UpstreamCredential,
 } from '@gulley/providers';
-import { InMemoryBudgetStore, RedisBudgetStore } from '@gulley/budget';
+import { type BudgetStore, InMemoryBudgetStore, RedisBudgetStore } from '@gulley/budget';
 import {
   CacheEngine,
   type EmbeddingProvider,
@@ -79,6 +79,7 @@ import {
 import {
   createBudgetCapResolver,
   createDatabase,
+  loadBudgetHealData,
   createRateLimitResolver,
   createRedisClient,
   type Database,
@@ -612,7 +613,7 @@ export function createProductionContext(config: Config): GatewayContext {
   // except for the in-memory store, which we seed with the model caps so multi-level
   // enforcement still works in the counter-less (single-node/dev) path.
   const dbCapResolver = createBudgetCapResolver(db);
-  const budgets = config.REDIS_COUNTERS_URL
+  const budgets: BudgetStore = config.REDIS_COUNTERS_URL
     ? new RedisBudgetStore(createRedisClient(config.REDIS_COUNTERS_URL), (scopeKey) =>
         // Compose: `model:` scopes resolve from config; everything else from the DB.
         scopeKey.startsWith('model:')
@@ -620,6 +621,25 @@ export function createProductionContext(config: Config): GatewayContext {
           : dbCapResolver(scopeKey),
       )
     : new InMemoryBudgetStore(new Map(modelCaps));
+
+  // Self-heal LOST committed budget counters from the durable ledger on boot: a
+  // counters-Redis flush resets them to 0 and would over-admit past the hard cap
+  // until the window rolls. healCommitted only rebuilds an ABSENT counter (a live
+  // one is authoritative and untouched), so this is safe to run unconditionally on
+  // every boot. Fire-and-forget (never blocks boot); rebuild seeds the ledger sum,
+  // so concurrent replicas rebuilding to the same value is safe.
+  if (config.REDIS_COUNTERS_URL && budgets.healCommitted) {
+    void (async () => {
+      try {
+        for (const d of await loadBudgetHealData(db)) {
+          await budgets.healCommitted?.(d.workspaceId, d.ledgerMicroUsd, d.periodSeconds);
+        }
+      } catch {
+        /* best-effort; enforcement still applies, just not pre-healed */
+      }
+    })();
+  }
+
   const otel = initTelemetry({
     endpoint: config.OTEL_EXPORTER_OTLP_ENDPOINT,
     serviceName: config.OTEL_SERVICE_NAME,
@@ -768,6 +788,7 @@ export function createProductionContext(config: Config): GatewayContext {
     bufferFailClosed: config.BUFFER_FAIL_CLOSED,
     chargeOnMissingUsage: config.METER_CHARGE_ON_MISSING_USAGE,
     meterFailClosedOnUnpriced: config.METER_FAIL_CLOSED_ON_UNPRICED,
+    requestDeadlineMs: config.REQUEST_DEADLINE_MS > 0 ? config.REQUEST_DEADLINE_MS : undefined,
     hedgeDelayMs: config.HEDGE_DELAY_MS > 0 ? config.HEDGE_DELAY_MS : undefined,
     streamEnforce: config.STREAMING_ENFORCE,
     streamEnforceWindowChars: config.STREAMING_ENFORCE_WINDOW_CHARS,

@@ -213,6 +213,13 @@ const Env = z.object({
   GUARDRAILS_MODEL_ARMOR_TEMPLATE: z.string().optional(),
   GUARDRAILS_MODEL_ARMOR_ACCESS_TOKEN: z.string().optional(),
 
+  // Total pre-first-byte deadline (ms): bounds the whole dispatch/failover/retry
+  // phase so a slow or serially-failing set of upstreams can't pin a request for
+  // N x the per-attempt header timeout. Measured from request entry; once the first
+  // byte arrives the inactivity watchdog takes over. 0 = off. On breach the client
+  // gets a 504 and any partial spend is metered.
+  REQUEST_DEADLINE_MS: z.coerce.number().int().nonnegative().default(0),
+
   // Same-target retry (pre-first-byte, body already buffered): bounded attempts
   // on transient errors before failing over to the next candidate. Default 1 =
   // no retry (behavior unchanged). Backoff is exponential, floored by Retry-After.

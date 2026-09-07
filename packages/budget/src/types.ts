@@ -27,6 +27,17 @@ export interface BudgetStore {
     worstCaseMicroUsd: number,
   ): Promise<BudgetDecision | null>;
   commit(workspaceId: string, requestId: string, actualMicroUsd: number): Promise<void>;
+  /** Optional: rebuild a LOST committed counter from the durable ledger. The counters
+   *  are "a rebuildable projection" of the ledger, but a counters-Redis flush resets
+   *  committed to 0 and over-admits until the window rolls. Given the ledger sum over
+   *  the active window, this rebuilds the counter ONLY when it is absent (flush
+   *  recovery) — a live counter is authoritative for its fixed window and is never
+   *  overwritten. Backends without a losable counter (in-memory) may omit this. */
+  healCommitted?(
+    workspaceId: string,
+    ledgerMicroUsd: number,
+    periodSeconds: number,
+  ): Promise<{ healed: boolean; committedMicroUsd: number }>;
 }
 
 export type CapResolver = (workspaceId: string) => Promise<Budget | null>;

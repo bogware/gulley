@@ -1,7 +1,51 @@
 import { describe, expect, it } from 'vitest';
 import { estimateWorstCaseMicroUsd } from './estimate';
 import { InMemoryBudgetStore } from './memory';
+import { type EvalRedis, RedisBudgetStore } from './redis';
 import type { Budget } from './types';
+
+/** A minimal Redis that interprets the committed-counter EXISTS/GET/SET the HEAL
+ *  script performs — enough to exercise RedisBudgetStore.healCommitted's
+ *  only-rebuild-a-lost-counter semantics without a live Redis. */
+class HealFakeRedis implements EvalRedis {
+  constructor(private readonly committed = new Map<string, number>()) {}
+  get(key: string): number {
+    return this.committed.get(key) ?? 0;
+  }
+  async eval(_script: string, _numKeys: number, ...args: (string | number)[]): Promise<unknown> {
+    const key = String(args[0]);
+    const ledgerSum = Number(args[1]);
+    if (this.committed.has(key)) return [0, this.committed.get(key) ?? 0]; // EXISTS==1
+    if (ledgerSum > 0) {
+      this.committed.set(key, ledgerSum);
+      return [1, ledgerSum];
+    }
+    return [0, 0];
+  }
+}
+
+describe('RedisBudgetStore.healCommitted', () => {
+  const cap = async () => ({ capMicroUsd: 1_000_000, periodSeconds: 3600 });
+
+  it('rebuilds a lost (absent) counter from the ledger sum', async () => {
+    const redis = new HealFakeRedis(); // committed absent (as after a flush)
+    const store = new RedisBudgetStore(redis, cap);
+    const r = await store.healCommitted('ws_1', 750_000, 3600);
+    expect(r).toEqual({ healed: true, committedMicroUsd: 750_000 });
+    expect(redis.get('budget:{ws_1}:committed')).toBe(750_000);
+  });
+
+  it('never overwrites a LIVE counter, even when the sliding ledger sum is higher', async () => {
+    // The regression: a live fixed-window counter (600k) whose sliding ledger sum
+    // (900k, incl. prior-window spend) is higher must NOT be raised — that would
+    // over-enforce a healthy workspace on every restart.
+    const redis = new HealFakeRedis(new Map([['budget:{ws_1}:committed', 600_000]]));
+    const store = new RedisBudgetStore(redis, cap);
+    const r = await store.healCommitted('ws_1', 900_000, 3600);
+    expect(r).toEqual({ healed: false, committedMicroUsd: 600_000 });
+    expect(redis.get('budget:{ws_1}:committed')).toBe(600_000);
+  });
+});
 
 describe('estimateWorstCaseMicroUsd', () => {
   it('over-estimates input and prices the full output budget', () => {

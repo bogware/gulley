@@ -1105,6 +1105,47 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     srv.close();
   });
 
+  it('504s when the pre-first-byte deadline elapses before the first byte', async () => {
+    // An upstream that never returns headers within the deadline: the gateway aborts
+    // the dispatch phase and returns a 504 rather than pinning the request.
+    const timers: NodeJS.Timeout[] = [];
+    const slow = http.createServer((req, res) => {
+      req.resume();
+      // Respond far later than the deadline; the gateway aborts long before this.
+      timers.push(setTimeout(() => res.writeHead(200).end('{}'), 5000));
+    });
+    await new Promise<void>((r) => slow.listen(0, '127.0.0.1', r));
+    const slowUrl = `http://127.0.0.1:${(slow.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, breaker } = buildContext(store);
+    const failSpy = vi.spyOn(breaker, 'recordFailure');
+    ctx.requestDeadlineMs = 120; // pre-first-byte budget
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', slowUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const t0 = Date.now();
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 10, messages: [] }),
+    });
+    await res.text();
+    expect(res.status).toBe(504);
+    expect(Date.now() - t0).toBeLessThan(2000); // aborted near the deadline, not at 5s
+    // A gateway deadline is NOT an upstream fault — the breaker must not be blamed.
+    expect(failSpy).not.toHaveBeenCalled();
+    for (const t of timers) clearTimeout(t);
+    await app.close();
+    slow.close();
+  });
+
   const openaiRoute = (): ProviderRoute => ({
     clientPaths: ['/v1/chat/completions'],
     createExtractor: () => new OpenAIUsageExtractor(),
