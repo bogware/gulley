@@ -1413,6 +1413,28 @@ async function handleProxy(
           : [];
     const outputSensitive = outFindings.some((f) => f.confidence >= CACHE_SENSITIVE_CONFIDENCE);
 
+    // Cache ↔ output-enforcement coexistence. Enforcement normally disables caching
+    // (storeCache requires !outputEnforcing) because fullChunks holds the RAW upstream
+    // bytes and serveFromCache neither re-enforces nor detokenizes on replay — so
+    // caching them would serve un-enforced (or masked-token) content. But when the
+    // BUFFERED enforcement pass applied NO transform (nothing masked/redacted, not
+    // blocked), the raw body IS the enforced body, so it is safe to cache and replay.
+    // Masked, redacted, or blocked bodies are still never cached (and streamed
+    // enforcement, which doesn't buffer, stays uncached). This lets DLP-enforced routes
+    // keep the cache-savings win on the common clean-response case.
+    const cacheableMiss = cacheOn && cacheLookup?.status === 'miss' && statusCode < 400;
+    // The precise "raw body IS the enforced body" condition is that enforcement
+    // produced NO transform: transformedText === undefined. (outFindings.length is a
+    // proxy that holds for native detectors but NOT for an output guardrail plugin,
+    // which can mask with an empty findings array — so gate on transformedText too,
+    // or a plugin-masked body could be cached as raw un-sanitized bytes.)
+    const enforcementCacheSafe =
+      !outputEnforcing ||
+      (bufferOutput &&
+        outFindings.length === 0 &&
+        outputEnforced?.transformedText === undefined &&
+        outputEnforced?.blocked !== true);
+
     // Release the reservation FIRST and independently of the best-effort durable
     // sinks below — a failed ledger/requestLog/audit write must never leak the
     // reservation (which would accumulate and DoS the budget). Commit the actual
@@ -1537,7 +1559,8 @@ async function handleProxy(
       }
       // Persist to cache — only clean, non-sensitive, non-truncated 2xx bodies.
       if (
-        storeCache &&
+        cacheableMiss &&
+        enforcementCacheSafe &&
         ctx.cache &&
         cacheReq &&
         cacheLookup &&

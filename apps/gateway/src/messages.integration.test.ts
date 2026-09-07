@@ -7,6 +7,7 @@ import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { InMemoryAesCipher } from '@gulley/crypto';
 import type { MaskVaultRecord } from '@gulley/storage';
 import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
+import { CacheEngine, InMemoryExactCache } from '@gulley/cache';
 import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { RequestMirror } from '@gulley/http-edge';
 import { RequestTracer } from './tracer';
@@ -901,6 +902,207 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(ledger.entries[0]?.costMicroUsd).toBeGreaterThan(0);
     await app.close();
     up.close();
+  });
+
+  it('caches a clean response even when output enforcement is on (coexistence)', async () => {
+    // With an enforcing output policy, a CLEAN response (nothing to redact) is now
+    // cacheable — the raw body IS the enforced body, so replay is safe. Previously
+    // enforcement disabled caching entirely, gutting cache savings on DLP routes.
+    const CLEAN_JSON = JSON.stringify({
+      id: 'msg_c',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'text', text: 'the sky is blue' }],
+      usage: { input_tokens: 10, output_tokens: 5 },
+      stop_reason: 'end_turn',
+    });
+    let upstreamCalls = 0;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        void b;
+        upstreamCalls++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(CLEAN_JSON);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    ctx.guardrails = new GuardrailEngine([new NativeDetector({})], {
+      input: { action: 'audit' },
+      output: { action: 'redact', minConfidence: 0.5 }, // enforcing (not audit)
+    });
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const opts = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 50,
+        messages: [{ role: 'user', content: 'why is the sky blue' }],
+      }),
+    };
+    await fetch(`${base}/v1/messages`, opts).then((r) => r.text());
+    await new Promise((r) => setTimeout(r, 40)); // let the store (in teardown) settle
+    const second = await fetch(`${base}/v1/messages`, opts);
+    await second.text();
+
+    // Served from cache despite enforcement being on — the second never hit upstream.
+    expect(second.headers.get('cache-status')).toContain('hit');
+    expect(upstreamCalls).toBe(1);
+    await app.close();
+    srv.close();
+  });
+
+  it('does NOT cache an enforced response that had a finding (never serve un-enforced content)', async () => {
+    // A response carrying a secret is redacted by enforcement; it must NOT be cached,
+    // or a cache hit would replay the RAW (un-redacted) body serveFromCache stores.
+    const SECRET_JSON = JSON.stringify({
+      id: 'msg_s',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'text', text: 'your key is sk-proj-abcdefghijklmnopqrstuvwxyz0123456789' }],
+      usage: { input_tokens: 10, output_tokens: 5 },
+      stop_reason: 'end_turn',
+    });
+    let upstreamCalls = 0;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        void b;
+        upstreamCalls++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(SECRET_JSON);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    ctx.guardrails = new GuardrailEngine([new NativeDetector({})], {
+      input: { action: 'audit' },
+      output: { action: 'redact', minConfidence: 0.5 },
+    });
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const opts = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 50,
+        messages: [{ role: 'user', content: 'what is my key' }],
+      }),
+    };
+    await fetch(`${base}/v1/messages`, opts).then((r) => r.text());
+    await new Promise((r) => setTimeout(r, 40));
+    const second = await fetch(`${base}/v1/messages`, opts);
+    await second.text();
+
+    // A response with a finding under enforcement is never cached — upstream re-hit.
+    expect(second.headers.get('cache-status') ?? '').not.toContain('hit');
+    expect(upstreamCalls).toBe(2);
+    await app.close();
+    srv.close();
+  });
+
+  it('does NOT cache a plugin-masked response that reported zero findings', async () => {
+    // Defense-in-depth: an output guardrail PLUGIN can mask a body while returning an
+    // empty findings array, so a findings-count check alone would wrongly cache the
+    // RAW (un-sanitized) body. The store gate also requires no transform was applied.
+    const CLEAN_JSON = JSON.stringify({
+      id: 'msg_p',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'text', text: 'internal system detail' }],
+      usage: { input_tokens: 10, output_tokens: 5 },
+      stop_reason: 'end_turn',
+    });
+    let upstreamCalls = 0;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        void b;
+        upstreamCalls++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(CLEAN_JSON);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    // A plugin that masks the output but reports NO structured findings.
+    const emptyFindingMaskPlugin = {
+      name: 'test-mask',
+      inspect: async (_text: string, direction: 'input' | 'output') =>
+        direction === 'output'
+          ? { action: 'masked' as const, maskedText: '[sanitized]', findings: [] }
+          : { action: 'none' as const, findings: [] },
+    };
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    ctx.guardrails = new GuardrailEngine(
+      [new NativeDetector({})],
+      { input: { action: 'audit' }, output: { action: 'redact', minConfidence: 0.5 } },
+      emptyFindingMaskPlugin,
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const opts = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 50,
+        messages: [{ role: 'user', content: 'tell me the detail' }],
+      }),
+    };
+    await fetch(`${base}/v1/messages`, opts).then((r) => r.text());
+    await new Promise((r) => setTimeout(r, 40));
+    const second = await fetch(`${base}/v1/messages`, opts);
+    await second.text();
+
+    // The plugin masked the body (transform applied), so the raw body is NOT cached.
+    expect(second.headers.get('cache-status') ?? '').not.toContain('hit');
+    expect(upstreamCalls).toBe(2);
+    await app.close();
+    srv.close();
   });
 
   const openaiRoute = (): ProviderRoute => ({
