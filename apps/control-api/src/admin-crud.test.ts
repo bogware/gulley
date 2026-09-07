@@ -1,8 +1,9 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
 import { createInMemoryControlContext } from './context';
+import { verifyOnboardingPack } from './onboarding';
 import { buildServer } from './server';
 
 let app: FastifyInstance;
@@ -228,5 +229,80 @@ describe('break-glass emergency elevation', () => {
       payload: JSON.stringify({ reason: 'nope' }),
     });
     expect(res.statusCode).toBe(403);
+  });
+});
+
+describe('signed onboarding packs', () => {
+  it('501s the onboarding-pack route without a signing key', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: `/admin/workspaces/${workspaceId}/onboarding-pack`,
+      headers: authNoBody(),
+    });
+    expect(res.statusCode).toBe(501);
+  });
+
+  it('issues a verifiable signed pack and serves the public key', async () => {
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const g = `gadm_${randomBytes(24).toString('base64url')}`;
+    const ctx = createInMemoryControlContext({
+      pepper: 'admin-crud-pepper-16chars!!!!!!!',
+      bootstrapEnabled: true,
+      bootstrapTokenSha256: createHash('sha256').update(g).digest('hex'),
+      sessionSecrets: ['admin-crud-session-secret-32bytes-long'],
+      maxSessionTtlMs: 900_000,
+      gatewayPublicUrl: 'https://gulley.acme.internal',
+      onboardingSigningKey: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+    });
+    const app2 = buildServer(loadConfig({ LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv), ctx);
+    const h = { authorization: `Bearer ${g}`, 'content-type': 'application/json' };
+    try {
+      const oid = (
+        (await app2
+          .inject({
+            method: 'POST',
+            url: '/orgs',
+            headers: h,
+            payload: JSON.stringify({ name: 'Acme' }),
+          })
+          .then((r) => r.json())) as { org: { id: string } }
+      ).org.id;
+      const wid = (
+        (await app2
+          .inject({
+            method: 'POST',
+            url: '/workspaces',
+            headers: h,
+            payload: JSON.stringify({ orgId: oid, name: 'prod' }),
+          })
+          .then((r) => r.json())) as { workspace: { id: string } }
+      ).workspace.id;
+
+      // Public key is served unauthenticated for out-of-band verification.
+      const keyRes = await app2.inject({
+        method: 'GET',
+        url: '/.well-known/gulley-onboarding-key',
+      });
+      expect(keyRes.statusCode).toBe(200);
+      const servedPub = (keyRes.json() as { publicKey: string }).publicKey;
+
+      const packRes = await app2.inject({
+        method: 'GET',
+        url: `/admin/workspaces/${wid}/onboarding-pack?agent=codex`,
+        headers: { authorization: `Bearer ${g}` },
+      });
+      expect(packRes.statusCode).toBe(200);
+      const { pack } = packRes.json() as { pack: Parameters<typeof verifyOnboardingPack>[0] };
+      // The pack verifies against BOTH the served key and the raw public key.
+      expect(verifyOnboardingPack(pack, servedPub)).toBe(true);
+      expect(
+        verifyOnboardingPack(pack, publicKey.export({ type: 'spki', format: 'pem' }).toString()),
+      ).toBe(true);
+      // A tampered gateway URL breaks the signature.
+      const tampered = { ...pack, manifest: { ...pack.manifest, gatewayUrl: 'https://evil' } };
+      expect(verifyOnboardingPack(tampered, servedPub)).toBe(false);
+    } finally {
+      await app2.close();
+    }
   });
 });

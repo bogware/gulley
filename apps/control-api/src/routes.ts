@@ -25,6 +25,7 @@ import {
   visibleWorkspaceIds,
 } from './admin';
 import { type ClientAgent, generateClientConfig } from './client-config';
+import { buildOnboardingManifest, publicKeyOf, signOnboardingPack } from './onboarding';
 import type { ControlContext } from './context';
 import type { CollectionKind } from './domain';
 import type { FastifyInstance, FastifyReply } from 'fastify';
@@ -443,6 +444,63 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       return reply.send({ config });
     }),
   );
+
+  // Signed onboarding pack: the client config wrapped in an Ed25519-signed manifest
+  // so `gulley init` can verify authenticity (against the org's published public key)
+  // before writing any settings — a phished/tampered pack is rejected. Needs both a
+  // gateway public URL and a signing key.
+  app.get(
+    '/admin/workspaces/:id/onboarding-pack',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!ctx.gatewayPublicUrl || !ctx.onboardingSigningKey) {
+        return reply.code(501).send({
+          error: {
+            type: 'not_supported',
+            message: 'onboarding packs require GATEWAY_PUBLIC_URL and ONBOARDING_SIGNING_KEY',
+          },
+        });
+      }
+      const workspaceId = paramId(request);
+      const ws = ctx.workspaces.get(workspaceId);
+      if (!ws) return notFound(reply, 'workspace');
+      if (!visibleWorkspaceIds(ctx, admin).has(workspaceId)) return forbidden(reply);
+      const agent: ClientAgent =
+        str((request.query as Record<string, unknown>)?.['agent']) === 'codex'
+          ? 'codex'
+          : 'claude-code';
+      const allow = new Set<string>();
+      for (const e of ctx.collections['policy'].all()) {
+        if (e.workspaceId !== workspaceId) continue;
+        const a = e.config['allow'];
+        if (Array.isArray(a)) for (const m of a) if (typeof m === 'string') allow.add(m);
+      }
+      const manifest = buildOnboardingManifest({
+        agent,
+        gatewayUrl: ctx.gatewayPublicUrl,
+        allowedModels: [...allow],
+        issuedFor: ws.name,
+        issuedAt: new Date().toISOString(),
+      });
+      const pack = signOnboardingPack(manifest, ctx.onboardingSigningKey);
+      await ctx.audit.append({
+        orgId: ws.orgId,
+        actor: admin.subject,
+        action: 'onboarding.pack.issue',
+        target: workspaceId,
+        payload: { agent, issuedFor: ws.name },
+      });
+      return reply.send({ pack });
+    }),
+  );
+  // The org's onboarding public key — PUBLIC (no auth), so a developer's `gulley init`
+  // can fetch it out-of-band to verify a pack's signature.
+  app.get('/.well-known/gulley-onboarding-key', async (_request, reply) => {
+    if (!ctx.onboardingSigningKey) {
+      return reply.code(404).send({ error: { type: 'not_found', message: 'no onboarding key' } });
+    }
+    return reply.send({ alg: 'ed25519', publicKey: publicKeyOf(ctx.onboardingSigningKey) });
+  });
+
   // Revoke (disable) a key — effective on the gateway's next lookup.
   app.post(
     '/keys/:id/disable',

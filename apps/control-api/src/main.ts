@@ -79,6 +79,7 @@ function buildContext(config: Config): ControlContext | undefined {
     maxSessionTtlMs: config.ADMIN_SESSION_MAX_MS,
     outboundAllowlist: outboundAllowlist(config),
     gatewayPublicUrl: config.GATEWAY_PUBLIC_URL,
+    onboardingSigningKey: config.ONBOARDING_SIGNING_KEY,
     providerUsageSources,
     shadowSpendFlagBps: config.SHADOW_SPEND_FLAG_BPS,
     oidc,

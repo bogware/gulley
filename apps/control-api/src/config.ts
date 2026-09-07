@@ -37,6 +37,12 @@ const Env = z.object({
   // (GET /admin/workspaces/:id/client-config). Absent ⇒ the endpoint 501s.
   GATEWAY_PUBLIC_URL: z.string().url().optional(),
 
+  // Ed25519 private key (PEM) that SIGNS onboarding packs (GET .../onboarding-pack).
+  // The org publishes the matching public key (served at /.well-known/gulley-onboarding-key)
+  // so `gulley init` verifies a pack before writing any config — a phished/tampered
+  // pack is rejected. Absent ⇒ the onboarding-pack endpoint 501s.
+  ONBOARDING_SIGNING_KEY: z.string().optional(),
+
   // Shadow-spend reconciliation (bypass detection): org-level ADMIN keys for the
   // providers' own usage/cost APIs. When set, GET /admin/analytics/shadow-spend
   // pulls each provider's billed spend and reconciles it against the gateway ledger

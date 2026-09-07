@@ -125,6 +125,9 @@ export interface ControlContext {
   /** The gateway's public base URL for generated client configs; absent ⇒ the
    *  client-config endpoint is not served. */
   gatewayPublicUrl?: string;
+  /** Ed25519 private key (PEM) that signs onboarding packs; absent ⇒ the
+   *  onboarding-pack + public-key endpoints are not served. */
+  onboardingSigningKey?: string;
   /** OIDC session gate config; absent = OIDC login disabled (token-paste only). */
   oidc?: OidcSessionConfig;
   /** Broadcasts a post-commit config signal to gateway replicas; absent = no
@@ -158,6 +161,8 @@ export interface InMemoryContextOptions {
   outboundAllowlist?: ReadonlySet<string>;
   /** Gateway public base URL for generated client configs. */
   gatewayPublicUrl?: string;
+  /** Ed25519 private key (PEM) that signs onboarding packs. */
+  onboardingSigningKey?: string;
   /** Inject a pre-seeded query backend (tests); defaults to a fresh in-memory log. */
   requestLogQuery?: RequestLogQuery;
   oidc?: OidcSessionConfig;
@@ -317,6 +322,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     maskVaultEncryptor: opts.maskVaultEncryptor,
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
     gatewayPublicUrl: opts.gatewayPublicUrl,
+    onboardingSigningKey: opts.onboardingSigningKey,
     oidc: opts.oidc,
     notifier: opts.notifier,
     originId: newOriginId(),
