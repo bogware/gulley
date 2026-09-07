@@ -1,3 +1,4 @@
+import { setAirGappedEgress } from '@gulley/egress';
 import { type MetricsServerHandle, startMetricsServer } from '@gulley/metrics';
 import { closeUpstreamPool } from '@gulley/providers';
 import { loadConfig } from './config';
@@ -8,6 +9,9 @@ import type { GatewayContext } from './routes/messages';
 import { buildServer } from './server';
 
 const config = loadConfig();
+// Air-gapped posture is process-wide, set before any egress can happen: fail-closed on
+// any guarded outbound without an explicit allowlist.
+setAirGappedEgress(config.AIR_GAPPED);
 let metricsServer: MetricsServerHandle | undefined;
 let configWatcher: ConfigWatcher | undefined;
 

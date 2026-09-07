@@ -140,6 +140,54 @@ export function runDoctor(config: Config): DoctorFinding[] {
     });
   }
 
+  // Air-gapped readiness: egress is fail-closed, so any feature that reaches a PUBLIC
+  // host (not an *_ALLOW_INTERNAL internal service) will be blocked. Surface those so a
+  // sovereign/offline deployment fails loudly at preflight, not silently at runtime.
+  if (config.AIR_GAPPED) {
+    f.push({
+      level: 'info',
+      check: 'air-gapped',
+      detail:
+        'AIR_GAPPED is on — guarded egress is deny-by-default; only *_ALLOW_INTERNAL services and allowlisted hosts are reachable. Providers must be internal upstreams.',
+    });
+    if (!config.MODELS_CATALOG_FILE) {
+      f.push({
+        level: 'warn',
+        check: 'air-gapped',
+        detail:
+          'AIR_GAPPED without MODELS_CATALOG_FILE — pricing falls back to in-tree seeds and no models.dev refresh is possible offline. Pin a catalog file.',
+      });
+    }
+    if (config.GUARDRAILS_WEBHOOK_URL && !config.GUARDRAILS_WEBHOOK_ALLOW_INTERNAL) {
+      f.push({
+        level: 'warn',
+        check: 'air-gapped',
+        detail:
+          'A DLP webhook is set but GUARDRAILS_WEBHOOK_ALLOW_INTERNAL is off — air-gapped egress will block it. Point it at an internal service and set the ALLOW_INTERNAL flag.',
+      });
+    }
+    if (config.EXTERNAL_AUTHZ_URL && !config.EXTERNAL_AUTHZ_ALLOW_INTERNAL) {
+      f.push({
+        level: 'warn',
+        check: 'air-gapped',
+        detail:
+          'EXTERNAL_AUTHZ_URL is set but EXTERNAL_AUTHZ_ALLOW_INTERNAL is off — air-gapped egress will block the authz hook. Use an internal endpoint + ALLOW_INTERNAL.',
+      });
+    }
+    if (
+      config.GUARDRAILS_MODERATION_BASE_URL ||
+      config.GUARDRAILS_AZURE_CS_ENDPOINT ||
+      config.GUARDRAILS_MODEL_ARMOR_PROJECT
+    ) {
+      f.push({
+        level: 'warn',
+        check: 'air-gapped',
+        detail:
+          'A managed guardrail plugin (OpenAI moderation / Azure Content Safety / Model Armor) calls a public cloud API — unavailable air-gapped. Rely on the native detectors + an internal DLP webhook.',
+      });
+    }
+  }
+
   return f;
 }
 

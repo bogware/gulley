@@ -7,6 +7,7 @@ import {
 } from '@gulley/crypto';
 import { loadCatalogFromFile } from '@gulley/catalog';
 import type { RateResolver } from '@gulley/cost';
+import { setAirGappedEgress } from '@gulley/egress';
 import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
 import { S3AuditMirror } from '@gulley/worm';
@@ -234,6 +235,9 @@ function buildContext(config: Config): ControlContext | undefined {
 }
 
 const config = loadConfig();
+// Air-gapped posture is process-wide, set before any egress can happen: every guarded
+// control-plane outbound then requires an explicit allowlist (fail-closed).
+setAirGappedEgress(config.AIR_GAPPED);
 const context = buildContext(config);
 const app = buildServer(config, context);
 if (!context) {

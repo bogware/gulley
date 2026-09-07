@@ -115,10 +115,27 @@ export function isBlockedIp(host: string): boolean {
 }
 
 export interface EgressOptions {
-  /** Exact, lowercased hostnames allowed. Empty/absent = allow any non-blocked host. */
+  /** Exact, lowercased hostnames allowed. Empty/absent = allow any non-blocked host,
+   *  UNLESS air-gapped (then an empty/absent allowlist denies all egress). */
   allowlist?: ReadonlySet<string> | readonly string[];
   /** Require https. Default true. */
   requireHttps?: boolean;
+  /** Air-gapped posture: an empty/absent allowlist DENIES (fail-closed) instead of
+   *  falling back to "allow any public host". Defaults to the process-wide setting
+   *  ({@link setAirGappedEgress}); pass explicitly to override per call (e.g. tests). */
+  airGapped?: boolean;
+}
+
+/** Process-wide air-gap default, set once at boot from the AIR_GAPPED config. When on,
+ *  any guarded egress without an explicit allowlist is denied — so a deployment can't
+ *  accidentally reach the public internet. Internal services reached via an
+ *  `*_ALLOW_INTERNAL` bypass (which never calls this guard) are unaffected. */
+let airGappedDefault = false;
+export function setAirGappedEgress(on: boolean): void {
+  airGappedDefault = on;
+}
+export function isAirGappedEgress(): boolean {
+  return airGappedDefault;
 }
 
 function toSet(a: EgressOptions['allowlist']): ReadonlySet<string> | undefined {
@@ -145,6 +162,13 @@ export function assertEgressAllowed(rawUrl: string, opts: EgressOptions = {}): U
     throw new EgressError('blocked-ip', `egress to internal/link-local address blocked: ${host}`);
   }
   const allow = toSet(opts.allowlist);
+  const airGapped = opts.airGapped ?? airGappedDefault;
+  if (airGapped && (!allow || allow.size === 0)) {
+    throw new EgressError(
+      'not-allowlisted',
+      `air-gapped: egress to ${host} requires an explicit outbound allowlist`,
+    );
+  }
   if (allow && allow.size > 0 && !allow.has(host)) {
     throw new EgressError('not-allowlisted', `host not in outbound allowlist: ${host}`);
   }

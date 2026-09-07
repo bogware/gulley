@@ -73,3 +73,53 @@ describe('gulley doctor', () => {
     expect(fs.filter((f) => f.level === 'error')).toHaveLength(0);
   });
 });
+
+describe('gulley doctor: air-gapped readiness', () => {
+  const airFindings = (fs: DoctorFinding[]) => fs.filter((f) => f.check === 'air-gapped');
+
+  it('emits nothing air-gap-related when AIR_GAPPED is off', () => {
+    expect(airFindings(runDoctor(cfg({ ANTHROPIC_UPSTREAM_API_KEY: 'sk-x' })))).toHaveLength(0);
+  });
+
+  it('reports the posture (info) and warns without a pinned catalog', () => {
+    const fs = airFindings(
+      runDoctor(cfg({ ANTHROPIC_UPSTREAM_API_KEY: 'sk-x', AIR_GAPPED: 'true' })),
+    );
+    expect(fs.some((f) => f.level === 'info')).toBe(true);
+    expect(fs.some((f) => f.level === 'warn' && /MODELS_CATALOG_FILE/.test(f.detail))).toBe(true);
+  });
+
+  it('warns about a public-reaching DLP webhook and managed guardrail plugins', () => {
+    const fs = airFindings(
+      runDoctor(
+        cfg({
+          ANTHROPIC_UPSTREAM_API_KEY: 'sk-x',
+          AIR_GAPPED: 'true',
+          MODELS_CATALOG_FILE: './cat.json',
+          GUARDRAILS_WEBHOOK_URL: 'https://dlp.public.example/scan',
+          GUARDRAILS_MODERATION_BASE_URL: 'https://api.openai.com/v1',
+        }),
+      ),
+    );
+    expect(fs.some((f) => /DLP webhook/.test(f.detail))).toBe(true);
+    expect(fs.some((f) => /managed guardrail/.test(f.detail))).toBe(true);
+    // A pinned catalog silences that particular warning.
+    expect(fs.some((f) => /MODELS_CATALOG_FILE/.test(f.detail))).toBe(false);
+  });
+
+  it('an internal (ALLOW_INTERNAL) DLP webhook does not warn', () => {
+    const fs = airFindings(
+      runDoctor(
+        cfg({
+          ANTHROPIC_UPSTREAM_API_KEY: 'sk-x',
+          AIR_GAPPED: 'true',
+          MODELS_CATALOG_FILE: './cat.json',
+          GUARDRAILS_WEBHOOK_URL: 'https://dlp.acme.internal/scan',
+          GUARDRAILS_WEBHOOK_ALLOW_INTERNAL: 'true',
+        }),
+      ),
+    );
+    expect(fs.some((f) => /DLP webhook/.test(f.detail))).toBe(false);
+    expect(fs.filter((f) => f.level === 'warn')).toHaveLength(0);
+  });
+});

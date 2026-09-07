@@ -32,6 +32,11 @@ const Env = z.object({
 
   // Provider base-URL egress allowlist (comma-separated hostnames).
   OUTBOUND_HOST_ALLOWLIST: z.string().default(''),
+  // Air-gapped deployment: fail-closed egress. Every control-plane outbound (WORM ship,
+  // SIEM export, anchor, shadow-spend ingest, eval runner, config-apply provider URLs)
+  // must target a host on OUTBOUND_HOST_ALLOWLIST — an empty allowlist denies ALL egress.
+  // Note: SDK-based egress (S3/KMS) bypasses the fetch guard; use VPC endpoints for those.
+  AIR_GAPPED: envBool(false),
 
   // The gateway's PUBLIC base URL, used to generate turnkey client configs
   // (GET /admin/workspaces/:id/client-config). Absent ⇒ the endpoint 501s.

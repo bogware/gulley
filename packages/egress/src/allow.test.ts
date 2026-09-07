@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { assertEgressAllowed, EgressError, isBlockedIp } from './allow';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  assertEgressAllowed,
+  EgressError,
+  isAirGappedEgress,
+  isBlockedIp,
+  setAirGappedEgress,
+} from './allow';
 
 describe('isBlockedIp', () => {
   it('blocks metadata, RFC1918, loopback, CGNAT, and IPv6 internals', () => {
@@ -49,5 +55,46 @@ describe('assertEgressAllowed', () => {
       allowlist: ['api.anthropic.com'],
     });
     expect(url.hostname).toBe('api.anthropic.com');
+  });
+});
+
+describe('air-gapped egress posture', () => {
+  afterEach(() => setAirGappedEgress(false)); // never leak the process-wide default
+
+  it('normally allows any non-blocked public host with no allowlist', () => {
+    expect(assertEgressAllowed('https://api.anthropic.com').hostname).toBe('api.anthropic.com');
+  });
+
+  it('per-call airGapped denies a host when no allowlist is given', () => {
+    expect(() => assertEgressAllowed('https://api.anthropic.com', { airGapped: true })).toThrow(
+      /air-gapped/,
+    );
+  });
+
+  it('per-call airGapped still permits an explicitly allowlisted host', () => {
+    const url = assertEgressAllowed('https://dlp.acme.internal/scan', {
+      airGapped: true,
+      allowlist: ['dlp.acme.internal'],
+    });
+    expect(url.hostname).toBe('dlp.acme.internal');
+    // ...and still rejects one that is NOT on the allowlist.
+    expect(() =>
+      assertEgressAllowed('https://evil.example', {
+        airGapped: true,
+        allowlist: ['dlp.acme.internal'],
+      }),
+    ).toThrow(/allowlist/);
+  });
+
+  it('the process-wide default hardens every call, and can be turned back off', () => {
+    setAirGappedEgress(true);
+    expect(isAirGappedEgress()).toBe(true);
+    expect(() => assertEgressAllowed('https://api.anthropic.com')).toThrow(/air-gapped/);
+    // An explicit per-call override still wins over the default.
+    expect(assertEgressAllowed('https://api.anthropic.com', { airGapped: false }).hostname).toBe(
+      'api.anthropic.com',
+    );
+    setAirGappedEgress(false);
+    expect(assertEgressAllowed('https://api.anthropic.com').hostname).toBe('api.anthropic.com');
   });
 });

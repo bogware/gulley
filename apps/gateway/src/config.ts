@@ -12,6 +12,11 @@ const envBool = (def: boolean) =>
 const Env = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+  // Air-gapped deployment: fail-closed egress. Any guarded outbound call without an
+  // explicit allowlist is DENIED, so the gateway can't accidentally reach the public
+  // internet. Internal services must be reached via their *_ALLOW_INTERNAL bypass or an
+  // allowlist; providers must be internal upstreams. `gulley doctor` flags gaps.
+  AIR_GAPPED: envBool(false),
   GATEWAY_HOST: z.string().default('0.0.0.0'),
   GATEWAY_PORT: z.coerce.number().int().positive().default(8080),
   // Maximum inbound request body. Fastify's default is 1 MiB, which silently 413s
