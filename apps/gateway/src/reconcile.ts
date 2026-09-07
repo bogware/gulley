@@ -124,7 +124,11 @@ export class GatewayReconciler {
 export class ConfigWatcher {
   private readonly gate: SignalGate;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private pollTimer: ReturnType<typeof setInterval> | undefined;
   private stopped = false;
+  /** Highest config version this watcher has successfully reconciled to. Drives
+   *  the steady-state poll: reconcile only when the store is ahead of it. */
+  private lastVersion = 0;
 
   constructor(
     private readonly subscriber: ConfigSubscriber,
@@ -134,6 +138,8 @@ export class ConfigWatcher {
     /** Extra cleanup on stop (e.g. close the store's DB pool). */
     private readonly cleanup?: () => Promise<void>,
     private readonly retryMs = 5_000,
+    /** Steady-state convergence poll interval (ms); 0 = off (NOTIFY only). */
+    private readonly pollMs = 0,
   ) {
     this.gate = new SignalGate(originId);
   }
@@ -146,12 +152,32 @@ export class ConfigWatcher {
     });
     await this.subscriber.start();
     await this.resync();
+    // Belt-and-suspenders: a bounded poll converges a long-lived replica even if a
+    // NOTIFY is never emitted or is missed (the listen socket stays up, so the
+    // reconnect resync never fires). Cheap: one currentVersion() read per tick,
+    // reconciling only when the store is ahead of what we've applied.
+    if (this.pollMs > 0) {
+      this.pollTimer = setInterval(() => void this.poll(), this.pollMs);
+      this.pollTimer.unref?.();
+    }
+  }
+
+  private async poll(): Promise<void> {
+    if (this.stopped) return;
+    try {
+      const version = await this.versions.currentVersion();
+      if (version > this.lastVersion) await this.resync();
+    } catch {
+      // Transient store error — the next tick retries; never throw from the timer.
+    }
   }
 
   private async handle(version: number): Promise<void> {
     const ok = await this.reconciler.reconcile();
-    if (ok) this.gate.observe(version);
-    else this.scheduleRetry(); // transient failure — retry so we don't stay stale
+    if (ok) {
+      this.gate.observe(version);
+      if (version > this.lastVersion) this.lastVersion = version;
+    } else this.scheduleRetry(); // transient failure — retry so we don't stay stale
   }
 
   private scheduleRetry(): void {
@@ -167,13 +193,16 @@ export class ConfigWatcher {
   async resync(): Promise<void> {
     const version = await this.versions.currentVersion();
     const ok = await this.reconciler.reconcile();
-    if (ok) this.gate.observe(version);
-    else this.scheduleRetry();
+    if (ok) {
+      this.gate.observe(version);
+      if (version > this.lastVersion) this.lastVersion = version;
+    } else this.scheduleRetry();
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.retryTimer) clearTimeout(this.retryTimer);
+    if (this.pollTimer) clearInterval(this.pollTimer);
     await this.subscriber.close();
     await this.cleanup?.();
   }

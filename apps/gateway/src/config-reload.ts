@@ -93,6 +93,14 @@ export function buildConfigWatcher(
   });
   // On stop, close the store's query pool too (the subscriber closes its own
   // listen connection) so neither is leaked.
-  ref.watcher = new ConfigWatcher(subscriber, reconciler, versions, newOriginId(), close);
+  ref.watcher = new ConfigWatcher(
+    subscriber,
+    reconciler,
+    versions,
+    newOriginId(),
+    close,
+    5_000,
+    config.CONFIG_POLL_INTERVAL_SECONDS * 1000,
+  );
   return ref.watcher;
 }

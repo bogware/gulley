@@ -1,4 +1,4 @@
-import type { ConfigDocument, ConfigStore } from '@gulley/config';
+import type { ConfigDocument, ConfigStore, ConfigVersionStore } from '@gulley/config';
 import { InMemoryConfigVersionStore } from '@gulley/config';
 import { MapSecretResolver } from '@gulley/core';
 import { CircuitBreaker, LoadScoreboard } from '@gulley/routing';
@@ -265,6 +265,32 @@ describe('ConfigWatcher', () => {
     await bus.emit({ v: 6, hash: 'h', origin: 'me', ts: 0 });
     await new Promise((r) => setTimeout(r, 20));
     expect(holder.routeFor('/v1/chat/completions')).toBeDefined(); // still openai (self ignored)
+
+    await watcher.stop();
+  });
+
+  it('converges via the steady-state poll when no signal is emitted', async () => {
+    const { holder } = holderWithState();
+    const store = storeReturning(docWith('anthropic'));
+    const reconciler = new GatewayReconciler(
+      holder,
+      store,
+      new MapSecretResolver(new Map([[ARN, 'k']])),
+    );
+    const bus = new InMemoryConfigBus();
+    // A version store the test advances by hand; the watcher only reads it.
+    let version = 1;
+    const versions = { currentVersion: async () => version } as unknown as ConfigVersionStore;
+    const watcher = new ConfigWatcher(bus, reconciler, versions, 'me', undefined, 5_000, 10);
+    await watcher.start(); // initial reconcile at v1
+    expect(holder.routeFor('/v1/messages')).toBeDefined();
+
+    // Swap the document and bump the version WITHOUT emitting a signal — only the
+    // poll can drive convergence here (the NOTIFY path is silent).
+    (store as unknown as { exportDocument: () => Promise<ConfigDocument> }).exportDocument =
+      async () => docWith('openai');
+    version = 2;
+    await vi.waitFor(() => expect(holder.routeFor('/v1/chat/completions')).toBeDefined());
 
     await watcher.stop();
   });
