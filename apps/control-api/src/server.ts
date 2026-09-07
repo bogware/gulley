@@ -5,6 +5,7 @@ import { registerConfigRoutes } from './config-routes';
 import type { ControlContext } from './context';
 import { registerCryptoShredRoutes } from './crypto-shred-routes';
 import { registerDebugRoutes } from './debug-routes';
+import { registerEvalRolloutRoutes } from './eval-rollout-routes';
 import { registerHttpEdge } from './http-edge';
 import { registerLogRoutes } from './log-routes';
 import { registerMaskVaultRoutes } from './mask-vault-routes';
@@ -51,6 +52,7 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     registerLogRoutes(app, ctx);
     registerMaskVaultRoutes(app, ctx);
     registerCryptoShredRoutes(app, ctx);
+    registerEvalRolloutRoutes(app, ctx);
     registerOidcRoutes(app, ctx);
     registerScimRoutes(app, ctx);
     registerDebugRoutes(app, ctx, config);

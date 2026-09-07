@@ -122,6 +122,19 @@ const Env = z.object({
   SIEM_EXPORT_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   SIEM_BATCH_MAX: z.coerce.number().int().positive().default(200),
 
+  // Eval-in-the-loop rollout controller (offline golden-set gate). Suites + rollouts are
+  // always manageable (owner-only); RUNNING a rollout proxies each case through the
+  // gateway, so it needs EVAL_GATEWAY_URL + EVAL_GATEWAY_KEY (a virtual key scoped for
+  // eval traffic). The gateway host must be on OUTBOUND_HOST_ALLOWLIST (SSRF guard). With
+  // MODELS_CATALOG_FILE set, the `max-cost-micro-usd` scorer is priced; else cost is null.
+  // Unset URL/key ⇒ POST /admin/rollouts/:id/run returns 501.
+  EVAL_ROLLOUT_ENABLED: envBool(false),
+  EVAL_GATEWAY_URL: z.string().url().optional(),
+  EVAL_GATEWAY_KEY: z.string().optional(),
+  EVAL_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  EVAL_MAX_TOKENS: z.coerce.number().int().positive().default(1024),
+  MODELS_CATALOG_FILE: z.string().optional(),
+
   // WORM-live: continuously mirror the durable, hash-chained audit log to an S3
   // Object Lock (COMPLIANCE) bucket — the retained, immutable system of record that
   // survives a Postgres compromise. Enabled only with WORM_ENABLED + WORM_BUCKET +

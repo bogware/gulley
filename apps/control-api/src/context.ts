@@ -40,6 +40,9 @@ import {
 import type { AuditMirror } from '@gulley/worm';
 import type { Anchor } from './anchor';
 import { type SiemConnector, SiemExporter } from './siem';
+import { type EvalStore, InMemoryEvalStore } from './eval-store';
+import type { EvalRunner } from './eval-runner';
+import type { RolloutPromoter } from './eval-rollout-routes';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
 import { WormShipper } from './worm-shipper';
@@ -149,6 +152,15 @@ export interface ControlContext {
   /** Per-subject crypto-shred key registry; present ⇒ the /admin/crypto-shred endpoints
    *  are served and mask-vault reveal of a shredded subject fails (data unrecoverable). */
   subjectKeys?: SubjectKeyStore;
+  /** Eval-in-the-loop rollout registry (suites + rollouts). Always present; the run
+   *  endpoint additionally needs an {@link evalRunner}. */
+  evalStore?: EvalStore;
+  /** Runs an eval case against a model through the real gateway. Absent ⇒
+   *  /admin/rollouts/:id/run returns 501. */
+  evalRunner?: EvalRunner;
+  /** Promotes a rollout (repoints the model alias via config-apply). Absent ⇒ built
+   *  from this context; tests inject a stub. */
+  rolloutPromoter?: RolloutPromoter;
   /** Hosts a provider base URL may egress to; empty = any non-blocked host. */
   outboundAllowlist: ReadonlySet<string>;
   /** The gateway's public base URL for generated client configs; absent ⇒ the
@@ -233,6 +245,13 @@ export interface InMemoryContextOptions {
   cryptoShredEnabled?: boolean;
   /** Inject a SubjectKeyStore directly (tests); overrides the DB-derived default. */
   subjectKeys?: SubjectKeyStore;
+  /** Inject an eval-rollout store (tests); default is a fresh in-memory registry. */
+  evalStore?: EvalStore;
+  /** Eval runner (prod: a GatewayEvalRunner from config; tests inject a fake returning
+   *  canned results). Absent ⇒ the rollout run endpoint 501s. */
+  evalRunner?: EvalRunner;
+  /** Inject a rollout promoter (tests); default repoints the alias via config-apply. */
+  rolloutPromoter?: RolloutPromoter;
   /** Provider usage/cost ingest sources for shadow-spend reconciliation. Tests
    *  inject fakes; prod wires Anthropic/OpenAI admin-API clients from config. */
   providerUsageSources?: ProviderUsageSource[];
@@ -421,6 +440,9 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     // makes it permanently unrecoverable; otherwise it's the raw master encryptor.
     maskVaultEncryptor: maskEncryptor,
     subjectKeys,
+    evalStore: opts.evalStore ?? new InMemoryEvalStore(),
+    evalRunner: opts.evalRunner,
+    rolloutPromoter: opts.rolloutPromoter,
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
     gatewayPublicUrl: opts.gatewayPublicUrl,
     onboardingSigningKey: opts.onboardingSigningKey,

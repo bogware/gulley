@@ -22,8 +22,10 @@
   },
   "dependencies": {
     "@gulley/auth": "workspace:*",
+    "@gulley/catalog": "workspace:*",
     "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",
+    "@gulley/cost": "workspace:*",
     "@gulley/egress": "workspace:*",
     "@gulley/http-edge": "workspace:*",
     "@gulley/crypto": "workspace:*",

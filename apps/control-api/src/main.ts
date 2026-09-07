@@ -5,11 +5,14 @@ import {
   KmsEnvelopeEncryptor,
   KmsSigner,
 } from '@gulley/crypto';
+import { loadCatalogFromFile } from '@gulley/catalog';
+import type { RateResolver } from '@gulley/cost';
 import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
 import { S3AuditMirror } from '@gulley/worm';
 import { type Anchor, HttpAnchor } from './anchor';
 import { buildSiemConnector, type SiemConnector } from './siem';
+import { type EvalRunner, GatewayEvalRunner } from './eval-runner';
 import { signCtxAttestation } from './audit-signing';
 import { type Config, loadConfig, outboundAllowlist, sessionSecrets } from './config';
 import {
@@ -101,6 +104,35 @@ function buildSiem(
     { allowlist: outboundAllowlist(config) },
   );
   return connector ? { connector, batchMax: config.SIEM_BATCH_MAX } : undefined;
+}
+
+/** Gateway-backed eval runner for the rollout controller. Present only when a gateway
+ *  URL + eval key are configured; the gateway host must be egress-allowlisted. With a
+ *  models catalog the cost scorer is priced, else cost is reported null. */
+function buildEvalRunner(config: Config, warn: (msg: string) => void): EvalRunner | undefined {
+  if (!config.EVAL_ROLLOUT_ENABLED) return undefined;
+  if (!config.EVAL_GATEWAY_URL || !config.EVAL_GATEWAY_KEY) {
+    warn(
+      'EVAL_ROLLOUT_ENABLED set but EVAL_GATEWAY_URL/EVAL_GATEWAY_KEY missing — rollout run disabled',
+    );
+    return undefined;
+  }
+  let rateResolver: RateResolver | undefined;
+  if (config.MODELS_CATALOG_FILE) {
+    try {
+      rateResolver = loadCatalogFromFile(config.MODELS_CATALOG_FILE).resolver();
+    } catch (err) {
+      warn(`failed to load MODELS_CATALOG_FILE for eval cost scoring: ${(err as Error).message}`);
+    }
+  }
+  return new GatewayEvalRunner({
+    gatewayUrl: config.EVAL_GATEWAY_URL,
+    apiKey: config.EVAL_GATEWAY_KEY,
+    allowlist: outboundAllowlist(config),
+    rateResolver,
+    timeoutMs: config.EVAL_TIMEOUT_MS,
+    defaultMaxTokens: config.EVAL_MAX_TOKENS,
+  });
 }
 
 /**
@@ -196,6 +228,8 @@ function buildContext(config: Config): ControlContext | undefined {
     // per-subject keys are held wrapped by the mask encryptor above = the customer CMK).
     // The context builds the PostgresSubjectKeyStore when a DB + mask encryptor are present.
     cryptoShredEnabled: config.CRYPTO_SHRED_ENABLED,
+    // Eval-in-the-loop rollout: a gateway-backed runner (offline golden-set gate).
+    evalRunner: buildEvalRunner(config, (m) => process.stderr.write(`${m}\n`)),
   });
 }
 

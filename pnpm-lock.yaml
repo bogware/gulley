@@ -38,12 +38,18 @@ importers:
       '@gulley/auth':
         specifier: workspace:*
         version: link:../../packages/auth
+      '@gulley/catalog':
+        specifier: workspace:*
+        version: link:../../packages/catalog
       '@gulley/config':
         specifier: workspace:*
         version: link:../../packages/config
       '@gulley/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@gulley/cost':
+        specifier: workspace:*
+        version: link:../../packages/cost
       '@gulley/crypto':
         specifier: workspace:*
         version: link:../../packages/crypto
