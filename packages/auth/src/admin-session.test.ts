@@ -102,4 +102,34 @@ describe('resolveAdmin (fail-closed, no fall-through)', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.reason).toBe('session-revoked');
   });
+
+  it('durable RBAC: unions persisted memberships into the session principal', async () => {
+    // Token carries only viewer@o1; the durable store grants owner@o2.
+    const token = signAdminSession(SECRET, claims({ sub: 'u1' }));
+    const r = await resolveAdmin(token, {
+      ...deps,
+      membershipLoader: async (subject) => {
+        expect(subject).toBe('u1');
+        return [{ role: 'owner', orgId: 'o2' }];
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // Effective memberships = token ∪ persisted (a persisted grant is not inert).
+      expect(r.value.memberships).toContainEqual({ role: 'viewer', orgId: 'o1' });
+      expect(r.value.memberships).toContainEqual({ role: 'owner', orgId: 'o2' });
+    }
+  });
+
+  it('fails closed to token memberships when the membership loader throws', async () => {
+    const token = signAdminSession(SECRET, claims({ sub: 'u1' }));
+    const r = await resolveAdmin(token, {
+      ...deps,
+      membershipLoader: async () => {
+        throw new Error('db down');
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.memberships).toEqual([{ role: 'viewer', orgId: 'o1' }]);
+  });
 });

@@ -22,8 +22,10 @@ import {
 import { and, asc, desc, eq, gte, inArray, isNotNull, lt, type SQL, sql } from 'drizzle-orm';
 import type { Database } from './db';
 import {
+  adminUser,
   auditLog,
   budget,
+  membership,
   rateLimit,
   requestLog,
   spendLedger,
@@ -166,6 +168,137 @@ export class PostgresKeyAdminStore {
       .where(eq(virtualKey.id, id))
       .returning({ id: virtualKey.id });
     return row ? { id: row.id, token: gen.token, keyPrefix: gen.keyPrefix } : undefined;
+  }
+}
+
+export interface AdminUserRow {
+  id: string;
+  subject: string;
+  displayName: string;
+  email: string | null;
+}
+
+export interface DurableMembershipRow {
+  id: string;
+  userId: string;
+  role: string;
+  orgId: string | null;
+  workspaceId: string | null;
+}
+
+/** Durable admin-user directory (the identities SCIM provisions and memberships
+ *  attach to). Distinct from data-plane virtual keys. */
+export class PostgresAdminUserStore {
+  constructor(private readonly db: Database) {}
+
+  /** Idempotent by subject (SCIM re-create / re-provision is a no-op update). */
+  async upsertBySubject(
+    subject: string,
+    displayName: string,
+    email?: string | null,
+  ): Promise<AdminUserRow> {
+    const [row] = await this.db
+      .insert(adminUser)
+      .values({ subject, displayName, email: email ?? null })
+      .onConflictDoUpdate({
+        target: adminUser.subject,
+        set: { displayName, email: email ?? null },
+      })
+      .returning();
+    return this.view(row!);
+  }
+
+  async getBySubject(subject: string): Promise<AdminUserRow | undefined> {
+    const rows = await this.db
+      .select()
+      .from(adminUser)
+      .where(eq(adminUser.subject, subject))
+      .limit(1);
+    return rows[0] ? this.view(rows[0]) : undefined;
+  }
+
+  async get(id: string): Promise<AdminUserRow | undefined> {
+    const rows = await this.db.select().from(adminUser).where(eq(adminUser.id, id)).limit(1);
+    return rows[0] ? this.view(rows[0]) : undefined;
+  }
+
+  async list(): Promise<AdminUserRow[]> {
+    const rows = await this.db.select().from(adminUser).orderBy(asc(adminUser.subject));
+    return rows.map((r) => this.view(r));
+  }
+
+  /** Cascades to the user's membership rows (FK onDelete cascade). */
+  async delete(id: string): Promise<boolean> {
+    const rows = await this.db
+      .delete(adminUser)
+      .where(eq(adminUser.id, id))
+      .returning({ id: adminUser.id });
+    return rows.length > 0;
+  }
+
+  private view(r: typeof adminUser.$inferSelect): AdminUserRow {
+    return { id: r.id, subject: r.subject, displayName: r.displayName, email: r.email };
+  }
+}
+
+/** Durable role grants. Unlike the in-memory MembershipStore, rows here are the
+ *  AUTHORITATIVE source for a session principal's effective memberships (loaded at
+ *  auth time via membershipsForSubject), so a grant/revoke takes effect immediately
+ *  rather than only when a token expires. */
+export class PostgresMembershipStore {
+  constructor(private readonly db: Database) {}
+
+  async create(
+    userId: string,
+    role: string,
+    orgId?: string | null,
+    workspaceId?: string | null,
+  ): Promise<DurableMembershipRow> {
+    const [row] = await this.db
+      .insert(membership)
+      .values({ userId, role, orgId: orgId ?? null, workspaceId: workspaceId ?? null })
+      .returning();
+    return this.view(row!);
+  }
+
+  async delete(id: string): Promise<boolean> {
+    const rows = await this.db
+      .delete(membership)
+      .where(eq(membership.id, id))
+      .returning({ id: membership.id });
+    return rows.length > 0;
+  }
+
+  async listByUser(userId: string): Promise<DurableMembershipRow[]> {
+    const rows = await this.db.select().from(membership).where(eq(membership.userId, userId));
+    return rows.map((r) => this.view(r));
+  }
+
+  /** Effective memberships for a subject (join admin_user), scoped-list style. */
+  async membershipsForSubject(subject: string): Promise<DurableMembershipRow[]> {
+    const rows = await this.db
+      .select({ m: membership })
+      .from(membership)
+      .innerJoin(adminUser, eq(membership.userId, adminUser.id))
+      .where(eq(adminUser.subject, subject));
+    return rows.map((r) => this.view(r.m));
+  }
+
+  /** All memberships whose org is visible to the caller (for the admin list route). */
+  async list(orgIds: readonly string[] | '*'): Promise<DurableMembershipRow[]> {
+    if (orgIds !== '*' && orgIds.length === 0) return [];
+    const rows =
+      orgIds === '*'
+        ? await this.db.select().from(membership)
+        : await this.db
+            .select()
+            .from(membership)
+            .where(inArray(membership.orgId, [...orgIds]));
+    return rows.map((r) => this.view(r));
+  }
+
+  private view(r: typeof membership.$inferSelect): DurableMembershipRow {
+    return { id: r.id, userId: r.userId, role: r.role, orgId: r.orgId, workspaceId: r.workspaceId };
   }
 }
 

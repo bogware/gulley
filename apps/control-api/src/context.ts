@@ -17,7 +17,9 @@ import {
   type Database,
   ledgerSpendTotals,
   newOriginId,
+  PostgresAdminUserStore,
   PostgresAuditSink,
+  PostgresMembershipStore,
   PostgresConfigStore,
   PostgresConfigVersionStore,
   PostgresKeyAdminStore,
@@ -45,7 +47,7 @@ import {
   verifyAuditChain,
 } from '@gulley/pipeline';
 import { InMemoryPromptRegistry, type PromptRegistry } from '@gulley/prompts';
-import { type AccessControl, InMemoryAccessControl } from '@gulley/rbac';
+import { type AccessControl, InMemoryAccessControl, isRole, type Membership } from '@gulley/rbac';
 import type { CollectionKind, KeyAdmin } from './domain';
 import { COLLECTION_KINDS } from './domain';
 import {
@@ -98,6 +100,11 @@ export interface ControlContext {
     workspaceIds?: string[];
   }) => Promise<ShadowSpendReport>;
   resolverDeps: AdminResolverDeps;
+  /** Durable admin-user directory (DB mode); absent = in-memory principal only. */
+  adminUsers?: PostgresAdminUserStore;
+  /** Durable role grants (DB mode) — authoritative for a session's effective
+   *  memberships (loaded via resolverDeps.membershipLoader). */
+  durableMemberships?: PostgresMembershipStore;
   /** Verify the underlying audit chain (the sink is guarded, so expose it). Async
    *  because the durable chain is read from Postgres when a DB is present. */
   verifyAudit: () => Promise<{ verified: boolean; count: number }>;
@@ -195,6 +202,26 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   const keyStore = new InMemoryKeyStore();
   const sessionStore = new InMemoryAdminSessionStore();
 
+  // Durable RBAC (DB mode): the admin-user directory + role grants persisted in
+  // Postgres. Unlike the in-memory MembershipStore (a write-only ledger), these rows
+  // are AUTHORITATIVE — loaded into a session principal at auth time via
+  // membershipLoader, so a grant/revoke is effective immediately.
+  const adminUsers = db ? new PostgresAdminUserStore(db) : undefined;
+  const durableMemberships = db ? new PostgresMembershipStore(db) : undefined;
+  const membershipLoader = durableMemberships
+    ? async (subject: string): Promise<Membership[]> => {
+        const rows = await durableMemberships.membershipsForSubject(subject);
+        return rows
+          .filter((r) => isRole(r.role))
+          .map((r) => ({
+            role: r.role as Membership['role'],
+            // A persisted NULL org is a platform grant (covers all orgs).
+            orgId: r.orgId ?? '*',
+            workspaceId: r.workspaceId,
+          }));
+      }
+    : undefined;
+
   const collections = Object.fromEntries(
     COLLECTION_KINDS.map((k) => [k, new ScopedCollection()]),
   ) as Record<CollectionKind, ScopedCollection>;
@@ -265,7 +292,10 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
       sessionSecrets: opts.sessionSecrets,
       sessionStore,
       maxSessionTtlMs: opts.maxSessionTtlMs,
+      membershipLoader,
     },
+    adminUsers,
+    durableMemberships,
     // Verify the durable chain when a DB is present (the same rows attestation
     // reads), else the in-memory sink — so a DB-backed deploy no longer reports the
     // empty in-memory chain while admin/PII-reveal audits land in Postgres.

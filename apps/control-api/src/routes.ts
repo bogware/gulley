@@ -235,15 +235,39 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     '/memberships',
     adminRoute(ctx, async (request, reply, admin) => {
       const b = body(request);
+      // Durable RBAC (DB mode) grants by SUBJECT (the identity a session carries) —
+      // the admin_user is upserted so the grant is effective at the subject's next
+      // auth. The in-memory path keeps the legacy opaque `userId`. Either way the
+      // grant requires membership:create, owner needs grant_owner, and no role may
+      // exceed the granter's rank at the scope (anti-amplification).
+      const subject = str(b['subject']);
       const userId = str(b['userId']);
       const role = b['role'];
       const orgId = str(b['orgId']);
       const workspaceId = str(b['workspaceId']) ?? null;
-      if (!userId || !isRole(role) || !orgId) return invalid(reply, 'userId, role, orgId required');
+      if (!isRole(role) || !orgId) return invalid(reply, 'role, orgId required');
       const at = { orgId, workspaceId };
       if (!can(admin, 'membership:create', at)) return forbidden(reply);
       if (role === 'owner' && !can(admin, 'membership:grant_owner', at)) return forbidden(reply);
       if (roleRank[role] > maxRankAt(admin, at)) return forbidden(reply);
+
+      if (ctx.durableMemberships && ctx.adminUsers) {
+        const uid = subject
+          ? (await ctx.adminUsers.upsertBySubject(subject, str(b['displayName']) ?? subject)).id
+          : userId;
+        if (!uid) return invalid(reply, 'subject (or userId) required');
+        const created = await ctx.durableMemberships.create(uid, role, orgId, workspaceId);
+        await ctx.audit.append({
+          orgId,
+          actor: admin.subject,
+          action: 'membership.create',
+          target: subject ?? uid,
+          payload: { role, orgId, workspaceId, subject },
+        });
+        return reply.code(201).send({ membership: created });
+      }
+
+      if (!userId) return invalid(reply, 'userId required');
       const created = ctx.memberships.create({ userId, role, orgId, workspaceId });
       await ctx.audit.append({
         orgId,
@@ -253,6 +277,41 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         payload: { role, orgId, workspaceId },
       });
       return reply.code(201).send({ membership: created });
+    }),
+  );
+  // List role grants visible to the caller (durable in DB mode, else the in-memory
+  // ledger). A membership row is now authoritative for authz, so listing it matters.
+  app.get(
+    '/memberships',
+    adminRoute(ctx, async (_request, reply, admin) => {
+      const orgIds = coveredOrgIds(admin);
+      const memberships = ctx.durableMemberships
+        ? await ctx.durableMemberships.list(orgIds)
+        : ctx.memberships.list(orgIds);
+      return reply.send({ memberships });
+    }),
+  );
+  // Revoke a durable role grant (DB mode) — effective at the subject's next request
+  // (membershipLoader stops returning it), not only on token expiry.
+  app.delete(
+    '/memberships/:id',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!ctx.durableMemberships) {
+        return reply.code(501).send({
+          error: { type: 'not_supported', message: 'durable memberships require a database' },
+        });
+      }
+      if (!can(admin, 'membership:delete', {})) return forbidden(reply);
+      const id = paramId(request);
+      const ok = await ctx.durableMemberships.delete(id);
+      if (!ok) return notFound(reply, 'membership');
+      await ctx.audit.append({
+        actor: admin.subject,
+        action: 'membership.delete',
+        target: id,
+        payload: {},
+      });
+      return reply.send({ deleted: true });
     }),
   );
 

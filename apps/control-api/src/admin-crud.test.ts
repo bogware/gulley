@@ -177,3 +177,21 @@ describe('generated client config', () => {
     }
   });
 });
+
+describe('memberships (durable RBAC surface)', () => {
+  it('grants (in-memory ledger), lists, and 501s a durable delete without a DB', async () => {
+    const created = await post('/memberships', { userId: 'u-123', role: 'editor', orgId });
+    expect(created.statusCode).toBe(201);
+    const list = await app.inject({ method: 'GET', url: '/memberships', headers: authNoBody() });
+    expect(list.statusCode).toBe(200);
+    const ms = (list.json() as { memberships: Array<{ role: string }> }).memberships;
+    expect(ms.some((m) => m.role === 'editor')).toBe(true);
+    // Durable revoke needs a database; the in-memory path 501s (never a silent no-op).
+    const del = await app.inject({
+      method: 'DELETE',
+      url: '/memberships/some-id',
+      headers: authNoBody(),
+    });
+    expect(del.statusCode).toBe(501);
+  });
+});
