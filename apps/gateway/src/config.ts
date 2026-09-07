@@ -88,6 +88,16 @@ const Env = z.object({
   // CEL transformation — JSON { requestHeaders?, responseHeaders?, requestBody? }.
   // Each header/body value is a CEL expression over { request, principal }.
   CEL_TRANSFORM: z.string().optional(),
+  // LLM-leg tool-call intent governance (no MCP proxy) — a JSON array of CEL rules
+  // (same shape as CEL_AUTHZ) evaluated against each tool call the MODEL requests in
+  // its response, over { tool: { name, input }, model, provider, principal }. Deny-
+  // first: a matching deny (or a failed allow-list) withholds the whole response
+  // fail-closed, so an out-of-policy tool call never reaches the client's executor.
+  // Governs BOTH streamed and non-streamed responses (a streamed response is buffered
+  // and its tool calls reassembled from the SSE, so `stream:true` cannot bypass it) —
+  // buffering trades streaming latency for governance on tool-policy deployments.
+  // e.g. [{"effect":"deny","expr":"tool.name==\"shell\" && tool.input.command.contains(\"rm -rf\")"}]
+  TOOL_POLICY: z.string().optional(),
 
   // External authorization hook — delegate allow/deny to an operator HTTP policy
   // service (the { request, principal } activation is POSTed; { allow, reason }

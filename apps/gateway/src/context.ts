@@ -49,6 +49,7 @@ import type { JwtAuthConfig } from './jwt-auth';
 import { applyRouteGroups, parseRouteGroups } from './route-groups';
 import { buildSecretResolver } from './secrets';
 import { DbTenantCredentialResolver } from './tenant';
+import { parseToolPolicy } from './tool-governance';
 import { RequestTracer } from './tracer';
 import {
   AzureContentSafetyPlugin,
@@ -602,6 +603,10 @@ export function createProductionContext(config: Config): GatewayContext {
     authorizer = new CelAuthorizer(rules, { declaredVars: ['request', 'principal'] });
   }
 
+  // LLM-leg tool-call governance policy (parsed + compiled here so a bad rule fails
+  // boot, never silently disables governance).
+  const toolPolicy = parseToolPolicy(config.TOOL_POLICY);
+
   let transformer: CelTransformer | undefined;
   if (config.CEL_TRANSFORM) {
     let cfg: CelTransformConfig;
@@ -844,6 +849,7 @@ export function createProductionContext(config: Config): GatewayContext {
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,
+    toolPolicy,
     externalAuthorizer,
     externalAuthzSendBody: config.EXTERNAL_AUTHZ_SEND_BODY,
     transformer,

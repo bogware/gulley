@@ -28,6 +28,12 @@ import {
   type TokenVault,
 } from '@gulley/guardrails';
 import type { CelAuthorizer, CelTransformer, ExternalAuthorizer, HeaderChanges } from '@gulley/cel';
+import {
+  extractToolCalls,
+  extractToolCallsFromSse,
+  governToolCalls,
+  type ToolCall,
+} from '../tool-governance';
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
@@ -165,6 +171,9 @@ export interface GatewayContext {
   retryBackoffMs?: number;
   /** CEL authorization rules; absent = scope-based authz only. */
   authorizer?: CelAuthorizer;
+  /** LLM-leg tool-call intent governance (CEL over the model's tool calls); absent =
+   *  tool calls are not governed. Deny withholds the response (non-streamed only). */
+  toolPolicy?: CelAuthorizer;
   /** External policy-service authorization hook (cached); absent = none. */
   externalAuthorizer?: ExternalAuthorizer;
   /** Include the request body in the payload sent to the external policy service.
@@ -1380,7 +1389,14 @@ async function handleProxy(
   // enforcement on the routes that ask for it.
   const holdStreamed =
     streamed && outputEnforcing && route.holdStreamedOutput === true && statusCode < 400;
-  const bufferOutput = (outputEnforcing && !streamed && statusCode < 400) || holdStreamed;
+  // LLM-leg tool-call governance: evaluate the model's tool calls against the CEL
+  // policy — on BOTH streamed and non-streamed responses (a streamed response is
+  // buffered and its tool calls reassembled from the SSE, so `stream:true` can't
+  // bypass governance). Buffering is required so a denied call withholds the whole
+  // response fail-closed before any byte reaches the client's executor.
+  const toolGovern = ctx.toolPolicy !== undefined && statusCode < 400;
+  const bufferOutput =
+    (outputEnforcing && !streamed && statusCode < 400) || holdStreamed || toolGovern;
 
   // M17: windowed in-stream output enforcement (opt-in) — redacts matched spans,
   // reversibly masks, or blocks on the first violation via a delayed-emit window,
@@ -1406,7 +1422,12 @@ async function handleProxy(
     outputEnforcing &&
     // Global toggle (M17) OR a per-route/per-workspace opt-in (DLP default-on).
     (ctx.streamEnforce === true || route.streamEnforce === true) &&
-    !holdStreamed &&
+    // Windowed in-stream enforcement is impossible once the body is buffered (its
+    // bytes are held, not streamed), so it is OFF whenever the response is buffered
+    // — hold-then-flush (holdStreamed) OR a tool policy forcing a buffer. In those
+    // cases the buffered-streamed branch enforces the output policy on the whole
+    // body instead (see onUpstreamEnd), so enforcement is preserved, not dropped.
+    !bufferOutput &&
     statusCode < 400 &&
     (anthropicClient || openaiChatClient || responsesClient);
   const redactor =
@@ -1449,6 +1470,11 @@ async function handleProxy(
   let fullBytes = 0;
   let captureOverflow = false;
   let outputEnforced: OutputInspection | undefined;
+  // Tool-call governance state (set in onUpstreamEnd, read in teardown for the
+  // cache-store gate + telemetry): whether the response carried any tool call, and
+  // the first policy-denied call if governance withheld the response.
+  let responseHasToolCalls = false;
+  let toolBlocked: { call: ToolCall; reason: string } | undefined;
 
   const teardown = async (): Promise<void> => {
     if (settled) return;
@@ -1659,6 +1685,16 @@ async function handleProxy(
       if (
         cacheableMiss &&
         enforcementCacheSafe &&
+        // Never cache a governed response that carries a tool call: a cache HIT is
+        // served without re-running tool-call governance, so caching it would let a
+        // later request replay an ungoverned (or now-out-of-policy) tool call.
+        !(toolGovern && responseHasToolCalls) &&
+        // Never cache a WITHHELD body (guardrail block, tool-policy block, or an
+        // ungovernable/undecodable response arm A withheld). enforcementCacheSafe
+        // short-circuits to true when no output engine enforces, so this independent
+        // guard is what stops a withheld tool-govern response from being cached and
+        // then replayed to a byte-identical request that the direct path would deny.
+        outputEnforced?.blocked !== true &&
         ctx.cache &&
         cacheReq &&
         cacheLookup &&
@@ -1950,8 +1986,44 @@ async function handleProxy(
       try {
         await onUpstreamEnd();
       } catch (err) {
+        // Output finalization threw (e.g. an output-guardrail plugin or a tool-policy
+        // CEL eval rejected). In BUFFERED mode no arm reached its writeHead, so a bare
+        // end() here would flush Node's default 200 with an empty body — a fail-OPEN
+        // that hides a dropped enforcement AND records the request as a success. Fail
+        // CLOSED: emit an error status + provider-shaped body, and mark the request an
+        // error so teardown does not log it as 'ok'.
         request.log.error({ err }, 'output finalization failed');
-        if (!reply.raw.writableEnded) reply.raw.end();
+        if (!reply.raw.writableEnded) {
+          if (!reply.raw.headersSent) {
+            status = 'error';
+            statusCode = 502;
+            try {
+              reply.raw.writeHead(
+                502,
+                finalizeResp({
+                  ...rlHeaders,
+                  'content-type': streamed ? 'text/event-stream' : 'application/json',
+                  'x-gulley-request-id': requestId,
+                  'x-gulley-target': servedTarget.name,
+                  'x-gulley-cache': 'bypass',
+                }),
+              );
+              reply.raw.write(
+                streamed
+                  ? providerErrorFrame(clientDialect, 'output finalization failed')
+                  : Buffer.from(
+                      JSON.stringify({
+                        type: 'error',
+                        error: { type: 'api_error', message: 'output finalization failed' },
+                      }),
+                    ),
+              );
+            } catch {
+              /* client already gone */
+            }
+          }
+          reply.raw.end();
+        }
       } finally {
         await teardown();
       }
@@ -1963,6 +2035,10 @@ async function handleProxy(
     const tail = decoder ? decoder.end() : '';
     if (tail && outScanner) outScanner.push(tail);
 
+    // Reassemble the model's tool calls for governance: from the buffered SSE on a
+    // streamed response, or from the parsed JSON on a non-streamed one. Either way
+    // the response is still metered below (the provider generated + billed it).
+    let toolCalls: ToolCall[] | undefined;
     if (streamed) {
       try {
         if (tail) usage.ingestSse(parserSse.push(tail));
@@ -1970,15 +2046,98 @@ async function handleProxy(
       } catch {
         /* best-effort */
       }
+      if (toolGovern && !captureOverflow && fullBytes > 0) {
+        toolCalls = extractToolCallsFromSse(
+          Buffer.concat(fullChunks).toString('utf8'),
+          clientDialect,
+        );
+      }
     } else if (fullBytes > 0 && !captureOverflow) {
       try {
-        usage.ingestJson(JSON.parse(Buffer.concat(fullChunks).toString('utf8')));
+        const parsedResp = JSON.parse(Buffer.concat(fullChunks).toString('utf8')) as Record<
+          string,
+          unknown
+        >;
+        usage.ingestJson(parsedResp);
+        if (toolGovern) toolCalls = extractToolCalls(parsedResp);
       } catch {
         /* unparseable body — still forwarded verbatim */
       }
     }
 
-    if (bufferOutput && engine && captureOverflow) {
+    // Govern the reassembled/parsed tool calls (streamed + non-streamed share this).
+    if (toolGovern && ctx.toolPolicy && toolCalls) {
+      responseHasToolCalls = toolCalls.length > 0;
+      if (responseHasToolCalls) {
+        const gov = governToolCalls(ctx.toolPolicy, toolCalls, {
+          model: usage.normalized().model ?? requestedModel,
+          provider,
+          principal: {
+            id: principal.id,
+            orgId: principal.scope.orgId,
+            workspaceId: principal.scope.workspaceId,
+          },
+        });
+        if (gov.denied) toolBlocked = gov.denied;
+      }
+    }
+    // Fail CLOSED whenever a tool-governed response could NOT be governed: it
+    // overflowed the buffer (never fully captured), or it carries an undecodable
+    // content-encoding (fullChunks holds compressed bytes, so tool-call extraction
+    // sees garbage and finds nothing). Either way a tool_use could reach the executor
+    // ungoverned, so withhold rather than forward it.
+    const toolGovernUngovernable =
+      toolGovern && (captureOverflow || passthroughEncoding !== undefined);
+
+    if (toolBlocked || toolGovernUngovernable) {
+      // Withhold the WHOLE response fail-closed (a partial-strip could still leak an
+      // unsafe call), audit it, and return a provider-shaped error in the CLIENT's
+      // dialect (SSE frame for a streamed request, JSON otherwise). Headers were
+      // deferred (bufferOutput), so we write them here exactly once.
+      outputEnforced = {
+        findings: [],
+        summary: { total: 0, categories: {}, maxConfidence: 0 },
+        blocked: true,
+      };
+      const ungovernableReason = captureOverflow ? 'buffer-overflow' : 'undecodable-encoding';
+      const message = toolBlocked
+        ? `tool call '${toolBlocked.call.name}' denied by policy`
+        : 'response could not be governed for tool calls';
+      try {
+        await ctx.audit.append({
+          orgId: principal.scope.orgId,
+          actor: principal.id,
+          action: 'tool_policy.blocked',
+          target: servedTarget.name,
+          payload: toolBlocked
+            ? { tool: toolBlocked.call.name, reason: toolBlocked.reason }
+            : { reason: ungovernableReason },
+        });
+      } catch (err) {
+        request.log.error({ err }, 'tool_policy audit append failed');
+      }
+      const bodyOut = streamed
+        ? Buffer.from(providerErrorFrame(clientDialect, message), 'utf8')
+        : Buffer.from(
+            JSON.stringify({ type: 'error', error: { type: 'tool_policy_blocked', message } }),
+          );
+      if (!reply.raw.writableEnded) {
+        reply.raw.writeHead(
+          statusCode,
+          finalizeResp({
+            ...filterResponseHeaders(upstreamHeaders),
+            ...rlHeaders,
+            'content-type': streamed ? 'text/event-stream' : 'application/json',
+            'x-gulley-request-id': requestId,
+            'x-gulley-target': servedTarget.name,
+            'x-gulley-cache': 'bypass',
+            'x-gulley-tool-policy': 'blocked',
+          }),
+        );
+        reply.raw.write(bodyOut);
+        reply.raw.end();
+      }
+    } else if (bufferOutput && engine && captureOverflow) {
       // The response outgrew the buffer limit, so the guardrail could not inspect
       // the whole body (and the raw bytes were not streamed through). Fail closed:
       // withhold rather than forward a truncated, unenforced response.
@@ -2016,11 +2175,15 @@ async function handleProxy(
         reply.raw.write(bodyOut);
         reply.raw.end();
       }
-    } else if (bufferOutput && engine && holdStreamed) {
-      // Streamed hold-then-flush: enforce on the whole SSE body. Because we can't
-      // re-encode a redaction into SSE frames, any enforcing verdict (block OR
-      // would-redact) WITHHOLDS the response (a terminal error frame); otherwise
-      // flush the buffered SSE, detokenized.
+    } else if (bufferOutput && engine && streamed) {
+      // Buffered STREAMED response with a guardrail engine — hold-then-flush enforce
+      // on the whole SSE body. Reached by an opt-in hold-then-flush route AND by a
+      // tool policy forcing a buffer while STREAMING_ENFORCE was configured (windowed
+      // in-stream enforcement is impossible once buffered, so the output policy is
+      // enforced here instead, never silently dropped). Because we can't re-encode a
+      // redaction into SSE frames, any enforcing verdict (block OR would-redact)
+      // WITHHOLDS the response (a terminal error frame); an audit-only policy records
+      // findings and flushes the buffered SSE, detokenized.
       const text = Buffer.concat(fullChunks).toString('utf8');
       const out = await engine.inspectOutput(text);
       outputEnforced = out;
@@ -2046,9 +2209,17 @@ async function handleProxy(
         reply.raw.write(bodyOut);
         reply.raw.end();
       }
-    } else if (bufferOutput && engine) {
-      // Enforce the output policy on the whole (non-streamed) body, then write.
-      const text = Buffer.concat(fullChunks).toString('utf8');
+    } else if (bufferOutput && engine && !streamed) {
+      // Reverse the input mask FIRST (restore the client's own values the model
+      // echoed back), THEN enforce the output policy on the real text — mirroring the
+      // streaming-enforce transform's order (detok → enforce). Detokenizing AFTER an
+      // output mask would be unsafe: input and output vaults mint tokens from the
+      // same `<<GULLEY_CAT_n>>` namespace + counter, so a post-mask detok could
+      // rewrite an OUTPUT placeholder to an INPUT original (defeating the output mask
+      // and leaking cross-direction). Detok-before makes inspectOutput mask the real
+      // values with its own fresh tokens, with no collision.
+      const raw = Buffer.concat(fullChunks).toString('utf8');
+      const text = detok ? detok.push(raw) + detok.flush() : raw;
       const out = await engine.inspectOutput(text);
       outputEnforced = out;
       const bodyOut = out.blocked
@@ -2079,6 +2250,32 @@ async function handleProxy(
         reply.raw.write(bodyOut);
         reply.raw.end();
       }
+    } else if (bufferOutput) {
+      // Buffered with NO guardrail engine — the buffer was forced by tool-call
+      // governance and the calls were allowed. (Any engine-bearing buffered response,
+      // streamed or not, is handled by the enforcing branches above.) The bytes were
+      // held (bufferOutput short-circuits the raw pipe), so write the whole body
+      // through now — detokenizing a masked-input stream. Headers were deferred;
+      // preserve an undecodable passthrough encoding.
+      const buffered = Buffer.concat(fullChunks);
+      const bodyOut = detok
+        ? Buffer.from(detok.push(buffered.toString('utf8')) + detok.flush(), 'utf8')
+        : buffered;
+      if (!reply.raw.writableEnded) {
+        reply.raw.writeHead(
+          statusCode,
+          finalizeResp({
+            ...filterResponseHeaders(upstreamHeaders),
+            ...rlHeaders,
+            ...(passthroughEncoding ? { 'content-encoding': passthroughEncoding } : {}),
+            'x-gulley-request-id': requestId,
+            'x-gulley-target': servedTarget.name,
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
+          }),
+        );
+        reply.raw.write(bodyOut);
+        reply.raw.end();
+      }
     } else {
       // Flush the streaming transform's held tail (the windowed enforcer, else the
       // detokenizer) so no bytes are lost at stream end.
@@ -2093,10 +2290,40 @@ async function handleProxy(
     status = controller.signal.aborted ? 'aborted' : 'error';
     request.log.error({ err }, 'upstream stream error');
     if (!reply.raw.writableEnded) {
-      // A raw pipe that just ends mid-stream leaves the client with a truncated,
-      // unparseable response. If we're streaming and the client is still here,
-      // emit a clean provider-shaped terminal error event before closing.
-      if (streamed && !controller.signal.aborted) {
+      if (!reply.raw.headersSent) {
+        // Buffered mode (headers were NOT flushed eagerly, and onUpstreamEnd never
+        // runs on the error path): a mid-stream upstream failure must not surface as
+        // an implicit 200. Send an error status + a provider-shaped error body — no
+        // bytes reached the client yet, so this cannot corrupt a partial response.
+        const code = statusCode >= 400 ? statusCode : 502;
+        try {
+          reply.raw.writeHead(
+            code,
+            finalizeResp({
+              ...rlHeaders,
+              'content-type': streamed ? 'text/event-stream' : 'application/json',
+              'x-gulley-request-id': requestId,
+              'x-gulley-target': servedTarget.name,
+              'x-gulley-cache': 'bypass',
+            }),
+          );
+          reply.raw.write(
+            streamed
+              ? providerErrorFrame(clientDialect, 'upstream stream error')
+              : Buffer.from(
+                  JSON.stringify({
+                    type: 'error',
+                    error: { type: 'api_error', message: 'upstream stream error' },
+                  }),
+                ),
+          );
+        } catch {
+          /* client already gone */
+        }
+      } else if (streamed && !controller.signal.aborted) {
+        // Non-buffered stream: headers (200) already flushed and bytes may have been
+        // sent, so we can only append a clean terminal error frame before closing —
+        // never a fresh body (that would corrupt the partial response).
         try {
           reply.raw.write(providerErrorFrame(clientDialect, 'upstream stream error'));
         } catch {

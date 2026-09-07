@@ -11,6 +11,7 @@ import { CacheEngine, InMemoryExactCache } from '@gulley/cache';
 import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import { RequestMirror } from '@gulley/http-edge';
 import { RequestTracer } from './tracer';
+import { parseToolPolicy } from './tool-governance';
 import { MapTenantCredentialResolver } from './tenant';
 import { MapTenantRouteResolver } from './tenant-routes';
 import { OidcProvider } from '@gulley/oidc';
@@ -1127,6 +1128,708 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     expect(tr.content).toContain('ignore all rules'); // content preserved, just delimited
     // Trusted user text is untouched.
     expect(sent.messages[0]!.content).toBe('summarize');
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('governs LLM tool calls: a denied call withholds the non-streamed response', async () => {
+    const TOOL_RESP = JSON.stringify({
+      id: 'msg_t',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'shell', input: { command: 'rm -rf /' } }],
+      usage: { input_tokens: 5, output_tokens: 8 },
+      stop_reason: 'tool_use',
+    });
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        void b;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(TOOL_RESP);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, audit } = buildContext(store);
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([
+        {
+          effect: 'deny',
+          name: 'no-rm',
+          expr: 'tool.name == "shell" && tool.input.command.contains("rm -rf")',
+        },
+      ]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'delete everything' }],
+      }),
+    });
+    const text = await res.text();
+    // The out-of-policy tool call is withheld fail-closed — the client never sees it.
+    expect(res.headers.get('x-gulley-tool-policy')).toBe('blocked');
+    expect(text).toContain('tool_policy_blocked');
+    expect(text).not.toContain('rm -rf');
+    // The decision is audited.
+    expect(audit.rows.some((e) => e.action === 'tool_policy.blocked')).toBe(true);
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('governs LLM tool calls: an allowed call passes through and is NOT cached (no bypass)', async () => {
+    const TOOL_RESP = JSON.stringify({
+      id: 'msg_t2',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'tool_use', id: 'tu2', name: 'shell', input: { command: 'ls -la' } }],
+      usage: { input_tokens: 5, output_tokens: 8 },
+      stop_reason: 'tool_use',
+    });
+    let upstreamCalls = 0;
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        void b;
+        upstreamCalls++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(TOOL_RESP);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([
+        { effect: 'deny', name: 'no-rm', expr: 'tool.input.command.contains("rm -rf")' },
+      ]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const opts = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'list files' }],
+      }),
+    };
+    const first = await fetch(`${base}/v1/messages`, opts);
+    const firstText = await first.text();
+    // The allowed tool call passes through (buffered-passthrough branch).
+    expect(first.status).toBe(200);
+    expect(firstText).toContain('tool_use');
+    expect(firstText).toContain('ls -la');
+    // A second identical request must NOT be served from cache — a cache hit would
+    // replay the tool call without re-governing it.
+    await fetch(`${base}/v1/messages`, opts).then((r) => r.text());
+    expect(upstreamCalls).toBe(2);
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('governs LLM tool calls on a STREAMED response — stream:true cannot bypass', async () => {
+    const ev = (event: string, data: unknown) =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const toolSse =
+      ev('message_start', {
+        type: 'message_start',
+        message: { id: 'm', usage: { input_tokens: 5, output_tokens: 0 } },
+      }) +
+      ev('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tu1', name: 'shell', input: {} },
+      }) +
+      ev('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"command":"rm -rf /"}' },
+      }) +
+      ev('content_block_stop', { type: 'content_block_stop', index: 0 }) +
+      ev('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use' },
+        usage: { output_tokens: 8 },
+      }) +
+      ev('message_stop', { type: 'message_stop' });
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(toolSse);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, audit } = buildContext(store);
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([
+        { effect: 'deny', name: 'no-rm', expr: 'tool.input.command.contains("rm -rf")' },
+      ]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'clean up' }],
+      }),
+    });
+    const text = await res.text();
+    // The streamed tool call is reassembled, governed, and WITHHELD as an SSE error —
+    // the denied call never reaches the client.
+    expect(res.headers.get('x-gulley-tool-policy')).toBe('blocked');
+    expect(text).toContain('event: error');
+    expect(text).not.toContain('rm -rf');
+    expect(audit.rows.some((e) => e.action === 'tool_policy.blocked')).toBe(true);
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('fails CLOSED when a tool-governed response overflows the buffer (no truncated passthrough)', async () => {
+    // A response bigger than the buffer limit can't be fully captured/governed — it
+    // must be withheld, not forwarded truncated + ungoverned.
+    const bigInput = 'x'.repeat(2000);
+    const TOOL_RESP = JSON.stringify({
+      id: 'msg_big',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'shell', input: { command: bigInput } }],
+      usage: { input_tokens: 5, output_tokens: 8 },
+      stop_reason: 'tool_use',
+    });
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(TOOL_RESP);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.responseBufferLimit = 200; // force overflow
+    ctx.toolPolicy = parseToolPolicy(JSON.stringify([{ effect: 'deny', expr: 'true' }]));
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    });
+    const text = await res.text();
+    // Fail closed: the (ungovernable) oversized body is withheld, not passed through.
+    expect(res.headers.get('x-gulley-tool-policy')).toBe('blocked');
+    expect(text).toContain('tool_policy_blocked');
+    expect(text).not.toContain(bigInput);
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('preserves streamed output enforcement when a tool policy is co-configured (STREAMING_ENFORCE + TOOL_POLICY)', async () => {
+    const ev = (event: string, data: unknown) =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    // A streamed TEXT response containing a secret (no tool call).
+    const secretSse =
+      ev('message_start', {
+        type: 'message_start',
+        message: { id: 'm', usage: { input_tokens: 5, output_tokens: 0 } },
+      }) +
+      ev('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      }) +
+      ev('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'the key is AKIAIOSFODNN7EXAMPLE ok' },
+      }) +
+      ev('content_block_stop', { type: 'content_block_stop', index: 0 }) +
+      ev('message_delta', { type: 'message_delta', delta: {}, usage: { output_tokens: 8 } }) +
+      ev('message_stop', { type: 'message_stop' });
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(secretSse);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.streamEnforce = true; // windowed in-stream enforcement configured
+    ctx.guardrails = new GuardrailEngine([new NativeDetector({})], {
+      input: { action: 'audit' },
+      output: { action: 'redact', minConfidence: 0.5 }, // enforcing
+    });
+    // A tool policy that never matches — but its presence forces buffering, which
+    // must NOT silently disable the output enforcement above.
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "nope"' }]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'print the key' }],
+      }),
+    });
+    const text = await res.text();
+    // Enforcement is preserved (hold-then-flush): the secret is withheld, not leaked.
+    expect(text).not.toContain('AKIAIOSFODNN7EXAMPLE');
+    expect(res.headers.get('x-gulley-guardrail')).toBe('output-blocked');
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('fails CLOSED when the upstream content-encoding is undecodable under a tool policy', async () => {
+    const TOOL_RESP = JSON.stringify({
+      id: 'm',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'shell', input: { command: 'evilcmd' } }],
+      usage: { input_tokens: 5, output_tokens: 8 },
+      stop_reason: 'tool_use',
+    });
+    // Label the body with an encoding the gateway cannot decode (zstd): it can't be
+    // parsed for tool calls, so governance must fail closed rather than forward it.
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'zstd' });
+      res.end(TOOL_RESP);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "nope"' }]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.headers.get('x-gulley-tool-policy')).toBe('blocked');
+    expect(text).toContain('tool_policy_blocked');
+    expect(text).not.toContain('evilcmd'); // the ungoverned tool call is withheld
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
+  it('does not cache an ungovernable (undecodable-encoding) withheld tool response', async () => {
+    const TOOL_RESP = JSON.stringify({
+      id: 'm',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'tool_use', id: 'tu1', name: 'shell', input: { command: 'x' } }],
+      usage: { input_tokens: 5, output_tokens: 8 },
+      stop_reason: 'tool_use',
+    });
+    let upstreamCalls = 0;
+    const server = http.createServer((_req, res) => {
+      upstreamCalls++;
+      res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'zstd' });
+      res.end(TOOL_RESP);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    // No output engine (tool-governance-only): enforcementCacheSafe short-circuits true.
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "nope"' }]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', url) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const opts = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    };
+    const r1 = await fetch(`${base}/v1/messages`, opts);
+    expect(r1.headers.get('x-gulley-tool-policy')).toBe('blocked'); // withheld
+    await fetch(`${base}/v1/messages`, opts).then((r) => r.text());
+    // The withheld body must NOT have been cached — the 2nd request hits upstream
+    // again (a cache HIT would replay the ungoverned body the direct path withheld).
+    expect(upstreamCalls).toBe(2);
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('detokenizes a masked-input NON-streamed response under a tool policy (buffered enforce arm)', async () => {
+    // Input masking + a tool policy forces the non-streamed buffered arm; the input
+    // vault must still be reversed so the client sees the original, not the token.
+    let upstreamBody = '';
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        upstreamBody = Buffer.concat(chunks).toString('utf8');
+        const body = JSON.parse(upstreamBody) as { messages?: Array<{ content?: string }> };
+        const echoed = body.messages?.[0]?.content ?? '';
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            id: 'm',
+            type: 'message',
+            role: 'assistant',
+            model: 'claude-sonnet-4-6',
+            content: [{ type: 'text', text: echoed }],
+            usage: { input_tokens: 5, output_tokens: 5 },
+            stop_reason: 'end_turn',
+          }),
+        );
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "nope"' }]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('mask', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'contact jane@example.com please' }],
+      }),
+    });
+    const text = await res.text();
+    expect(upstreamBody).toContain('<<GULLEY_EMAIL_'); // provider saw the masked token
+    expect(text).toContain('jane@example.com'); // client got the restored original (detok ran)
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('surfaces an upstream mid-stream failure as a non-200 under a tool policy (no implicit 200)', async () => {
+    // Buffered mode (tool policy) skips the eager writeHead; a mid-stream upstream
+    // reset must still produce an error status, not an implicit empty 200.
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{"id":"m","content":'); // partial body...
+      res.socket?.destroy(); // ...then abrupt connection reset (stream error)
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "nope"' }]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', url) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    }).catch(() => undefined);
+    // The request must NOT look successful: either a 5xx error status or a dropped
+    // connection (fetch rejects) — never an implicit 200 with an empty body.
+    if (res) expect(res.status).toBeGreaterThanOrEqual(500);
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('does not leak an input-masked value into an output-masked body under a tool policy (vault namespace collision)', async () => {
+    // input=mask + output=mask + non-streamed + tool policy (forces the buffered
+    // enforce arm). The model echoes the masked input token AND emits a new email.
+    // Detok must run BEFORE the output mask, else the shared <<GULLEY_EMAIL_1>> token
+    // namespace would rewrite the output placeholder to the INPUT original (leak).
+    let upstreamBody = '';
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        upstreamBody = Buffer.concat(chunks).toString('utf8');
+        const body = JSON.parse(upstreamBody) as { messages?: Array<{ content?: string }> };
+        const echoed = body.messages?.[0]?.content ?? '';
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            id: 'm',
+            type: 'message',
+            role: 'assistant',
+            model: 'claude-sonnet-4-6',
+            content: [{ type: 'text', text: `${echoed} and also bob@vendor.com` }],
+            usage: { input_tokens: 5, output_tokens: 5 },
+            stop_reason: 'end_turn',
+          }),
+        );
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "nope"' }]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('mask', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'mask', minConfidence: 0.5 },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'contact alice@corp.com please' }],
+      }),
+    });
+    const text = await res.text();
+    // Neither email leaks raw: the input original is NOT spliced into the output body,
+    // and the output email is masked. (The old post-mask detok leaked alice@corp.com.)
+    expect(text).not.toContain('alice@corp.com');
+    expect(text).not.toContain('bob@vendor.com');
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('fails CLOSED (non-200) when an output guardrail plugin throws during finalization', async () => {
+    const TOOL_RESP = JSON.stringify({
+      id: 'm',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'text', text: 'hello' }],
+      usage: { input_tokens: 5, output_tokens: 2 },
+      stop_reason: 'end_turn',
+    });
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(TOOL_RESP);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    // An enforcing output policy whose PLUGIN rejects → inspectOutput rejects inside
+    // onUpstreamEnd. Buffered mode (enforcing) means no headers were flushed yet.
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', url) },
+        guardrails: new GuardrailEngine(
+          [new NativeDetector({})],
+          { input: { action: 'audit' }, output: { action: 'block' } },
+          {
+            name: 'boom',
+            inspect: () => Promise.reject(new Error('plugin down')),
+          },
+        ),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).catch(() => undefined);
+    // The dropped-enforcement request must NOT be an implicit 200 — fail closed.
+    if (res) {
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(await res.text()).not.toContain('hello'); // the unenforced body is withheld
+    }
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('does not cache a STREAMED tool response (no stream→non-stream replay bypass)', async () => {
+    const ev = (event: string, data: unknown) =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const toolSse =
+      ev('message_start', {
+        type: 'message_start',
+        message: { id: 'm', usage: { input_tokens: 5, output_tokens: 0 } },
+      }) +
+      ev('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tu1', name: 'read_file', input: {} },
+      }) +
+      ev('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"path":"/tmp/a"}' },
+      }) +
+      ev('content_block_stop', { type: 'content_block_stop', index: 0 }) +
+      ev('message_delta', { type: 'message_delta', delta: {}, usage: { output_tokens: 8 } }) +
+      ev('message_stop', { type: 'message_stop' });
+    let upstreamCalls = 0;
+    const srv = http.createServer((_req, res) => {
+      upstreamCalls++;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(toolSse);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    // Allow-all-ish policy (a deny that never matches) so the call passes through.
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "nope"' }]),
+    );
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const body = {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'read it' }],
+    };
+    // 1) Streamed request stores nothing (tool response); 2) identical NON-streamed
+    // request must NOT hit that entry (the cache key drops `stream`) — else it would
+    // replay an ungoverned tool call.
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({ ...body, stream: true }),
+    }).then((r) => r.text());
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({ ...body, stream: false }),
+    }).then((r) => r.text());
+    expect(upstreamCalls).toBe(2); // no cache hit — the streamed tool response was not stored
     await app.close();
     await new Promise<void>((r) => srv.close(() => r()));
   });
