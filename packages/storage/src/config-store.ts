@@ -323,4 +323,21 @@ export class PostgresConfigVersionStore implements ConfigVersionStore {
       auditSeq: rec.auditSeq,
     });
   }
+
+  async history(limit: number): Promise<ConfigVersionRecord[]> {
+    const rows = await this.db
+      .select()
+      .from(configVersion)
+      .orderBy(sql`${configVersion.version} desc`)
+      .limit(limit);
+    return rows.map((row) => ({
+      version: row.version,
+      contentHash: row.contentHash,
+      yaml: row.yaml,
+      actor: row.actor,
+      summary: row.summary as ConfigVersionRecord['summary'],
+      auditSeq: Number(row.auditSeq),
+      createdAt: row.createdAt.toISOString(),
+    }));
+  }
 }

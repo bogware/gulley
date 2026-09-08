@@ -99,6 +99,17 @@ export class ProviderStore {
   get(id: string): Provider | undefined {
     return this.byId.get(id);
   }
+  update(id: string, patch: Partial<Pick<Provider, 'enabled' | 'baseUrl'>>): Provider | undefined {
+    const row = this.byId.get(id);
+    if (!row) return undefined;
+    const next: Provider = {
+      ...row,
+      ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+      ...(patch.baseUrl !== undefined ? { baseUrl: patch.baseUrl } : {}),
+    };
+    this.byId.set(id, next);
+    return next;
+  }
   delete(id: string): boolean {
     return this.byId.delete(id);
   }

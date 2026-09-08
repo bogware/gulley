@@ -42,6 +42,13 @@ const Env = z.object({
   // (GET /admin/workspaces/:id/client-config). Absent ⇒ the endpoint 501s.
   GATEWAY_PUBLIC_URL: z.string().url().optional(),
 
+  // The gateway's Prometheus /metrics URL (its SEPARATE management listener, e.g.
+  // http://gateway:9090/metrics). The control-api fetches + parses it for the console's
+  // live Observability page. Its host must be on OUTBOUND_HOST_ALLOWLIST (SSRF/air-gap
+  // guard). Absent ⇒ /admin/observability/* endpoints 501.
+  GATEWAY_METRICS_URL: z.string().url().optional(),
+  GATEWAY_METRICS_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+
   // Ed25519 private key (PEM) that SIGNS onboarding packs (GET .../onboarding-pack).
   // The org publishes the matching public key (served at /.well-known/gulley-onboarding-key)
   // so `gulley init` verifies a pack before writing any config — a phished/tampered

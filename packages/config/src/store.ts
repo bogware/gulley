@@ -40,6 +40,9 @@ export interface ConfigVersionStore {
    *  new version, or null on a lost race (optimistic concurrency). */
   tryReserve(expected: number): Promise<number | null>;
   append(rec: ConfigVersionRecord): Promise<void>;
+  /** Newest-first list of applied config versions (for the console's audit/rollback
+   *  timeline). Optional so a minimal store need not implement it. */
+  history?(limit: number): Promise<ConfigVersionRecord[]>;
 }
 
 export class InMemoryConfigVersionStore implements ConfigVersionStore {
@@ -59,5 +62,8 @@ export class InMemoryConfigVersionStore implements ConfigVersionStore {
   }
   async append(rec: ConfigVersionRecord): Promise<void> {
     this.records.push(rec);
+  }
+  async history(limit: number): Promise<ConfigVersionRecord[]> {
+    return this.records.slice(-limit).reverse();
   }
 }

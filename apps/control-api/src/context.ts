@@ -43,6 +43,7 @@ import { type SiemConnector, SiemExporter } from './siem';
 import { type EvalStore, InMemoryEvalStore } from './eval-store';
 import type { EvalRunner } from './eval-runner';
 import type { RolloutPromoter } from './eval-rollout-routes';
+import type { GatewayMetricsProvider } from './gateway-metrics';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
 import { WormShipper } from './worm-shipper';
@@ -114,6 +115,9 @@ export interface ControlContext {
     to?: Date;
     workspaceIds?: string[];
   }) => Promise<ShadowSpendReport>;
+  /** Live gateway observability: fetch + parse the gateway's Prometheus /metrics.
+   *  Absent ⇒ /admin/observability/* returns 501. */
+  gatewayMetrics?: GatewayMetricsProvider;
   resolverDeps: AdminResolverDeps;
   /** Durable admin-user directory (DB mode); absent = in-memory principal only. */
   adminUsers?: PostgresAdminUserStore;
@@ -261,6 +265,9 @@ export interface InMemoryContextOptions {
   /** Inject the shadow-spend port directly (tests / a custom backend); overrides
    *  the DB-derived default. */
   shadowSpend?: ControlContext['shadowSpend'];
+  /** Live gateway metrics provider (prod: built from GATEWAY_METRICS_URL; tests inject
+   *  a fake). Absent ⇒ /admin/observability/* returns 501. */
+  gatewayMetrics?: GatewayMetricsProvider;
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -403,6 +410,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
             );
           }
         : undefined),
+    gatewayMetrics: opts.gatewayMetrics,
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,
       bootstrapTokenSha256: opts.bootstrapTokenSha256,

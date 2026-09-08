@@ -114,4 +114,24 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
       });
     }),
   );
+
+  // Newest-first applied-version timeline (rollback is a GitOps re-apply of a prior
+  // exported document; historical document bodies aren't retained, only their metadata).
+  app.get(
+    '/config/versions/history',
+    adminRoute(ctx, async (request, reply) => {
+      const q = request.query as Record<string, string | undefined>;
+      const limit = Math.min(Math.max(Number(q['limit']) || 50, 1), 200);
+      const history = ctx.configVersions.history ? await ctx.configVersions.history(limit) : [];
+      return reply.send({
+        versions: history.map((r) => ({
+          version: r.version,
+          contentHash: r.contentHash,
+          actor: r.actor,
+          summary: r.summary,
+          createdAt: r.createdAt,
+        })),
+      });
+    }),
+  );
 }

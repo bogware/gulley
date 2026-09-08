@@ -14,6 +14,7 @@ import { S3AuditMirror } from '@gulley/worm';
 import { type Anchor, HttpAnchor } from './anchor';
 import { buildSiemConnector, type SiemConnector } from './siem';
 import { type EvalRunner, GatewayEvalRunner } from './eval-runner';
+import { buildGatewayMetricsProvider } from './gateway-metrics';
 import { signCtxAttestation } from './audit-signing';
 import { type Config, loadConfig, outboundAllowlist, sessionSecrets } from './config';
 import {
@@ -231,6 +232,14 @@ function buildContext(config: Config): ControlContext | undefined {
     cryptoShredEnabled: config.CRYPTO_SHRED_ENABLED,
     // Eval-in-the-loop rollout: a gateway-backed runner (offline golden-set gate).
     evalRunner: buildEvalRunner(config, (m) => process.stderr.write(`${m}\n`)),
+    // Live gateway observability: fetch + parse the gateway's Prometheus /metrics.
+    gatewayMetrics: config.GATEWAY_METRICS_URL
+      ? buildGatewayMetricsProvider({
+          url: config.GATEWAY_METRICS_URL,
+          allowlist: outboundAllowlist(config),
+          timeoutMs: config.GATEWAY_METRICS_TIMEOUT_MS,
+        })
+      : undefined,
   });
 }
 
