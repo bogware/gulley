@@ -1,7 +1,7 @@
 name: Dependency bump (manual)
 
 # Deliberately manual — NO `schedule:` trigger. Dependency updates are grouped
-# into a single reviewed PR, per policy (see CLAUDE.md / ARCHITECTURE).
+# into a single reviewed PR, per policy (see CONTRIBUTING.md / ARCHITECTURE).
 on:
   workflow_dispatch:
     inputs:
@@ -14,12 +14,18 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: dependency-bump
+  cancel-in-progress: false
+
 jobs:
   bump:
+    # Only on the upstream repo — this job holds a write-scoped token.
+    if: github.repository == 'bogware/gulley'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Update dependencies
@@ -32,7 +38,7 @@ jobs:
           bash ci/install.sh
           bash ci/verify.sh
       - name: Open a single grouped PR
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6
         with:
           branch: deps/manual-bump
           title: 'chore(deps): manual grouped dependency bump'

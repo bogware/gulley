@@ -10,6 +10,10 @@ pr:
     include:
       - '*'
 
+# SECURITY: this PR pipeline runs untrusted fork code (pnpm install/test/build) —
+# keep it on a Microsoft-hosted pool. Never point it at a self-hosted pool. In the
+# project's pipeline settings keep "Make secrets available to fork PR builds" OFF
+# and require a maintainer comment before building a fork PR (see docs/CI_SECURITY.md).
 pool:
   vmImage: ubuntu-latest
 
@@ -44,4 +48,4 @@ jobs:
           curl -fsSL "https://releases.hashicorp.com/terraform/1.15.8/terraform_1.15.8_linux_amd64.zip" -o /tmp/tf.zip
           sudo unzip -o /tmp/tf.zip -d /usr/local/bin
           bash ci/tf-check.sh
-        displayName: Terraform fmt + validate (dev + prod)
+        displayName: Terraform fmt + validate

@@ -1,6 +1,8 @@
 name: Release
 
-# Manual or tag-driven only — never scheduled.
+# Manual or tag-driven only — never scheduled, never on pull_request. Only these
+# TRUSTED (non-fork) jobs may run on a self-hosted runner if you choose to; they
+# are gated to the upstream repo so a fork can never reach the credentialed steps.
 on:
   workflow_dispatch:
     inputs:
@@ -15,47 +17,49 @@ permissions:
   contents: read
   id-token: write # OIDC federation to AWS (no long-lived keys)
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never interrupt a deploy mid-push
+
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
 
 jobs:
   image:
+    # Trusted-only: never run the credentialed build on a fork.
+    if: github.repository == 'bogware/gulley'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - uses: docker/setup-buildx-action@v3
-      - uses: sigstore/cosign-installer@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Build + push image (SBOM + provenance + cosign signature)
         env:
           IMAGE_TAG: ${{ inputs.image_tag || github.ref_name }}
         run: bash ci/build-image.sh
       - name: Scan image (fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
         with:
           image-ref: ${{ env.ECR_REPOSITORY }}:${{ inputs.image_tag || github.ref_name }}
           severity: HIGH,CRITICAL
           exit-code: '1'
           ignore-unfixed: true
 
-  plan:
-    needs: image
+  # IaC sanity at release time: format + validate the single Terraform module. A
+  # real prod `terraform plan/apply` is operator-driven with your own backend +
+  # tfvars (see infra/terraform/INSTALL.md), so this step needs no cloud creds.
+  terraform-validate:
+    if: github.repository == 'bogware/gulley'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: 1.15.8
-      - name: Terraform plan (prod)
-        working-directory: infra/terraform/envs/prod
-        run: |
-          terraform init -backend-config=backend.hcl -input=false
-          terraform plan -input=false -var "image_tag=${{ inputs.image_tag || github.ref_name }}"
+      - name: Terraform fmt + validate
+        run: bash ci/tf-check.sh

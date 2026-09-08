@@ -38,25 +38,25 @@ stages:
                 curl -fsSL "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64" -o /usr/local/bin/cosign
                 chmod +x /usr/local/bin/cosign
                 bash ci/build-image.sh
-                curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                # Pin the Trivy installer to a release TAG (never pipe the main
+                # branch into a shell in a credentialed stage).
+                TRIVY_VERSION=v0.74.0
+                curl -fsSL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" \
+                  | sh -s -- -b /usr/local/bin "${TRIVY_VERSION}"
                 trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ECR_REPOSITORY:$IMAGE_TAG"
 
-  - stage: plan
-    displayName: Terraform plan (prod)
+  # IaC sanity: fmt + validate the single Terraform module. A real prod plan/apply
+  # is operator-driven with your own backend + tfvars (infra/terraform/INSTALL.md),
+  # so this stage needs no AWS credentials.
+  - stage: terraform_validate
+    displayName: Terraform fmt + validate
     dependsOn: image
     jobs:
-      - job: plan
+      - job: validate
         steps:
-          - task: AWSShellScript@1
-            displayName: terraform plan
-            inputs:
-              awsCredentials: gulley-aws
-              regionName: $(AWS_REGION)
-              scriptType: inline
-              inlineScript: |
-                set -euo pipefail
-                curl -fsSL "https://releases.hashicorp.com/terraform/1.15.8/terraform_1.15.8_linux_amd64.zip" -o /tmp/tf.zip
-                sudo unzip -o /tmp/tf.zip -d /usr/local/bin
-                cd infra/terraform/envs/prod
-                terraform init -backend-config=backend.hcl -input=false
-                terraform plan -input=false -var "image_tag=${{ parameters.imageTag }}"
+          - script: |
+              set -euo pipefail
+              curl -fsSL "https://releases.hashicorp.com/terraform/1.15.8/terraform_1.15.8_linux_amd64.zip" -o /tmp/tf.zip
+              sudo unzip -o /tmp/tf.zip -d /usr/local/bin
+              bash ci/tf-check.sh
+            displayName: terraform fmt + validate

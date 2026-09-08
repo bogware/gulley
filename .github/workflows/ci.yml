@@ -7,28 +7,42 @@ on:
 
 # No scheduled triggers — dependency updates are manual and grouped by design.
 
+# Least privilege: PR jobs get a read-only token, and no secrets are referenced.
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref (also caps fork-PR run flooding).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ SECURITY — DO NOT MOVE THESE JOBS TO A SELF-HOSTED RUNNER.                │
+# │ Every job below checks out and executes UNTRUSTED fork-PR code            │
+# │ (pnpm install / test / build). On a self-hosted runner that is a remote   │
+# │ code-execution + secret-exfiltration vector. Keep `pull_request`-         │
+# │ triggered work on GitHub-hosted runners. Self-hosted is only for trusted, │
+# │ non-fork jobs (see release.yml and docs/CI_SECURITY.md).                  │
+# └─────────────────────────────────────────────────────────────────────────┘
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Install
         run: bash ci/install.sh
       - name: Verify
-        # format / lint / typecheck / test (incl. the M1-M5 credential-leak,
-        # ReDoS, and guard fuzz tests) / build.
+        # format / lint / typecheck / test (incl. the credential-leak, ReDoS, and
+        # guard fuzz tests) / build.
         run: bash ci/verify.sh
 
   hotpath:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # need history to diff against origin/main
       - name: Hot-path review guard
@@ -41,9 +55,9 @@ jobs:
   terraform:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: 1.15.8
-      - name: Terraform fmt + validate (dev + prod)
+      - name: Terraform fmt + validate
         run: bash ci/tf-check.sh
