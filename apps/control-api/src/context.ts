@@ -343,7 +343,9 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   const scimGroups = db
     ? new PostgresScimGroupStore(db, (displayName) => {
         const e = opts.scimGroupRoleMap?.[displayName];
-        return e && isRole(e.role) ? { role: e.role, orgId: e.orgId === '*' ? null : e.orgId } : null;
+        return e && isRole(e.role)
+          ? { role: e.role, orgId: e.orgId === '*' ? null : e.orgId }
+          : null;
       })
     : undefined;
   const membershipLoader = durableMemberships

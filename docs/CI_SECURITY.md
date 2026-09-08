@@ -42,11 +42,11 @@ important rule below.
 
 Workflow files can't express everything — set these in GitHub repo settings:
 
-- **Actions → Fork pull request workflows**: *Require approval for all outside
-  collaborators* (or for all external contributors).
+- **Actions → Fork pull request workflows**: _Require approval for all outside
+  collaborators_ (or for all external contributors).
 - **Actions → Workflow permissions**: default `GITHUB_TOKEN` = **read-only**;
   require approval for it to create/approve PRs.
-- **Code security**: enable *secret scanning* and *push protection*.
+- **Code security**: enable _secret scanning_ and _push protection_.
 - **Branch protection** on `main`: require a PR + review, require status checks
   (`verify`, `hotpath`, `terraform`), no force-push, no deletion.
 

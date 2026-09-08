@@ -14,11 +14,7 @@ describe('extractGroups (App Roles primary + group fallback, unioned)', () => {
       { roles: ['gulley-admin'], groups: ['00000000-0000-0000-0000-000000000001'], wids: ['x'] },
       'wids',
     );
-    expect(got).toEqual([
-      'gulley-admin',
-      'x',
-      '00000000-0000-0000-0000-000000000001',
-    ]);
+    expect(got).toEqual(['gulley-admin', 'x', '00000000-0000-0000-0000-000000000001']);
   });
 
   it('accepts a scalar claim value and ignores non-strings', () => {
@@ -34,7 +30,10 @@ describe('extractGroups (App Roles primary + group fallback, unioned)', () => {
 describe('hasGroupOverage', () => {
   it('detects the Entra >200-group overage indirection', () => {
     expect(
-      hasGroupOverage({ _claim_names: { groups: 'src1' }, _claim_sources: { src1: { endpoint: 'https://graph...' } } }),
+      hasGroupOverage({
+        _claim_names: { groups: 'src1' },
+        _claim_sources: { src1: { endpoint: 'https://graph...' } },
+      }),
     ).toBe(true);
   });
   it('is false for a normal token', () => {

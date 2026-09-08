@@ -60,7 +60,9 @@ describe('EntraGraphIdp.isPrincipalActive', () => {
 
   it('reuses a fresh last-known-good result when Graph is transiently down', async () => {
     let up = true;
-    const { fetchImpl } = fakeGraph(() => (up ? { status: 200, body: { accountEnabled: true } } : { status: 503 }));
+    const { fetchImpl } = fakeGraph(() =>
+      up ? { status: 200, body: { accountEnabled: true } } : { status: 503 },
+    );
     const idp = base(fetchImpl);
     expect(await idp.isPrincipalActive('oid-1')).toBe(true); // primes the cache
     up = false;

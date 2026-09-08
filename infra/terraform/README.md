@@ -11,9 +11,9 @@ and ACM/Route53. It replaces the older nested `modules/` + `envs/` layout: every
 
 A `tier` variable selects a preset:
 
-| tier   | footprint                                                                             |
-| ------ | ------------------------------------------------------------------------------------- |
-| `test` | 1 NAT, single-AZ Aurora (0.5–2 ACU), one shared Redis node, Fargate Spot, no WORM, no interface endpoints — the cheapest working stack. |
+| tier   | footprint                                                                                                                                                  |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test` | 1 NAT, single-AZ Aurora (0.5–2 ACU), one shared Redis node, Fargate Spot, no WORM, no interface endpoints — the cheapest working stack.                    |
 | `prod` | 3 AZs, NAT per AZ, Aurora multi-AZ, three role-split Redis groups, on-demand Fargate, private interface endpoints, WORM (COMPLIANCE), deletion protection. |
 
 Every knob is individually overridable on top of the preset (see `variables.tf`):

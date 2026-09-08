@@ -51,7 +51,7 @@ describe('PostgresScimGroupStore', () => {
     const g = await groups.create('gulley-editors', 'ext-1');
 
     await groups.addMember(g.id, alice.id, 'gulley-editors');
-    let mine = await memberships.listByUser(alice.id);
+    const mine = await memberships.listByUser(alice.id);
     expect(mine.map((m) => m.role)).toEqual(['editor']);
     expect(mine[0]!.orgId).toBeNull(); // platform-wide
 
@@ -95,7 +95,10 @@ describe('PostgresScimGroupStore', () => {
     expect(await memberships.listByUser(carol.id)).toEqual([]);
     expect(await groups.get(g.id)).toBeUndefined();
     // group_member rows are gone with the cascade
-    const left = await db.select().from(schema.scimGroupMember).where(eq(schema.scimGroupMember.groupId, g.id));
+    const left = await db
+      .select()
+      .from(schema.scimGroupMember)
+      .where(eq(schema.scimGroupMember.groupId, g.id));
     expect(left).toEqual([]);
   });
 });

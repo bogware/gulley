@@ -183,7 +183,10 @@ export function extractGroups(claims: Record<string, unknown>, claimName: string
 export function hasGroupOverage(claims: Record<string, unknown>): boolean {
   const cn = claims['_claim_names'];
   return (
-    !!cn && typeof cn === 'object' && !Array.isArray(cn) && 'groups' in (cn as Record<string, unknown>)
+    !!cn &&
+    typeof cn === 'object' &&
+    !Array.isArray(cn) &&
+    'groups' in (cn as Record<string, unknown>)
   );
 }
 

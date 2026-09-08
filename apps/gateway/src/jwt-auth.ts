@@ -94,7 +94,9 @@ function callerGroups(c: Record<string, unknown>, groupsClaim: string | undefine
 /** Merge the per-rule allow-lists for the chosen workspace: any rule with NO
  *  restriction widens to '*'; otherwise the union of the listed values. Returns
  *  undefined when there are no rules to merge (caller falls back to its default). */
-function mergeAllow(lists: ReadonlyArray<readonly string[] | undefined>): readonly string[] | '*' | undefined {
+function mergeAllow(
+  lists: ReadonlyArray<readonly string[] | undefined>,
+): readonly string[] | '*' | undefined {
   if (lists.length === 0) return undefined;
   if (lists.some((l) => l === undefined)) return '*';
   const out = new Set<string>();

@@ -12,7 +12,9 @@ export interface ScimGroupRow {
 /** Maps a provisioned group's displayName to the role it grants, or null when the
  *  group is not mapped (members are tracked but granted nothing). orgId null = a
  *  platform-wide grant (the membership loader reads NULL org as '*'). */
-export type GroupRoleResolver = (displayName: string) => { role: string; orgId: string | null } | null;
+export type GroupRoleResolver = (
+  displayName: string,
+) => { role: string; orgId: string | null } | null;
 
 /**
  * Durable SCIM 2.0 Groups. A group's members each receive the role its displayName
