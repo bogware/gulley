@@ -1,4 +1,6 @@
 import type { RequestStatus, UsageBucketWidth } from '@gulley/pipeline';
+import { coveredOrgIds } from '@gulley/rbac';
+import type { AdminPrincipal } from '@gulley/rbac';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { adminRoute, notFound, visibleWorkspaceIds } from './admin';
 import type { ControlContext } from './context';
@@ -7,13 +9,29 @@ function query(request: FastifyRequest): Record<string, string | undefined> {
   return (request.query ?? {}) as Record<string, string | undefined>;
 }
 
-/** Resolve the workspace scope for a read: an explicit `workspaceId` must be one
- *  the caller can see; otherwise every visible workspace. Returns null when the
- *  caller can see nothing in scope — the caller then returns an empty result
- *  rather than falling through to an unscoped (leaky) query. */
-function readScope(request: FastifyRequest, visible: Set<string>): string[] | null {
+/**
+ * Resolve the workspace scope for a read:
+ *  - 'all'  — a platform owner (a `*` membership) sees every workspace. This is the
+ *    ONLY unfiltered case, and it matters in durable deployments where workspaces
+ *    live in Postgres (seed / config-apply) and are not in the in-memory registry —
+ *    so the in-memory `visibleWorkspaceIds` would (wrongly) hide all usage.
+ *  - string[] — a scoped admin's visible workspaces (or an explicit, permitted one).
+ *  - null — the caller can see nothing; return an empty result rather than leak an
+ *    unscoped query.
+ */
+function readScope(
+  request: FastifyRequest,
+  ctx: ControlContext,
+  admin: AdminPrincipal,
+): string[] | 'all' | null {
   const wid = query(request)['workspaceId'];
-  if (wid) return visible.has(wid) ? [wid] : null;
+  const platformOwner = coveredOrgIds(admin) === '*';
+  if (wid) {
+    if (platformOwner) return [wid];
+    return visibleWorkspaceIds(ctx, admin).has(wid) ? [wid] : null;
+  }
+  if (platformOwner) return 'all';
+  const visible = visibleWorkspaceIds(ctx, admin);
   return visible.size > 0 ? [...visible] : null;
 }
 
@@ -32,9 +50,9 @@ export function registerLogRoutes(app: FastifyInstance, ctx: ControlContext): vo
   app.get(
     '/admin/logs',
     adminRoute(ctx, async (request, reply, admin) => {
-      const visible = visibleWorkspaceIds(ctx, admin);
-      const workspaceIds = readScope(request, visible);
-      if (!workspaceIds) return reply.send({ entries: [] });
+      const scope = readScope(request, ctx, admin);
+      if (scope === null) return reply.send({ entries: [] });
+      const workspaceIds = scope === 'all' ? undefined : scope;
       const q = query(request);
       const page = await ctx.requestLogQuery.search({
         workspaceIds,
@@ -54,10 +72,11 @@ export function registerLogRoutes(app: FastifyInstance, ctx: ControlContext): vo
   app.get(
     '/admin/logs/:requestId',
     adminRoute(ctx, async (request, reply, admin) => {
-      const visible = visibleWorkspaceIds(ctx, admin);
       const requestId = (request.params as { requestId: string }).requestId;
       const entry = await ctx.requestLogQuery.get(requestId);
-      if (!entry || !visible.has(entry.workspaceId)) return notFound(reply, 'request log');
+      const platformOwner = coveredOrgIds(admin) === '*';
+      if (!entry || (!platformOwner && !visibleWorkspaceIds(ctx, admin).has(entry.workspaceId)))
+        return notFound(reply, 'request log');
       return reply.send({ entry });
     }),
   );
@@ -65,9 +84,9 @@ export function registerLogRoutes(app: FastifyInstance, ctx: ControlContext): vo
   app.get(
     '/admin/analytics/usage',
     adminRoute(ctx, async (request, reply, admin) => {
-      const visible = visibleWorkspaceIds(ctx, admin);
-      const workspaceIds = readScope(request, visible);
-      if (!workspaceIds) return reply.send({ buckets: [] });
+      const scope = readScope(request, ctx, admin);
+      if (scope === null) return reply.send({ buckets: [] });
+      const workspaceIds = scope === 'all' ? undefined : scope;
       const q = query(request);
       const bucket: UsageBucketWidth =
         q['bucket'] === 'minute' || q['bucket'] === 'day' ? q['bucket'] : 'hour';
@@ -93,9 +112,9 @@ export function registerLogRoutes(app: FastifyInstance, ctx: ControlContext): vo
           .code(501)
           .send({ error: { type: 'not_supported', message: 'chargeback requires a database' } });
       }
-      const visible = visibleWorkspaceIds(ctx, admin);
-      const workspaceIds = readScope(request, visible);
-      if (!workspaceIds) return reply.send({ rows: [] });
+      const scope = readScope(request, ctx, admin);
+      if (scope === null) return reply.send({ rows: [] });
+      const workspaceIds = scope === 'all' ? undefined : scope;
       const gb = query(request)['groupBy'];
       const groupBy =
         gb === 'workspace' || gb === 'provider' || (gb && gb.startsWith('attr:')) ? gb : 'model';
@@ -124,9 +143,9 @@ export function registerLogRoutes(app: FastifyInstance, ctx: ControlContext): vo
           },
         });
       }
-      const visible = visibleWorkspaceIds(ctx, admin);
-      const workspaceIds = readScope(request, visible);
-      if (!workspaceIds) return reply.send({ rows: [], flagged: false });
+      const scope = readScope(request, ctx, admin);
+      if (scope === null) return reply.send({ rows: [], flagged: false });
+      const workspaceIds = scope === 'all' ? undefined : scope;
       const to = parseDate(query(request)['to']) ?? new Date();
       const from =
         parseDate(query(request)['from']) ?? new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);

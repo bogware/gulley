@@ -137,28 +137,15 @@ describe('admin log browser + usage analytics', () => {
     try {
       const inject = (url: string) =>
         app2.inject({ method: 'GET', url, headers: { authorization: `Bearer ${gadm2}` } });
-      // Give the admin a visible workspace so readScope resolves to a scope.
-      const org = await app2.inject({
-        method: 'POST',
-        url: '/orgs',
-        headers: { authorization: `Bearer ${gadm2}`, 'content-type': 'application/json' },
-        payload: JSON.stringify({ name: 'Acme' }),
-      });
-      const orgId = (org.json().org as { id: string }).id;
-      const ws = await app2.inject({
-        method: 'POST',
-        url: '/workspaces',
-        headers: { authorization: `Bearer ${gadm2}`, 'content-type': 'application/json' },
-        payload: JSON.stringify({ orgId, name: 'Default' }),
-      });
-      const wsId = (ws.json().workspace as { id: string }).id;
-
       const res = await inject('/admin/analytics/shadow-spend');
       expect(res.statusCode).toBe(200);
       const body = res.json() as { flagged: boolean; shadowTotalMicroUsd: number };
       expect(body.flagged).toBe(true);
       expect(body.shadowTotalMicroUsd).toBe(400_000);
-      expect(capturedScope).toContain(wsId); // the port was RBAC-scoped
+      // The bootstrap admin is a platform owner (`*`), so the port is called
+      // UNFILTERED (sees every workspace) — critical in durable deployments where
+      // workspaces live in Postgres and not the in-memory registry.
+      expect(capturedScope).toBeUndefined();
     } finally {
       await app2.close();
     }
