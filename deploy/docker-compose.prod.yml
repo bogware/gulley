@@ -12,7 +12,9 @@
 # pin GULLEY_TAG for a real deployment.
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector-enabled Postgres — the semantic-cache migration needs the `vector`
+    # extension (plain postgres:16 lacks it and db:migrate fails).
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: gulley
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
