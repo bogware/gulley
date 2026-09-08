@@ -5,16 +5,56 @@ import type {
   SelectHTMLAttributes,
 } from 'react';
 
-function cx(...parts: Array<string | false | undefined>): string {
+export function cx(...parts: Array<string | false | undefined>): string {
   return parts.filter(Boolean).join(' ');
 }
 
-const CARD =
-  'rounded-xl border border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900';
+/* ------------------------------------------------------------------ surfaces */
 
-export function Card({ children, className }: { children: ReactNode; className?: string }) {
-  return <div className={cx(CARD, className)}>{children}</div>;
+/** A raised panel: platinum surface, hairline card border, 4px radius, top-light
+ *  bevel. The base container for every card in the console. */
+export function Panel({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cx('rounded-card border border-line-card bg-panel shadow-raise', className)}>
+      {children}
+    </div>
+  );
 }
+
+/** A panel's header strip: title on the left, optional meta/actions on the right. */
+export function PanelHeader({
+  title,
+  meta,
+  right,
+  className,
+}: {
+  title?: ReactNode;
+  meta?: ReactNode;
+  right?: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cx(
+        'flex items-center justify-between gap-3 border-b border-line px-3 py-2.5',
+        className,
+      )}
+    >
+      <div className="flex min-w-0 items-baseline gap-2">
+        {title ? <div className="truncate text-[12px] font-medium text-ink">{title}</div> : null}
+        {meta ? <div className="truncate font-mono text-2xs text-secondary">{meta}</div> : null}
+      </div>
+      {right ? <div className="flex shrink-0 items-center gap-2">{right}</div> : null}
+    </div>
+  );
+}
+
+/** Back-compat alias — existing pages import `Card`. */
+export function Card({ children, className }: { children: ReactNode; className?: string }) {
+  return <Panel className={className}>{children}</Panel>;
+}
+
+/* -------------------------------------------------------------------- header */
 
 export function PageHeader({
   title,
@@ -26,15 +66,25 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="mb-6 flex items-start justify-between gap-4">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
-        {subtitle ? <p className="mt-1 text-sm text-neutral-500">{subtitle}</p> : null}
+    <div className="-mx-5 -mt-4 mb-4 flex items-center justify-between gap-4 border-b border-line bg-header px-5 py-3.5">
+      <div className="min-w-0">
+        <h1 className="text-[19px] font-semibold tracking-[-0.015em] text-ink">{title}</h1>
+        {subtitle ? <p className="mt-0.5 text-[11.5px] text-secondary">{subtitle}</p> : null}
       </div>
       {actions ? <div className="flex shrink-0 items-center gap-2">{actions}</div> : null}
     </div>
   );
 }
+
+export function MicroLabel({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cx('text-[9px] font-medium uppercase tracking-[0.14em] text-micro', className)}>
+      {children}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------- controls */
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: 'primary' | 'secondary' | 'danger' | 'ghost';
@@ -42,18 +92,18 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
 
 export function Button({ variant = 'secondary', className, ...props }: ButtonProps) {
   const styles: Record<string, string> = {
-    primary:
-      'bg-neutral-900 text-white hover:bg-neutral-700 dark:bg-white dark:text-neutral-900 dark:hover:bg-neutral-200',
+    // Primary = solid ink; secondary = bevelled platinum; danger; ghost.
+    primary: 'bg-ink text-[#F6F3EC] hover:bg-[#33302A]',
     secondary:
-      'border border-neutral-300 bg-white text-neutral-800 hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:hover:bg-neutral-800',
-    danger: 'bg-red-600 text-white hover:bg-red-500',
-    ghost: 'text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800',
+      'border border-line-control bg-gradient-to-b from-panel to-[#EDE9E0] text-body hover:to-[#E4DFD3]',
+    danger: 'border border-err-border bg-err-bg text-err-text hover:brightness-[.98]',
+    ghost: 'text-secondary hover:bg-rail',
   };
   return (
     <button
       {...props}
       className={cx(
-        'inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+        'inline-flex items-center gap-1.5 rounded-control px-[11px] py-[5px] text-[11.5px] font-medium transition-colors duration-[120ms] ease-out disabled:cursor-not-allowed disabled:opacity-50',
         styles[variant],
         className,
       )}
@@ -61,16 +111,11 @@ export function Button({ variant = 'secondary', className, ...props }: ButtonPro
   );
 }
 
+const FIELD =
+  'w-full rounded-control border border-line-control bg-[#FDFCF9] px-2.5 py-[5px] text-[11.5px] text-ink shadow-field outline-none placeholder:text-secondary/70';
+
 export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElement>) {
-  return (
-    <input
-      {...props}
-      className={cx(
-        'w-full rounded-lg border border-neutral-300 bg-white px-3 py-1.5 text-sm text-neutral-900 outline-none placeholder:text-neutral-400 focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100',
-        className,
-      )}
-    />
-  );
+  return <input {...props} className={cx(FIELD, 'font-mono', className)} />;
 }
 
 export function Select({
@@ -79,89 +124,206 @@ export function Select({
   ...props
 }: SelectHTMLAttributes<HTMLSelectElement> & { children: ReactNode }) {
   return (
-    <select
-      {...props}
-      className={cx(
-        'rounded-lg border border-neutral-300 bg-white px-2.5 py-1.5 text-sm text-neutral-900 outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100',
-        className,
-      )}
-    >
+    <select {...props} className={cx(FIELD, 'w-auto cursor-pointer pr-6 font-mono', className)}>
       {children}
     </select>
   );
 }
 
-export function Badge({
+/** A labelled field wrapper (micro-label above a control). */
+export function Field({
+  label,
   children,
-  tone = 'neutral',
+  className,
 }: {
+  label: string;
   children: ReactNode;
-  tone?: 'neutral' | 'green' | 'red' | 'amber' | 'blue';
+  className?: string;
 }) {
-  const tones: Record<string, string> = {
-    neutral: 'bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300',
-    green: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
-    red: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
-    amber: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
-    blue: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
-  };
   return (
-    <span className={cx('inline-flex rounded-full px-2 py-0.5 text-xs font-medium', tones[tone])}>
+    <label className={cx('flex flex-col gap-1', className)}>
+      <MicroLabel>{label}</MicroLabel>
+      {children}
+    </label>
+  );
+}
+
+/** Segmented control: one bordered rail, active cell filled ink. */
+export function SegmentedControl<T extends string>({
+  options,
+  value,
+  onChange,
+  className,
+}: {
+  options: ReadonlyArray<{ value: T; label: string }>;
+  value: T;
+  onChange: (v: T) => void;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cx(
+        'inline-flex overflow-hidden rounded-control border border-line-control bg-panel',
+        className,
+      )}
+    >
+      {options.map((o, i) => {
+        const active = o.value === value;
+        return (
+          <button
+            key={o.value}
+            type="button"
+            onClick={() => onChange(o.value)}
+            className={cx(
+              'px-2.5 py-[4px] text-[11px] font-medium transition-colors duration-[120ms]',
+              i > 0 && 'border-l border-line-control',
+              active ? 'bg-ink text-[#F6F3EC]' : 'text-secondary hover:bg-rail',
+            )}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------- status */
+
+type Tone = 'neutral' | 'green' | 'red' | 'amber' | 'blue';
+
+const CHIP_TONES: Record<Tone, string> = {
+  neutral: 'bg-rail text-secondary border-line-control',
+  green: 'bg-ok-bg text-ok-text border-ok-border',
+  red: 'bg-err-bg text-err-text border-err-border',
+  amber: 'bg-warn-bg text-warn-text border-warn-border',
+  blue: 'bg-accent-tint text-accent-ink border-accent-soft',
+};
+
+/** Rectangular status chip (2px radius, mono) — the Platinum replacement for a pill. */
+export function StatusChip({ children, tone = 'neutral' }: { children: ReactNode; tone?: Tone }) {
+  return (
+    <span
+      className={cx(
+        'inline-flex items-center rounded-chip border px-1.5 py-[1px] font-mono text-[10px] font-medium',
+        CHIP_TONES[tone],
+      )}
+    >
       {children}
     </span>
   );
 }
 
-/** Colored pill for an HTTP status / request status. */
+/** Back-compat: existing pages import `Badge`. Same tones, chip shape now. */
+export function Badge({ children, tone = 'neutral' }: { children: ReactNode; tone?: Tone }) {
+  return <StatusChip tone={tone}>{children}</StatusChip>;
+}
+
 export function StatusPill({ status, code }: { status?: string; code?: number }) {
   const ok = status === 'ok' || (code !== undefined && code < 400);
   const aborted = status === 'aborted';
-  return <Badge tone={ok ? 'green' : aborted ? 'amber' : 'red'}>{code ?? status ?? '—'}</Badge>;
+  return (
+    <StatusChip tone={ok ? 'green' : aborted ? 'amber' : 'red'}>{code ?? status ?? '—'}</StatusChip>
+  );
 }
+
+/** A status dot; `halo` adds a soft ring for the "degraded" state. */
+export function Dot({
+  tone = 'green',
+  halo,
+}: {
+  tone?: 'green' | 'amber' | 'red';
+  halo?: boolean;
+}) {
+  const color = tone === 'green' ? '#4B7A4E' : tone === 'amber' ? '#C67A28' : '#A0392E';
+  return (
+    <span
+      className="inline-block h-[7px] w-[7px] shrink-0 rounded-full"
+      style={{ background: color, boxShadow: halo ? `0 0 0 2px ${color}33` : undefined }}
+    />
+  );
+}
+
+/* --------------------------------------------------------------------- data */
 
 export function StatTile({
   label,
   value,
   hint,
+  delta,
 }: {
   label: string;
   value: ReactNode;
   hint?: string;
+  delta?: { dir: 'up' | 'down'; text: string; good?: boolean };
 }) {
   return (
-    <Card className="p-4">
-      <div className="text-xs font-medium uppercase tracking-wide text-neutral-400">{label}</div>
-      <div className="mt-1 font-mono text-2xl font-semibold tabular-nums">{value}</div>
-      {hint ? <div className="mt-1 text-xs text-neutral-400">{hint}</div> : null}
-    </Card>
+    <Panel className="px-3 py-2.5">
+      <MicroLabel>{label}</MicroLabel>
+      <div className="mt-1.5 font-mono text-[25px] font-medium tabular-nums tracking-[-0.02em] text-ink">
+        {value}
+      </div>
+      {delta ? (
+        <div className="mt-1 flex items-center gap-1 text-[10.5px]">
+          <span style={{ color: delta.good ? '#3D6B42' : '#A0392E' }}>
+            {delta.dir === 'up' ? '▲' : '▼'}
+          </span>
+          <span className="text-secondary">{delta.text}</span>
+        </div>
+      ) : hint ? (
+        <div className="mt-1 text-[10.5px] text-secondary">{hint}</div>
+      ) : null}
+    </Panel>
   );
 }
 
+/** Inset progress meter; `over` switches to the hatched over-cap fill. */
+export function Meter({ ratio, over }: { ratio: number; over?: boolean }) {
+  const pct = Math.max(0, Math.min(1, ratio)) * 100;
+  return (
+    <div className="h-2 w-full overflow-hidden rounded-[2px] bg-inset shadow-field">
+      <div
+        className="h-full rounded-[2px]"
+        style={{
+          width: `${pct}%`,
+          background: over
+            ? 'repeating-linear-gradient(135deg,#A0392E 0 4px,#8E2E22 4px 8px)'
+            : 'linear-gradient(#4E80B4,#2F5D8C)',
+        }}
+      />
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------- states */
+
 export function Spinner() {
   return (
-    <div className="flex items-center gap-2 py-8 text-sm text-neutral-400">
-      <span className="h-3 w-3 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-600" />
+    <div className="flex items-center gap-2 py-8 text-[11.5px] text-secondary">
+      <span className="h-3 w-3 animate-spin rounded-full border-2 border-line-card border-t-accent" />
       Loading…
     </div>
   );
 }
 
 export function EmptyState({ message }: { message: string }) {
-  return <div className="py-10 text-center text-sm text-neutral-400">{message}</div>;
+  return <div className="py-10 text-center text-[11.5px] text-micro">{message}</div>;
 }
 
 export function ErrorNote({ error }: { error: string }) {
   return (
-    <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+    <div className="rounded-control border border-err-border bg-err-bg px-3 py-2 text-[11.5px] text-err-text">
       {error}
     </div>
   );
 }
 
+/* --------------------------------------------------------------------- table */
+
 export function Table({ children }: { children: ReactNode }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full text-sm">{children}</table>
+      <table className="w-full border-collapse text-[11.5px]">{children}</table>
     </div>
   );
 }
@@ -169,7 +331,7 @@ export function Th({ children, className }: { children?: ReactNode; className?: 
   return (
     <th
       className={cx(
-        'border-b border-neutral-200 px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-neutral-400 dark:border-neutral-800',
+        'border-b border-line bg-rail px-3 py-2 text-left text-[9px] font-medium uppercase tracking-[0.14em] text-micro',
         className,
       )}
     >
@@ -179,10 +341,6 @@ export function Th({ children, className }: { children?: ReactNode; className?: 
 }
 export function Td({ children, className }: { children?: ReactNode; className?: string }) {
   return (
-    <td
-      className={cx('border-b border-neutral-100 px-3 py-2 dark:border-neutral-800/60', className)}
-    >
-      {children}
-    </td>
+    <td className={cx('border-b border-line-soft px-3 py-2 text-body', className)}>{children}</td>
   );
 }

@@ -2,6 +2,45 @@
 @tailwind components;
 @tailwind utilities;
 
+/* The Platinum system is a single committed light aesthetic. */
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
+}
+
+html,
+body {
+  background: #f5f3ee;
+}
+
+body {
+  color: #3e3a32;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Focus: a 1px accent ring plus a 2px tint halo on interactive elements only —
+   no browser default outline (design_handoff §Interactions). */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 1px #2f5d8c,
+    0 0 0 3px #e7eef5;
+}
+
+::selection {
+  background: #e7eef5;
+}
+
+/* Thin platinum scrollbars so dense tables don't get chunky OS chrome. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #c9c2b4 transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #c9c2b4;
+  border: 3px solid #f5f3ee;
+  border-radius: 6px;
 }

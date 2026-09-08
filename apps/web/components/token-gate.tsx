@@ -36,14 +36,19 @@ export function TokenGate() {
   }
 
   return (
-    <div className="mx-auto flex min-h-[70vh] max-w-md flex-col justify-center gap-4 px-6">
+    <div className="mx-auto flex min-h-[80vh] max-w-sm flex-col justify-center gap-4 px-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Sign in to Gulley</h1>
-        <p className="mt-1 text-sm text-neutral-500">Open the control-plane console.</p>
+        <div className="text-[15px] font-semibold tracking-[-0.01em] text-ink">Gulley</div>
+        <h1 className="mt-3 text-[19px] font-semibold tracking-[-0.015em] text-ink">
+          Sign in to the console
+        </h1>
+        <p className="mt-1 text-[11.5px] text-secondary">
+          Open the cross-vendor LLM-gateway control plane.
+        </p>
       </div>
 
       {oidc?.enabled ? (
-        <Card className="p-4">
+        <Card className="p-3.5">
           <Button
             variant="primary"
             className="w-full justify-center"
@@ -53,12 +58,12 @@ export function TokenGate() {
           >
             Sign in with SSO
           </Button>
-          <p className="mt-2 text-center text-xs text-neutral-400">OpenID Connect single sign-on</p>
+          <p className="mt-2 text-center text-[10.5px] text-micro">OpenID Connect single sign-on</p>
         </Card>
       ) : null}
 
-      <Card className="space-y-3 p-4">
-        <div className="text-sm font-medium">
+      <Card className="space-y-3 p-3.5">
+        <div className="text-[12px] font-medium text-ink">
           {oidc?.enabled ? 'Or use an admin token' : 'Admin token'}
         </div>
         <Input
@@ -74,7 +79,7 @@ export function TokenGate() {
         <Button variant="secondary" onClick={() => void connect()} disabled={busy || !value.trim()}>
           {busy ? 'Connecting…' : 'Connect with token'}
         </Button>
-        <p className="text-xs text-neutral-400">Dev / break-glass: a bootstrap or session token.</p>
+        <p className="text-[10.5px] text-micro">Dev / break-glass: a bootstrap or session token.</p>
       </Card>
     </div>
   );

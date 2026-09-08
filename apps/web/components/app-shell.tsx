@@ -4,21 +4,51 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import type { ReactNode } from 'react';
 import { useAdmin } from '../lib/admin-context';
+import { useAdminQuery } from '../lib/hooks';
 import { TokenGate } from './token-gate';
-import { Spinner } from './ui';
+import { cx, Dot, Spinner } from './ui';
 
-const NAV: Array<{ href: string; label: string }> = [
-  { href: '/', label: 'Dashboard' },
-  { href: '/logs', label: 'Request logs' },
-  { href: '/analytics', label: 'Analytics' },
-  { href: '/keys', label: 'Virtual keys' },
-  { href: '/providers', label: 'Providers' },
-  { href: '/orgs', label: 'Orgs & workspaces' },
-  { href: '/budgets', label: 'Budgets' },
-  { href: '/rate-limits', label: 'Rate limits' },
-  { href: '/guardrails', label: 'Guardrails' },
-  { href: '/audit', label: 'Audit' },
+interface NavItem {
+  href: string;
+  label: string;
+}
+const NAV_GROUPS: Array<{ group: string; items: NavItem[] }> = [
+  {
+    group: 'Observe',
+    items: [
+      { href: '/', label: 'Overview' },
+      { href: '/logs', label: 'Request logs' },
+      { href: '/analytics', label: 'Analytics' },
+      { href: '/audit', label: 'Audit & WORM' },
+    ],
+  },
+  {
+    group: 'Configure',
+    items: [
+      { href: '/routes', label: 'Routes & aliases' },
+      { href: '/providers', label: 'Providers' },
+      { href: '/keys', label: 'Virtual keys' },
+      { href: '/budgets', label: 'Budgets' },
+      { href: '/rate-limits', label: 'Rate limits' },
+      { href: '/guardrails', label: 'Guardrails' },
+      { href: '/orgs', label: 'Orgs & workspaces' },
+    ],
+  },
 ];
+
+function AuditStatus() {
+  const q = useAdminQuery((api) => api.verifyAudit(), []);
+  const verified = q.data?.verified;
+  return (
+    <div className="flex items-center gap-1.5">
+      <Dot tone={q.loading ? 'amber' : verified ? 'green' : 'red'} />
+      <span className="font-mono text-2xs text-secondary">
+        audit chain ·{' '}
+        {q.loading ? '…' : verified ? `verified (${q.data?.count ?? 0})` : 'unverified'}
+      </span>
+    </div>
+  );
+}
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { authed, ready, setToken } = useAdmin();
@@ -35,34 +65,67 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <div className="flex min-h-screen">
-      <aside className="w-56 shrink-0 border-r border-neutral-200 p-4 dark:border-neutral-800">
-        <div className="mb-6 px-2 text-lg font-semibold tracking-tight">Gulley</div>
-        <nav className="space-y-0.5">
-          {NAV.map((n) => {
-            const active = pathname === n.href;
-            return (
-              <Link
-                key={n.href}
-                href={n.href}
-                className={
-                  active
-                    ? 'block rounded-lg bg-neutral-100 px-3 py-1.5 text-sm font-medium dark:bg-neutral-800'
-                    : 'block rounded-lg px-3 py-1.5 text-sm text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-neutral-800/60'
-                }
-              >
-                {n.label}
-              </Link>
-            );
-          })}
+      <aside className="flex w-[214px] shrink-0 flex-col border-r border-line-control bg-sidebar shadow-[inset_-1px_0_0_#F7F4ED]">
+        {/* wordmark */}
+        <div className="border-b border-[#C9C2B3] px-3.5 py-3">
+          <div className="text-[15px] font-semibold tracking-[-0.01em] text-ink">Gulley</div>
+          <div className="mt-0.5 font-mono text-[10px] text-secondary">v1.14.2 · self-hosted</div>
+        </div>
+
+        {/* nav groups */}
+        <nav className="flex-1 overflow-y-auto px-2 py-3">
+          {NAV_GROUPS.map((g) => (
+            <div key={g.group} className="mb-3">
+              <div className="px-2 pb-1.5 text-[9px] font-medium uppercase tracking-[0.14em] text-micro">
+                {g.group}
+              </div>
+              <div className="flex flex-col gap-px">
+                {g.items.map((n) => {
+                  const active = pathname === n.href;
+                  return (
+                    <Link
+                      key={n.href}
+                      href={n.href}
+                      className={cx(
+                        'flex items-center gap-2 rounded-control px-2 py-[5px] text-[12.5px] transition-colors duration-[120ms]',
+                        active ? 'bg-ink font-medium text-[#F6F3EC]' : 'text-body hover:bg-rail',
+                      )}
+                    >
+                      <span
+                        className="h-[5px] w-[5px] shrink-0"
+                        style={{ background: active ? '#C9A227' : '#BDB6A6' }}
+                      />
+                      {n.label}
+                    </Link>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
         </nav>
-        <button
-          onClick={() => setToken(null)}
-          className="mt-6 px-3 text-xs text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200"
-        >
-          Disconnect
-        </button>
+
+        {/* footer status */}
+        <div className="mt-auto border-t border-[#C9C2B3] px-3.5 py-3">
+          <div className="flex items-center gap-1.5">
+            <Dot tone="green" />
+            <span className="font-mono text-2xs text-secondary">control API · connected</span>
+          </div>
+          <div className="mt-1">
+            <AuditStatus />
+          </div>
+          <div className="mt-2.5 flex items-center justify-between rounded-control border border-line-control bg-panel px-2 py-1">
+            <span className="font-mono text-[10px] text-body">admin · session</span>
+            <button
+              onClick={() => setToken(null)}
+              className="text-[10px] text-secondary transition-colors hover:text-err-text"
+            >
+              Disconnect
+            </button>
+          </div>
+        </div>
       </aside>
-      <main className="min-w-0 flex-1 px-8 py-8">{children}</main>
+
+      <main className="min-w-0 flex-1 px-5 py-4">{children}</main>
     </div>
   );
 }
