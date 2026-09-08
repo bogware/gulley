@@ -1,8 +1,11 @@
-import type {
-  ButtonHTMLAttributes,
-  InputHTMLAttributes,
-  ReactNode,
-  SelectHTMLAttributes,
+'use client';
+
+import {
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type ReactNode,
+  type SelectHTMLAttributes,
+  useState,
 } from 'react';
 
 export function cx(...parts: Array<string | false | undefined>): string {
@@ -411,5 +414,172 @@ export function Th({ children, className }: { children?: ReactNode; className?: 
 export function Td({ children, className }: { children?: ReactNode; className?: string }) {
   return (
     <td className={cx('border-b border-line-soft px-3 py-2 text-body', className)}>{children}</td>
+  );
+}
+
+/* --------------------------------------------------------------- extras (parity) */
+
+/** 34×16 platinum toggle (design_handoff): on = blue gradient, knob right. */
+export function Toggle({
+  checked,
+  onChange,
+  disabled,
+  label,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  label?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={cx(
+        'relative inline-flex h-4 w-[34px] shrink-0 items-center rounded-full transition-colors duration-[120ms] disabled:opacity-50',
+        checked ? 'bg-gradient-to-b from-[#3F6F9E] to-accent' : 'bg-inset shadow-field',
+      )}
+    >
+      <span
+        className="absolute h-3 w-3 rounded-full bg-gradient-to-b from-white to-[#DCD6C9] transition-all duration-[120ms]"
+        style={{ left: checked ? '18px' : '2px' }}
+      />
+    </button>
+  );
+}
+
+/** Underlined tab bar. Keys are the tab ids; active gets the accent underline. */
+export function Tabs<T extends string>({
+  tabs,
+  value,
+  onChange,
+}: {
+  tabs: ReadonlyArray<{ value: T; label: string }>;
+  value: T;
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1 border-b border-line">
+      {tabs.map((t) => {
+        const active = t.value === value;
+        return (
+          <button
+            key={t.value}
+            type="button"
+            onClick={() => onChange(t.value)}
+            className={cx(
+              '-mb-px border-b-2 px-2.5 py-2 text-[11.5px] font-medium transition-colors',
+              active
+                ? 'border-accent text-ink'
+                : 'border-transparent text-secondary hover:text-ink',
+            )}
+          >
+            {t.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Copy-to-clipboard button with a transient "copied" state. */
+export function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
+  const [done, setDone] = useState(false);
+  return (
+    <Button
+      onClick={() => {
+        void navigator.clipboard?.writeText(text);
+        setDone(true);
+        window.setTimeout(() => setDone(false), 1200);
+      }}
+    >
+      {done ? 'Copied ✓' : label}
+    </Button>
+  );
+}
+
+/** Monospace code / JSON block on the inset surface (optionally the terminal palette). */
+export function CodeBlock({
+  children,
+  terminal,
+  className,
+}: {
+  children: ReactNode;
+  terminal?: boolean;
+  className?: string;
+}) {
+  return (
+    <pre
+      className={cx(
+        'overflow-x-auto rounded-control border px-3 py-2.5 font-mono text-[10.5px] leading-[1.6]',
+        terminal
+          ? 'border-term-border bg-term-bg text-term-text'
+          : 'border-line-soft bg-inset text-body',
+        className,
+      )}
+    >
+      {children}
+    </pre>
+  );
+}
+
+/** A pretty-printed JSON viewer. */
+export function JsonBlock({ value, terminal }: { value: unknown; terminal?: boolean }) {
+  return <CodeBlock terminal={terminal}>{JSON.stringify(value, null, 2)}</CodeBlock>;
+}
+
+/** An inline result strip (success / error / info) — never a toast. */
+export function InlineResult({
+  tone,
+  children,
+}: {
+  tone: 'ok' | 'err' | 'info';
+  children: ReactNode;
+}) {
+  const styles =
+    tone === 'ok'
+      ? 'border-ok-border bg-ok-bg text-ok-text'
+      : tone === 'err'
+        ? 'border-err-border bg-err-bg text-err-text'
+        : 'border-accent-soft bg-accent-tint text-accent-ink';
+  return (
+    <div
+      className={cx(
+        'flex items-center gap-2 rounded-control border px-2.5 py-1.5 text-[11px]',
+        styles,
+      )}
+    >
+      <Dot tone={tone === 'ok' ? 'green' : tone === 'err' ? 'red' : 'green'} />
+      {children}
+    </div>
+  );
+}
+
+/** A labelled key/value row (mono value) for detail lists. */
+export function KV({
+  label,
+  value,
+  mono = true,
+}: {
+  label: ReactNode;
+  value: ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-4 border-b border-line-soft py-1.5 last:border-0">
+      <span className="text-[10.5px] text-micro">{label}</span>
+      <span
+        className={cx(
+          'break-all text-right text-[11px] text-ink',
+          mono && 'font-mono text-[10.5px]',
+        )}
+      >
+        {value}
+      </span>
+    </div>
   );
 }
