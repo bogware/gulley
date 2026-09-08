@@ -270,14 +270,12 @@ export function registerEvalRolloutRoutes(app: FastifyInstance, ctx: ControlCont
       const fromModel = str(b['fromModel']);
       const toModel = str(b['toModel']);
       if (!suiteId || !workspaceId || !alias || !fromModel || !toModel) {
-        return reply
-          .code(422)
-          .send({
-            error: {
-              type: 'validation',
-              message: 'suiteId, workspaceId, alias, fromModel, toModel required',
-            },
-          });
+        return reply.code(422).send({
+          error: {
+            type: 'validation',
+            message: 'suiteId, workspaceId, alias, fromModel, toModel required',
+          },
+        });
       }
       if (fromModel === toModel)
         return reply
