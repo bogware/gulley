@@ -24,6 +24,10 @@ pnpm-debug.log*
 # test / coverage
 coverage/
 .vitest/
+test-results/
+playwright-report/
+.playwright/
+blob-report/
 
 # terraform
 **/.terraform/*
