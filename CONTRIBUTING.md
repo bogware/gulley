@@ -55,10 +55,10 @@ Or in one shot, the way CI does it: `bash ci/verify.sh`.
 ## Dependency updates
 
 Dependency bumps are **manual and grouped** — there is no scheduled automation. Run the
-`workflow_dispatch`-only dependency workflow (added in a later milestone) to open a single
-grouped update PR. Please don't add scheduled Dependabot/renovate configs.
+`workflow_dispatch`-only dependency workflow to open a single grouped update PR. Please
+don't add scheduled Dependabot/renovate configs.
 
 ## Reporting security issues
 
 Please do not open public issues for security vulnerabilities. Follow the process in
-`SECURITY.md` (added alongside the security-hardening milestone).
+[`SECURITY.md`](SECURITY.md).

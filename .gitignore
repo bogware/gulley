@@ -44,3 +44,6 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# internal design handoff — not for public release
+design_handoff_gulley_console/

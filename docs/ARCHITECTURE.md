@@ -1,10 +1,8 @@
 # Gulley — Architecture
 
 > **Gulley** is a self-hostable, enterprise-grade **LLM Gateway**: a single container you run in AWS ECS that fronts every LLM provider your organization uses, adding routing, cost control, observability, caching, guardrails, access control, and audit — without changing a line of application code.
->
-> _"Gulley" is the working name; the final product/package namespace is pending (see [Open Decisions](#16-open-decisions))._
 
-**Status:** M1–M18 delivered. This document is the design source of truth; where it diverges from the shipped code, **`apps/gateway/src/routes/messages.ts` (`handleProxy`) is authoritative** for the request-pipeline order. It folds in a competitor + provider-integration research pass and a four-lens adversarial architecture review (hot-path/streaming, auth/security, provider fidelity, data/ops).
+This document is the design source of truth; where it diverges from the shipped code, **`apps/gateway/src/routes/messages.ts` (`handleProxy`) is authoritative** for the request-pipeline order. See the [CHANGELOG](../CHANGELOG.md) for delivered capabilities. It folds in a competitor + provider-integration research pass and a four-lens adversarial architecture review (hot-path/streaming, auth/security, provider fidelity, data/ops).
 
 ---
 
@@ -288,8 +286,8 @@ gulley/
 │  ├─ config/           # DB↔YAML serialization, versioning, drift detection
 │  ├─ telemetry/        # OTel GenAI emitters, sensitive-header scrubber
 │  ├─ storage/          # Drizzle schema + migrations, Redis clients (role-split)
-│  └─ sdk/              # thin control-plane management SDK
-├─ infra/terraform/     # modules + dev/prod root stacks
+│  └─ control-client/   # thin control-plane management client
+├─ infra/terraform/     # single adaptable module (test/prod tiers)
 ├─ ci/                  # shared build/test/scan/deploy scripts (called by both CIs)
 ├─ .github/workflows/   # GitHub Actions (thin, call ci/)
 ├─ .azuredevops/        # Azure Pipelines (thin, call ci/)

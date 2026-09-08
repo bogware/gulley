@@ -16,7 +16,8 @@ compromised, rotate it immediately, and notify the maintainers.
 
 ## Scope
 
-A full threat model and control mapping (SOC 2 Type II) lands with the security-hardening
-milestone (see [`docs/ROADMAP.md`](docs/ROADMAP.md), M6). Core invariants — deterministic
-fail-closed auth, SSRF egress lockdown, always-on credential scrubbing, tamper-evident
-audit — are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Gulley's core security invariants — deterministic fail-closed auth, SSRF egress lockdown,
+always-on credential scrubbing, and a tamper-evident (hash-chained, optionally WORM-mirrored
+and KMS-signed) audit trail — are documented in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Supported versions: the latest release on the
+default branch. Please report against `main`.

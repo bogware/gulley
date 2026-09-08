@@ -12,9 +12,10 @@ translate to/from it. Single-tenant per deployment (`org_id`/`workspace_id`/`pro
 columns exist for a future multi-tenant mode, but no isolation machinery in v1).
 
 `docs/ARCHITECTURE.md` is the source of truth for the design and its non-negotiable
-invariants; `docs/ROADMAP.md` records what is actually built. **The README's "M0 — scaffold"
-status is stale** — M1–M6 are delivered (read the "Delivered" blocks in the roadmap for the
-real state, including scope caveats like "streaming output guardrails are audit-only").
+invariants; the [CHANGELOG](CHANGELOG.md) records what is actually built. The core gateway,
+routing, cost/budget, caching, guardrails/DLP, RBAC, identity (OAuth/OIDC), compliance, and
+the admin console are delivered. Note scope caveats documented in ARCHITECTURE.md (e.g.
+"streaming output guardrails are audit-only by default unless the windowed enforcer is on").
 
 ## Commands
 

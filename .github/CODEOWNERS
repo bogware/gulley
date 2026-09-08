@@ -1,0 +1,20 @@
+# Default owner for everything in the repo.
+* @draxios
+
+# Data-plane hot path — changes here require extra scrutiny (see docs/HOTPATH_REVIEW.md).
+/apps/gateway/src/routes/messages.ts @draxios
+/apps/gateway/src/context.ts         @draxios
+/packages/budget/                    @draxios
+/packages/cost/                      @draxios
+/packages/cache/                     @draxios
+/packages/routing/                   @draxios
+/packages/providers/src/sse.ts       @draxios
+
+# Security-sensitive surfaces.
+/packages/auth/     @draxios
+/packages/rbac/     @draxios
+/packages/crypto/   @draxios
+/packages/oauth/    @draxios
+/packages/oidc/     @draxios
+/.github/workflows/ @draxios
+/infra/             @draxios

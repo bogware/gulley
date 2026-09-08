@@ -12,3 +12,6 @@ packages/storage/migrations
 docs/openapi/control-api.json
 # Helm templates are Go-templated YAML, not standard YAML (prettier can't parse them).
 deploy/helm/gulley/templates
+
+# internal design handoff
+design_handoff_gulley_console/
