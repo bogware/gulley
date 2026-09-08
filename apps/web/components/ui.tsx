@@ -318,6 +318,75 @@ export function ErrorNote({ error }: { error: string }) {
   );
 }
 
+/* ---------------------------------------------------------------- grid table */
+
+/** A CSS-grid table row on fixed px tracks + one 1fr — the dense Platinum table
+ *  shape (single-line cells). `cols` is a grid-template-columns string. */
+export function GridRow({
+  cols,
+  header,
+  selected,
+  onClick,
+  className,
+  children,
+}: {
+  cols: string;
+  header?: boolean;
+  selected?: boolean;
+  onClick?: () => void;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      onClick={onClick}
+      style={{ gridTemplateColumns: cols }}
+      className={cx(
+        'grid items-center gap-2 px-3',
+        header
+          ? 'border-b border-line bg-rail py-1.5 text-[9px] font-medium uppercase tracking-[0.14em] text-micro'
+          : 'border-b border-line-soft py-[7px] text-[11.5px] last:border-0',
+        !header && selected && 'bg-accent-tint shadow-selrow',
+        !header && !selected && onClick && 'cursor-pointer transition-colors hover:bg-[#F3F0E8]',
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** A single-line cell for {@link GridRow}. */
+export function Cell({
+  children,
+  align = 'left',
+  mono,
+  tone = 'body',
+  className,
+}: {
+  children?: ReactNode;
+  align?: 'left' | 'right';
+  mono?: boolean;
+  tone?: 'ink' | 'body' | 'secondary';
+  className?: string;
+}) {
+  return (
+    <div
+      className={cx(
+        'truncate',
+        align === 'right' && 'text-right tabular-nums',
+        mono && 'font-mono',
+        tone === 'ink' && 'text-ink',
+        tone === 'body' && 'text-body',
+        tone === 'secondary' && 'text-secondary',
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
 /* --------------------------------------------------------------------- table */
 
 export function Table({ children }: { children: ReactNode }) {
