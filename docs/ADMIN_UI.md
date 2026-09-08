@@ -3,29 +3,27 @@
 The control-plane UI (`apps/web`), built on the control-api endpoints that already
 exist.
 
-> **Status: ✅ DELIVERED** (2026-08-26). All pages below are built and the app
-> builds clean (`next build`, 13 routes). Auth is the pasted-token flow; the
-> **OIDC session gate is the one remaining piece (M11)** — until then, connect
-> with a bootstrap admin token. `pnpm --filter @gulley/web dev` serves it;
+> **Status: ✅ DELIVERED.** The pages below are built and the app builds clean
+> (`next build`). Auth supports both a **bootstrap/paste-token** flow (dev /
+> break-glass) and **Entra SSO** ("Sign in with SSO" — see
+> [ENTRA_SETUP.md](ENTRA_SETUP.md)). `pnpm --filter @gulley/web dev` serves it;
 > `/control/*` proxies to the control-api (`CONTROL_API_URL`, default :8081).
 
 ## Stack
 
 - **Next.js 15 (App Router) + React 19 + Tailwind** (already set up). Add
-  **shadcn/ui** for primitives (button, table, dialog, card, badge, tabs) and a
-  lightweight chart approach — inline SVG / a small charting lib — per the
-  `dataviz` guidance. Keep it dependency-light.
+  primitives (button, table, dialog, card, badge, tabs) and a lightweight chart
+  approach — inline SVG / a small charting lib. Keep it dependency-light.
 - **Data layer:** `apps/web/lib/api.ts` (`GulleyAdminApi`) + `lib/types.ts` DTOs,
   mirroring the control-api responses. Base URL from `NEXT_PUBLIC_CONTROL_API_URL`.
 
 ## Auth flow (dependency)
 
 The console authenticates against the control-api with an **admin session bearer
-token**. In production that token is minted by the **OIDC login → admin session**
-gate (an open **M11** item — inbound OIDC). Until that lands, dev uses a
-**bootstrap admin token** pasted into the console (stored in `sessionStorage`, sent
-as `Authorization: Bearer`). Build order: ship the console against a pasted token,
-then wire the OIDC session when M11 delivers it.
+token**. In production that token is minted by the **Entra OIDC login → admin
+session** gate (auth-code + PKCE; see [ENTRA_SETUP.md](ENTRA_SETUP.md)). For dev or
+break-glass, a **bootstrap admin token** is pasted into the console (stored in
+`localStorage`, sent as `Authorization: Bearer`).
 
 ## Routes / pages
 
@@ -45,7 +43,7 @@ then wire the OIDC session when M11 delivers it.
 
 - **AppShell** — sidebar nav + top bar (workspace switcher, token status).
 - **StatTile / SpendTile** — KPI cards (total spend, requests, tokens, error rate)
-  from the usage rollup; follow the `dataviz` stat-tile spec.
+  from the usage rollup.
 - **UsageChart** — area/bar over `UsageBucket[]` (endpoint emphasized), theme-aware.
 - **LogTable** — server-driven table with the filter bar and a "load more" cursor
   button (the API returns `nextCursor`); a row opens a **LogDetail** drawer.
