@@ -55,8 +55,10 @@ export function parsePromText(text: string): ParsedMetrics {
   for (const line of capped.split('\n')) {
     const t = line.trim();
     if (!t || t.startsWith('#')) continue;
-    // name{labels} value   OR   name value
-    const m = /^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(.+)$/.exec(t);
+    // name{labels} value   OR   name value. The label block is greedy up to the LAST
+    // '}' so a label VALUE containing '}' (Prometheus permits it inside quotes) doesn't
+    // truncate the sample; parseLabels only reads quoted name="value" pairs anyway.
+    const m = /^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(\S+)$/.exec(t);
     if (!m) continue;
     const name = m[1] as string;
     const labels = parseLabels(m[2]?.slice(1, -1));
@@ -123,13 +125,17 @@ const total = (samples: PromSample[] | undefined): number =>
 function quantile(hists: PromHistogram[] | undefined, q: number): number {
   if (!hists || hists.length === 0) return 0;
   const merged = new Map<number, number>();
-  let count = 0;
+  let countFromSum = 0;
   for (const h of hists) {
-    count += h.count;
+    countFromSum += h.count;
     for (const b of h.buckets) merged.set(b.le, (merged.get(b.le) ?? 0) + b.count);
   }
-  if (count === 0) return 0;
   const bounds = [...merged.entries()].sort((a, b) => a[0] - b[0]);
+  // Prefer the total observation count, but fall back to the largest cumulative bucket
+  // (the +Inf bucket) when the `_count` line is absent or disagrees, so percentiles
+  // don't collapse to 0 on a partial scrape.
+  const count = Math.max(countFromSum, bounds.length ? (bounds[bounds.length - 1]?.[1] ?? 0) : 0);
+  if (count === 0) return 0;
   const target = q * count;
   let prevLe = 0;
   let prevCum = 0;
@@ -215,9 +221,13 @@ export async function fetchGatewayMetricsText(opts: GatewayMetricsOptions): Prom
   const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 5000);
   timer.unref?.();
   try {
-    const res = await doFetch(opts.url, { signal: ctrl.signal });
+    // redirect:'error' — the egress guard vets only the initial URL, and following a
+    // redirect (widened by requireHttps:false) to an internal host would re-open SSRF.
+    const res = await doFetch(opts.url, { signal: ctrl.signal, redirect: 'error' });
     if (!res.ok) throw new Error(`gateway metrics endpoint returned ${res.status}`);
-    return await res.text();
+    const text = await res.text();
+    if (text.length > MAX_TEXT_BYTES) throw new Error('gateway metrics response too large');
+    return text;
   } finally {
     clearTimeout(timer);
   }

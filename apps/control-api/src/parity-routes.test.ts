@@ -113,4 +113,20 @@ describe('parity routes', () => {
     expect(r.statusCode).toBe(200);
     expect((r.json() as { configured: boolean }).configured).toBe(false);
   });
+
+  it('GET /config/versions/history is config:read-gated (403 for a workspace-scoped viewer)', async () => {
+    // The platform-owner bootstrap admin can read it.
+    expect((await get('/config/versions/history')).statusCode).toBe(200);
+    // A workspace-scoped viewer lacks config:read at the empty deployment scope → 403,
+    // not the fleet-wide config-change timeline.
+    const sess = (await post('/admin/sessions', {
+      memberships: [{ role: 'viewer', orgId, workspaceId }],
+    }).then((r) => r.json())) as { token: string };
+    const r = await app.inject({
+      method: 'GET',
+      url: '/config/versions/history',
+      headers: { authorization: `Bearer ${sess.token}` },
+    });
+    expect(r.statusCode).toBe(403);
+  });
 });

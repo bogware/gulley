@@ -59,6 +59,27 @@ describe('parsePromText / summarizeGatewayMetrics', () => {
     expect(s.duration.p99).toBe(0);
   });
 
+  it('keeps a sample whose label VALUE contains a "}"', () => {
+    const p = parsePromText('gulley_requests_total{provider="a",model="weird}id",status="ok"} 7\n');
+    const s = summarizeGatewayMetrics(p, 'now');
+    expect(s.requests.total).toBe(7);
+    expect(s.requests.byModel['weird}id']).toBe(7);
+  });
+
+  it('derives the percentile denominator from the +Inf bucket when _count is missing', () => {
+    // No _count / _sum line — percentiles must not collapse to 0.
+    const p = parsePromText(
+      [
+        'gulley_request_duration_seconds_bucket{status="ok",le="0.5"} 50',
+        'gulley_request_duration_seconds_bucket{status="ok",le="1"} 90',
+        'gulley_request_duration_seconds_bucket{status="ok",le="+Inf"} 100',
+      ].join('\n'),
+    );
+    const s = summarizeGatewayMetrics(p, 'now');
+    expect(s.duration.p50).toBeGreaterThan(0);
+    expect(s.duration.p90).toBeGreaterThan(0.5);
+  });
+
   it('handles an unknown future metric name without breaking', () => {
     const p = parsePromText(
       'gulley_new_metric_total{x="y"} 5\ngulley_requests_total{status="ok"} 1\n',

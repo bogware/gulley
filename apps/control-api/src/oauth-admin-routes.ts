@@ -31,6 +31,11 @@ export function registerOAuthAdminRoutes(app: FastifyInstance, ctx: ControlConte
     adminRoute(ctx, async (request, reply, admin) => {
       if (!(await ctx.access.can(admin, 'membership:delete', {}))) return forbidden(reply);
       const jti = (request.params as { jti: string }).jti;
+      // jti is a uuid column in the durable registry — reject a malformed id (a raw cast
+      // would 500 and insert a placeholder revoked row for an arbitrary string).
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(jti)) {
+        return notFound(reply, 'session');
+      }
       await ctx.sessions.revoke(jti);
       await ctx.audit.append({
         orgId: null,

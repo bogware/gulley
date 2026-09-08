@@ -15,6 +15,17 @@ import { and, eq, sql } from 'drizzle-orm';
 import type { Database } from './db';
 import { authCode, deviceCode, oauthClient, oauthGrant } from './schema';
 
+/**
+ * Affected-row count from a drizzle non-returning UPDATE, portable across drivers:
+ * postgres-js Result is an Array subclass with `.count` (NO rowCount); pglite exposes
+ * `.rowCount`. A generation-guarded CAS therefore MUST read this — never Array.isArray,
+ * which is always true on the postgres-js Result and reports a lost race as a success.
+ */
+export function affectedRows(res: unknown): number {
+  const r = res as { rowCount?: number; count?: number };
+  return r?.rowCount ?? r?.count ?? 0;
+}
+
 const ms = (d: Date | null): number => (d ? d.getTime() : 0);
 const dt = (n: number): Date => new Date(n);
 
@@ -97,7 +108,7 @@ export class PostgresGrantStore implements GrantStore {
           eq(oauthGrant.refreshGeneration, expectedGen),
         ),
       );
-    return (res as unknown as { rowCount?: number }).rowCount === 1 || Array.isArray(res);
+    return affectedRows(res) === 1;
   }
 
   /** Console listing (secret-free): active grants, newest first. */
@@ -181,7 +192,7 @@ export class PostgresDeviceCodeStore implements DeviceCodeStore {
       .update(deviceCode)
       .set({ status: to })
       .where(and(eq(deviceCode.deviceCode, dc), eq(deviceCode.status, from)));
-    return (res as unknown as { rowCount?: number }).rowCount === 1 || Array.isArray(res);
+    return affectedRows(res) === 1;
   }
   async list(limit = 100): Promise<DeviceCode[]> {
     const rows = await this.db

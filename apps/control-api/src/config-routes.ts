@@ -1,7 +1,7 @@
 import { applyConfig, detectDrift, isConfigDocument, plan } from '@gulley/config';
 import { coveredOrgIds } from '@gulley/rbac';
 import type { FastifyInstance } from 'fastify';
-import { adminRoute, body } from './admin';
+import { adminRoute, body, forbidden } from './admin';
 import { ControlConfigStore } from './config-store';
 import type { ControlContext } from './context';
 
@@ -119,7 +119,10 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
   // exported document; historical document bodies aren't retained, only their metadata).
   app.get(
     '/config/versions/history',
-    adminRoute(ctx, async (request, reply) => {
+    adminRoute(ctx, async (request, reply, admin) => {
+      // The version timeline is fleet-wide config-change metadata (who changed config,
+      // when, the summary/hash) — gate it on config:read, matching /admin/status.
+      if (!(await ctx.access.can(admin, 'config:read', {}))) return forbidden(reply);
       const q = request.query as Record<string, string | undefined>;
       const limit = Math.min(Math.max(Number(q['limit']) || 50, 1), 200);
       const history = ctx.configVersions.history ? await ctx.configVersions.history(limit) : [];

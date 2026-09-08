@@ -409,13 +409,17 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
             deviceCodeTtlMs: brokerCfg.deviceCodeTtlMs ?? 900_000,
             deviceIntervalMs: brokerCfg.deviceIntervalMs ?? 5000,
             onReuse: (g) => {
-              void audit.append({
-                orgId: null,
-                actor: g.principalId,
-                action: 'oauth.refresh_reuse',
-                target: g.handle,
-                payload: { clientId: g.clientId, principalId: g.principalId },
-              });
+              // Best-effort theft signal; swallow a rejected audit write so it never
+              // becomes an unhandled promise rejection (the family is already revoked).
+              audit
+                .append({
+                  orgId: null,
+                  actor: g.principalId,
+                  action: 'oauth.refresh_reuse',
+                  target: g.handle,
+                  payload: { clientId: g.clientId, principalId: g.principalId },
+                })
+                .catch(() => {});
             },
           },
           oauthAdmin
