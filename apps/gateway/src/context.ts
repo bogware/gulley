@@ -45,7 +45,7 @@ import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulle
 import { OidcProvider } from '@gulley/oidc';
 import { readFileSync } from 'node:fs';
 import { BudgetAlerter } from './budget-alerts';
-import type { JwtAuthConfig } from './jwt-auth';
+import { type JwtAuthConfig, parseGroupScopeMap } from './jwt-auth';
 import { applyRouteGroups, parseRouteGroups } from './route-groups';
 import { buildSecretResolver } from './secrets';
 import { DbTenantCredentialResolver } from './tenant';
@@ -668,6 +668,8 @@ export function createProductionContext(config: Config): GatewayContext {
       orgClaim: config.JWT_ORG_CLAIM,
       modelsClaim: config.JWT_MODELS_CLAIM,
       providersClaim: config.JWT_PROVIDERS_CLAIM,
+      groupsClaim: config.JWT_GROUPS_CLAIM,
+      groupScopeRules: parseGroupScopeMap(config.JWT_GROUP_SCOPE_MAP),
       defaultWorkspaceId: config.JWT_DEFAULT_WORKSPACE_ID,
       defaultOrgId: config.JWT_DEFAULT_ORG_ID,
     };

@@ -1,6 +1,6 @@
 import type { OidcProvider } from '@gulley/oidc';
 import { describe, expect, it } from 'vitest';
-import { type JwtAuthConfig, resolveJwtPrincipal } from './jwt-auth';
+import { type JwtAuthConfig, parseGroupScopeMap, resolveJwtPrincipal } from './jwt-auth';
 
 /** A minimal OidcProvider whose verify() returns fixed claims — resolveJwtPrincipal
  *  only calls verify(), so the rest of the surface is unneeded. */
@@ -45,5 +45,63 @@ describe('resolveJwtPrincipal groups', () => {
     };
     const p = await resolveJwtPrincipal('eyJ.a.b', cfg);
     expect(p?.scope.groups).toBeUndefined();
+  });
+});
+
+describe('resolveJwtPrincipal Entra group/App-Role → scope allowlist', () => {
+  const rules = parseGroupScopeMap(
+    JSON.stringify([
+      {
+        group: 'gulley-eng',
+        orgId: 'org_1',
+        workspaceId: 'ws_eng',
+        models: ['claude-x'],
+        providers: ['anthropic'],
+      },
+      { group: 'gulley-admin', orgId: 'org_1', workspaceId: 'ws_admin' },
+    ]),
+  );
+  const base = {
+    audience: 'gulley',
+    workspaceClaim: 'ws',
+    orgClaim: 'org',
+    groupsClaim: 'groups',
+    groupScopeRules: rules,
+  } satisfies Omit<JwtAuthConfig, 'provider'>;
+
+  it('derives org/workspace + narrows models/providers from an Entra App Role (roles claim)', async () => {
+    const p = await resolveJwtPrincipal('eyJ.a.b', {
+      ...base,
+      provider: providerReturning({ sub: 'u1', roles: ['gulley-eng'] }),
+    });
+    expect(p?.scope.workspaceId).toBe('ws_eng');
+    expect(p?.scope.orgId).toBe('org_1');
+    expect(p?.scope.allowedModels).toEqual(['claude-x']);
+    expect(p?.scope.allowedProviders).toEqual(['anthropic']);
+  });
+
+  it('matches a raw security group value too', async () => {
+    const p = await resolveJwtPrincipal('eyJ.a.b', {
+      ...base,
+      provider: providerReturning({ sub: 'u2', groups: ['gulley-admin'] }),
+    });
+    expect(p?.scope.workspaceId).toBe('ws_admin');
+    expect(p?.scope.allowedModels).toBe('*'); // no restriction on that rule
+  });
+
+  it('DENIES a valid token whose groups match no rule (allowlist, no explicit ws claim)', async () => {
+    const p = await resolveJwtPrincipal('eyJ.a.b', {
+      ...base,
+      provider: providerReturning({ sub: 'u3', roles: ['some-other-app-role'] }),
+    });
+    expect(p).toBeNull();
+  });
+
+  it('still honors an explicit workspace claim even with an allowlist configured', async () => {
+    const p = await resolveJwtPrincipal('eyJ.a.b', {
+      ...base,
+      provider: providerReturning({ sub: 'u4', ws: 'ws_direct', org: 'org_1' }),
+    });
+    expect(p?.scope.workspaceId).toBe('ws_direct');
   });
 });

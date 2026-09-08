@@ -80,6 +80,14 @@ const Env = z.object({
   JWT_ORG_CLAIM: z.string().default('gulley_org'),
   JWT_MODELS_CLAIM: z.string().optional(),
   JWT_PROVIDERS_CLAIM: z.string().optional(),
+  // Group/role tags for per-group config + the scope allowlist below. Combined with
+  // Entra App Roles (the `roles` claim) automatically.
+  JWT_GROUPS_CLAIM: z.string().default('groups'),
+  // Entra group/App-Role → scope allowlist (JSON [{group, orgId, workspaceId,
+  // models?, providers?}]). When non-empty a caller must match a rule (or carry an
+  // explicit workspace claim) or the request is denied — Entra group membership,
+  // not just a valid token, authorizes the data plane.
+  JWT_GROUP_SCOPE_MAP: z.string().default('[]'),
   JWT_DEFAULT_WORKSPACE_ID: z.string().optional(),
   JWT_DEFAULT_ORG_ID: z.string().optional(),
 
