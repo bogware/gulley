@@ -21,4 +21,6 @@ EXPOSE 8081 8080
 USER node
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s CMD \
   node -e "fetch('http://127.0.0.1:'+(process.env.CONTROL_API_PORT||8081)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["node", "--import", "tsx", "apps/control-api/src/main.ts"]
+# Run from the app dir so pnpm's isolated `tsx` resolves; Node stays PID 1.
+WORKDIR /app/apps/control-api
+CMD ["node", "--import", "tsx", "src/main.ts"]

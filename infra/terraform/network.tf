@@ -1,14 +1,5 @@
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-data "aws_region" "current" {}
-
-locals {
-  azs         = slice(data.aws_availability_zones.available.names, 0, var.az_count)
-  nat_count   = var.single_nat ? 1 : var.az_count
-  region_name = data.aws_region.current.name
-}
+# VPC, public/private subnets per AZ, NAT (shared or per-AZ), route tables,
+# security groups, and (optionally) private interface endpoints for AWS APIs.
 
 resource "aws_vpc" "this" {
   cidr_block           = var.cidr
@@ -23,7 +14,7 @@ resource "aws_internet_gateway" "this" {
 }
 
 resource "aws_subnet" "public" {
-  count                   = var.az_count
+  count                   = local.az_count
   vpc_id                  = aws_vpc.this.id
   cidr_block              = cidrsubnet(var.cidr, 4, count.index)
   availability_zone       = local.azs[count.index]
@@ -32,7 +23,7 @@ resource "aws_subnet" "public" {
 }
 
 resource "aws_subnet" "private" {
-  count             = var.az_count
+  count             = local.az_count
   vpc_id            = aws_vpc.this.id
   cidr_block        = cidrsubnet(var.cidr, 4, count.index + 8)
   availability_zone = local.azs[count.index]
@@ -49,7 +40,7 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table_association" "public" {
-  count          = var.az_count
+  count          = local.az_count
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
@@ -69,17 +60,17 @@ resource "aws_nat_gateway" "this" {
 }
 
 resource "aws_route_table" "private" {
-  count  = var.az_count
+  count  = local.az_count
   vpc_id = aws_vpc.this.id
   route {
     cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.this[var.single_nat ? 0 : count.index].id
+    nat_gateway_id = aws_nat_gateway.this[local.single_nat ? 0 : count.index].id
   }
   tags = merge(var.tags, { Name = "${var.name}-private-rt-${count.index}" })
 }
 
 resource "aws_route_table_association" "private" {
-  count          = var.az_count
+  count          = local.az_count
   subnet_id      = aws_subnet.private[count.index].id
   route_table_id = aws_route_table.private[count.index].id
 }
@@ -88,28 +79,29 @@ resource "aws_route_table_association" "private" {
 
 resource "aws_security_group" "alb" {
   name        = "${var.name}-alb"
-  description = "ALB — public ingress on 80/443."
+  description = "ALB - public ingress on 80/443."
   vpc_id      = aws_vpc.this.id
   tags        = merge(var.tags, { Name = "${var.name}-alb" })
 }
 
 resource "aws_security_group" "service" {
   name        = "${var.name}-service"
-  description = "ECS tasks — ingress from the ALB only."
+  description = "ECS tasks - ingress from the ALB only."
   vpc_id      = aws_vpc.this.id
   tags        = merge(var.tags, { Name = "${var.name}-service" })
 }
 
 resource "aws_security_group" "data" {
   name        = "${var.name}-data"
-  description = "Aurora + Redis — ingress from the service SG only."
+  description = "Aurora + Redis - ingress from the service SG only."
   vpc_id      = aws_vpc.this.id
   tags        = merge(var.tags, { Name = "${var.name}-data" })
 }
 
 resource "aws_security_group" "endpoints" {
+  count       = local.enable_interface_endpoints ? 1 : 0
   name        = "${var.name}-endpoints"
-  description = "VPC interface endpoints — 443 from within the VPC."
+  description = "VPC interface endpoints - 443 from within the VPC."
   vpc_id      = aws_vpc.this.id
   tags        = merge(var.tags, { Name = "${var.name}-endpoints" })
 }
@@ -136,11 +128,13 @@ resource "aws_vpc_security_group_egress_rule" "alb_all" {
   ip_protocol       = "-1"
 }
 
+# ALB -> tasks on each container port (gateway 8080, control-api 8081, web 3000).
 resource "aws_vpc_security_group_ingress_rule" "service_from_alb" {
+  for_each                     = toset([for p in values(local.ports) : tostring(p)])
   security_group_id            = aws_security_group.service.id
   referenced_security_group_id = aws_security_group.alb.id
-  from_port                    = var.app_port
-  to_port                      = var.app_port
+  from_port                    = tonumber(each.value)
+  to_port                      = tonumber(each.value)
   ip_protocol                  = "tcp"
 }
 
@@ -167,15 +161,17 @@ resource "aws_vpc_security_group_ingress_rule" "data_redis" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "endpoints_https" {
-  security_group_id            = aws_security_group.endpoints.id
+  count                        = local.enable_interface_endpoints ? 1 : 0
+  security_group_id            = aws_security_group.endpoints[0].id
   referenced_security_group_id = aws_security_group.service.id
   from_port                    = 443
   to_port                      = 443
   ip_protocol                  = "tcp"
 }
 
-# --- VPC endpoints (keep AWS API traffic off the public internet) ----------
+# --- VPC endpoints ---------------------------------------------------------
 
+# S3 gateway endpoint is free and always worthwhile (WORM writes + ECR layers).
 resource "aws_vpc_endpoint" "gateway_s3" {
   vpc_id            = aws_vpc.this.id
   service_name      = "com.amazonaws.${local.region_name}.s3"
@@ -184,13 +180,15 @@ resource "aws_vpc_endpoint" "gateway_s3" {
   tags              = merge(var.tags, { Name = "${var.name}-s3" })
 }
 
+# Interface endpoints keep AWS API traffic off the public internet but bill per
+# ENI per AZ; off in the test tier (NAT reaches these APIs just fine).
 resource "aws_vpc_endpoint" "interface" {
-  for_each            = toset(["ecr.api", "ecr.dkr", "secretsmanager", "kms", "logs", "sts", "bedrock-runtime"])
+  for_each            = local.enable_interface_endpoints ? toset(["ecr.api", "ecr.dkr", "secretsmanager", "kms", "logs", "sts", "bedrock-runtime"]) : toset([])
   vpc_id              = aws_vpc.this.id
   service_name        = "com.amazonaws.${local.region_name}.${each.value}"
   vpc_endpoint_type   = "Interface"
   subnet_ids          = aws_subnet.private[*].id
-  security_group_ids  = [aws_security_group.endpoints.id]
+  security_group_ids  = [aws_security_group.endpoints[0].id]
   private_dns_enabled = true
   tags                = merge(var.tags, { Name = "${var.name}-${each.value}" })
 }

@@ -1,19 +1,15 @@
-data "aws_caller_identity" "current" {}
-data "aws_region" "current" {}
+# Split KMS keys (blast-radius isolation), out-of-band-populated Secrets Manager
+# secrets, and least-privilege IAM task roles.
 
 locals {
-  # Split KMS keys per secret class (blast-radius isolation, ARCH §12).
   key_classes = ["secrets", "database", "cache", "audit-export", "oauth"]
-  # Deterministic WORM bucket ARN (same construction as the data module), so the
-  # IAM policies here don't create a module cycle with `data`.
-  worm_bucket_arn = "arn:aws:s3:::${var.name}-audit-worm-${data.aws_caller_identity.current.account_id}"
 }
 
 resource "aws_kms_key" "this" {
   for_each                = toset(local.key_classes)
   description             = "${var.name} ${each.value} encryption key"
   enable_key_rotation     = true
-  deletion_window_in_days = 30
+  deletion_window_in_days = 7
   tags                    = merge(var.tags, { Name = "${var.name}-${each.value}", Class = each.value })
 }
 
@@ -24,8 +20,7 @@ resource "aws_kms_alias" "this" {
 }
 
 # The audit-export key also encrypts the CloudWatch log group; a CMK-encrypted
-# log group requires the Logs service principal to be granted in the KEY policy
-# (an IAM policy alone is insufficient), else `apply` fails creating the group.
+# log group requires the Logs service principal to be granted in the KEY policy.
 data "aws_iam_policy_document" "audit_key" {
   statement {
     sid       = "RootAdmin"
@@ -33,7 +28,7 @@ data "aws_iam_policy_document" "audit_key" {
     resources = ["*"]
     principals {
       type        = "AWS"
-      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+      identifiers = ["arn:aws:iam::${local.account_id}:root"]
     }
   }
   statement {
@@ -42,12 +37,12 @@ data "aws_iam_policy_document" "audit_key" {
     resources = ["*"]
     principals {
       type        = "Service"
-      identifiers = ["logs.${data.aws_region.current.name}.amazonaws.com"]
+      identifiers = ["logs.${local.region_name}.amazonaws.com"]
     }
     condition {
       test     = "ArnLike"
       variable = "kms:EncryptionContext:aws:logs:arn"
-      values   = ["arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/gulley/*"]
+      values   = ["arn:aws:logs:${local.region_name}:${local.account_id}:log-group:/gulley/*"]
     }
   }
 }
@@ -59,13 +54,14 @@ resource "aws_kms_key_policy" "audit_export" {
 
 # Secrets are provisioned empty; values are written out-of-band (never in TF state).
 resource "aws_secretsmanager_secret" "this" {
-  for_each   = toset(var.secret_names)
-  name       = each.value
-  kms_key_id = aws_kms_key.this["secrets"].arn
-  tags       = merge(var.tags, { Name = each.value })
+  for_each                = toset(local.secret_names)
+  name                    = each.value
+  kms_key_id              = aws_kms_key.this["secrets"].arn
+  recovery_window_in_days = 0 # allow immediate delete/recreate on teardown+redeploy
+  tags                    = merge(var.tags, { Name = each.value })
 }
 
-# --- IAM ------------------------------------------------------------------
+# --- IAM -------------------------------------------------------------------
 
 data "aws_iam_policy_document" "ecs_assume" {
   statement {
@@ -77,7 +73,7 @@ data "aws_iam_policy_document" "ecs_assume" {
   }
 }
 
-# Task execution role — pulls images + injects secrets into the task at start.
+# Task execution role - pulls images + injects secrets + writes logs.
 resource "aws_iam_role" "execution" {
   name               = "${var.name}-task-execution"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
@@ -108,7 +104,7 @@ resource "aws_iam_role_policy" "execution_secrets" {
   policy = data.aws_iam_policy_document.execution_secrets.json
 }
 
-# Gateway task role — runtime: Bedrock invoke/guardrail, WORM writes, decrypt.
+# Gateway task role - runtime: Bedrock invoke/guardrail, WORM writes, decrypt.
 resource "aws_iam_role" "gateway_task" {
   name               = "${var.name}-gateway-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
@@ -152,7 +148,7 @@ resource "aws_iam_role_policy" "gateway_task" {
   policy = data.aws_iam_policy_document.gateway_task.json
 }
 
-# Control-plane task role — reads WORM for chain-anchor verification + oauth key.
+# Control-plane task role - reads WORM for chain-anchor verification + oauth/audit KMS.
 resource "aws_iam_role" "control_task" {
   name               = "${var.name}-control-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json

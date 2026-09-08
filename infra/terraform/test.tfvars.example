@@ -1,0 +1,33 @@
+# Cheapest working footprint (tier = "test"). Copy to test.tfvars and edit.
+# Full step-by-step in INSTALL.md. *.tfvars is gitignored; *.tfvars.example is not.
+
+name       = "gulley-test"
+aws_region = "us-east-1"
+tier       = "test" # 1 NAT, single-AZ Aurora, 1 shared Redis, Fargate Spot, no WORM
+
+# --- exposure --------------------------------------------------------------
+# TLS on a subdomain of a Route53 public zone you control. The console is served
+# at domain_name; the gateway + control-api at api.<domain_name>.
+enable_tls     = true
+domain_name    = "gulley-test.example.com"
+hosted_zone_id = "Z0123456789ABCDEFGHIJ"
+enable_web     = true
+# Set enable_tls = false to skip DNS/ACM and serve plain HTTP on the ALB DNS name.
+
+# --- break-glass bootstrap admin ------------------------------------------
+# Generate a token and hash it (keep the TOKEN secret; it is the admin bearer):
+#   TOKEN="gadm_$(openssl rand -hex 24)"; printf %s "$TOKEN" | sha256sum
+# Put ONLY the hash here (a one-way hash is not a secret).
+bootstrap_admin_token_sha256 = "REPLACE_WITH_SHA256_HEX"
+
+# --- images ----------------------------------------------------------------
+image_tag     = "latest" # gateway + control-api monorepo image
+web_image_tag = "latest" # web console image
+
+# --- optional fine-grained overrides (else the test preset applies) --------
+# redis_single_node          = true
+# enable_interface_endpoints = false
+# enable_worm                = false
+# max_acu                    = 2
+# cpu                        = 512
+# memory                     = 1024

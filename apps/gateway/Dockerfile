@@ -24,5 +24,9 @@ EXPOSE 8080 8081
 USER node
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s CMD \
   node -e "fetch('http://127.0.0.1:'+(process.env.GATEWAY_PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-# Default to the gateway; the ECS task definition overrides `command` for control-api.
-CMD ["node", "--import", "tsx", "apps/gateway/src/main.ts"]
+# Run from the app dir: pnpm's isolated linker installs `tsx` under
+# apps/<app>/node_modules, so `node --import tsx` only resolves it from there.
+# Node stays PID 1 (SIGTERM reaches the graceful-drain handler).
+WORKDIR /app/apps/gateway
+# Default to the gateway; the ECS task definition overrides `command`/`workingDirectory` for control-api.
+CMD ["node", "--import", "tsx", "src/main.ts"]

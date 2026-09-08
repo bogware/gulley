@@ -1,68 +1,47 @@
-# Gulley — Terraform
+# Gulley infrastructure (Terraform)
 
-Infrastructure as code for deploying Gulley to AWS ECS Fargate.
+A **single, adaptable Terraform root module** that deploys the whole Gulley stack on
+AWS — VPC + NAT, split-KMS + Secrets Manager + IAM, Aurora PostgreSQL Serverless v2 +
+ElastiCache Redis, ECS Fargate (gateway + control-api + web console) behind one ALB,
+and ACM/Route53. It replaces the older nested `modules/` + `envs/` layout: every
+`*.tf` in this directory composes into one module, and environments are just
+`.tfvars` files.
 
-> **Status:** built in **M6**. `terraform validate` passes for both `envs/dev`
-> and `envs/prod`.
+## Adaptability
 
-## Layout
+A `tier` variable selects a preset:
 
-```
-infra/terraform/
-├─ modules/
-│  ├─ network/         VPC, public/private subnets, NAT, SGs, VPC interface
-│  │                   endpoints (ecr.api/ecr.dkr/secretsmanager/kms/logs/sts/
-│  │                   bedrock-runtime) + S3 gateway endpoint
-│  ├─ security/        split KMS keys (secrets/database/cache/audit-export/oauth),
-│  │                   Secrets Manager (empty; values out-of-band), IAM task
-│  │                   roles (least-privilege), optional cross-account Bedrock
-│  ├─ data/            Aurora PG Serverless v2, Redis×3 (cache=allkeys-lru,
-│  │                   counters+vector=noeviction), S3 Object Lock WORM bucket
-│  ├─ compute/         ECS cluster, SSE-tuned ALB (idle 300s, dereg delay),
-│  │                   task defs (ARM64), services, request-count autoscaling
-│  ├─ edge/            ACM certificate (DNS-validated)
-│  ├─ observability/   CloudWatch log group, ECR repo (scan-on-push, immutable)
-│  └─ stack/           composes the above + the ALB alias record
-└─ envs/
-   ├─ dev/             single-NAT, single-AZ services, min footprint
-   └─ prod/            multi-AZ, HA, deletion protection
-```
+| tier   | footprint                                                                             |
+| ------ | ------------------------------------------------------------------------------------- |
+| `test` | 1 NAT, single-AZ Aurora (0.5–2 ACU), one shared Redis node, Fargate Spot, no WORM, no interface endpoints — the cheapest working stack. |
+| `prod` | 3 AZs, NAT per AZ, Aurora multi-AZ, three role-split Redis groups, on-demand Fargate, private interface endpoints, WORM (COMPLIANCE), deletion protection. |
 
-## Usage
+Every knob is individually overridable on top of the preset (see `variables.tf`):
+sizing (`min_acu`/`max_acu`, `redis_node_type`, `cpu`/`memory`, `desired_count`,
+`min_capacity`/`max_capacity`), toggles (`enable_worm`, `enable_interface_endpoints`,
+`redis_single_node`, `enable_tls`, `enable_web`, `use_fargate_spot`,
+`enable_services`), and DNS (`domain_name`, `hosted_zone_id`).
 
-```sh
-cd envs/dev            # or envs/prod
-cp terraform.tfvars.example terraform.tfvars   # set domain_name + hosted_zone_id
-terraform init -backend-config=backend.hcl     # S3 state (bucket/key/region/lock table)
-terraform plan
-terraform apply
-```
+## Files
 
-After `apply`, set the empty Secrets Manager secrets out-of-band (never in state):
-`gulley/key-pepper`, `gulley/admin-session-secret`, `gulley/db-url`,
-`gulley/provider-{anthropic,openai,bedrock}`. The container reads them as task
-`secrets`. Run DB migrations (`pnpm --filter @gulley/storage db:migrate`) once
-Aurora is reachable.
+`versions.tf` providers/backend · `variables.tf` inputs · `locals.tf` tier presets +
+derived wiring · `network.tf` VPC/subnets/NAT/SGs/endpoints · `security.tf`
+KMS/Secrets/IAM · `data.tf` Aurora/Redis/WORM · `observability.tf` logs/ECR ·
+`compute.tf` ECS/ALB/services/autoscaling · `edge.tf` ACM/Route53 · `outputs.tf`.
 
-## Validation (no cloud)
+## Deploy
+
+**Follow [INSTALL.md](./INSTALL.md)** — the exact, ordered runbook (two-phase apply,
+image build/push, secret population, migration, verification, teardown). Quick shape:
 
 ```sh
-terraform fmt -recursive -check
-cd envs/dev  && terraform init -backend=false && terraform validate
-cd envs/prod && terraform init -backend=false && terraform validate
+cp test.tfvars.example test.tfvars     # edit domain_name, hosted_zone_id, bootstrap hash
+terraform init
+terraform apply -var-file=test.tfvars -var enable_services=false   # infra, 0 tasks
+# ... build+push images, populate secrets, run the migrate task ...
+terraform apply -var-file=test.tfvars                              # start services
+# ... test ...
+terraform destroy -var-file=test.tfvars                           # clean teardown
 ```
 
-## Key infra constants (from the architecture)
-
-- ALB `idle_timeout` = 300 (SSE streams; the 60s default kills them).
-- Gateway target group `deregistration_delay` = 180 (drain in-flight streams).
-- Fargate container `stopTimeout` = 120 → clients reconnect via `Last-Event-ID`.
-- Aurora Serverless v2 `serverlessv2_scaling_configuration { min, max }`.
-- Redis split by role; counters + vector are `noeviction` (never lose a budget
-  counter or silently degrade recall).
-- KMS split per secret class; S3 audit bucket is Object Lock COMPLIANCE.
-- All AWS API traffic stays on VPC interface endpoints (complements SSRF lockdown).
-
-> **Not applied here:** `terraform apply` needs a real AWS account + state
-> backend and is left to the operator; this session validated the configuration
-> only (`terraform validate`).
+`bash ci/tf-check.sh` runs `terraform fmt -check` + `validate` (no cloud creds).

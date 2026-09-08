@@ -1,0 +1,31 @@
+# Multi-AZ HA footprint (tier = "prod"). Copy to prod.tfvars and edit.
+# The prod preset already sets: 3 AZs, one NAT per AZ, Aurora multi-AZ (2 instances),
+# three role-split Redis groups (2 nodes each), on-demand Fargate, private interface
+# endpoints, WORM in COMPLIANCE mode (7-year retention), and Aurora deletion protection.
+# Use a durable S3 state backend for prod (see versions.tf + INSTALL.md), not local state.
+
+name       = "gulley-prod"
+aws_region = "us-east-1"
+tier       = "prod"
+
+enable_tls     = true
+domain_name    = "gulley.example.com"
+hosted_zone_id = "Z0123456789ABCDEFGHIJ"
+enable_web     = true
+
+# In prod, prefer OIDC-minted admin sessions over a bootstrap token: leave this
+# empty and configure the OIDC knobs on the control-api instead. A bootstrap token
+# is fine for the very first login / break-glass.
+bootstrap_admin_token_sha256 = ""
+
+# Pin immutable, signed image tags in prod (the ECR repo is IMMUTABLE at this tier).
+image_tag     = "v1.0.0"
+web_image_tag = "v1.0.0"
+
+# --- example overrides on top of the prod preset --------------------------
+# max_acu             = 32
+# redis_node_type     = "cache.r7g.xlarge"
+# desired_count       = 4
+# max_capacity        = 40
+# worm_mode           = "COMPLIANCE"
+# worm_retention_days = 2555
