@@ -321,6 +321,36 @@ export const membership = pgTable(
   (t) => [index('membership_user_idx').on(t.userId)],
 );
 
+// SCIM 2.0 Groups: an IdP-provisioned group. Its displayName maps (via
+// SCIM_GROUP_ROLE_MAP) to a role, and each member gets that role granted as a
+// `membership` row — so an Entra Enterprise-App group assignment provisions RBAC.
+export const scimGroup = pgTable(
+  'scim_group',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    externalId: text('external_id'),
+    displayName: text('display_name').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('scim_group_display_idx').on(t.displayName)],
+);
+
+// A member of a SCIM group, and the membership row that member's role grant produced
+// (so removing the member revokes exactly that grant).
+export const scimGroupMember = pgTable(
+  'scim_group_member',
+  {
+    groupId: uuid('group_id')
+      .notNull()
+      .references(() => scimGroup.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => adminUser.id, { onDelete: 'cascade' }),
+    membershipId: uuid('membership_id'),
+  },
+  (t) => [uniqueIndex('scim_group_member_idx').on(t.groupId, t.userId)],
+);
+
 // Server-side admin sessions — the revocation record for a gses_ token.
 export const adminSession = pgTable(
   'admin_session',

@@ -20,6 +20,7 @@ import {
   PostgresAdminUserStore,
   PostgresAuditSink,
   PostgresMembershipStore,
+  PostgresScimGroupStore,
   PostgresConfigStore,
   PostgresConfigVersionStore,
   PostgresKeyAdminStore,
@@ -149,6 +150,8 @@ export interface ControlContext {
   /** Durable role grants (DB mode) — authoritative for a session's effective
    *  memberships (loaded via resolverDeps.membershipLoader). */
   durableMemberships?: PostgresMembershipStore;
+  /** SCIM-provisioned groups (DB mode) — member changes grant/revoke role memberships. */
+  scimGroups?: PostgresScimGroupStore;
   /** Verify the underlying audit chain (the sink is guarded, so expose it). Async
    *  because the durable chain is read from Postgres when a DB is present. */
   verifyAudit: () => Promise<{ verified: boolean; count: number }>;
@@ -307,6 +310,9 @@ export interface InMemoryContextOptions {
      *  treats every principal as active (dev/simulated) — wire an EntraGraphIdp in prod. */
     idp?: IdentityProvider;
   };
+  /** SCIM Groups → role mapping (group displayName → { role, orgId }; orgId "*" =
+   *  platform-wide). Drives role provisioning on /scim/v2/Groups member changes. */
+  scimGroupRoleMap?: Record<string, { role: string; orgId: string }>;
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -334,6 +340,12 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   // membershipLoader, so a grant/revoke is effective immediately.
   const adminUsers = db ? new PostgresAdminUserStore(db) : undefined;
   const durableMemberships = db ? new PostgresMembershipStore(db) : undefined;
+  const scimGroups = db
+    ? new PostgresScimGroupStore(db, (displayName) => {
+        const e = opts.scimGroupRoleMap?.[displayName];
+        return e && isRole(e.role) ? { role: e.role, orgId: e.orgId === '*' ? null : e.orgId } : null;
+      })
+    : undefined;
   const membershipLoader = durableMemberships
     ? async (subject: string): Promise<Membership[]> => {
         const rows = await durableMemberships.membershipsForSubject(subject);
@@ -527,6 +539,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     },
     adminUsers,
     durableMemberships,
+    scimGroups,
     // Verify the durable chain when a DB is present (the same rows attestation
     // reads), else the in-memory sink — so a DB-backed deploy no longer reports the
     // empty in-memory chain while admin/PII-reveal audits land in Postgres.

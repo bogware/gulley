@@ -225,6 +225,12 @@ const Env = z.object({
   ENTRA_GRAPH_BASE: z.string().url().default('https://graph.microsoft.com'),
   ENTRA_LOGIN_BASE: z.string().url().default('https://login.microsoftonline.com'),
   ENTRA_ACTIVE_CACHE_MS: z.coerce.number().int().positive().default(600_000),
+
+  // SCIM Groups → role mapping. JSON { "<group displayName>": { role, orgId } }.
+  // When an IdP provisions a group via /scim/v2/Groups, each member is granted the
+  // mapped role (orgId "*" = platform-wide). A group not in the map is tracked but
+  // grants nothing. Empty {} => SCIM Groups accepted but no role provisioning.
+  SCIM_GROUP_ROLE_MAP: z.string().default('{}'),
 });
 
 export type Config = z.infer<typeof Env>;

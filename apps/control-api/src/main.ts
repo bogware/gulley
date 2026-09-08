@@ -270,7 +270,25 @@ function buildContext(config: Config): ControlContext | undefined {
               : {}),
           }
         : undefined,
+    scimGroupRoleMap: parseScimGroupRoleMap(config.SCIM_GROUP_ROLE_MAP),
   });
+}
+
+/** Parse SCIM_GROUP_ROLE_MAP (JSON { displayName: { role, orgId } }); tolerant. */
+function parseScimGroupRoleMap(json: string): Record<string, { role: string; orgId: string }> {
+  try {
+    const raw = JSON.parse(json) as Record<string, unknown>;
+    const out: Record<string, { role: string; orgId: string }> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      const e = v as { role?: unknown; orgId?: unknown };
+      if (typeof e?.role === 'string' && typeof e?.orgId === 'string') {
+        out[k] = { role: e.role, orgId: e.orgId };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
 }
 
 const config = loadConfig();

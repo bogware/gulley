@@ -1,4 +1,4 @@
-import type { AdminUserRow } from '@gulley/storage';
+import type { AdminUserRow, ScimGroupRow } from '@gulley/storage';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { adminRoute, body, str } from './admin';
 import type { ControlContext } from './context';
@@ -12,10 +12,12 @@ import type { ControlContext } from './context';
  *
  * Requires a database (identities are inherently durable) and platform-owner authz
  * (membership:create at the platform scope), the credential an IdP is configured
- * with. Group→role provisioning is a documented follow-up; role assignment today is
- * via POST /memberships or the OIDC group map.
+ * with. Groups (/scim/v2/Groups) map a provisioned group's displayName to a role via
+ * SCIM_GROUP_ROLE_MAP and grant it to each member; role assignment is also available
+ * via POST /memberships or the OIDC/App-Role login claim.
  */
 const USER_SCHEMA = 'urn:ietf:params:scim:schemas:core:2.0:User';
+const GROUP_SCHEMA = 'urn:ietf:params:scim:schemas:core:2.0:Group';
 const LIST_SCHEMA = 'urn:ietf:params:scim:api:messages:2.0:ListResponse';
 const ERROR_SCHEMA = 'urn:ietf:params:scim:api:messages:2.0:Error';
 const SCIM_CT = 'application/scim+json';
@@ -66,6 +68,60 @@ function parseUserNameEq(filter: string | undefined): string | undefined {
   if (!filter) return undefined;
   const m = /^\s*userName\s+eq\s+"(.*)"\s*$/i.exec(filter);
   return m ? m[1] : undefined;
+}
+
+function parseDisplayNameEq(filter: string | undefined): string | undefined {
+  if (!filter) return undefined;
+  const m = /^\s*displayName\s+eq\s+"(.*)"\s*$/i.exec(filter);
+  return m ? m[1] : undefined;
+}
+
+function toScimGroup(g: ScimGroupRow): Record<string, unknown> {
+  return {
+    schemas: [GROUP_SCHEMA],
+    id: g.id,
+    displayName: g.displayName,
+    ...(g.externalId ? { externalId: g.externalId } : {}),
+    members: g.members.map((id) => ({ value: id })),
+    meta: { resourceType: 'Group', location: `/scim/v2/Groups/${g.id}` },
+  };
+}
+
+/** SCIM member references from a `members` value array → admin_user ids. */
+function memberValues(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .map((m) => (m as Record<string, unknown>)?.['value'])
+    .filter((x): x is string => typeof x === 'string' && x.length > 0);
+}
+
+/** Parse a SCIM Group PatchOp into member adds/removes/replace (the shapes Entra/Okta
+ *  send for group membership sync). */
+function parseGroupPatch(b: Record<string, unknown>): {
+  adds: string[];
+  removes: string[];
+  replace?: string[];
+} {
+  const ops = b['Operations'] ?? b['operations'];
+  const adds: string[] = [];
+  const removes: string[] = [];
+  let replace: string[] | undefined;
+  if (!Array.isArray(ops)) return { adds, removes };
+  for (const raw of ops) {
+    const op = raw as Record<string, unknown>;
+    const kind = String(op['op']).toLowerCase();
+    const path = typeof op['path'] === 'string' ? (op['path'] as string) : undefined;
+    if (kind === 'add' && (!path || path === 'members')) adds.push(...memberValues(op['value']));
+    else if (kind === 'replace' && (!path || path === 'members'))
+      replace = memberValues(op['value']);
+    else if (kind === 'remove') {
+      // `members[value eq "id"]` or a value array.
+      const m = path && /members\[value eq "(.+?)"\]/i.exec(path);
+      if (m) removes.push(m[1]!);
+      else removes.push(...memberValues(op['value']));
+    }
+  }
+  return { adds, removes, ...(replace !== undefined ? { replace } : {}) };
 }
 
 /** True when a SCIM PatchOp sets `active` to false (the deprovision signal). */
@@ -193,6 +249,118 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
         action: 'scim.user.deprovision',
         target: id,
         payload: { userName: row.subject, via: 'delete' },
+      });
+      return reply.code(204).send();
+    }),
+  );
+
+  // --- SCIM Groups: an IdP-provisioned group grants its mapped role to each member ---
+
+  const groups = ctx.scimGroups;
+  const groupGuard = async (
+    reply: FastifyReply,
+    admin: Parameters<Parameters<typeof adminRoute>[1]>[2],
+  ): Promise<boolean> => {
+    if (!groups) {
+      scimError(reply, 501, 'SCIM Groups requires a database');
+      return false;
+    }
+    if (!(await ctx.access.can(admin, 'membership:create', {}))) {
+      scimError(reply, 403, 'not authorized to provision', 'forbidden');
+      return false;
+    }
+    return true;
+  };
+
+  app.post(
+    '/scim/v2/Groups',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!groups || !(await groupGuard(reply, admin))) return reply;
+      const b = body(request);
+      const displayName = str(b['displayName']);
+      if (!displayName) return scimError(reply, 400, 'displayName is required', 'invalidValue');
+      const g = await groups.create(displayName, str(b['externalId']) ?? null);
+      for (const userId of memberValues(b['members'])) {
+        await groups.addMember(g.id, userId, displayName);
+      }
+      await ctx.audit.append({
+        actor: admin.subject,
+        action: 'scim.group.provision',
+        target: g.id,
+        payload: { displayName, members: memberValues(b['members']).length },
+      });
+      const full = (await groups.get(g.id)) ?? g;
+      return reply.code(201).header('content-type', SCIM_CT).send(toScimGroup(full));
+    }),
+  );
+
+  app.get(
+    '/scim/v2/Groups/:id',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!groups || !(await groupGuard(reply, admin))) return reply;
+      const g = await groups.get((request.params as { id: string }).id);
+      if (!g) return scimError(reply, 404, 'group not found');
+      return reply.header('content-type', SCIM_CT).send(toScimGroup(g));
+    }),
+  );
+
+  app.get(
+    '/scim/v2/Groups',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!groups || !(await groupGuard(reply, admin))) return reply;
+      const filterName = parseDisplayNameEq((request.query as Record<string, string>)?.['filter']);
+      const all = await groups.list();
+      const matched = filterName ? all.filter((g) => g.displayName === filterName) : all;
+      return reply.header('content-type', SCIM_CT).send({
+        schemas: [LIST_SCHEMA],
+        totalResults: matched.length,
+        startIndex: 1,
+        itemsPerPage: matched.length,
+        Resources: matched.map((g) => toScimGroup(g)),
+      });
+    }),
+  );
+
+  app.patch(
+    '/scim/v2/Groups/:id',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!groups || !(await groupGuard(reply, admin))) return reply;
+      const id = (request.params as { id: string }).id;
+      const g = await groups.get(id);
+      if (!g) return scimError(reply, 404, 'group not found');
+      const patch = parseGroupPatch(body(request));
+      // `replace` sets the exact member set: remove those not in the new list, add new.
+      if (patch.replace) {
+        const next = new Set(patch.replace);
+        for (const cur of g.members) if (!next.has(cur)) await groups.removeMember(id, cur);
+        for (const uid of patch.replace) await groups.addMember(id, uid, g.displayName);
+      }
+      for (const uid of patch.adds) await groups.addMember(id, uid, g.displayName);
+      for (const uid of patch.removes) await groups.removeMember(id, uid);
+      await ctx.audit.append({
+        actor: admin.subject,
+        action: 'scim.group.update',
+        target: id,
+        payload: {
+          added: patch.adds.length + (patch.replace?.length ?? 0),
+          removed: patch.removes.length,
+        },
+      });
+      return reply.header('content-type', SCIM_CT).send(toScimGroup((await groups.get(id)) ?? g));
+    }),
+  );
+
+  app.delete(
+    '/scim/v2/Groups/:id',
+    adminRoute(ctx, async (request, reply, admin) => {
+      if (!groups || !(await groupGuard(reply, admin))) return reply;
+      const id = (request.params as { id: string }).id;
+      if (!(await groups.delete(id))) return scimError(reply, 404, 'group not found');
+      await ctx.audit.append({
+        actor: admin.subject,
+        action: 'scim.group.deprovision',
+        target: id,
+        payload: {},
       });
       return reply.code(204).send();
     }),

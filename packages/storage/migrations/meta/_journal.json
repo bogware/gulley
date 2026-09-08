@@ -134,6 +134,13 @@
       "when": 1788830254513,
       "tag": "0018_tough_loa",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1788843190882,
+      "tag": "0019_strange_cardiac",
+      "breakpoints": true
     }
   ]
 }
