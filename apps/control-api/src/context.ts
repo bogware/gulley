@@ -303,6 +303,9 @@ export interface InMemoryContextOptions {
     absoluteTtlMs?: number;
     deviceCodeTtlMs?: number;
     deviceIntervalMs?: number;
+    /** Upstream identity provider for revoke-on-deprovision. When omitted the broker
+     *  treats every principal as active (dev/simulated) — wire an EntraGraphIdp in prod. */
+    idp?: IdentityProvider;
   };
 }
 
@@ -397,7 +400,13 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
       }
     : undefined;
   const brokerCfg = opts.oauthBroker;
-  const prodIdp: IdentityProvider = { mode: 'entra', isPrincipalActive: async () => true };
+  // Prod: an EntraGraphIdp (Graph accountEnabled) wired in by main.ts so a disabled
+  // user loses broker access at the next refresh. Absent (dev/no Graph creds): treat
+  // every principal as active.
+  const prodIdp: IdentityProvider = brokerCfg?.idp ?? {
+    mode: 'entra',
+    isPrincipalActive: async () => true,
+  };
   const oauthBroker =
     brokerCfg?.enabled && brokerCfg.pepper
       ? new BrokerService(

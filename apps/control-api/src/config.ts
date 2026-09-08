@@ -212,6 +212,19 @@ const Env = z.object({
   OIDC_ROLE_MAP: z.string().default('[]'),
   OIDC_POST_LOGIN_REDIRECT: z.string().default('/'),
   OIDC_COOKIE_SECURE: envBool(false),
+
+  // Entra (Azure AD) Graph adapter for the OAuth broker's revoke-on-deprovision.
+  // When TENANT_ID + GRAPH_CLIENT_ID + GRAPH_CLIENT_SECRET are set, the broker checks
+  // Microsoft Graph `accountEnabled` on refresh (app registration needs the
+  // User.Read.All / Directory.Read.All APPLICATION permission with admin consent).
+  // Graph + login hosts must be on OUTBOUND_HOST_ALLOWLIST. Otherwise every principal
+  // is treated as active (dev/simulated).
+  ENTRA_TENANT_ID: z.string().optional(),
+  ENTRA_GRAPH_CLIENT_ID: z.string().optional(),
+  ENTRA_GRAPH_CLIENT_SECRET: z.string().optional(),
+  ENTRA_GRAPH_BASE: z.string().url().default('https://graph.microsoft.com'),
+  ENTRA_LOGIN_BASE: z.string().url().default('https://login.microsoftonline.com'),
+  ENTRA_ACTIVE_CACHE_MS: z.coerce.number().int().positive().default(600_000),
 });
 
 export type Config = z.infer<typeof Env>;

@@ -7,7 +7,8 @@ import {
 } from '@gulley/crypto';
 import { loadCatalogFromFile } from '@gulley/catalog';
 import type { RateResolver } from '@gulley/cost';
-import { setAirGappedEgress } from '@gulley/egress';
+import { assertEgressAllowed, setAirGappedEgress } from '@gulley/egress';
+import { EntraGraphIdp } from '@gulley/oauth';
 import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
 import { S3AuditMirror } from '@gulley/worm';
@@ -250,6 +251,23 @@ function buildContext(config: Config): ControlContext | undefined {
             refreshTtlMs: config.OAUTH_REFRESH_TTL_MS,
             absoluteTtlMs: config.OAUTH_ABSOLUTE_TTL_MS,
             deviceCodeTtlMs: config.OAUTH_DEVICE_CODE_TTL_MS,
+            // Real Entra revoke-on-deprovision when Graph app creds are configured.
+            ...(config.ENTRA_TENANT_ID &&
+            config.ENTRA_GRAPH_CLIENT_ID &&
+            config.ENTRA_GRAPH_CLIENT_SECRET
+              ? {
+                  idp: new EntraGraphIdp({
+                    tenantId: config.ENTRA_TENANT_ID,
+                    clientId: config.ENTRA_GRAPH_CLIENT_ID,
+                    clientSecret: config.ENTRA_GRAPH_CLIENT_SECRET,
+                    graphBase: config.ENTRA_GRAPH_BASE,
+                    loginBase: config.ENTRA_LOGIN_BASE,
+                    cacheTtlMs: config.ENTRA_ACTIVE_CACHE_MS,
+                    assertAllowed: (url) =>
+                      assertEgressAllowed(url, { allowlist: outboundAllowlist(config) }),
+                  }),
+                }
+              : {}),
           }
         : undefined,
   });
