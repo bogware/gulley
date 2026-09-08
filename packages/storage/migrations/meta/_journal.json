@@ -127,6 +127,13 @@
       "when": 1788820463248,
       "tag": "0017_cheerful_captain_britain",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1788830254513,
+      "tag": "0018_tough_loa",
+      "breakpoints": true
     }
   ]
 }

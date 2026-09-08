@@ -52,6 +52,14 @@ export interface BrokerConfig {
   deviceCodeTtlMs: number;
   deviceIntervalMs: number;
   now?: () => number;
+  /** Fired when a token family is killed because a SUPERSEDED refresh token was
+   *  replayed (genuine reuse → theft signal). Best-effort; never blocks the revoke. */
+  onReuse?: (grant: {
+    handle: string;
+    clientId: string;
+    principalId: string;
+    orgId: string;
+  }) => void;
 }
 
 export interface BrokerDeps {
@@ -341,6 +349,16 @@ export class BrokerService {
       verifyHash(this.cfg.pepper, parsed.secret, grant.prevRefreshTokenHash);
     if (isSuperseded) {
       await this.deps.grants.revoke(grant.handle); // genuine single-step reuse → kill family
+      try {
+        this.cfg.onReuse?.({
+          handle: grant.handle,
+          clientId: grant.clientId,
+          principalId: grant.principalId,
+          orgId: grant.orgId,
+        });
+      } catch {
+        /* best-effort theft signal; never block the revoke */
+      }
       return e('invalid_grant');
     }
 

@@ -116,15 +116,24 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
 
     const ttlSec = Math.floor(ctx.resolverDeps.maxSessionTtlMs / 1000);
     const iat = Math.floor(now() / 1000);
+    const jti = randomUUID();
+    const subject = claims.sub ?? 'oidc-user';
     const token = signAdminSession(secret, {
-      sub: claims.sub ?? 'oidc-user',
+      sub: subject,
       name: claims.name ?? claims.preferred_username ?? claims.email ?? claims.sub ?? 'user',
-      jti: randomUUID(),
+      jti,
       memberships,
       iat,
       exp: iat + ttlSec,
       typ: 'admin-session',
       ver: 1,
+    });
+    await ctx.sessions.record?.({
+      jti,
+      subject,
+      source: 'oidc',
+      createdAt: new Date(iat * 1000).toISOString(),
+      expiresAt: new Date((iat + ttlSec) * 1000).toISOString(),
     });
 
     await ctx.audit.append({

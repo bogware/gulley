@@ -26,9 +26,22 @@ import {
   PostgresMaskVaultStore,
   PostgresSubjectKeyStore,
   PostgresRequestLogQuery,
+  PostgresAdminSessionStore,
+  PostgresGrantStore,
+  PostgresDeviceCodeStore,
+  PostgresAuthCodeStore,
+  PostgresOAuthClientStore,
   readAuditRows,
   type MaskVaultStore,
 } from '@gulley/storage';
+import {
+  BrokerService,
+  type IdentityProvider,
+  InMemoryAuthCodeStore,
+  InMemoryDeviceCodeStore,
+  InMemoryGrantStore,
+  InMemoryOAuthClientStore,
+} from '@gulley/oauth';
 import {
   type AsymmetricSigner,
   type BatchVerifier,
@@ -118,6 +131,18 @@ export interface ControlContext {
   /** Live gateway observability: fetch + parse the gateway's Prometheus /metrics.
    *  Absent ⇒ /admin/observability/* returns 501. */
   gatewayMetrics?: GatewayMetricsProvider;
+  /** OAuth broker (enterprise device + auth-code/PKCE). Present ⇒ /oauth/* is mounted. */
+  oauthBroker?: BrokerService;
+  /** Durable broker stores for the OAuth admin console (DB mode): grant/device/client
+   *  listing + revoke + client CRUD. Absent ⇒ the OAuth admin endpoints 501. */
+  oauthAdmin?: {
+    grants: PostgresGrantStore;
+    devices: PostgresDeviceCodeStore;
+    clients: PostgresOAuthClientStore;
+  };
+  /** Admin-session registry (for the Sessions console). Same object as
+   *  resolverDeps.sessionStore; its optional list/revoke drive the view. */
+  sessions: AdminSessionStore;
   resolverDeps: AdminResolverDeps;
   /** Durable admin-user directory (DB mode); absent = in-memory principal only. */
   adminUsers?: PostgresAdminUserStore;
@@ -268,6 +293,17 @@ export interface InMemoryContextOptions {
   /** Live gateway metrics provider (prod: built from GATEWAY_METRICS_URL; tests inject
    *  a fake). Absent ⇒ /admin/observability/* returns 501. */
   gatewayMetrics?: GatewayMetricsProvider;
+  /** OAuth broker config. When `enabled`, the broker is built (durable stores when a DB
+   *  is present) and /oauth/* is mounted. */
+  oauthBroker?: {
+    enabled: boolean;
+    pepper: string;
+    accessTtlMs?: number;
+    refreshTtlMs?: number;
+    absoluteTtlMs?: number;
+    deviceCodeTtlMs?: number;
+    deviceIntervalMs?: number;
+  };
 }
 
 /** Build a fully in-memory control-plane context — used by tests and the live
@@ -283,7 +319,11 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   // a DB was configured, so a restart wiped the record of who revealed which PII).
   const audit = new GuardedAuditSink(db ? new PostgresAuditSink(db) : inner);
   const keyStore = new InMemoryKeyStore();
-  const sessionStore = new InMemoryAdminSessionStore();
+  // Durable session registry (DB mode) so the console can list + revoke live admin
+  // sessions; in-memory otherwise (revocation + per-process listing only).
+  const sessionStore: AdminSessionStore = db
+    ? new PostgresAdminSessionStore(db)
+    : new InMemoryAdminSessionStore();
 
   // Durable RBAC (DB mode): the admin-user directory + role grants persisted in
   // Postgres. Unlike the in-memory MembershipStore (a write-only ledger), these rows
@@ -345,6 +385,56 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     subjectKeys && opts.maskVaultEncryptor
       ? new ShreddableCipher(opts.maskVaultEncryptor, subjectKeys)
       : opts.maskVaultEncryptor;
+
+  // OAuth broker (enterprise device + auth-code/PKCE). Durable stores when a DB is
+  // present so the admin console can list + revoke grants/clients/device-codes; a
+  // superseded-refresh replay (theft) fires onReuse → an oauth.refresh_reuse audit row.
+  const oauthAdmin = db
+    ? {
+        grants: new PostgresGrantStore(db),
+        devices: new PostgresDeviceCodeStore(db),
+        clients: new PostgresOAuthClientStore(db),
+      }
+    : undefined;
+  const brokerCfg = opts.oauthBroker;
+  const prodIdp: IdentityProvider = { mode: 'entra', isPrincipalActive: async () => true };
+  const oauthBroker =
+    brokerCfg?.enabled && brokerCfg.pepper
+      ? new BrokerService(
+          {
+            pepper: brokerCfg.pepper,
+            accessTtlMs: brokerCfg.accessTtlMs ?? 3_600_000,
+            refreshTtlMs: brokerCfg.refreshTtlMs ?? 30 * 86_400_000,
+            absoluteTtlMs: brokerCfg.absoluteTtlMs ?? 90 * 86_400_000,
+            deviceCodeTtlMs: brokerCfg.deviceCodeTtlMs ?? 900_000,
+            deviceIntervalMs: brokerCfg.deviceIntervalMs ?? 5000,
+            onReuse: (g) => {
+              void audit.append({
+                orgId: null,
+                actor: g.principalId,
+                action: 'oauth.refresh_reuse',
+                target: g.handle,
+                payload: { clientId: g.clientId, principalId: g.principalId },
+              });
+            },
+          },
+          oauthAdmin
+            ? {
+                grants: oauthAdmin.grants,
+                devices: oauthAdmin.devices,
+                codes: new PostgresAuthCodeStore(db!),
+                clients: oauthAdmin.clients,
+                idp: prodIdp,
+              }
+            : {
+                grants: new InMemoryGrantStore(),
+                devices: new InMemoryDeviceCodeStore(),
+                codes: new InMemoryAuthCodeStore(),
+                clients: new InMemoryOAuthClientStore(),
+                idp: prodIdp,
+              },
+        )
+      : undefined;
 
   const collections = Object.fromEntries(
     COLLECTION_KINDS.map((k) => [k, new ScopedCollection()]),
@@ -411,6 +501,9 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
           }
         : undefined),
     gatewayMetrics: opts.gatewayMetrics,
+    oauthBroker,
+    oauthAdmin,
+    sessions: sessionStore,
     resolverDeps: {
       bootstrapEnabled: opts.bootstrapEnabled,
       bootstrapTokenSha256: opts.bootstrapTokenSha256,

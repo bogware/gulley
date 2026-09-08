@@ -240,6 +240,18 @@ function buildContext(config: Config): ControlContext | undefined {
           timeoutMs: config.GATEWAY_METRICS_TIMEOUT_MS,
         })
       : undefined,
+    // OAuth broker (enterprise device + auth-code/PKCE). Off unless enabled + a pepper.
+    oauthBroker:
+      config.OAUTH_BROKER_ENABLED && config.GULLEY_KEY_PEPPER
+        ? {
+            enabled: true,
+            pepper: config.GULLEY_KEY_PEPPER,
+            accessTtlMs: config.OAUTH_ACCESS_TTL_MS,
+            refreshTtlMs: config.OAUTH_REFRESH_TTL_MS,
+            absoluteTtlMs: config.OAUTH_ABSOLUTE_TTL_MS,
+            deviceCodeTtlMs: config.OAUTH_DEVICE_CODE_TTL_MS,
+          }
+        : undefined,
   });
 }
 

@@ -21,6 +21,7 @@
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
     "@gulley/crypto": "workspace:*",
+    "@gulley/oauth": "workspace:*",
     "@gulley/pipeline": "workspace:*",
     "drizzle-orm": "^0.38.2",
     "ioredis": "^5.4.2",

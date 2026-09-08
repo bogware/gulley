@@ -326,9 +326,12 @@ export const adminSession = pgTable(
   'admin_session',
   {
     jti: uuid('jti').primaryKey(),
-    tokenHash: text('token_hash').notNull(),
+    tokenHash: text('token_hash').notNull().default(''),
     subject: text('subject').notNull(),
+    // How the session was minted: 'exchange' | 'oidc' | 'break-glass' (console list).
+    source: text('source').notNull().default('exchange'),
     revoked: boolean('revoked').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   },
   (t) => [uniqueIndex('admin_session_hash_idx').on(t.tokenHash)],

@@ -8,4 +8,6 @@ export * from './cache-adapters';
 export * from './centroid-store';
 export * from './mask-vault-store';
 export * from './subject-key-store';
+export * from './oauth-stores';
+export * from './admin-session-store';
 export * from './config-store';

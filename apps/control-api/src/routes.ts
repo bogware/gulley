@@ -88,6 +88,13 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         ver: 1,
       };
       const token = signAdminSession(secret, claims);
+      await ctx.sessions.record?.({
+        jti,
+        subject,
+        source: 'exchange',
+        createdAt: new Date(now).toISOString(),
+        expiresAt: new Date(claims.exp * 1000).toISOString(),
+      });
       await ctx.audit.append({
         orgId: null,
         actor: admin.subject,
@@ -133,6 +140,13 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       };
       const token = signAdminSession(secret, claims);
       const expiresAt = new Date(claims.exp * 1000).toISOString();
+      await ctx.sessions.record?.({
+        jti,
+        subject: claims.sub,
+        source: 'break-glass',
+        createdAt: new Date(now).toISOString(),
+        expiresAt,
+      });
       await ctx.audit.append({
         orgId: null,
         actor: admin.subject,

@@ -49,6 +49,17 @@ const Env = z.object({
   GATEWAY_METRICS_URL: z.string().url().optional(),
   GATEWAY_METRICS_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
 
+  // OAuth broker (enterprise device + auth-code/PKCE for Claude Code / Codex). When on
+  // (with a DB) the /oauth/* protocol surface is mounted and grants/clients/device-codes
+  // persist durably for the console. Needs GULLEY_KEY_PEPPER (the broker hashes tokens
+  // with it). The admin management endpoints (sessions, clients, grants, reuse alerts)
+  // are always served; the durable views 501 without a DB.
+  OAUTH_BROKER_ENABLED: envBool(false),
+  OAUTH_ACCESS_TTL_MS: z.coerce.number().int().positive().default(3_600_000),
+  OAUTH_REFRESH_TTL_MS: z.coerce.number().int().positive().default(2_592_000_000),
+  OAUTH_ABSOLUTE_TTL_MS: z.coerce.number().int().positive().default(7_776_000_000),
+  OAUTH_DEVICE_CODE_TTL_MS: z.coerce.number().int().positive().default(900_000),
+
   // Ed25519 private key (PEM) that SIGNS onboarding packs (GET .../onboarding-pack).
   // The org publishes the matching public key (served at /.well-known/gulley-onboarding-key)
   // so `gulley init` verifies a pack before writing any config — a phished/tampered

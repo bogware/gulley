@@ -8,6 +8,8 @@ import { registerDebugRoutes } from './debug-routes';
 import { registerEvalRolloutRoutes } from './eval-rollout-routes';
 import { registerObservabilityRoutes } from './observability-routes';
 import { registerParityRoutes } from './parity-routes';
+import { registerOAuthAdminRoutes } from './oauth-admin-routes';
+import { registerOAuthRoutes } from './oauth-routes';
 import { registerHttpEdge } from './http-edge';
 import { registerLogRoutes } from './log-routes';
 import { registerMaskVaultRoutes } from './mask-vault-routes';
@@ -57,6 +59,9 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     registerEvalRolloutRoutes(app, ctx);
     registerObservabilityRoutes(app, ctx);
     registerParityRoutes(app, ctx);
+    registerOAuthAdminRoutes(app, ctx);
+    // Mount the broker's own /oauth/* protocol surface only when it is enabled.
+    if (ctx.oauthBroker) registerOAuthRoutes(app, ctx.oauthBroker, ctx);
     registerOidcRoutes(app, ctx);
     registerScimRoutes(app, ctx);
     registerDebugRoutes(app, ctx, config);
