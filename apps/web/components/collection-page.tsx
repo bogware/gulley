@@ -3,25 +3,28 @@
 import { useState } from 'react';
 import { useAdmin } from '../lib/admin-context';
 import { useAdminQuery } from '../lib/hooks';
-import type { CollectionKind } from '../lib/types';
+import type { CollectionEntity, CollectionKind } from '../lib/types';
 import {
   Button,
-  Card,
+  Cell,
+  CodeBlock,
   EmptyState,
   ErrorNote,
+  Field,
+  GridRow,
   Input,
   PageHeader,
+  Panel,
+  PanelHeader,
   Select,
   Spinner,
-  Table,
-  Td,
-  Th,
 } from './ui';
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const COLS = 'minmax(0,1fr) 140px minmax(0,1.4fr) 120px';
 
-/** Generic create/list panel for the workspace-scoped config collections, which
- *  all share the { workspaceId, name, config } shape. */
+/** Generic create/list/edit/delete panel for the workspace-scoped config collections,
+ *  which all share the { workspaceId, name, config } shape. */
 export function CollectionPage({
   kind,
   title,
@@ -39,10 +42,17 @@ export function CollectionPage({
   const [ws, setWs] = useState('');
   const [name, setName] = useState('');
   const [config, setConfig] = useState(placeholder);
+  const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | undefined>(undefined);
 
-  async function add(): Promise<void> {
-    if (!api || !ws || !name.trim()) return;
+  const reset = (): void => {
+    setEditing(null);
+    setName('');
+    setConfig(placeholder);
+  };
+
+  async function save(): Promise<void> {
+    if (!api || !name.trim()) return;
     setError(undefined);
     let parsed: Record<string, unknown>;
     try {
@@ -52,14 +62,38 @@ export function CollectionPage({
       return;
     }
     try {
-      await api.createCollectionItem(kind, ws, name.trim(), parsed);
-      setName('');
+      if (editing)
+        await api.updateCollectionItem(kind, editing, { name: name.trim(), config: parsed });
+      else {
+        if (!ws) return;
+        await api.createCollectionItem(kind, ws, name.trim(), parsed);
+      }
+      reset();
       items.refetch();
     } catch (e) {
       setError(msg(e));
     }
   }
 
+  async function remove(id: string): Promise<void> {
+    if (!api) return;
+    try {
+      await api.deleteCollectionItem(kind, id);
+      if (editing === id) reset();
+      items.refetch();
+    } catch (e) {
+      setError(msg(e));
+    }
+  }
+
+  function startEdit(e: CollectionEntity): void {
+    setEditing(e.id);
+    setName(e.name);
+    setConfig(JSON.stringify(e.config, null, 2));
+  }
+
+  const wsName = (id: string): string =>
+    workspaces.data?.workspaces.find((w) => w.id === id)?.name ?? id;
   const list = items.data?.entities ?? [];
 
   return (
@@ -67,65 +101,96 @@ export function CollectionPage({
       <PageHeader title={title} subtitle={subtitle} />
       {error ? <ErrorNote error={error} /> : null}
 
-      <Card className="mb-6 p-4">
-        <div className="mb-3 font-medium">Create</div>
-        <div className="flex flex-wrap items-start gap-2">
-          {workspaces.loading ? (
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <Panel className="overflow-hidden">
+          <PanelHeader title={title} meta={`${list.length}`} />
+          {items.loading ? (
             <Spinner />
+          ) : list.length === 0 ? (
+            <EmptyState message="None configured." />
           ) : (
-            <Select value={ws} onChange={(e) => setWs(e.target.value)}>
-              <option value="">workspace…</option>
-              {workspaces.data?.workspaces.map((w) => (
-                <option key={w.id} value={w.id}>
-                  {w.name}
-                </option>
-              ))}
-            </Select>
+            <div className="overflow-x-auto">
+              <div style={{ minWidth: '600px' }}>
+                <GridRow cols={COLS} header>
+                  <Cell>Name</Cell>
+                  <Cell>Workspace</Cell>
+                  <Cell>Config</Cell>
+                  <Cell align="right">Actions</Cell>
+                </GridRow>
+                {list.map((e) => (
+                  <GridRow key={e.id} cols={COLS} selected={editing === e.id}>
+                    <Cell mono tone="ink">
+                      {e.name}
+                    </Cell>
+                    <Cell tone="secondary">{wsName(e.workspaceId)}</Cell>
+                    <Cell mono tone="secondary">
+                      {JSON.stringify(e.config)}
+                    </Cell>
+                    <div className="flex justify-end gap-1">
+                      <Button variant="ghost" onClick={() => startEdit(e)}>
+                        Edit
+                      </Button>
+                      <Button variant="ghost" onClick={() => void remove(e.id)}>
+                        Delete
+                      </Button>
+                    </div>
+                  </GridRow>
+                ))}
+              </div>
+            </div>
           )}
-          <Input
-            className="w-48"
-            placeholder="name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-          <textarea
-            className="min-h-[80px] w-96 rounded-lg border border-neutral-300 bg-white px-3 py-1.5 font-mono text-xs text-neutral-900 outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
-            value={config}
-            onChange={(e) => setConfig(e.target.value)}
-            spellCheck={false}
-          />
-          <Button variant="primary" onClick={() => void add()} disabled={!ws || !name.trim()}>
-            Create
-          </Button>
-        </div>
-      </Card>
+        </Panel>
 
-      <Card>
-        {items.loading ? (
-          <Spinner />
-        ) : list.length === 0 ? (
-          <EmptyState message="None configured." />
-        ) : (
-          <Table>
-            <thead>
-              <tr>
-                <Th>Name</Th>
-                <Th>Workspace</Th>
-                <Th>Config</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {list.map((e) => (
-                <tr key={e.id}>
-                  <Td>{e.name}</Td>
-                  <Td className="font-mono text-xs text-neutral-400">{e.workspaceId}</Td>
-                  <Td className="font-mono text-xs text-neutral-500">{JSON.stringify(e.config)}</Td>
-                </tr>
-              ))}
-            </tbody>
-          </Table>
-        )}
-      </Card>
+        <Panel>
+          <PanelHeader title={editing ? 'Edit item' : 'Create item'} />
+          <div className="flex flex-col gap-3 p-3.5">
+            {!editing ? (
+              <Field label="Workspace">
+                {workspaces.loading ? (
+                  <Spinner />
+                ) : (
+                  <Select value={ws} onChange={(e) => setWs(e.target.value)} className="w-full">
+                    <option value="">workspace…</option>
+                    {workspaces.data?.workspaces.map((w) => (
+                      <option key={w.id} value={w.id}>
+                        {w.name}
+                      </option>
+                    ))}
+                  </Select>
+                )}
+              </Field>
+            ) : null}
+            <Field label="Name">
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="name" />
+            </Field>
+            <Field label="Config (JSON)">
+              <textarea
+                className="min-h-[160px] w-full rounded-control border border-line-control bg-[#FDFCF9] px-2.5 py-2 font-mono text-[11px] leading-[1.55] text-ink shadow-field outline-none"
+                value={config}
+                onChange={(e) => setConfig(e.target.value)}
+                spellCheck={false}
+              />
+            </Field>
+            <div className="flex gap-2">
+              <Button
+                variant="primary"
+                onClick={() => void save()}
+                disabled={!name.trim() || (!editing && !ws)}
+              >
+                {editing ? 'Save changes' : 'Create'}
+              </Button>
+              {editing ? (
+                <Button variant="ghost" onClick={reset}>
+                  Cancel
+                </Button>
+              ) : null}
+            </div>
+            <CodeBlock className="text-[10px]">
+              {`Config is applied verbatim; secret-resolving fields must be ARNs, never values.`}
+            </CodeBlock>
+          </div>
+        </Panel>
+      </div>
     </div>
   );
 }

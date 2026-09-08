@@ -2,20 +2,28 @@
 
 import { useState } from 'react';
 import {
-  Badge,
   Button,
-  Card,
+  Cell,
+  CopyButton,
+  EmptyState,
   ErrorNote,
+  Field,
+  GridRow,
+  InlineResult,
   Input,
   PageHeader,
+  Panel,
+  PanelHeader,
   Select,
   Spinner,
+  StatusChip,
 } from '../../components/ui';
 import { useAdmin } from '../../lib/admin-context';
 import { useAdminQuery } from '../../lib/hooks';
 import type { VirtualKeyView } from '../../lib/types';
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const COLS = 'minmax(0,1fr) 130px 90px 150px';
 
 export default function KeysPage() {
   const { api } = useAdmin();
@@ -25,9 +33,8 @@ export default function KeysPage() {
   const [minted, setMinted] = useState<{ id: string; token: string; keyPrefix: string } | null>(
     null,
   );
-  const [lookupId, setLookupId] = useState('');
-  const [looked, setLooked] = useState<VirtualKeyView | null>(null);
   const [error, setError] = useState<string | undefined>(undefined);
+  const keys = useAdminQuery((a) => (ws ? a.listKeys(ws) : Promise.resolve({ keys: [] })), [ws]);
 
   async function mint(): Promise<void> {
     if (!api || !ws || !name.trim()) return;
@@ -36,100 +43,144 @@ export default function KeysPage() {
       const r = await api.createKey(ws, name.trim());
       setMinted(r);
       setName('');
+      keys.refetch();
     } catch (e) {
       setError(msg(e));
     }
   }
-  async function lookup(): Promise<void> {
-    if (!api || !lookupId.trim()) return;
-    setError(undefined);
+  async function disable(id: string): Promise<void> {
+    if (!api) return;
     try {
-      const r = await api.key(lookupId.trim());
-      setLooked(r.key);
+      await api.disableKey(id);
+      keys.refetch();
     } catch (e) {
       setError(msg(e));
-      setLooked(null);
     }
   }
+  async function rotate(id: string): Promise<void> {
+    if (!api) return;
+    try {
+      setMinted(await api.rotateKey(id));
+      keys.refetch();
+    } catch (e) {
+      setError(msg(e));
+    }
+  }
+
+  const list = keys.data?.keys ?? [];
 
   return (
     <div>
       <PageHeader
         title="Virtual keys"
-        subtitle="Mint API keys scoped to a workspace. The token is shown once, never again."
+        subtitle="Mint, list, disable, and rotate workspace-scoped keys. A token is shown once, never again."
       />
       {error ? <ErrorNote error={error} /> : null}
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card className="p-4">
-          <div className="mb-3 font-medium">Mint a key</div>
-          <div className="flex flex-wrap gap-2">
-            {workspaces.loading ? (
-              <Spinner />
-            ) : (
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <Panel className="overflow-hidden">
+          <PanelHeader
+            title="Keys"
+            meta={ws ? `${list.length}` : 'select a workspace'}
+            right={
               <Select value={ws} onChange={(e) => setWs(e.target.value)}>
-                <option value="">select workspace…</option>
+                <option value="">workspace…</option>
                 {workspaces.data?.workspaces.map((w) => (
                   <option key={w.id} value={w.id}>
                     {w.name}
                   </option>
                 ))}
               </Select>
-            )}
-            <Input placeholder="key name" value={name} onChange={(e) => setName(e.target.value)} />
-            <Button variant="primary" onClick={() => void mint()} disabled={!ws || !name.trim()}>
-              Mint
-            </Button>
-          </div>
-
-          {minted ? (
-            <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/30">
-              <div className="text-xs font-medium text-amber-700 dark:text-amber-300">
-                Copy this token now — it is never shown again.
-              </div>
-              <code className="mt-2 block break-all font-mono text-xs">{minted.token}</code>
-              <div className="mt-2 flex items-center gap-2">
-                <Button onClick={() => void navigator.clipboard?.writeText(minted.token)}>
-                  Copy
-                </Button>
-                <Badge>prefix {minted.keyPrefix}</Badge>
-                <Badge>id {minted.id}</Badge>
+            }
+          />
+          {!ws ? (
+            <EmptyState message="Select a workspace to list its keys." />
+          ) : keys.loading ? (
+            <Spinner />
+          ) : list.length === 0 ? (
+            <EmptyState message="No keys in this workspace yet." />
+          ) : (
+            <div className="overflow-x-auto">
+              <div style={{ minWidth: '500px' }}>
+                <GridRow cols={COLS} header>
+                  <Cell>Name</Cell>
+                  <Cell>Prefix</Cell>
+                  <Cell>State</Cell>
+                  <Cell align="right">Actions</Cell>
+                </GridRow>
+                {list.map((k: VirtualKeyView) => (
+                  <GridRow key={k.id} cols={COLS}>
+                    <Cell tone="ink">{k.displayName}</Cell>
+                    <Cell mono tone="secondary">
+                      {k.keyPrefix}
+                    </Cell>
+                    <Cell>
+                      <StatusChip tone={k.disabled ? 'red' : 'green'}>
+                        {k.disabled ? 'disabled' : 'active'}
+                      </StatusChip>
+                    </Cell>
+                    <div className="flex justify-end gap-1">
+                      <Button variant="ghost" onClick={() => void rotate(k.id)}>
+                        Rotate
+                      </Button>
+                      {!k.disabled ? (
+                        <Button variant="ghost" onClick={() => void disable(k.id)}>
+                          Disable
+                        </Button>
+                      ) : null}
+                    </div>
+                  </GridRow>
+                ))}
               </div>
             </div>
-          ) : null}
-        </Card>
+          )}
+        </Panel>
 
-        <Card className="p-4">
-          <div className="mb-3 font-medium">Look up a key</div>
-          <div className="flex gap-2">
-            <Input
-              placeholder="key id"
-              value={lookupId}
-              onChange={(e) => setLookupId(e.target.value)}
-            />
-            <Button onClick={() => void lookup()} disabled={!lookupId.trim()}>
-              Look up
+        <Panel>
+          <PanelHeader title="Mint a key" />
+          <div className="flex flex-col gap-3 p-3.5">
+            <Field label="Workspace">
+              <Select value={ws} onChange={(e) => setWs(e.target.value)} className="w-full">
+                <option value="">workspace…</option>
+                {workspaces.data?.workspaces.map((w) => (
+                  <option key={w.id} value={w.id}>
+                    {w.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Key name">
+              <Input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="claude-code · platform-eng"
+              />
+            </Field>
+            <Button variant="primary" onClick={() => void mint()} disabled={!ws || !name.trim()}>
+              Mint key
             </Button>
-          </div>
-          {looked ? (
-            <dl className="mt-4 space-y-2 text-sm">
-              <Row k="Name" v={looked.displayName} />
-              <Row k="Prefix" v={looked.keyPrefix} />
-              <Row k="Workspace" v={looked.workspaceId} />
-              <Row k="Disabled" v={String(looked.disabled)} />
-            </dl>
-          ) : null}
-        </Card>
-      </div>
-    </div>
-  );
-}
 
-function Row({ k, v }: { k: string; v: string }) {
-  return (
-    <div className="flex justify-between gap-4">
-      <dt className="text-neutral-400">{k}</dt>
-      <dd className="break-all text-right font-mono text-xs">{v}</dd>
+            {minted ? (
+              <div className="rounded-control border border-warn-border bg-warn-bg p-2.5">
+                <div className="text-[10.5px] font-medium text-warn-text">
+                  Copy this token now — it is never shown again.
+                </div>
+                <code className="mt-1.5 block break-all font-mono text-[10.5px] text-ink">
+                  {minted.token}
+                </code>
+                <div className="mt-2 flex items-center gap-2">
+                  <CopyButton text={minted.token} />
+                  <StatusChip>prefix {minted.keyPrefix}</StatusChip>
+                </div>
+              </div>
+            ) : (
+              <InlineResult tone="info">
+                Point Claude Code / Codex at the gateway with this key.
+              </InlineResult>
+            )}
+          </div>
+        </Panel>
+      </div>
     </div>
   );
 }
