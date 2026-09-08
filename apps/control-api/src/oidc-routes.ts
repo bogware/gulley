@@ -8,6 +8,7 @@ import {
   exchangeCode,
   extractGroups,
   FLOW_COOKIE,
+  hasGroupOverage,
   mapMemberships,
   parseCookies,
   serializeCookie,
@@ -111,8 +112,16 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
 
     const claims = verified.claims;
     const groups = extractGroups(claims as Record<string, unknown>, oidc.groupsClaim);
+    const overage = hasGroupOverage(claims as Record<string, unknown>);
     const orgIds = ctx.orgs.list('*').map((o) => o.id);
     const memberships = mapMemberships(groups, oidc.roleRules, orgIds);
+    if (overage && memberships.length === 0) {
+      request.log.warn(
+        'OIDC login: Entra returned a groups-overage indirection and no App Role matched — ' +
+          'this principal is in >200 groups. Map roles via Entra App Roles (the `roles` claim) ' +
+          'to avoid the overage. This user has no memberships from the token.',
+      );
+    }
 
     const ttlSec = Math.floor(ctx.resolverDeps.maxSessionTtlMs / 1000);
     const iat = Math.floor(now() / 1000);
@@ -136,12 +145,28 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
       expiresAt: new Date((iat + ttlSec) * 1000).toISOString(),
     });
 
+    // Persist the SSO principal into the durable admin-user directory so it is one
+    // identity across SSO, RBAC, SCIM, and the console — and so a SCIM/admin grant
+    // (unioned in by membershipLoader) applies, and a SCIM/Graph deprovision can
+    // deactivate it. Best-effort: a directory hiccup must not block login.
+    if (ctx.adminUsers) {
+      try {
+        await ctx.adminUsers.upsertBySubject(
+          subject,
+          claims.name ?? claims.preferred_username ?? claims.email ?? subject,
+          claims.email ?? null,
+        );
+      } catch (e) {
+        request.log.warn({ err: (e as Error).message }, 'OIDC login: admin-user upsert failed');
+      }
+    }
+
     await ctx.audit.append({
       orgId: null,
       actor: claims.sub ?? 'oidc-user',
       action: 'admin.session.oidc',
       target: claims.sub ?? '',
-      payload: { memberships: memberships.length, groups: groups.length },
+      payload: { memberships: memberships.length, groups: groups.length, overage },
     });
 
     reply.header('set-cookie', [

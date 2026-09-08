@@ -151,10 +151,40 @@ export function parseRoleMap(json: string): OidcRoleRule[] {
   );
 }
 
+/**
+ * Collect the identity values used for role mapping, UNION-ing three sources so an
+ * OIDC_ROLE_MAP rule can match either an Entra App Role or a security group:
+ *   1. `roles` — Entra App Roles (PRIMARY): human-readable, assignable to users or
+ *      groups on the Enterprise App, and immune to the >200-group overage.
+ *   2. the configured groups claim (OIDC_GROUPS_CLAIM, default `groups`).
+ *   3. `groups` — raw security-group values (GUID fallback).
+ * Deduped, order-stable.
+ */
 export function extractGroups(claims: Record<string, unknown>, claimName: string): string[] {
-  const v = claims[claimName] ?? claims['groups'] ?? claims['roles'];
-  if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string');
-  return typeof v === 'string' ? [v] : [];
+  const out = new Set<string>();
+  for (const key of ['roles', claimName, 'groups']) {
+    const v = claims[key];
+    if (Array.isArray(v)) {
+      for (const x of v) if (typeof x === 'string') out.add(x);
+    } else if (typeof v === 'string') {
+      out.add(v);
+    }
+  }
+  return [...out];
+}
+
+/**
+ * True when Entra returned a groups "overage" indirection (`_claim_names.groups`)
+ * instead of the group values — it does this when the principal is in more than
+ * ~200 groups. The group values are then NOT in the token; resolving them requires
+ * a Graph `memberOf` call. App Roles (the `roles` claim) never overflow, so the
+ * recommended mapping avoids this entirely. Callers should surface a clear warning.
+ */
+export function hasGroupOverage(claims: Record<string, unknown>): boolean {
+  const cn = claims['_claim_names'];
+  return (
+    !!cn && typeof cn === 'object' && !Array.isArray(cn) && 'groups' in (cn as Record<string, unknown>)
+  );
 }
 
 export function mapMemberships(
