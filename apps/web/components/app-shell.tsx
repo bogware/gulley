@@ -19,19 +19,41 @@ const NAV_GROUPS: Array<{ group: string; items: NavItem[] }> = [
       { href: '/', label: 'Overview' },
       { href: '/logs', label: 'Request logs' },
       { href: '/analytics', label: 'Analytics' },
-      { href: '/audit', label: 'Audit & WORM' },
+      { href: '/observability', label: 'Observability' },
+    ],
+  },
+  {
+    group: 'Govern',
+    items: [
+      { href: '/compliance', label: 'Compliance & WORM' },
+      { href: '/guardrails', label: 'Guardrails' },
+      { href: '/rollouts', label: 'Eval rollouts' },
+    ],
+  },
+  {
+    group: 'FinOps',
+    items: [
+      { href: '/finops', label: 'Chargeback & bypass' },
+      { href: '/budgets', label: 'Budgets' },
+      { href: '/rate-limits', label: 'Rate limits' },
+    ],
+  },
+  {
+    group: 'Identity',
+    items: [
+      { href: '/identity', label: 'Users & sessions' },
+      { href: '/keys', label: 'Virtual keys' },
     ],
   },
   {
     group: 'Configure',
     items: [
+      { href: '/config', label: 'Config console' },
       { href: '/routes', label: 'Routes & aliases' },
       { href: '/providers', label: 'Providers' },
-      { href: '/keys', label: 'Virtual keys' },
-      { href: '/budgets', label: 'Budgets' },
-      { href: '/rate-limits', label: 'Rate limits' },
-      { href: '/guardrails', label: 'Guardrails' },
+      { href: '/prompts', label: 'Prompts' },
       { href: '/orgs', label: 'Orgs & workspaces' },
+      { href: '/settings', label: 'Settings & status' },
     ],
   },
 ];
