@@ -17,6 +17,10 @@ export interface CircuitBreakerOptions {
   /** Optional cross-replica ejection sharing (default: no sharing). */
   sync?: BreakerSync;
   now?: () => number;
+  /** Fire-and-forget observability hook, called once when a target transitions
+   *  CLOSED → OPEN (ejected) — the key resiliency event to alert on. Never throws into
+   *  the caller (invoked in a try/catch); does not affect breaker behavior. */
+  onOpen?: (key: string) => void;
 }
 
 interface CircuitState {
@@ -58,6 +62,7 @@ export class CircuitBreaker {
   private readonly alpha: number;
   private readonly sync: BreakerSync;
   private readonly now: () => number;
+  private readonly onOpen?: (key: string) => void;
 
   constructor(opts: CircuitBreakerOptions = {}) {
     this.threshold = opts.failureThreshold ?? 5;
@@ -68,6 +73,7 @@ export class CircuitBreaker {
     this.alpha = opts.alpha ?? 0.2;
     this.sync = opts.sync ?? new NoopBreakerSync();
     this.now = opts.now ?? ((): number => Date.now());
+    this.onOpen = opts.onOpen;
   }
 
   isOpen(key: string): boolean {
@@ -113,11 +119,20 @@ export class CircuitBreaker {
     const tripConsecutive = s.consecutiveFailures >= this.threshold;
     const tripRate = s.samples >= this.minSamples && s.ewmaError >= this.errorRateThreshold;
     if (tripConsecutive || tripRate) {
+      const wasOpen = s.openUntil > this.now(); // distinguish a fresh ejection from a re-trip
       s.ejections += 1;
       const backoff = Math.min(this.cooldownMs * 2 ** (s.ejections - 1), this.maxCooldownMs);
       s.openUntil = this.now() + Math.max(backoff, retryAfterMs ?? 0);
       // Broadcast so peer replicas eject this target too (fire-and-forget).
       this.sync.publishOpen(key, s.openUntil);
+      // Notify only on a CLOSED → OPEN transition (not every extend), best-effort.
+      if (!wasOpen && this.onOpen) {
+        try {
+          this.onOpen(key);
+        } catch {
+          /* observability hook must never affect breaker behavior */
+        }
+      }
     }
   }
 }

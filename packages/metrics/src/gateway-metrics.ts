@@ -14,6 +14,9 @@ export interface RequestMetricData {
   streamed: boolean;
   inputTokens: number;
   outputTokens: number;
+  /** Cache-read / cache-write token breakdown of the inclusive input total. */
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   costMicroUsd: number;
   startedAtMs: number;
   cacheStatus?: string;
@@ -31,6 +34,16 @@ export interface RequestMetricData {
 // responses routinely run for minutes.
 const DURATION_BUCKETS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300] as const;
 
+// Budget-utilization buckets (used/cap at admission) — resiliency headroom signal.
+const UTILIZATION_BUCKETS = [0.5, 0.7, 0.8, 0.9, 0.95, 1] as const;
+
+// Hard cap on distinct `model` label values. The model on a non-2xx exit is the
+// client-supplied, unverified request model, so a client sending {"model":"<random>"}
+// each request would otherwise grow the (never-evicting) series map without bound — a
+// metrics-cardinality / memory-DoS vector. Verified models beyond the cap fold into
+// "__other__"; unverified (non-2xx) models are never emitted (see boundedModel).
+const MAX_MODEL_LABELS = 1000;
+
 /**
  * The gateway's Prometheus instruments. `record` derives the bulk of them from a
  * single telemetry event (requests, tokens, cost, cache, guardrail action,
@@ -47,7 +60,13 @@ export class GatewayMetrics {
   private readonly saved: Counter;
   private readonly unpriced: Counter;
   private readonly budgetAlerts: Counter;
+  private readonly breakerStateChanges: Counter;
+  private readonly hedges: Counter;
+  private readonly classifierCost: Counter;
   private readonly duration: Histogram;
+  private readonly budgetUtilization: Histogram;
+  /** Distinct verified model labels seen, to bound cardinality (see MAX_MODEL_LABELS). */
+  private readonly modelLabels = new Set<string>();
 
   constructor(private readonly now: () => number = Date.now) {
     this.requests = this.registry.counter(
@@ -86,15 +105,44 @@ export class GatewayMetrics {
       'gulley_budget_alerts_total',
       'Soft-threshold budget alerts fired, by threshold.',
     );
+    this.breakerStateChanges = this.registry.counter(
+      'gulley_breaker_state_changes_total',
+      'Circuit-breaker state transitions by target and new state (open|closed|half_open).',
+    );
+    this.hedges = this.registry.counter(
+      'gulley_hedge_total',
+      'Request-hedging outcomes (fired|primary_won|hedge_won).',
+    );
+    this.classifierCost = this.registry.counter(
+      'gulley_classifier_cost_micro_usd_total',
+      'Smart-routing classifier sub-call spend in micro-USD.',
+    );
     this.duration = this.registry.histogram(
       'gulley_request_duration_seconds',
       'End-to-end proxied request duration in seconds.',
       DURATION_BUCKETS,
     );
+    this.budgetUtilization = this.registry.histogram(
+      'gulley_budget_utilization',
+      'Workspace budget utilization (used/cap) sampled at admission.',
+      UTILIZATION_BUCKETS,
+    );
+  }
+
+  /** Bound the client-influenced `model` label. On a non-2xx exit the model is the
+   *  unverified client request model — never emit it (cardinality-DoS). Otherwise cap
+   *  the distinct verified models and fold the overflow into "__other__". */
+  private boundedModel(d: RequestMetricData): string {
+    if (d.statusCode >= 400) return '__unmetered__';
+    const model = d.responseModel || d.requestModel || 'unknown';
+    if (this.modelLabels.has(model)) return model;
+    if (this.modelLabels.size >= MAX_MODEL_LABELS) return '__other__';
+    this.modelLabels.add(model);
+    return model;
   }
 
   record(d: RequestMetricData): void {
-    const model = d.responseModel || d.requestModel || 'unknown';
+    const model = this.boundedModel(d);
     const base = { provider: d.provider, model };
     this.requests.inc({
       ...base,
@@ -104,6 +152,10 @@ export class GatewayMetrics {
     });
     if (d.inputTokens > 0) this.tokens.inc({ ...base, type: 'input' }, d.inputTokens);
     if (d.outputTokens > 0) this.tokens.inc({ ...base, type: 'output' }, d.outputTokens);
+    if (d.cacheReadTokens && d.cacheReadTokens > 0)
+      this.tokens.inc({ ...base, type: 'cache_read' }, d.cacheReadTokens);
+    if (d.cacheWriteTokens && d.cacheWriteTokens > 0)
+      this.tokens.inc({ ...base, type: 'cache_write' }, d.cacheWriteTokens);
     if (d.costMicroUsd > 0) this.cost.inc(base, d.costMicroUsd);
     if (d.cacheStatus) this.cache.inc({ status: d.cacheStatus });
     if (d.guardrailAction) this.guardrail.inc({ action: d.guardrailAction });
@@ -122,6 +174,27 @@ export class GatewayMetrics {
 
   recordBudgetAlert(threshold: number): void {
     this.budgetAlerts.inc({ threshold: String(threshold) });
+  }
+
+  /** A circuit-breaker state transition (the key resiliency signal — a dead upstream
+   *  ejected from rotation). Emitted from the breaker's transition hook, not per-fault. */
+  recordBreakerState(target: string, state: 'open' | 'closed' | 'half_open'): void {
+    this.breakerStateChanges.inc({ target, state });
+  }
+
+  /** A hedging outcome: 'fired' when a hedge leg launches, then 'primary_won'/'hedge_won'. */
+  recordHedge(outcome: 'fired' | 'primary_won' | 'hedge_won'): void {
+    this.hedges.inc({ outcome });
+  }
+
+  /** Smart-routing classifier sub-call spend (micro-USD). */
+  recordClassifierCost(microUsd: number): void {
+    if (microUsd > 0) this.classifierCost.inc({}, microUsd);
+  }
+
+  /** Budget headroom at admission (used/cap), bucketed — no per-workspace label. */
+  recordBudgetUtilization(utilization: number): void {
+    this.budgetUtilization.observe({}, Math.max(0, utilization));
   }
 
   render(): string {

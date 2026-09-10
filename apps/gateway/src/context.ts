@@ -798,8 +798,20 @@ export function createProductionContext(config: Config): GatewayContext {
   const telemetry: Telemetry = metrics
     ? {
         recordRequest: (d) => {
-          otel.recordRequest(d);
-          metrics.record(d);
+          // Telemetry is best-effort and must NEVER break the proxy — isolate each sink
+          // so a throw in one can't skip the other, turn a clean 4xx into a 500 on an
+          // early-exit path, or reject the fire-and-forget teardown. (safeRecord in the
+          // pipeline wraps the outer call too; this keeps the two sinks independent.)
+          try {
+            otel.recordRequest(d);
+          } catch (err) {
+            console.warn(`[gulley] otel recordRequest failed: ${(err as Error).message}`);
+          }
+          try {
+            metrics.record(d);
+          } catch (err) {
+            console.warn(`[gulley] metrics record failed: ${(err as Error).message}`);
+          }
         },
         forceFlush: () => otel.forceFlush(),
         shutdown: () => otel.shutdown(),
@@ -872,7 +884,11 @@ export function createProductionContext(config: Config): GatewayContext {
     requestLog,
     flushLogs: () => requestLog.close(),
     audit: new PostgresAuditSink(db),
-    breaker: new CircuitBreaker(breakerSync ? { sync: breakerSync } : {}),
+    breaker: new CircuitBreaker({
+      ...(breakerSync ? { sync: breakerSync } : {}),
+      // Surface a target ejection (CLOSED → OPEN) as a metric — the key resiliency event.
+      ...(metrics ? { onOpen: (target) => metrics.recordBreakerState(target, 'open') } : {}),
+    }),
     breakerSync,
     limiter: config.ADAPTIVE_CONCURRENCY_ENABLED
       ? new AdaptiveLimiter({

@@ -38,6 +38,17 @@ export interface RequestSpanData {
   unpriced?: boolean;
   /** W3C trace id (32-hex) this request belongs to, for cross-system correlation. */
   traceId?: string;
+  /** Parent span id (16-hex) — the gateway's own generated span id, which it injected
+   *  upstream as traceparent, so the emitted span shares the propagated trace id. */
+  traceParentId?: string;
+  /** Propagation sampling decision. false = the inbound/derived trace is NOT sampled,
+   *  so the local span is dropped too (keeps local span volume in step with the
+   *  forwarded sampled flag). undefined = no trace context (emit). */
+  sampled?: boolean;
+  /** Cache-read / cache-write token breakdown of the inclusive input total, surfaced
+   *  so a trace can show cached-vs-fresh composition (prompt-cache effectiveness). */
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   /** Per-stage timings (epoch ms), materialized as child spans under the request
    *  span — recorded off the hot path (cheap marks), never per-chunk. */
   stages?: Array<{ name: string; startMs: number; endMs: number }>;
@@ -89,10 +100,29 @@ export function initTelemetry(opts: TelemetryOptions): Telemetry {
 
   return {
     recordRequest(data): void {
-      const span = tracer.startSpan(`chat ${data.requestModel}`, {
-        kind: SpanKind.CLIENT,
-        startTime: data.startedAtMs,
-      });
+      // Honor propagation sampling: when the forwarded trace is explicitly not sampled,
+      // drop the local span too so sampleRatio actually controls span volume. Emit when
+      // there is no trace context at all (sampled undefined) — OTel on without trace
+      // propagation must still export.
+      if (data.sampled === false) return;
+      // Parent the span into the propagated trace so the gateway's leg shares the
+      // client's/upstream's trace id (correlated in one trace, not an orphan under a
+      // fresh random id). The SDK mints its own span id, so this unifies the trace id
+      // rather than making the upstream leg a literal child — a real improvement.
+      const parentCtx =
+        data.traceId && data.traceParentId
+          ? trace.setSpanContext(context.active(), {
+              traceId: data.traceId,
+              spanId: data.traceParentId,
+              traceFlags: data.sampled ? 1 : 0,
+              isRemote: true,
+            })
+          : undefined;
+      const span = tracer.startSpan(
+        `chat ${data.requestModel}`,
+        { kind: SpanKind.CLIENT, startTime: data.startedAtMs },
+        parentCtx,
+      );
       span.setAttributes({
         'gen_ai.operation.name': 'chat',
         'gen_ai.provider.name': data.provider,
@@ -102,6 +132,13 @@ export function initTelemetry(opts: TelemetryOptions): Telemetry {
         'gen_ai.usage.input_tokens': data.inputTokens,
         'gen_ai.usage.output_tokens': data.outputTokens,
         'gulley.cost.micro_usd': data.costMicroUsd,
+        // Cache/read/write breakdown of the inclusive input total (semconv-aligned).
+        ...(data.cacheReadTokens
+          ? { 'gen_ai.usage.cache_read.input_tokens': data.cacheReadTokens }
+          : {}),
+        ...(data.cacheWriteTokens
+          ? { 'gen_ai.usage.cache_creation.input_tokens': data.cacheWriteTokens }
+          : {}),
         'gulley.route': data.route,
         'gulley.streamed': data.streamed,
         'http.response.status_code': data.statusCode,

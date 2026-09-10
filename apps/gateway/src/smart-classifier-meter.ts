@@ -10,6 +10,8 @@ export interface ClassifierMeterDeps {
   ledger: Ledger;
   audit: AuditSink;
   rateResolver?: RateResolver;
+  /** Optional Prometheus sink for the classifier sub-call spend counter. */
+  metrics?: { recordClassifierCost(microUsd: number): void };
 }
 
 export interface ClassifierMeterPrincipal {
@@ -52,6 +54,7 @@ export async function meterClassifierSpend(
   } catch {
     return; // costing failed → nothing to meter, and never fail the served request
   }
+  deps.metrics?.recordClassifierCost(micro); // observability: classifier spend counter
   const subId = `${requestId}#classify`;
   const ws = principal.workspaceId;
 

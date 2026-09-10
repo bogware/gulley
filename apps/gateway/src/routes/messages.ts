@@ -633,6 +633,26 @@ async function handleProxy(
     }
   }
 
+  // Emit a metric + span for a pre-dispatch DENIAL (401/403) so auth-failure rate and
+  // policy/residency refusals are observable — a credential-stuffing burst of 401s would
+  // otherwise be invisible on /metrics and in traces. The model label is bucketed to
+  // '__unmetered__' on non-2xx (it's the unverified client model), so this adds no
+  // cardinality. Kept minimal (no principal/route needed).
+  const recordDenied = (statusCode: number, provider = 'unknown'): void =>
+    safeRecord(ctx, request.log, {
+      provider,
+      requestModel: requestedModel,
+      responseModel: requestedModel,
+      route: '',
+      statusCode,
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      streamed: false,
+      startedAtMs: started,
+    });
+
   // --- authn: Basic (if enabled) OR inbound JWT (bearer is a JWT) OR virtual key ---
   // Deterministic mode selection by credential channel — no fall-through: the
   // `Basic ` scheme, a JWT-shaped bearer, and the `gk_` virtual-key prefix are
@@ -644,6 +664,7 @@ async function handleProxy(
     const basic = resolveBasicPrincipal(authHeader, ctx.basicAuth);
     if (isErr(basic)) {
       request.log.info({ reason: basic.error.reason }, 'basic auth rejected');
+      recordDenied(401);
       await reply.code(401).send({
         type: 'error',
         error: { type: 'authentication_error', message: 'invalid credentials' },
@@ -655,6 +676,7 @@ async function handleProxy(
     const jwtPrincipal = await resolveJwtPrincipal(bearer, ctx.jwtAuth);
     if (!jwtPrincipal) {
       request.log.info('jwt auth rejected');
+      recordDenied(401);
       await reply.code(401).send({
         type: 'error',
         error: { type: 'authentication_error', message: 'invalid credentials' },
@@ -669,6 +691,7 @@ async function handleProxy(
     );
     if (isErr(auth)) {
       request.log.info({ reason: auth.error.reason }, 'auth rejected');
+      recordDenied(401);
       await reply.code(401).send({
         type: 'error',
         error: { type: 'authentication_error', message: 'invalid credentials' },
@@ -750,6 +773,7 @@ async function handleProxy(
 
   // --- authz: model + provider scope (candidates filtered to allowed providers) ---
   if (!scopeAllowsModel(principal.scope, requestedModel)) {
+    recordDenied(403);
     await reply
       .code(403)
       .send({ type: 'error', error: { type: 'permission_error', message: 'model not permitted' } });
@@ -766,6 +790,7 @@ async function handleProxy(
       target: requestedModel,
       payload: { model: requestedModel },
     });
+    recordDenied(403);
     await reply.code(403).send({
       type: 'error',
       error: { type: 'permission_error', message: 'model denied by policy' },
@@ -824,6 +849,7 @@ async function handleProxy(
             candidateRegions: scoped.map((t) => t.region ?? null),
           },
         });
+        recordDenied(403);
         await reply.code(403).send({
           type: 'error',
           error: {
@@ -834,6 +860,7 @@ async function handleProxy(
         return;
       }
     }
+    recordDenied(403);
     await reply
       .code(403)
       .send({ type: 'error', error: { type: 'permission_error', message: 'not permitted' } });
@@ -1336,6 +1363,7 @@ async function handleProxy(
     if (decision?.allowed) reservedScopes.push(principal.scope.workspaceId);
     if (decision && decision.capMicroUsd > 0) {
       admittedUtilization = decision.usedMicroUsd / decision.capMicroUsd;
+      ctx.metrics?.recordBudgetUtilization(admittedUtilization); // headroom trend (bucketed)
       try {
         ctx.budgetAlerter?.check(
           principal.scope.workspaceId,
@@ -1678,7 +1706,10 @@ async function handleProxy(
       abortableSleep(delayMs, controller.signal).then(() => ({ tag: 'timer' as const })),
     ]);
     if (raced.tag === 'a') {
-      if (raced.r.kind === 'usable') return { winner: raced.r, nextIndex: 2 };
+      if (raced.r.kind === 'usable') {
+        ctx.metrics?.recordHedge('primary_won'); // primary answered before the hedge delay
+        return { winner: raced.r, nextIndex: 2 };
+      }
       if (raced.r.kind === 'aborted') return { nextIndex: candidates.length }; // client gone
       return { nextIndex: 1 }; // A failed/saturated fast → failover to B normally
     }
@@ -1687,11 +1718,13 @@ async function handleProxy(
       return { nextIndex: candidates.length };
     }
     const ctrlB = linkChild();
+    ctx.metrics?.recordHedge('fired'); // primary slow past the delay — race a second target
     const pB = hedgeBranch(b, ctrlB.signal);
     const winner = await firstUsable([
       { p: pA, ctrl: ctrlA },
       { p: pB, ctrl: ctrlB },
     ]);
+    ctx.metrics?.recordHedge(winner?.target.name === b.name ? 'hedge_won' : 'primary_won');
     return { winner, nextIndex: 2 };
   };
 
@@ -2531,6 +2564,8 @@ async function handleProxy(
       status,
       inputTokens: cost.totalInputTokens,
       outputTokens: cost.outputTokens,
+      cacheReadTokens: cost.cacheReadTokens,
+      cacheWriteTokens: cost.cacheWriteTokens,
       costMicroUsd,
       cacheSavedMicroUsd: cost.cacheSavedUsd > 0 ? toMicroUsd(cost.cacheSavedUsd) : undefined,
       cacheSavedSource: cost.cacheSavedUsd > 0 ? 'prompt_cache' : undefined,
@@ -2543,6 +2578,8 @@ async function handleProxy(
       guardrailOutputFindings: engine ? outFindings.length : undefined,
       guardrailAction: reportedGuardrailAction,
       traceId: trace?.traceId,
+      traceParentId: trace?.spanId,
+      sampled: trace?.sampled,
       stages:
         dispatchMs !== undefined && firstByteMs !== undefined
           ? [
