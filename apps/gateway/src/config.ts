@@ -215,6 +215,19 @@ const Env = z.object({
   // value is client-supplied, so every attr-cap counter must expire to keep the
   // (noeviction) counters store bounded. Enforced on the counter-less path too.
   BUDGET_ATTR_CAPS: z.string().optional(),
+  // Behavior when the budget counter store (counters-Redis) is UNREACHABLE at admission.
+  // true (default) = fail OPEN: serve the request without a reservation and record a
+  // loud audit (`budget.store_unavailable`) — the durable Postgres ledger is the source
+  // of truth and self-heals the counter, so a transient Redis blip degrades to
+  // best-effort metering rather than a fleet-wide outage. false = fail CLOSED: refuse
+  // with 503 + Retry-After so a hard cap is never bypassed during the outage.
+  BUDGET_FAIL_OPEN: envBool(true),
+  // Max lifetime of a worst-case reservation before the orphan-sweep reclaims it (ms).
+  // Guards against a request that crashed between reserve and commit stranding its
+  // reservation forever. A live stream is kept alive by a throttled refresh, so this
+  // only needs to exceed the refresh interval — raise it if you disable the refresh or
+  // run very long single generations with a tight budget. Default 10 min.
+  BUDGET_RESERVATION_LIFETIME_MS: z.coerce.number().int().min(30_000).default(600_000),
   // Redis for the exact cache / Redis Stack vector index (when selected).
   REDIS_CACHE_URL: z.string().url().optional(),
   REDIS_VECTOR_URL: z.string().url().optional(),

@@ -128,4 +128,40 @@ describe('OpenAIUsageExtractor', () => {
     expect(u.outputTokens).toBe(7);
     expect(u.model).toBe('gpt-4.1-mini');
   });
+
+  it('extracts Responses usage on response.incomplete (max-tokens truncation)', () => {
+    // The normal outcome when max_output_tokens is reached — the terminal frame is
+    // `response.incomplete`, NOT completed, but still carries the full billable usage.
+    // Regression: this used to meter zero on exactly the max-output case.
+    const sse = [
+      'event: response.incomplete',
+      'data: {"type":"response.incomplete","response":{"model":"gpt-5","status":"incomplete","usage":{"input_tokens":40,"output_tokens":128,"input_tokens_details":{"cached_tokens":0}}}}',
+      '',
+      '',
+    ].join('\n');
+    const ex = new OpenAIUsageExtractor();
+    ex.ingestSse(new SSEParser().push(sse));
+    const u = ex.normalized();
+    expect(u.seen).toBe(true);
+    expect(u.inputTokens).toBe(40);
+    expect(u.outputTokens).toBe(128);
+    expect(u.model).toBe('gpt-5');
+    expect(u.stopReason).toBe('incomplete');
+  });
+
+  it('extracts Responses usage on response.failed', () => {
+    const sse = [
+      'event: response.failed',
+      'data: {"type":"response.failed","response":{"model":"gpt-5","status":"failed","usage":{"input_tokens":12,"output_tokens":3}}}',
+      '',
+      '',
+    ].join('\n');
+    const ex = new OpenAIUsageExtractor();
+    ex.ingestSse(new SSEParser().push(sse));
+    const u = ex.normalized();
+    expect(u.seen).toBe(true);
+    expect(u.inputTokens).toBe(12);
+    expect(u.outputTokens).toBe(3);
+    expect(u.stopReason).toBe('failed');
+  });
 });

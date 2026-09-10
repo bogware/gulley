@@ -8,7 +8,12 @@ import {
   scopeAllowsProvider,
   scopeGroups,
 } from '@gulley/auth';
-import { type BudgetDecision, type BudgetStore, estimateWorstCaseMicroUsd } from '@gulley/budget';
+import {
+  type BudgetDecision,
+  type BudgetStore,
+  estimateInputTokens,
+  estimateWorstCaseMicroUsd,
+} from '@gulley/budget';
 import {
   type CacheableRequest,
   type CacheEngine,
@@ -168,6 +173,14 @@ export interface GatewayContext {
    *  client byte. Empty/absent = no cascade. */
   cascade?: CascadePolicy[];
   budgets: BudgetStore;
+  /** Behavior when the budget counter store is unreachable at admission: true/undefined
+   *  = fail-open (serve without a reservation + audit; the ledger self-heals the
+   *  counter), false = fail-closed (503 + Retry-After). */
+  budgetFailOpen?: boolean;
+  /** Interval (ms) at which a live stream's worst-case reservation is refreshed so the
+   *  orphan-sweep can't reap it mid-flight. Absent = no refresh (in-memory store, or a
+   *  store without an expiry sweep). */
+  budgetReserveRefreshMs?: number;
   /** Soft-threshold budget alerter (metric + webhook); absent = no alerts. */
   budgetAlerter?: { check(workspaceId: string, usedMicroUsd: number, capMicroUsd: number): void };
   /** Budget-aware downshift: at/above `threshold` utilization, rewrite the request
@@ -1165,6 +1178,10 @@ async function handleProxy(
   const maxOutput =
     numField(parsed['max_tokens']) ??
     numField(parsed['max_output_tokens']) ??
+    // OpenAI reasoning / o-series / gpt-5-class models take `max_completion_tokens`
+    // (and reject `max_tokens`); without this a request that sets only that field
+    // reserves against the 8k default and can breach the hard cap at scale.
+    numField(parsed['max_completion_tokens']) ??
     DEFAULT_MAX_OUTPUT_TOKENS;
   let worstCase = estimateWorstCaseMicroUsd(
     provider0,
@@ -1243,9 +1260,75 @@ async function handleProxy(
       .send({ type: 'error', error: { type: 'budget_exceeded', message: 'budget exceeded' } });
   };
 
+  // Reserve against a scope, tolerating a counter-STORE outage per BUDGET_FAIL_OPEN.
+  // A store fault (counters-Redis down/failover) rejects out of ctx.budgets.reserve;
+  // without this it would surface as an opaque 500 for every budgeted request. Returns
+  // storeError=true (decision undefined) so the caller applies the fail-open/closed
+  // policy. The loud alert (audit + log) fires once per request.
+  let budgetStoreDown = false;
+  const reserveSafe = async (
+    scope: string,
+  ): Promise<{ decision: BudgetDecision | null; storeError: boolean }> => {
+    try {
+      return {
+        decision: await ctx.budgets.reserve(scope, requestId, worstCase),
+        storeError: false,
+      };
+    } catch (err) {
+      if (!budgetStoreDown) {
+        budgetStoreDown = true;
+        request.log.error({ err, scope }, 'budget store unavailable');
+        await auditSafe({
+          orgId: principal.scope.orgId,
+          actor: principal.id,
+          action: 'budget.store_unavailable',
+          target: provider0,
+          payload: { scope, model: requestedModel, failOpen: ctx.budgetFailOpen !== false },
+        });
+      }
+      return { decision: null, storeError: true };
+    }
+  };
+
+  // Fail CLOSED on a store outage: roll back any reservation already taken and 503.
+  const failBudgetStore = async (): Promise<void> => {
+    for (const s of reservedScopes) {
+      try {
+        await ctx.budgets.commit(s, requestId, 0);
+      } catch {
+        /* best-effort rollback */
+      }
+    }
+    reservedScopes.length = 0;
+    safeRecord(ctx, request.log, {
+      provider: provider0,
+      requestModel: requestedModel,
+      responseModel: requestedModel,
+      route: candidates[0]?.upstreamPath ?? '',
+      statusCode: 503,
+      status: 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      streamed: false,
+      startedAtMs: started,
+    });
+    await reply
+      .code(503)
+      .headers({ 'retry-after': '2' })
+      .send({
+        type: 'error',
+        error: { type: 'api_error', message: 'budget store unavailable' },
+      });
+  };
+
   // Workspace budget: reserve worst-case at admission (hard cap, TOCTOU-safe).
   if (worstCase > 0) {
-    const decision = await ctx.budgets.reserve(principal.scope.workspaceId, requestId, worstCase);
+    const { decision, storeError } = await reserveSafe(principal.scope.workspaceId);
+    if (storeError && ctx.budgetFailOpen === false) {
+      await failBudgetStore();
+      return;
+    }
     if (decision && !decision.allowed) {
       await rejectBudget(principal.scope.workspaceId, decision);
       return;
@@ -1309,7 +1392,11 @@ async function handleProxy(
   // reservation for a request that won't run.
   if (worstCase > 0 && ctx.budgetModelCaps?.has(requestedModel)) {
     const modelScope = `model:${requestedModel}`;
-    const md = await ctx.budgets.reserve(modelScope, requestId, worstCase);
+    const { decision: md, storeError } = await reserveSafe(modelScope);
+    if (storeError && ctx.budgetFailOpen === false) {
+      await failBudgetStore();
+      return;
+    }
     if (md && !md.allowed) {
       await rejectBudget(modelScope, md);
       return;
@@ -1326,7 +1413,11 @@ async function handleProxy(
     ctx.budgetModelCaps?.has(cascade.model)
   ) {
     const t1ModelScope = `model:${cascade.model}`;
-    const t1md = await ctx.budgets.reserve(t1ModelScope, requestId, worstCase);
+    const { decision: t1md, storeError } = await reserveSafe(t1ModelScope);
+    if (storeError && ctx.budgetFailOpen === false) {
+      await failBudgetStore();
+      return;
+    }
     if (t1md && !t1md.allowed) {
       await rejectBudget(t1ModelScope, t1md);
       return;
@@ -1344,13 +1435,30 @@ async function handleProxy(
       const value = attribution[key];
       if (!value) continue;
       const attrScope = `attr:${key}:${value}`;
-      const ad = await ctx.budgets.reserve(attrScope, requestId, worstCase);
+      const { decision: ad, storeError } = await reserveSafe(attrScope);
+      if (storeError && ctx.budgetFailOpen === false) {
+        await failBudgetStore();
+        return;
+      }
       if (ad && !ad.allowed) {
         await rejectBudget(attrScope, ad);
         return;
       }
       if (ad?.allowed) reservedScopes.push(attrScope);
     }
+  }
+
+  // Keep the worst-case reservation from being reaped by the orphan-sweep while a long
+  // stream is still in flight: refresh its expiry on a throttled interval (well under
+  // the reservation lifetime), fire-and-forget, never per-chunk. Cleared in teardown.
+  // A fast request's interval never fires (it's > the request duration).
+  let reserveRefresh: ReturnType<typeof setInterval> | undefined;
+  if (ctx.budgets.refresh && ctx.budgetReserveRefreshMs && reservedScopes.length > 0) {
+    const refreshFn = ctx.budgets.refresh.bind(ctx.budgets);
+    reserveRefresh = setInterval(() => {
+      for (const scope of reservedScopes) void refreshFn(scope, requestId).catch(() => {});
+    }, ctx.budgetReserveRefreshMs);
+    reserveRefresh.unref();
   }
 
   const controller = new AbortController();
@@ -1921,6 +2029,11 @@ async function handleProxy(
   // audit/telemetry rows AND stops the limiter from penalizing the target for a policy
   // decision that is not an upstream fault.
   let streamGuardrailAction: 'block' | 'redact' | undefined;
+  // Set when the audit-only output scan threw on a chunk (and was swallowed to keep the
+  // client stream alive). The scan is the SOLE input to the cache-sensitivity gate, so a
+  // missed chunk must fail SAFE: treat the response as sensitive so a secret-bearing body
+  // whose scan we couldn't complete is never cached + replayed.
+  let outputScanFailed = false;
 
   // Output guardrails: a windowed audit scanner (never mutates) + an optional
   // detokenizer that restores masked values in the client-bound stream. Output
@@ -2026,6 +2139,7 @@ async function handleProxy(
     if (settled) return;
     settled = true;
     if (deadlineTimer) clearTimeout(deadlineTimer);
+    if (reserveRefresh) clearInterval(reserveRefresh);
     if (scoreboardHeld && served) {
       scoreboardHeld = false;
       ctx.scoreboard?.end(served.name);
@@ -2046,7 +2160,14 @@ async function handleProxy(
     // usage was never parsed), but the provider still generated and billed it.
     // Charge the worst-case reservation rather than $0, so a withheld over-cap
     // response can't be used to drive real provider spend past the budget.
-    const meteringFailed = captureOverflow && bufferOutput && !n.seen;
+    // A captured-but-overflowed response was never parsed (usage unseen), yet the
+    // provider generated and billed it. Charge the worst-case reserve rather than $0 for
+    // ANY such metered response — not only buffered-enforcement mode — so a large
+    // (>bufferLimit) NON-STREAMED 2xx can't be served for free: otherwise it bills $0,
+    // refunds its reservation, and writes NO ledger/audit row (cap bypass + a SOC 2
+    // audit-completeness hole). Streamed usage is parsed from the SSE independently of
+    // captureOverflow, so n.seen is normally true there and this won't fire spuriously.
+    const meteringFailed = captureOverflow && captureFull && !n.seen && statusCode < 400;
     // A successful response that emitted no usage would bill $0 and fully refund its
     // reservation — opt-in, charge the worst-case reserve instead so a usage-less
     // backend can't slip the budget (mirrors the buffered-overflow charge).
@@ -2080,7 +2201,10 @@ async function handleProxy(
         : outScanner && engine
           ? filterByPolicy(outScanner.findings(), engine.outputPolicy)
           : [];
-    const outputSensitive = outFindings.some((f) => f.confidence >= CACHE_SENSITIVE_CONFIDENCE);
+    // Fail SAFE: an incomplete audit scan (a swallowed throw) can't clear a response for
+    // caching — a secret in an un-scanned chunk would otherwise be cached and replayed.
+    const outputSensitive =
+      outputScanFailed || outFindings.some((f) => f.confidence >= CACHE_SENSITIVE_CONFIDENCE);
     // The single guardrail-action label for the durable/telemetry rows: an input
     // mask/redact wins, else the M17 in-stream action, else a buffered-output block.
     const reportedGuardrailAction =
@@ -2140,12 +2264,17 @@ async function handleProxy(
     // True up the token-rate windows with actual usage (best-effort; the limiter
     // swallows its own errors so a lost true-up under-counts but never blocks).
     if (ctx.rateLimiter && rlRules.length > 0) {
-      await ctx.rateLimiter.commit(
-        principal.scope.workspaceId,
-        rlRules,
-        requestId,
-        cost.totalInputTokens + cost.outputTokens,
-      );
+      // When the response was charged worst-case because usage was never observed
+      // (usage-missing / buffered-overflow), commit the worst-case TOKEN estimate to the
+      // TPM windows too — otherwise the request bills its worst-case dollars but adds 0
+      // tokens, so TPM systematically under-counts on backends that omit stream usage.
+      // Mirror the dollar worst-case inputs (body length + requested max output). Gated
+      // on !n.seen so the unpriced case (real tokens already counted) is untouched.
+      const tokens =
+        chargedWorstCase && !n.seen
+          ? estimateInputTokens(body.length) + maxOutput
+          : cost.totalInputTokens + cost.outputTokens;
+      await ctx.rateLimiter.commit(principal.scope.workspaceId, rlRules, requestId, tokens);
     }
 
     try {
@@ -2559,7 +2688,10 @@ async function handleProxy(
         try {
           outScanner.push(text);
         } catch (err) {
-          request.log.warn({ err }, 'output audit scan failed — continuing');
+          // Keep streaming (don't sever a live response for a choking audit detector),
+          // but mark the scan incomplete so the cache gate fails SAFE (see teardown).
+          outputScanFailed = true;
+          request.log.warn({ err }, 'output audit scan failed — continuing, will not cache');
         }
       }
     }
@@ -2688,7 +2820,8 @@ async function handleProxy(
       try {
         outScanner.push(tail);
       } catch (err) {
-        request.log.warn({ err }, 'output audit scan (tail) failed — continuing');
+        outputScanFailed = true; // fail safe on the cache gate (see teardown)
+        request.log.warn({ err }, 'output audit scan (tail) failed — continuing, will not cache');
       }
     }
 

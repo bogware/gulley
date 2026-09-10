@@ -741,13 +741,22 @@ export function createProductionContext(config: Config): GatewayContext {
         : null;
   const dbCapResolver = createBudgetCapResolver(db);
   const budgets: BudgetStore = config.REDIS_COUNTERS_URL
-    ? new RedisBudgetStore(createRedisClient(config.REDIS_COUNTERS_URL), (scopeKey) =>
-        // Compose: `model:` + `attr:` scopes resolve from config; else from the DB.
-        scopeKey.startsWith('model:') || scopeKey.startsWith('attr:')
-          ? Promise.resolve(configCapResolver(scopeKey))
-          : dbCapResolver(scopeKey),
+    ? new RedisBudgetStore(
+        createRedisClient(config.REDIS_COUNTERS_URL),
+        (scopeKey) =>
+          // Compose: `model:` + `attr:` scopes resolve from config; else from the DB.
+          scopeKey.startsWith('model:') || scopeKey.startsWith('attr:')
+            ? Promise.resolve(configCapResolver(scopeKey))
+            : dbCapResolver(scopeKey),
+        config.BUDGET_RESERVATION_LIFETIME_MS,
       )
     : new InMemoryBudgetStore(configCapResolver);
+  // Refresh a live reservation at most this often (well under the lifetime) so a long
+  // stream is never swept as an orphan, without adding per-chunk control-plane I/O.
+  const budgetReserveRefreshMs = Math.min(
+    60_000,
+    Math.max(10_000, Math.floor(config.BUDGET_RESERVATION_LIFETIME_MS / 2)),
+  );
 
   // One-time eviction-policy check on the counters Redis (budget + rate-limit + the
   // shared breaker all use it). Pointing it at an `allkeys-lru` instance silently
@@ -884,6 +893,8 @@ export function createProductionContext(config: Config): GatewayContext {
         })
       : undefined,
     budgets,
+    budgetFailOpen: config.BUDGET_FAIL_OPEN,
+    budgetReserveRefreshMs,
     budgetAlerter,
     budgetDownshift:
       config.BUDGET_DOWNSHIFT_MODEL && config.BUDGET_DOWNSHIFT_THRESHOLD > 0

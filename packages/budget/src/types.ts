@@ -27,6 +27,12 @@ export interface BudgetStore {
     worstCaseMicroUsd: number,
   ): Promise<BudgetDecision | null>;
   commit(workspaceId: string, requestId: string, actualMicroUsd: number): Promise<void>;
+  /** Optional: re-stamp a live reservation's expiry so a long-running stream is not
+   *  reaped by the orphan-sweep (which reclaims reservations older than the max
+   *  lifetime so a crashed request can't strand its worst-case forever). Called
+   *  throttled while a stream is in flight. Backends without an expiry-based sweep
+   *  (in-memory) may omit this. */
+  refresh?(workspaceId: string, requestId: string): Promise<void>;
   /** Optional: rebuild a LOST committed counter from the durable ledger. The counters
    *  are "a rebuildable projection" of the ledger, but a counters-Redis flush resets
    *  committed to 0 and over-admits until the window rolls. Given the ledger sum over

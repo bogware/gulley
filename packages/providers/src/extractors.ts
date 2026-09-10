@@ -53,10 +53,16 @@ export class OpenAIUsageExtractor implements UsageExtractor {
         continue; // e.g. the literal `[DONE]` terminator
       }
       if (typeof p['model'] === 'string') this.model = p['model'];
-      const type = ev.event ?? (p['type'] as string | undefined);
       const response = p['response'] as Record<string, unknown> | undefined;
 
-      if (type === 'response.completed' && response) {
+      if (response) {
+        // Any Responses event carrying a `response` object: the TERMINAL frames —
+        // response.completed AND response.incomplete (the normal max_output_tokens
+        // outcome) AND response.failed — all carry the final usage + status under
+        // `response`. Extract usage whenever it's present regardless of the event
+        // type, else a truncated/failed stream (which billed a full max_output_tokens)
+        // meters zero. Intermediate events (created/in_progress) carry usage:null and
+        // are skipped by `if (u)`; apply() overwrites, so the terminal frame wins.
         if (typeof response['model'] === 'string') this.model = response['model'];
         if (typeof response['status'] === 'string') this.stopReason = response['status'];
         const u = response['usage'] as Record<string, unknown> | undefined;

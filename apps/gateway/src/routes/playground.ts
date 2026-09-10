@@ -136,6 +136,7 @@ export async function handlePlaygroundVerify(
   const maxOutput =
     numField(parsed['max_tokens']) ??
     numField(parsed['max_output_tokens']) ??
+    numField(parsed['max_completion_tokens']) ?? // OpenAI reasoning/o-series/gpt-5 ceiling
     DEFAULT_MAX_OUTPUT_TOKENS;
   const provider = target?.provider ?? 'unknown';
   const estimatedWorstCaseMicroUsd = target

@@ -77,6 +77,22 @@ end
 return redis.call('GET', committedKey)
 `;
 
+// Re-stamp a live reservation's expiry (amount unchanged) so a long stream isn't
+// reaped by the RESERVE sweep. Idempotent; a no-op if the field is already gone
+// (committed/expired). Does not touch __total (the reserved amount is unchanged).
+const REFRESH_LUA = `
+local reservedKey = KEYS[1]
+local field = ARGV[1]
+local newExp = ARGV[2]
+local raw = redis.call('HGET', reservedKey, field)
+if not raw then return 0 end
+local sep = string.find(raw, ':')
+local amt = raw
+if sep then amt = string.sub(raw, 1, sep - 1) end
+redis.call('HSET', reservedKey, field, amt .. ':' .. newExp)
+return 1
+`;
+
 // Self-heal a LOST committed counter from the durable ledger. A live counter is
 // AUTHORITATIVE for its fixed window and is never overwritten: the ledger sum is
 // taken over a sliding window that would include prior-window spend and thus
@@ -136,6 +152,20 @@ export class RedisBudgetStore implements BudgetStore {
       String(this.maxReservationLifetimeMs),
     )) as [number, number];
     return { allowed: res[0] === 1, capMicroUsd: budget.capMicroUsd, usedMicroUsd: res[1] };
+  }
+
+  /** Push a live reservation's expiry to now + maxReservationLifetimeMs. Cheap; call
+   *  it throttled (never per-chunk) from the stream path so a legitimately long stream
+   *  is never mistaken for an orphan and swept while still in flight. */
+  async refresh(workspaceId: string, requestId: string): Promise<void> {
+    const [reservedKey] = this.keys(workspaceId);
+    await this.redis.eval(
+      REFRESH_LUA,
+      1,
+      reservedKey,
+      requestId,
+      String(Date.now() + this.maxReservationLifetimeMs),
+    );
   }
 
   async commit(workspaceId: string, requestId: string, actualMicroUsd: number): Promise<void> {
