@@ -29,6 +29,25 @@ describe('redactConfig', () => {
     expect(JSON.stringify(out)).not.toContain('super-secret-pepper-value');
     expect(JSON.stringify(out)).not.toContain('pass@');
   });
+
+  it('collapses Authorization / signing shared tokens the old pattern leaked (AUTHZ/BEARER/HMAC/SIGN)', () => {
+    const cfg = {
+      AUDIT_ANCHOR_AUTHZ: 'Bearer anchor-shared-token',
+      SIEM_AUTHZ: 'Splunk splunk-hec-token',
+      WORM_SIGNING_KEY: 'hmac-signing-material',
+      EXTERNAL_AUTHZ_TIMEOUT_MS: 3000, // numeric knob that merely MATCHES the pattern
+    } as unknown as Config;
+    const out = redactConfig(cfg);
+    expect(out['AUDIT_ANCHOR_AUTHZ']).toBe('<set>');
+    expect(out['SIEM_AUTHZ']).toBe('<set>');
+    expect(out['WORM_SIGNING_KEY']).toBe('<set>');
+    // A number can't carry a secret — shown as-is, not mislabeled '<unset>'.
+    expect(out['EXTERNAL_AUTHZ_TIMEOUT_MS']).toBe(3000);
+    const s = JSON.stringify(out);
+    expect(s).not.toContain('anchor-shared-token');
+    expect(s).not.toContain('splunk-hec-token');
+    expect(s).not.toContain('hmac-signing-material');
+  });
 });
 
 let app: FastifyInstance;

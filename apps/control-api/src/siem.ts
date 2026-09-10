@@ -153,8 +153,10 @@ export class SentinelConnector implements SiemConnector {
 
 export interface SiemExporterDeps {
   connector: SiemConnector;
-  /** The complete durable audit chain, seq-ascending (readAuditRows(db)). */
-  readRows: () => Promise<AuditRow[]>;
+  /** Read the durable audit chain seq-ascending. Pass `sinceSeq` to read only the tail
+   *  (`seq > sinceSeq`) so the ever-growing chain isn't pulled whole every tick; omit for
+   *  the full chain (readAuditRows(db, sinceSeq?)). */
+  readRows: (sinceSeq?: number) => Promise<AuditRow[]>;
   /** Max events per SIEM POST. Default 200. */
   batchMax?: number;
   log?: (msg: string) => void;
@@ -193,7 +195,10 @@ export class SiemExporter {
     if (this.inFlight) return { exported: 0, lastSeq: this.cursor };
     this.inFlight = true;
     try {
-      const rows = await this.deps.readRows();
+      // Bounded tail read: only rows past the cursor (identical set to the old
+      // read-then-filter; the JS filter/sort remains a guard). The full chain is no
+      // longer pulled into memory every ~60s tick.
+      const rows = await this.deps.readRows(this.cursor);
       const pending = rows.filter((r) => r.seq > this.cursor).sort((a, b) => a.seq - b.seq);
       if (pending.length === 0) return { exported: 0, lastSeq: this.cursor };
       const max = this.deps.batchMax ?? 200;

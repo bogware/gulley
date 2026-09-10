@@ -19,7 +19,7 @@ import {
   type UsageBucket,
   type UsageQuery,
 } from '@gulley/pipeline';
-import { and, asc, desc, eq, gte, inArray, isNotNull, lt, type SQL, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, lt, type SQL, sql } from 'drizzle-orm';
 import type { Database } from './db';
 import {
   adminUser,
@@ -542,11 +542,21 @@ export class PostgresAuditSink implements AuditSink {
   }
 }
 
-/** Read the full audit chain (ordered by seq) for independent verification — the
- *  audit-verify CLI / attestation export. Streaming isn't needed: the chain must be
- *  walked in order anyway, and it is bounded by the deployment's write history. */
-export async function readAuditRows(db: Database): Promise<AuditRow[]> {
-  const rows = await db.select().from(auditLog).orderBy(asc(auditLog.seq));
+/** Read the audit chain (ordered by seq). With no `sinceSeq` this is the FULL chain —
+ *  for independent verification (audit-verify CLI / attestation / anchor), which must walk
+ *  the complete chain. With `sinceSeq` it returns only rows `seq > sinceSeq`, for the
+ *  incremental TAILING paths (WORM shipper, SIEM exporter) so they no longer pull the
+ *  entire (ever-growing) table into memory every tick — the row set is identical to their
+ *  prior read-then-JS-filter because seq is monotonic and committed-only. */
+export async function readAuditRows(db: Database, sinceSeq?: number): Promise<AuditRow[]> {
+  const rows =
+    sinceSeq !== undefined
+      ? await db
+          .select()
+          .from(auditLog)
+          .where(gt(auditLog.seq, sinceSeq))
+          .orderBy(asc(auditLog.seq))
+      : await db.select().from(auditLog).orderBy(asc(auditLog.seq));
   return rows.map((r) => ({
     seq: r.seq,
     orgId: r.orgId,

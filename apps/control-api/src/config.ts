@@ -21,6 +21,10 @@ const Env = z.object({
   // surface (/oauth/*, /auth/*) — brute-force / flood protection on the highest-value
   // control-plane paths. In-memory per instance; 0 disables. Default 60/min.
   CONTROL_API_AUTH_RATE_LIMIT_PER_MIN: z.coerce.number().int().min(0).default(60),
+  // Explicit request body cap (bytes). Sized generously for the largest GitOps
+  // config-apply document (Fastify's 1 MB default would reject a big-fleet apply), while
+  // still bounding an abusive payload. Default 8 MiB.
+  CONTROL_API_BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(8_388_608),
 
   // Virtual-key pepper (KMS-held in prod) — needed to mint keys.
   GULLEY_KEY_PEPPER: z.string().min(16).optional(),

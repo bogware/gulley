@@ -34,8 +34,10 @@ export interface WormShipperDeps {
   mirror: AuditMirror;
   signer: Signer;
   verifier: BatchVerifier;
-  /** The COMPLETE durable audit chain, seq-ascending (readAuditRows(db)). */
-  readRows: () => Promise<AuditRow[]>;
+  /** Read the durable audit chain seq-ascending. Pass `sinceSeq` to read only the
+   *  incremental tail (`seq > sinceSeq`) so a long-lived chain isn't pulled whole every
+   *  tick; omit for the full chain (readAuditRows(db, sinceSeq?)). */
+  readRows: (sinceSeq?: number) => Promise<AuditRow[]>;
   /** Max rows per WORM object. Default 100. */
   batchMax?: number;
   log?: (msg: string) => void;
@@ -84,7 +86,11 @@ export class WormShipper {
     this.inFlight = true;
     try {
       await this.resolveLastShipped();
-      const rows = await this.deps.readRows();
+      // Bounded tail read: resolveLastShipped() has set lastShippedSeq from the mirror
+      // head, so ask only for rows past it (identical set to the old read-then-filter,
+      // but the DB no longer returns the whole chain). The JS filter/sort stays as a
+      // belt-and-suspenders guard against an out-of-order or unfiltered backend.
+      const rows = await this.deps.readRows(this.lastShippedSeq);
       const pending = rows.filter((r) => r.seq > this.lastShippedSeq).sort((a, b) => a.seq - b.seq);
       if (pending.length === 0) return { shipped: 0, lastSeq: this.lastShippedSeq };
       const max = this.deps.batchMax ?? 100;

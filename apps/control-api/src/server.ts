@@ -43,6 +43,9 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     // Trust a FIXED number of proxy hops (1 = the ALB), not every hop — `trustProxy:true`
     // lets a client spoof req.ip via X-Forwarded-For, defeating any IP-based control.
     trustProxy: config.CONTROL_API_TRUST_PROXY_HOPS,
+    // Explicit body cap: generous enough for a large GitOps config-apply document, but
+    // bounded (Fastify defaults to 1 MB, which would reject a big-fleet apply).
+    bodyLimit: config.CONTROL_API_BODY_LIMIT_BYTES,
     logger: {
       level: config.LOG_LEVEL,
       redact: {

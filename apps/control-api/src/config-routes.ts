@@ -91,14 +91,20 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
 
   app.get(
     '/config/drift',
-    adminRoute(ctx, async (_req, reply) => {
+    adminRoute(ctx, async (_req, reply, admin) => {
+      // Fleet-wide config state — gate on config:read to match /config/versions/history
+      // and /config/export (a scoped viewer must not read fleet drift).
+      if (!(await ctx.access.can(admin, 'config:read', {}))) return forbidden(reply);
       return reply.send(await detectDrift({ store, versions: ctx.configVersions }));
     }),
   );
 
   app.get(
     '/config/versions',
-    adminRoute(ctx, async (_req, reply) => {
+    adminRoute(ctx, async (_req, reply, admin) => {
+      // Who last changed fleet config, when, and the change summary — gate on config:read
+      // like /config/versions/history (this is the material information-disclosure one).
+      if (!(await ctx.access.can(admin, 'config:read', {}))) return forbidden(reply);
       const cur = await ctx.configVersions.current();
       return reply.send({
         version: await ctx.configVersions.currentVersion(),

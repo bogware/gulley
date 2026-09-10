@@ -374,13 +374,25 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     ? () => readAuditRows(db)
     : async () => inner.rows;
 
+  // Incremental (tail) reader for the WORM shipper + SIEM exporter: they track a cursor
+  // and only ever want rows past it, so they read `seq > sinceSeq` instead of pulling the
+  // ever-growing chain whole every ~60s tick (escalating DB load + heap pressure toward
+  // OOM as the compliance record accumulates). The full-chain reader above stays for
+  // attestation / verify / anchor, which must walk the complete chain.
+  const auditRowsSince = (sinceSeq?: number): Promise<AuditRow[]> =>
+    db
+      ? readAuditRows(db, sinceSeq)
+      : Promise.resolve(
+          sinceSeq === undefined ? inner.rows : inner.rows.filter((r) => r.seq > sinceSeq),
+        );
+
   // WORM-live shipper: ships that complete durable chain to the immutable mirror.
   const wormShipper = opts.worm
     ? new WormShipper({
         mirror: opts.worm.mirror,
         signer: opts.worm.signer,
         verifier: opts.worm.verifier,
-        readRows: auditRows,
+        readRows: auditRowsSince,
         ...(opts.worm.batchMax !== undefined ? { batchMax: opts.worm.batchMax } : {}),
       })
     : undefined;
@@ -389,7 +401,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   const siemExporter = opts.siem
     ? new SiemExporter({
         connector: opts.siem.connector,
-        readRows: auditRows,
+        readRows: auditRowsSince,
         ...(opts.siem.batchMax !== undefined ? { batchMax: opts.siem.batchMax } : {}),
       })
     : undefined;
