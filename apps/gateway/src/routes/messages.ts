@@ -1672,6 +1672,13 @@ async function handleProxy(
       }
       limiterAcquired = true;
     }
+    // Half-open single-probe gate (see the sequential loop): shed a concurrent probe as
+    // a saturated branch so the hedge falls over to its sibling / the next candidate.
+    if (!ctx.breaker.tryProbe(target.name)) {
+      if (limiterAcquired) ctx.limiter?.release(target.name);
+      anySaturation = true;
+      return { kind: 'saturated', target };
+    }
     anyRealAttempt = true;
     const forwardStart = Date.now();
     try {
@@ -1832,6 +1839,20 @@ async function handleProxy(
           continue;
         }
         limiterAcquired = true;
+      }
+      // Half-open single-probe gate: when this target's breaker cooldown has just
+      // expired, admit only ONE probe per replica; concurrent callers shed here so the
+      // fleet's accumulated load can't stampede (and immediately re-melt) the recovering
+      // upstream. A denied probe is a load-shed (like saturation), NOT a fault — the
+      // breaker is untouched and the request fails over to the next candidate, or, if
+      // none, sheds with 503 + Retry-After (anySaturation && !anyRealAttempt below).
+      // Checked at dispatch (not during ordering) so the recovering target still appears
+      // healthy for selection but only one caller actually contacts it.
+      if (!ctx.breaker.tryProbe(target.name)) {
+        if (limiterAcquired) ctx.limiter?.release(target.name);
+        anySaturation = true;
+        request.log.warn({ target: target.name }, 'half-open probe in flight — shedding');
+        continue;
       }
       anyRealAttempt = true;
 
@@ -2012,25 +2033,54 @@ async function handleProxy(
       let finalChunks = t0raw.chunks;
       if (shouldEscalate(cascade.policy, t0n.stopReason)) {
         const t1 = cascade.candidates[0]!;
+        // Route the tier-1 escalation through the SAME admission/accounting as a normal
+        // candidate (#40) so escalation traffic is not invisible to the resiliency
+        // controls: honor the adaptive limiter's in-flight ceiling — a SATURATED strong
+        // tier means DO NOT escalate (serve the valid, weaker tier-0 answer rather than
+        // pushing the expensive model past its adaptive limit) — and the half-open probe
+        // gate; on success feed the load scoreboard (P2C least-load) and the outlier
+        // latency detector so both see the escalation target's real load and TTFB.
+        let t1LimiterAcquired = false;
+        let t1Admitted = true;
+        if (ctx.limiter) {
+          if (ctx.limiter.tryAcquire(t1.name)) t1LimiterAcquired = true;
+          else t1Admitted = false;
+        }
+        if (t1Admitted && !ctx.breaker.tryProbe(t1.name)) {
+          if (t1LimiterAcquired) ctx.limiter?.release(t1.name);
+          t1Admitted = false; // half-open probe already in flight → don't escalate
+        }
         let resp1: typeof upstream | undefined;
-        try {
-          resp1 = await t1.adapter.forward({
-            path: t1.upstreamPath,
-            // cascade.body already carries the escalation model; a per-target arbitrage
-            // map (keyed by that model) still rewrites it to the upstream's id.
-            body: bodyForTarget(t1, cascade.body, cascade.model),
-            headers: forwardHeaders,
-            credential: await credentialFor(t1),
-            signal: controller.signal,
-          });
-        } catch {
-          resp1 = undefined;
-          // A genuine connection fault (not an abort) is a breaker fault — mirror the
-          // main failover loop, else tier-1's circuit never opens on a hard-down target.
-          if (!controller.signal.aborted) ctx.breaker.recordFailure(t1.name);
+        const t1ForwardStart = Date.now();
+        if (t1Admitted) {
+          try {
+            resp1 = await t1.adapter.forward({
+              path: t1.upstreamPath,
+              // cascade.body already carries the escalation model; a per-target arbitrage
+              // map (keyed by that model) still rewrites it to the upstream's id.
+              body: bodyForTarget(t1, cascade.body, cascade.model),
+              headers: forwardHeaders,
+              credential: await credentialFor(t1),
+              signal: controller.signal,
+            });
+          } catch {
+            resp1 = undefined;
+            // A genuine connection fault (not an abort) is a breaker fault — mirror the
+            // main failover loop, else tier-1's circuit never opens on a hard-down target.
+            if (!controller.signal.aborted) ctx.breaker.recordFailure(t1.name);
+            // Free the admission slot (fault → adapt the limit down), never leak it.
+            if (t1LimiterAcquired) ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, true);
+          }
         }
         if (resp1 && resp1.statusCode < 400) {
           ctx.breaker.recordSuccess(t1.name);
+          // Feed the escalation target's real TTFB to the outlier detector, like any
+          // served response, so peer-relative slow-target ejection sees tier-1's latency.
+          ctx.outlier?.recordLatency(
+            t1.name,
+            Date.now() - t1ForwardStart,
+            cascade.candidates.map((c) => c.name),
+          );
           let t1raw: Awaited<ReturnType<typeof readFully>> | undefined;
           try {
             t1raw = await readFully(resp1.body, capLimit, controller.signal);
@@ -2073,12 +2123,23 @@ async function handleProxy(
             requestedModel = cascade.model;
             // The served leg is now tier-1 — its worst-case is the fail-closed surrogate.
             servedWorstCase = cascadeReserveMicroUsd;
+            // Hold tier-1's scoreboard + limiter slots as the newly-served target so
+            // teardown records ITS in-flight load and RTT (not the released tier-0's).
+            // dispatchMs is re-pointed at the tier-1 forward so the limiter RTT is correct.
+            if (ctx.scoreboard) {
+              ctx.scoreboard.begin(t1.name);
+              scoreboardHeld = true;
+            }
+            if (t1LimiterAcquired) limiterHeld = true;
+            dispatchMs = t1ForwardStart;
             finalStatus = resp1.statusCode;
             finalHeaders = resp1.headers;
             finalChunks = t1raw.chunks;
           } else {
             // Tier-1 was a billed 2xx but couldn't be buffered (stall/error/over-cap) →
-            // charge it at worst-case and fall back to serving tier-0.
+            // charge it at worst-case and fall back to serving tier-0. The upstream itself
+            // was healthy (the cap is ours), so release the slot without a fault penalty.
+            if (t1LimiterAcquired) ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, false);
             chargeDiscarded('cascade-tier1', cascade.provider, cascade.model, cascade.body.length);
           }
         } else if (resp1) {
@@ -2086,8 +2147,12 @@ async function handleProxy(
           if (isFailoverStatus(cascade.strategy, resp1.statusCode)) {
             ctx.breaker.recordFailure(t1.name, parseRetryAfterMs(resp1.headers));
           }
+          // Free the admission slot — a failover-status response adapts the limit down.
+          if (t1LimiterAcquired) ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, true);
           resp1.body.resume(); // tier-1 error → fall back to tier-0
         }
+        // t1Admitted === false (saturated / probe-denied) OR resp1 threw: no escalation;
+        // the tier-0 leg is served unchanged (its holds stay put for teardown).
       }
       // Replay the chosen leg's buffered bytes as the served body (raw; headers intact).
       upstream = {

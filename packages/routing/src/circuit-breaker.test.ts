@@ -121,4 +121,81 @@ describe('CircuitBreaker (graded)', () => {
     c.advance(500);
     expect(b.isOpen('t')).toBe(false); // openUntil is exclusive; healthy at/after
   });
+
+  describe('half-open single-probe gate (tryProbe)', () => {
+    it('admits everyone when healthy or never-seen (no side effects on isOpen)', () => {
+      const c = clock();
+      const b = new CircuitBreaker({ now: c.now });
+      expect(b.tryProbe('never-seen')).toBe(true);
+      b.recordSuccess('t'); // seen, healthy
+      expect(b.tryProbe('t')).toBe(true);
+      expect(b.tryProbe('t')).toBe(true); // repeatable — no token held while healthy
+    });
+
+    it('admits the last-resort attempt while a target is still fully open (cooldown active)', () => {
+      const c = clock();
+      const b = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 1000, now: c.now });
+      b.recordFailure('t'); // open until 1000
+      expect(b.isOpen('t')).toBe(true);
+      // A fully-open target only reaches dispatch as a last resort ("a probe beats a
+      // hard fail") — tryProbe must not block it and must not consume a token.
+      expect(b.tryProbe('t')).toBe(true);
+      expect(b.tryProbe('t')).toBe(true);
+    });
+
+    it('admits exactly one probe in the half-open window and sheds concurrent callers', () => {
+      const c = clock();
+      const b = new CircuitBreaker({
+        failureThreshold: 1,
+        cooldownMs: 1000,
+        probeTimeoutMs: 5000,
+        now: c.now,
+      });
+      b.recordFailure('t'); // open until 1000
+      c.advance(1001); // cooldown expired → half-open
+      expect(b.isOpen('t')).toBe(false); // selection still sees it as healthy
+      expect(b.tryProbe('t')).toBe(true); // first caller wins the probe token
+      expect(b.tryProbe('t')).toBe(false); // concurrent callers are shed
+      expect(b.tryProbe('t')).toBe(false);
+    });
+
+    it('closes on a probe success so the whole fleet is re-admitted', () => {
+      const c = clock();
+      const b = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 1000, now: c.now });
+      b.recordFailure('t');
+      c.advance(1001);
+      expect(b.tryProbe('t')).toBe(true);
+      b.recordSuccess('t'); // probe succeeded → recovered
+      expect(b.tryProbe('t')).toBe(true); // token released; normal dispatch resumes
+      expect(b.tryProbe('t')).toBe(true);
+    });
+
+    it('re-opens on a probe failure (isOpen true again) and does not wedge afterward', () => {
+      const c = clock();
+      const b = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 1000, now: c.now });
+      b.recordFailure('t');
+      c.advance(1001);
+      expect(b.tryProbe('t')).toBe(true); // probe granted
+      b.recordFailure('t'); // probe failed → re-open (backoff doubles) + token cleared
+      expect(b.isOpen('t')).toBe(true);
+      c.advance(2001); // second cooldown (2000ms) elapses
+      expect(b.tryProbe('t')).toBe(true); // a fresh probe is admitted, not wedged
+    });
+
+    it('self-heals a granted-but-never-dispatched probe token after probeTimeoutMs', () => {
+      const c = clock();
+      const b = new CircuitBreaker({
+        failureThreshold: 1,
+        cooldownMs: 1000,
+        probeTimeoutMs: 3000,
+        now: c.now,
+      });
+      b.recordFailure('t');
+      c.advance(1001);
+      expect(b.tryProbe('t')).toBe(true); // token claimed, but the caller never dispatches
+      expect(b.tryProbe('t')).toBe(false); // still held
+      c.advance(3001); // token lifetime elapses without a record*()
+      expect(b.tryProbe('t')).toBe(true); // self-healed — another caller may probe
+    });
+  });
 });

@@ -356,6 +356,11 @@ const Env = z.object({
   BREAKER_SHARED: envBool(false),
   BREAKER_SHARED_PREFIX: z.string().default('gulley'),
   BREAKER_SHARED_REFRESH_MS: z.coerce.number().int().positive().default(1000),
+  // Half-open single-probe token lifetime: when a breaker's cooldown expires exactly
+  // one in-flight request per replica is admitted to probe the recovering upstream;
+  // others shed (503) until it resolves, preventing a herd from re-melting it. The
+  // token self-heals after this bound if the probe is never dispatched or hangs.
+  BREAKER_HALF_OPEN_PROBE_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
 
   // Adaptive concurrency: a per-target dynamic in-flight ceiling (gradient
   // limiter) that shrinks under rising latency/errors so the gateway stops

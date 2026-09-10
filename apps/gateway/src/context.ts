@@ -903,6 +903,7 @@ export function createProductionContext(config: Config): GatewayContext {
     audit: new PostgresAuditSink(db),
     breaker: new CircuitBreaker({
       ...(breakerSync ? { sync: breakerSync } : {}),
+      probeTimeoutMs: config.BREAKER_HALF_OPEN_PROBE_TIMEOUT_MS,
       // Surface a target ejection (CLOSED → OPEN) as a metric — the key resiliency event.
       ...(metrics ? { onOpen: (target) => metrics.recordBreakerState(target, 'open') } : {}),
     }),
