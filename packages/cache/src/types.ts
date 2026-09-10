@@ -1,14 +1,24 @@
 /** A request as the cache sees it. `scope` partitions the cache so a response is
  *  never shared across principals/workspaces or across models. */
 export interface CacheableRequest {
+  /** Authz partition. Every key is namespaced by this. Defaults to the workspace, so
+   *  entries are shared across principals WITHIN a workspace (one trust domain in the
+   *  single-tenant model) — set a per-principal scope on the route to make it a stricter
+   *  per-principal partition (no cross-principal reuse, at a lower hit rate). */
   scope: string;
   provider: string;
   model: string;
   path: string;
   body: Buffer;
   /** Extra request attributes that change response semantics (e.g. an
-   *  `anthropic-beta` header); folded into the exact key. */
+   *  `anthropic-beta` header / capability fingerprint); folded into the exact + vector
+   *  keys so a differing capability can never reuse another's entry. */
   variant?: string;
+  /** Per-route override of the semantic (fuzzy) tier. `false` disables it for this
+   *  request even when the deployment has semantic caching on — for routes carrying
+   *  sensitive/high-variance prompts where an approximate near-neighbor answer is
+   *  unacceptable. undefined = follow the deployment default. */
+  semantic?: boolean;
 }
 
 /** A stored upstream response, replayed verbatim on a hit. */

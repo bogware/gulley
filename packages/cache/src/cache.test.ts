@@ -119,6 +119,21 @@ describe('CacheEngine semantic tier', () => {
     expect(hit.response?.body.toString()).toBe('Paris');
   });
 
+  it('skips the semantic tier when the route opts out (semantic:false)', async () => {
+    const engine = make(0.9);
+    const a = req('ws1', { messages: [{ role: 'user', content: 'Capital of France' }] });
+    await engine.store(a, resp('Paris'), await engine.lookup(a));
+    // A paraphrase that WOULD semantic-hit, but the route disabled the fuzzy tier.
+    const b = req(
+      'ws1',
+      { messages: [{ role: 'user', content: 'capital of france?' }] },
+      { semantic: false },
+    );
+    const res = await engine.lookup(b);
+    expect(res.status).toBe('miss');
+    expect(res.embedding).toBeUndefined(); // embed+vector path was not run at all
+  });
+
   it('never serves a semantic hit across different models', async () => {
     const engine = make(0.9);
     const a = req(

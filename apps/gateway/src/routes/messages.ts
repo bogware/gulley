@@ -118,6 +118,14 @@ export interface ProviderRoute {
   guardrails?: GuardrailEngine;
   /** Set false to exclude this route from caching even when a cache is wired. */
   cacheable?: boolean;
+  /** Per-route override of the semantic (fuzzy) cache tier: `false` disables it for this
+   *  route even when the deployment enables semantic caching (for routes where an
+   *  approximate near-neighbor answer is unacceptable). undefined = deployment default. */
+  semantic?: boolean;
+  /** Partition this route's cache by PRINCIPAL, not just workspace — no cross-principal
+   *  reuse within a workspace (stricter isolation, lower hit rate). Default off
+   *  (workspace-scoped: one trust domain in the single-tenant model). */
+  cachePerPrincipal?: boolean;
   /** Request shaping (defaults/overrides/system enrichment) applied before forward. */
   shaping?: RequestShaping;
   /** Opt in to hold-then-flush enforcement of the OUTPUT policy on streamed
@@ -313,6 +321,10 @@ const MASK_VAULT_PERSIST_TIMEOUT_MS = 5_000;
 const STREAM_INACTIVITY_MS = Number(process.env['STREAM_INACTIVITY_MS']) || 120_000;
 /** Responses over this size are streamed through but never cached. */
 const CACHE_BODY_CAP = 2 * 1024 * 1024;
+/** Hard deadline for the whole cache lookup (exact read + embed + vector query). The
+ *  cache is best-effort, so a hung store must degrade to a plain proxy, not stall the
+ *  request forever before budget/dispatch. */
+const CACHE_LOOKUP_TIMEOUT_MS = Number(process.env['CACHE_LOOKUP_TIMEOUT_MS']) || 2_000;
 /** Findings at or above this confidence make a response too sensitive to cache. */
 const CACHE_SENSITIVE_CONFIDENCE = 0.8;
 
@@ -1166,19 +1178,34 @@ async function handleProxy(
   let cacheLookup: CacheLookup | undefined;
   if (cacheOn && ctx.cache) {
     cacheReq = {
-      scope: principal.scope.workspaceId,
+      // Default partition = workspace (shared within the one trust domain). A route may
+      // opt into a stricter per-PRINCIPAL partition so no cross-principal reuse occurs
+      // (most relevant to the fuzzy semantic tier); it lowers the intra-workspace hit
+      // rate, hence per-route opt-in rather than deployment-wide.
+      scope: route.cachePerPrincipal
+        ? `${principal.scope.workspaceId}~${principal.id}`
+        : principal.scope.workspaceId,
       provider: provider0,
       model: requestedModel,
       path: route.clientPaths[0] ?? '',
       body,
       variant: headerValue(request, 'anthropic-beta'),
+      semantic: route.semantic,
     };
     try {
-      cacheLookup = await ctx.cache.lookup(cacheReq);
+      // Bound the whole lookup: exact-store read + embed + vector query. A hung cache
+      // Redis / wedged Postgres would otherwise stall the request FOREVER here — before
+      // budget and before any dispatch/failover deadline. On timeout, bypass to a plain
+      // proxy exactly like the error path (the cache is best-effort).
+      cacheLookup = await withTimeout(
+        ctx.cache.lookup(cacheReq),
+        CACHE_LOOKUP_TIMEOUT_MS,
+        'cache lookup',
+      );
     } catch (err) {
-      // The cache is best-effort: an embeddings/vector outage must degrade to a
-      // plain proxy, never fail the request.
-      request.log.warn({ err }, 'cache lookup failed — bypassing');
+      // The cache is best-effort: an embeddings/vector outage (or a lookup timeout) must
+      // degrade to a plain proxy, never fail or stall the request.
+      request.log.warn({ err }, 'cache lookup failed/timed out — bypassing');
       cacheLookup = undefined;
     }
     if (cacheLookup?.response) {
