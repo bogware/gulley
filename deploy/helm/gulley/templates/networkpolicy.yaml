@@ -1,0 +1,66 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- if .Values.gateway.enabled }}
+# Gives the app's code-level egress/SSRF lockdown a network-layer parity (the
+# Terraform security-group story's Kubernetes equivalent). Default off because a CNI
+# that ignores NetworkPolicy makes it a silent no-op, and the egress half needs the
+# real Postgres/Redis/provider CIDRs. Selecting a policyType with no matching rule is
+# default-DENY for that direction.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "gulley.fullname" . }}-gateway
+  labels:
+    {{- include "gulley.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gulley.selectorLabels" (dict "root" . "plane" "gateway") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.egressCIDRs }}
+    - Egress
+    {{- end }}
+  ingress:
+    # Data port: from the intended ingress namespace(s), else same-namespace only.
+    - from:
+        {{- with .Values.networkPolicy.ingressNamespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- else }}
+        - podSelector: {}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gateway.port }}
+    # Metrics port: only the monitoring namespace may scrape it.
+    {{- with .Values.networkPolicy.metricsNamespaceSelector }}
+    - from:
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.gateway.metricsPort }}
+    {{- end }}
+  {{- if .Values.networkPolicy.egressCIDRs }}
+  egress:
+    # DNS is always required (kube-dns), or every egress silently breaks.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allowlisted destinations (Postgres / Redis / provider CIDRs).
+    - to:
+        {{- range .Values.networkPolicy.egressCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        {{- range .Values.networkPolicy.egressPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}

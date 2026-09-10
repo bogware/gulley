@@ -31,6 +31,8 @@ config:
 
 # Name of a pre-existing Kubernetes Secret whose keys are projected as env into
 # both pods (envFrom). Empty = no secret env (dev / secrets injected elsewhere).
+# IMPORTANT: every key in that Secret must EXACTLY equal a config.ts env var name
+# (envFrom projects keys verbatim, unprefixed) — e.g. GULLEY_KEY_PEPPER, not KEY_PEPPER.
 existingSecret: ''
 
 # --- Data plane (the stateless hot path) ---
@@ -55,8 +57,38 @@ gateway:
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilizationPercentage: 70
-  # SIGTERM → bounded graceful drain; give in-flight streams time to finish.
-  terminationGracePeriodSeconds: 40
+    # CPU alone under-scales a streaming proxy (its load is connection/event-loop
+    # bound). Add Pods/External metrics driven by the gateway's own Prometheus
+    # metrics (active in-flight requests per pod, event-loop lag) via a metrics
+    # adapter (prometheus-adapter / KEDA) — CPU stays as a coarse fallback. Each
+    # entry is a full autoscaling/v2 metric spec, appended verbatim to the HPA.
+    # REQUIRES an in-cluster metrics adapter AND that the gateway export the named
+    # metric; leave empty on clusters without one (CPU-only). Example:
+    #   customMetrics:
+    #     - type: Pods
+    #       pods:
+    #         metric: { name: gulley_gateway_inflight_requests }
+    #         target: { type: AverageValue, averageValue: '40' }
+    customMetrics: []
+  # SIGTERM → bounded graceful drain. MUST exceed SHUTDOWN_GRACE_MS (derived below)
+  # so the app's process.exit backstop fires a few seconds BEFORE k8s SIGKILL —
+  # otherwise an in-flight SSE stream is cut mid-drain and its single teardown()
+  # (budget-commit + ledger + hash-chained audit row) never runs.
+  terminationGracePeriodSeconds: 120
+  # SHUTDOWN_GRACE_MS is derived into the ConfigMap as
+  # (terminationGracePeriodSeconds - drainBufferSeconds) * 1000, so the two stay
+  # coupled if an operator retunes the grace period.
+  drainBufferSeconds: 10
+  # preStop sleep (seconds): on SIGTERM the pod sleeps this long BEFORE the app
+  # begins draining, so Service endpoint removal propagates first and in-flight
+  # requests stop landing on a terminating pod (kills the deregistration-race 502s).
+  # Must fit inside terminationGracePeriodSeconds.
+  preStopSleepSeconds: 10
+  podDisruptionBudget:
+    enabled: true
+    # maxUnavailable (not minAvailable) so a scale-down to 1 replica can't deadlock
+    # a node drain.
+    maxUnavailable: 1
 
 # --- Control plane (admin API; every write hash-chain audited) ---
 controlApi:
@@ -74,18 +106,62 @@ controlApi:
     limits:
       cpu: 500m
       memory: 512Mi
-  terminationGracePeriodSeconds: 30
+  terminationGracePeriodSeconds: 120
+  drainBufferSeconds: 10
+  preStopSleepSeconds: 5
 
 podAnnotations: {}
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
+  # emptyDir /tmp is group-writable for the non-root user under readOnlyRootFilesystem.
+  fsGroup: 1000
+  # RuntimeDefault seccomp so the pods meet the restricted Pod Security Standard and
+  # run with kernel-syscall confinement.
+  seccompProfile:
+    type: RuntimeDefault
 securityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
   capabilities:
     drop: ['ALL']
 
+# Soft pod-anti-affinity default spreads each plane's replicas across nodes so one
+# node loss can't take out all of them (the 2-replica HA posture is otherwise
+# illusory). Kept "preferred" so single-node/dev clusters still schedule. Pair with
+# the PodDisruptionBudget (voluntary drains) for real HA. Any value here fully
+# OVERRIDES this default.
+affinity: {}
+# When affinity is empty, use this default anti-affinity topology key.
+defaultAntiAffinityTopologyKey: kubernetes.io/hostname
+
 nodeSelector: {}
 tolerations: []
-affinity: {}
+
+# Opt-in NetworkPolicy (default off — a CNI that ignores NetworkPolicy would make it
+# a no-op, and the egress half needs the real Postgres/Redis/provider CIDRs). Gives
+# the code-level egress/SSRF lockdown a network-layer parity when the CNI enforces it.
+networkPolicy:
+  enabled: false
+  # Namespaces allowed to reach the gateway data port (label selector match). Empty
+  # = same-namespace only.
+  ingressNamespaceSelector: {}
+  # Namespace (by label) allowed to scrape the metrics port — your monitoring stack.
+  metricsNamespaceSelector: {}
+  # Egress allowlist. DNS (kube-dns) is always allowed; add the Postgres/Redis/provider
+  # CIDRs here. Empty egress list = egress policy NOT emitted (many CNIs ignore it).
+  egressCIDRs: []
+  egressPorts: []
+
+# Opt-in Ingress for the gateway (default off; operators often front it with their
+# own gateway/ALB). TLS is emitted when tls[] is set.
+ingress:
+  enabled: false
+  className: ''
+  annotations: {}
+  hosts:
+    - host: gulley.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []

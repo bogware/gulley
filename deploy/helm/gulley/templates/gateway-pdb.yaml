@@ -1,0 +1,19 @@
+{{- if and .Values.gateway.enabled .Values.gateway.podDisruptionBudget.enabled -}}
+# Protects the always-on data plane from voluntary disruptions (node drains,
+# cluster upgrades) taking out all replicas at once. maxUnavailable (not
+# minAvailable) so it degrades gracefully at any replica count and never deadlocks
+# a drain at replicaCount/minReplicas 1. Pair with the soft pod-anti-affinity
+# default so the replicas actually span nodes.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "gulley.fullname" . }}-gateway
+  labels:
+    {{- include "gulley.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  maxUnavailable: {{ .Values.gateway.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "gulley.selectorLabels" (dict "root" . "plane" "gateway") | nindent 6 }}
+{{- end }}

@@ -38,6 +38,15 @@ spec:
             {{- toYaml .Values.gateway.command | nindent 12 }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          # preStop sleep: on SIGTERM, wait for Service endpoint removal to propagate
+          # before the app starts refusing, so in-flight requests stop landing on a
+          # terminating pod (avoids the deregistration-race 502s on every rollout).
+          {{- if gt (int .Values.gateway.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ['sh', '-c', 'sleep {{ .Values.gateway.preStopSleepSeconds }}']
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.gateway.port }}
@@ -80,8 +89,6 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- include "gulley.affinity" (dict "root" . "plane" "gateway") | nindent 8 }}
 {{- end }}

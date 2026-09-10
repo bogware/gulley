@@ -8,6 +8,10 @@ data:
   GATEWAY_PORT: {{ .Values.gateway.port | quote }}
   METRICS_PORT: {{ .Values.gateway.metricsPort | quote }}
   CONTROL_API_PORT: {{ .Values.controlApi.port | quote }}
+  # Derived so the app's drain backstop always fires just BEFORE k8s SIGKILL:
+  # (terminationGracePeriodSeconds - drainBufferSeconds) seconds, in MILLISECONDS.
+  # An operator override in config.SHUTDOWN_GRACE_MS below wins (last key rendered).
+  SHUTDOWN_GRACE_MS: {{ mul (sub (int .Values.gateway.terminationGracePeriodSeconds) (int .Values.gateway.drainBufferSeconds)) 1000 | quote }}
   {{- range $k, $v := .Values.config }}
   {{- if and (ne $k "extra") (kindIs "string" $v) }}
   {{ $k }}: {{ $v | quote }}

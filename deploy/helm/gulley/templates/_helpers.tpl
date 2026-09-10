@@ -39,6 +39,28 @@ app.kubernetes.io/component: {{ .plane }}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
 
+{{/* Affinity for a plane (pass dict root + plane): the user's `affinity` override if
+     set, else a soft (preferred) pod anti-affinity that spreads that plane's replicas
+     across nodes by its selector labels — so one node loss can't take out all replicas.
+     "preferred" keeps single-node/dev clusters schedulable. Emitted at column 0; the
+     caller nindents. */}}
+{{- define "gulley.affinity" -}}
+{{- if .root.Values.affinity }}
+{{- toYaml .root.Values.affinity }}
+{{- else }}
+podAntiAffinity:
+  preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        topologyKey: {{ .root.Values.defaultAntiAffinityTopologyKey }}
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: {{ include "gulley.name" .root }}
+            app.kubernetes.io/instance: {{ .root.Release.Name }}
+            app.kubernetes.io/component: {{ .plane }}
+{{- end }}
+{{- end -}}
+
 {{/* ServiceAccount name. */}}
 {{- define "gulley.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}

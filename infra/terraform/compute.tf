@@ -203,10 +203,19 @@ resource "aws_lb_listener_rule" "gateway" {
 # --- container definitions -------------------------------------------------
 
 locals {
+  # Graceful-drain coupling: the app's SHUTDOWN_GRACE_MS backstop MUST fire a few seconds
+  # BEFORE ECS SIGKILL (the container stopTimeout), or an in-flight SSE stream is cut
+  # mid-drain and its single teardown() (budget-commit + ledger + hash-chained audit row)
+  # never runs. Derive the app grace from the stop timeout minus a small buffer so the two
+  # stay coupled, and reuse the same stopTimeout literal on the containers below.
+  ecs_stop_timeout_seconds = 120
+  shutdown_grace_ms        = (local.ecs_stop_timeout_seconds - 10) * 1000
+
   gateway_env = {
     NODE_ENV           = "production"
     GATEWAY_PORT       = tostring(local.ports.gateway)
     BEDROCK_REGION     = var.aws_region
+    SHUTDOWN_GRACE_MS  = tostring(local.shutdown_grace_ms)
     REDIS_CACHE_URL    = "rediss://${local.redis_endpoints["cache"]}:6379"
     REDIS_COUNTERS_URL = "rediss://${local.redis_endpoints["counters"]}:6379"
     REDIS_VECTOR_URL   = "rediss://${local.redis_endpoints["vector"]}:6379"
@@ -223,6 +232,7 @@ locals {
     NODE_ENV           = "production"
     CONTROL_API_PORT   = tostring(local.ports.control)
     GATEWAY_PUBLIC_URL = local.api_base_url
+    SHUTDOWN_GRACE_MS  = tostring(local.shutdown_grace_ms)
     }, var.bootstrap_admin_token_sha256 != "" ? {
     CONTROL_API_BOOTSTRAP_ENABLED       = "true"
     GULLEY_BOOTSTRAP_ADMIN_TOKEN_SHA256 = var.bootstrap_admin_token_sha256
@@ -257,7 +267,7 @@ locals {
     portMappings     = [{ containerPort = local.ports.gateway, protocol = "tcp" }]
     environment      = [for k, v in local.gateway_env : { name = k, value = v }]
     secrets          = [for k, v in local.gateway_secrets : { name = k, valueFrom = v }]
-    stopTimeout      = 120
+    stopTimeout      = local.ecs_stop_timeout_seconds
     healthCheck = {
       command     = ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:${local.ports.gateway}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval    = 30
@@ -281,7 +291,7 @@ locals {
     portMappings     = [{ containerPort = local.ports.control, protocol = "tcp" }]
     environment      = [for k, v in local.control_env : { name = k, value = v }]
     secrets          = [for k, v in local.control_secrets : { name = k, valueFrom = v }]
-    stopTimeout      = 120
+    stopTimeout      = local.ecs_stop_timeout_seconds
     logConfiguration = {
       logDriver = "awslogs"
       options   = { "awslogs-group" = local.log_opts.group, "awslogs-region" = local.log_opts.region, "awslogs-stream-prefix" = "control-api" }

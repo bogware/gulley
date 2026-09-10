@@ -98,11 +98,21 @@ try {
   }
   if ((svc['redis-cache']?.command ?? []).join(' ').includes('noeviction'))
     fail('redis-cache must be allkeys-lru, not noeviction');
-  // Both planes run the one image with a plane-selecting command.
+  // Both planes run the one image with a plane-selecting command. A service may either
+  // use the image's DEFAULT command (which starts that plane from its app dir — the
+  // gateway does this) or override it; an override must launch the plane's main.ts, and
+  // `tsx` only resolves from the app dir, so the path is workdir-relative
+  // (`src/main.ts` with working_dir /app/apps/<app>) or absolute (`apps/<app>/src/main.ts`).
   for (const app of ['gateway', 'control-api']) {
-    const cmd = svc[app]?.command ?? [];
-    if (cmd[0] !== 'node' || !cmd.some((a) => a.includes(`apps/${app}/src/main.ts`)))
-      fail(`${app} command must launch apps/${app}/src/main.ts`);
+    const def = svc[app] ?? {};
+    const cmd = def.command ?? [];
+    if (cmd.length === 0) continue; // image default — starts the correct plane
+    const wd = def.working_dir ?? '';
+    const launchesMain = cmd[0] === 'node' && cmd.some((a) => a.includes('src/main.ts'));
+    const rightApp =
+      cmd.some((a) => a.includes(`apps/${app}/src/main.ts`)) || wd.includes(`apps/${app}`);
+    if (!launchesMain || !rightApp)
+      fail(`${app} command must launch apps/${app}/src/main.ts (workdir-relative or absolute)`);
   }
   ok('docker-compose.prod.yml');
 } catch (e) {

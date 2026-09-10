@@ -24,7 +24,10 @@ try {
   console.warn(`[gateway] proxy disabled — ${(err as Error).message}`);
 }
 
-const app = buildServer(config, context);
+// Shared drain flag: /ready flips to 503 the instant a SIGTERM drain begins, so the pod
+// deregisters from Service/ALB endpoints before app.close() (see server.ts /ready).
+const drainState = { active: false };
+const app = buildServer(config, context, { isDraining: () => drainState.active });
 
 async function start(): Promise<void> {
   try {
@@ -74,6 +77,7 @@ let shuttingDown = false;
 async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  drainState.active = true; // /ready → 503 so endpoints deregister before app.close()
   app.log.info({ signal, graceMs }, 'draining');
   const backstop = setTimeout(() => {
     app.log.warn('drain grace elapsed, forcing exit');

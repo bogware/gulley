@@ -1,0 +1,11 @@
+# Cheapest working EKS footprint. Copy to test.tfvars and `terraform apply`.
+# Phase 1 (infra only): leave install_chart = false, apply.
+# Phase 2 (chart): create the gulley Secret (see README), set install_chart = true, apply.
+name       = "gulley-eks-test"
+aws_region = "us-east-1"
+tier       = "test"
+
+# Phase 2 toggles:
+# install_chart        = true
+# existing_secret_name = "gulley-secrets"
+# image_tag            = "latest"

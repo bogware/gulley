@@ -36,6 +36,12 @@ spec:
             {{- toYaml .Values.controlApi.command | nindent 12 }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if gt (int .Values.controlApi.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ['sh', '-c', 'sleep {{ .Values.controlApi.preStopSleepSeconds }}']
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.controlApi.port }}
@@ -74,8 +80,6 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- include "gulley.affinity" (dict "root" . "plane" "control-api") | nindent 8 }}
 {{- end }}

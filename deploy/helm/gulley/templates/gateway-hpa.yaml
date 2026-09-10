@@ -1,4 +1,7 @@
 {{- if and .Values.gateway.enabled .Values.gateway.autoscaling.enabled -}}
+{{- if gt (int .Values.gateway.autoscaling.minReplicas) (int .Values.gateway.autoscaling.maxReplicas) -}}
+{{- fail "gateway.autoscaling.minReplicas must be <= maxReplicas" -}}
+{{- end -}}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -14,10 +17,17 @@ spec:
   minReplicas: {{ .Values.gateway.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.gateway.autoscaling.maxReplicas }}
   metrics:
+    # CPU is a coarse fallback: a streaming proxy's real saturation is connection /
+    # event-loop bound, so add customMetrics (in-flight requests, event-loop lag) via a
+    # metrics adapter for accurate scale-out. CPU stays so clusters without an adapter
+    # still autoscale.
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
           averageUtilization: {{ .Values.gateway.autoscaling.targetCPUUtilizationPercentage }}
+    {{- with .Values.gateway.autoscaling.customMetrics }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 {{- end }}

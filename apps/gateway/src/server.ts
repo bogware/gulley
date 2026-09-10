@@ -20,7 +20,11 @@ export function parseTrustProxy(value: string): boolean | number | string {
   return v; // CIDR or comma-separated list
 }
 
-export function buildServer(config: Config, context?: GatewayContext): GatewayServer {
+export function buildServer(
+  config: Config,
+  context?: GatewayContext,
+  opts?: { isDraining?: () => boolean },
+): GatewayServer {
   const app = Fastify({
     // Cap the inbound body (Fastify defaults to 1 MiB, which 413s real coding-agent
     // requests). The custom application/json buffer parser respects this limit.
@@ -59,6 +63,14 @@ export function buildServer(config: Config, context?: GatewayContext): GatewaySe
   // recomputes providers from the (swappable) holder so a reconcile is reflected.
   app.get('/health', async () => ({ status: 'ok', service: 'gateway', version: GULLEY_VERSION }));
   app.get('/ready', async (_req, reply) => {
+    // Draining (SIGTERM received): report NOT ready immediately so the pod/task is pulled
+    // from Service/ALB endpoints before app.close(), closing the deregistration-race
+    // window. The preStop sleep is the reliable mechanism (probe removal lags by
+    // periodSeconds x failureThreshold); this flip is its complement.
+    if (opts?.isDraining?.()) {
+      reply.code(503);
+      return { status: 'draining' };
+    }
     const providers = holder?.providers() ?? [];
     // Degraded until there is at least one route: no context, OR a DB-config
     // gateway whose reconcile hasn't loaded routes yet — so the LB pulls the task

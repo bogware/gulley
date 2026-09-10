@@ -13,6 +13,22 @@ describe('gateway server', () => {
     await app.close();
   });
 
+  it('flips /ready to 503 (draining) once a drain begins, for pre-close endpoint deregistration', async () => {
+    const draining = { active: false };
+    const app = buildServer(
+      loadConfig({ NODE_ENV: 'test', LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv),
+      undefined,
+      { isDraining: () => draining.active },
+    );
+    // Health-only (no context) is already 503 'degraded'; assert the DRAINING status
+    // specifically once the flag is set — that is what the preStop path relies on.
+    draining.active = true;
+    const res = await app.inject({ method: 'GET', url: '/ready' });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toMatchObject({ status: 'draining' });
+    await app.close();
+  });
+
   it('applies the configured body limit (a large body is not 413ed by the 1 MiB default)', async () => {
     const app = buildServer(
       loadConfig({
