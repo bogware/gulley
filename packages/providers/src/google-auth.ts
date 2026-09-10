@@ -25,6 +25,11 @@ export interface GoogleTokenProviderOptions {
   skewSeconds?: number;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /** Bound on the shared token-exchange fetch (ms). The exchange is single-flight
+   *  and its lifetime must be INDEPENDENT of any one caller's request (fetch has no
+   *  default timeout), so it uses this internal deadline, never a caller AbortSignal.
+   *  Default 10s. */
+  exchangeTimeoutMs?: number;
 }
 
 const DEFAULT_TOKEN_URI = 'https://oauth2.googleapis.com/token';
@@ -44,6 +49,7 @@ export class GoogleServiceAccountTokenProvider {
   private readonly skewSeconds: number;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
+  private readonly exchangeTimeoutMs: number;
   private cached?: { token: string; expiresAtMs: number };
   /** Single-flight so concurrent callers share one token exchange. */
   private inflight?: Promise<string>;
@@ -57,6 +63,7 @@ export class GoogleServiceAccountTokenProvider {
     this.skewSeconds = opts.skewSeconds ?? 60;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? ((): number => Date.now());
+    this.exchangeTimeoutMs = opts.exchangeTimeoutMs ?? 10_000;
   }
 
   /** Parse a standard service-account JSON (as from GOOGLE_APPLICATION_CREDENTIALS). */
@@ -100,8 +107,12 @@ export class GoogleServiceAccountTokenProvider {
     return `${signingInput}.${signature}`;
   }
 
-  private async exchange(signal?: AbortSignal): Promise<string> {
+  private async exchange(): Promise<string> {
     const assertion = this.signAssertion();
+    // Bound the shared exchange with its OWN deadline — never a caller's AbortSignal.
+    // Concurrent callers share this single-flight promise, so binding it to the first
+    // caller's signal would cascade that one client's disconnect into a spurious abort
+    // for every other live request awaiting the same mint.
     const res = await this.fetchImpl(this.tokenUri, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -109,7 +120,7 @@ export class GoogleServiceAccountTokenProvider {
         grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
         assertion,
       }).toString(),
-      ...(signal ? { signal } : {}),
+      signal: AbortSignal.timeout(this.exchangeTimeoutMs),
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
@@ -127,11 +138,15 @@ export class GoogleServiceAccountTokenProvider {
     return body.access_token;
   }
 
-  /** A valid access token, minting/refreshing one as needed (single-flight). */
-  async getToken(signal?: AbortSignal): Promise<string> {
+  /** A valid access token, minting/refreshing one as needed (single-flight).
+   *  Note: the shared mint deliberately does NOT accept a per-request AbortSignal —
+   *  its lifetime is bounded by `exchangeTimeoutMs` so one caller's cancellation can
+   *  never fail the others sharing the exchange. The caller's signal still governs the
+   *  upstream provider call itself. */
+  async getToken(): Promise<string> {
     if (this.cached && this.cached.expiresAtMs > this.now()) return this.cached.token;
     if (this.inflight) return this.inflight;
-    this.inflight = this.exchange(signal).finally(() => {
+    this.inflight = this.exchange().finally(() => {
       this.inflight = undefined;
     });
     return this.inflight;

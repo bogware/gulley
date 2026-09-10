@@ -29,6 +29,20 @@ describe('NativeDetector', () => {
     expect(cats(pem)).toContain('private_key');
   });
 
+  it('scans the private_key pattern in linear time on hostile input (ReDoS guard)', () => {
+    // Many BEGIN anchors with NO matching END: an unbounded lazy gap would rescan to
+    // EOS at each anchor — O(n²), seconds-to-minutes of event-loop block on a large
+    // body. The bounded gap keeps each anchor's scan O(1), so the whole pass is linear.
+    const hostile = '-----BEGIN PRIVATE KEY-----\n'.repeat(20_000); // ~560 KB, ~20k anchors
+    const t0 = performance.now();
+    const found = det.detect(hostile);
+    const elapsed = performance.now() - t0;
+    // Linear scan of ~560 KB is single-digit ms even on slow CI; the pre-fix quadratic
+    // form took multiple seconds here. A generous ceiling still separates the two.
+    expect(elapsed).toBeLessThan(1_000);
+    expect(found.map((f) => f.category)).not.toContain('private_key'); // no closing END
+  });
+
   it('attributes sk-ant keys to Anthropic, not OpenAI', () => {
     const key = 'sk-ant-api03-' + 'Ab3xZ9qLmN'.repeat(3);
     const found = det.detect(`key ${key} used`);

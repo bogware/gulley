@@ -392,13 +392,16 @@ process.on('unhandledRejection', (reason) => {
 });
 
 const SHUTDOWN_GRACE_MS = Number(process.env['SHUTDOWN_GRACE_MS']) || 110_000;
+// After an uncaughtException the process state is undefined — drain briefly, then exit
+// non-zero for the orchestrator to restart, rather than dying abruptly mid-write.
+const UNCAUGHT_GRACE_MS = Math.min(SHUTDOWN_GRACE_MS, 5_000);
 let shuttingDown = false;
 
-async function shutdown(signal: string): Promise<void> {
+async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
-  app.log.info({ signal }, 'draining');
-  const backstop = setTimeout(() => process.exit(0), SHUTDOWN_GRACE_MS);
+  app.log.info({ signal, graceMs }, 'draining');
+  const backstop = setTimeout(() => process.exit(exitCode), graceMs);
   backstop.unref();
   if (wormTimer) clearInterval(wormTimer);
   if (anchorTimer) clearInterval(anchorTimer);
@@ -410,11 +413,18 @@ async function shutdown(signal: string): Promise<void> {
     app.log.error({ err }, 'shutdown error');
   }
   clearTimeout(backstop);
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => void shutdown(signal));
 }
+
+// Mirror the gateway: an uncaughtException must not abruptly kill an in-flight audit/
+// config write. Drain briefly through the same path, then exit non-zero to restart.
+process.on('uncaughtException', (err) => {
+  app.log.error({ err }, 'uncaughtException — draining and exiting');
+  void shutdown('uncaughtException', UNCAUGHT_GRACE_MS, 1);
+});
 
 void start();

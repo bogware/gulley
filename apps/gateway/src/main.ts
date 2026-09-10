@@ -64,16 +64,21 @@ process.on('unhandledRejection', (reason) => {
 // the upstream pool. A backstop under Fargate's 120s stopTimeout guarantees we
 // exit before SIGKILL; streams cut at the backstop reconnect via Last-Event-ID.
 const SHUTDOWN_GRACE_MS = Number(process.env['SHUTDOWN_GRACE_MS']) || 110_000;
+// After an uncaughtException the process is in an UNDEFINED state, so we must not
+// let in-flight streams keep running the full SIGTERM budget (they may compound the
+// fault). Drain briefly to give the single teardown()s a chance to commit budget +
+// write audit/ledger rows, then exit non-zero so the orchestrator restarts us.
+const UNCAUGHT_GRACE_MS = Math.min(SHUTDOWN_GRACE_MS, 5_000);
 let shuttingDown = false;
 
-async function shutdown(signal: string): Promise<void> {
+async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
-  app.log.info({ signal, graceMs: SHUTDOWN_GRACE_MS }, 'draining');
+  app.log.info({ signal, graceMs }, 'draining');
   const backstop = setTimeout(() => {
     app.log.warn('drain grace elapsed, forcing exit');
-    process.exit(0);
-  }, SHUTDOWN_GRACE_MS);
+    process.exit(exitCode);
+  }, graceMs);
   backstop.unref();
   try {
     await configWatcher?.stop(); // stop reloads before draining so none races the close
@@ -91,11 +96,23 @@ async function shutdown(signal: string): Promise<void> {
     app.log.error({ err }, 'shutdown error');
   }
   clearTimeout(backstop);
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => void shutdown(signal));
 }
+
+// A synchronous throw that escapes an event-loop callback (a stream listener, a
+// maintenance timer) would otherwise hit Node's default: an immediate exit that
+// severs every hijacked SSE socket WITHOUT running its centralized teardown(), so
+// reserved budget is never committed/refunded and no ledger/request-log/audit rows
+// are written — the exact SOC 2 audit-completeness gap the design guards against.
+// Route it through the SAME bounded drain (short grace) so teardowns get a chance
+// to run, then exit non-zero for the orchestrator to restart.
+process.on('uncaughtException', (err) => {
+  app.log.error({ err }, 'uncaughtException — draining and exiting');
+  void shutdown('uncaughtException', UNCAUGHT_GRACE_MS, 1);
+});
 
 void start();

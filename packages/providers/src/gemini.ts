@@ -438,9 +438,11 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
 
 // --- Adapter: Anthropic in, native Gemini upstream, Anthropic out ---
 
-/** Mints a short-lived Bearer token (e.g. a Vertex OAuth2 access token). */
+/** Mints a short-lived Bearer token (e.g. a Vertex OAuth2 access token). The mint is
+ *  single-flight and self-bounded; it deliberately takes no per-request AbortSignal so
+ *  one caller's disconnect can't fail the concurrent callers sharing the exchange. */
 export interface TokenProvider {
-  getToken(signal?: AbortSignal): Promise<string>;
+  getToken(): Promise<string>;
 }
 
 export interface GeminiNativeOptions {
@@ -483,7 +485,7 @@ export class GeminiNativeAdapter implements ProviderAdapter {
     // Vertex rotates its OAuth access token; mint a fresh Bearer per call when a
     // token provider is wired, otherwise use the route's static credential.
     const credential = this.opts.tokenProvider
-      ? { scheme: 'bearer' as const, value: await this.opts.tokenProvider.getToken(req.signal) }
+      ? { scheme: 'bearer' as const, value: await this.opts.tokenProvider.getToken() }
       : req.credential;
     const resp = await this.opts.inner.forward({
       path,

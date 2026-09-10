@@ -62,8 +62,15 @@ export const SECRET_PATTERNS: PatternDef[] = [
   {
     category: 'private_key',
     source: 'secret',
+    // The body gap is LENGTH-BOUNDED ({0,8192}), not an unbounded lazy `[\s\S]*?`.
+    // An unbounded gap makes the pass quadratic on hostile input: many `-----BEGIN`
+    // anchors with no matching `-----END` force an O(n)-to-EOS rescan at each of the
+    // O(n) anchors — O(n²) event-loop block on a body up to the 32 MiB Fastify limit.
+    // 8 KiB comfortably covers real PEM private keys (RSA-4096 body ≈ 3.2 KB); an
+    // over-long blob is still caught by the high-entropy fallback. Keep every built-in
+    // linear-time (see the file header) — bound any future multi-line pattern the same way.
     regex:
-      /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g,
+      /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]{0,8192}?-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g,
     confidence: 0.99,
   },
   {
