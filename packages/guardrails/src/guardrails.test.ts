@@ -29,18 +29,36 @@ describe('NativeDetector', () => {
     expect(cats(pem)).toContain('private_key');
   });
 
-  it('scans the private_key pattern in linear time on hostile input (ReDoS guard)', () => {
-    // Many BEGIN anchors with NO matching END: an unbounded lazy gap would rescan to
-    // EOS at each anchor — O(n²), seconds-to-minutes of event-loop block on a large
-    // body. The bounded gap keeps each anchor's scan O(1), so the whole pass is linear.
-    const hostile = '-----BEGIN PRIVATE KEY-----\n'.repeat(20_000); // ~560 KB, ~20k anchors
-    const t0 = performance.now();
-    const found = det.detect(hostile);
-    const elapsed = performance.now() - t0;
-    // Linear scan of ~560 KB is single-digit ms even on slow CI; the pre-fix quadratic
-    // form took multiple seconds here. A generous ceiling still separates the two.
-    expect(elapsed).toBeLessThan(1_000);
-    expect(found.map((f) => f.category)).not.toContain('private_key'); // no closing END
+  it('scans the private_key pattern in sub-quadratic time on hostile input (ReDoS guard)', () => {
+    // Many BEGIN anchors with NO matching END: an unbounded lazy gap rescans to EOS at
+    // each anchor — O(n²), seconds-to-minutes of event-loop block. The length-bounded
+    // gap keeps each anchor's scan bounded, so the whole pass is linear. Timing is
+    // machine-dependent, so assert the SCALING, not an absolute bound: doubling the
+    // input ~doubles a linear scan but ~quadruples a quadratic one.
+    const marker = '-----BEGIN PRIVATE KEY-----\n';
+    const measure = (repeats: number): number => {
+      const body = marker.repeat(repeats);
+      const t0 = performance.now();
+      det.detect(body);
+      return performance.now() - t0;
+    };
+    measure(2_000); // warm up the JIT so the two timed runs are comparable
+    const small = measure(10_000); // ~280 KB
+    const large = measure(20_000); // ~560 KB — twice the input
+    expect(large).toBeLessThan(small * 3); // linear ≈ 2×; the pre-fix quadratic was ≈ 4×
+    // A hostile all-BEGIN body (no END) yields no private_key finding either way.
+    expect(det.detect(marker.repeat(5_000)).map((f) => f.category)).not.toContain('private_key');
+  });
+
+  it('detects a large private key (>8KB body) at cache-excluding confidence (regression guard)', () => {
+    // The length bound must sit ABOVE real key sizes: a >0.8-confidence private_key
+    // finding is what keeps a secret-bearing RESPONSE out of the cache. A ~10 KB body
+    // (RSA-16384-ish; between the old 8 KiB bound and the 16 KiB one) MUST still match.
+    const body = 'MIIB' + 'A'.repeat(10_000);
+    const pem = `-----BEGIN RSA PRIVATE KEY-----\n${body}\n-----END RSA PRIVATE KEY-----`;
+    const pk = det.detect(pem).find((f) => f.category === 'private_key');
+    expect(pk).toBeDefined();
+    expect(pk?.confidence).toBeGreaterThanOrEqual(0.8);
   });
 
   it('attributes sk-ant keys to Anthropic, not OpenAI', () => {

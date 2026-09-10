@@ -62,15 +62,18 @@ export const SECRET_PATTERNS: PatternDef[] = [
   {
     category: 'private_key',
     source: 'secret',
-    // The body gap is LENGTH-BOUNDED ({0,8192}), not an unbounded lazy `[\s\S]*?`.
+    // The body gap is LENGTH-BOUNDED ({0,16384}), not an unbounded lazy `[\s\S]*?`.
     // An unbounded gap makes the pass quadratic on hostile input: many `-----BEGIN`
     // anchors with no matching `-----END` force an O(n)-to-EOS rescan at each of the
-    // O(n) anchors — O(n²) event-loop block on a body up to the 32 MiB Fastify limit.
-    // 8 KiB comfortably covers real PEM private keys (RSA-4096 body ≈ 3.2 KB); an
-    // over-long blob is still caught by the high-entropy fallback. Keep every built-in
-    // linear-time (see the file header) — bound any future multi-line pattern the same way.
+    // O(n) anchors. 16 KiB covers real PEM/PGP private keys with margin (RSA-16384
+    // body ≈ 12.8 KB; RSA-4096 ≈ 3.2 KB) — the bound must stay comfortably ABOVE real
+    // key sizes because this high-confidence (0.99) finding is what excludes a
+    // secret-bearing RESPONSE from the cache (cache-sensitivity is confidence-gated at
+    // 0.8, and the entropy fallback only reaches 0.4). The residual linear cost on a
+    // hostile body is bounded by NativeDetector's maxScanBytes cap. The complete fix
+    // for untrusted regexes is RE2 (a documented seam; see the file header).
     regex:
-      /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]{0,8192}?-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g,
+      /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]{0,16384}?-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g,
     confidence: 0.99,
   },
   {

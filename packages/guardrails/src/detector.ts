@@ -12,7 +12,17 @@ export interface NativeDetectorOptions {
   /** Raise a finding's confidence when a category context word sits nearby
    *  (e.g. "SSN" beside a 9-digit run). Default true. */
   contextBoost?: boolean;
+  /** Cap on the bytes actually scanned per call. The built-in patterns are linear,
+   *  but a hostile body of millions of secret-marker anchors (up to the 32 MiB request
+   *  limit) still costs `anchors × gap` work — real, if no longer quadratic. Scanning
+   *  only a bounded prefix caps that worst case; the tradeoff is a documented DLP
+   *  false-negative for secrets past the cap in an unusually large body. Default 4 MiB;
+   *  legitimate content is far smaller and only pathological inputs are ever truncated.
+   *  The complete fix (linear regardless of input) is RE2 — a documented seam. */
+  maxScanBytes?: number;
 }
+
+const DEFAULT_MAX_SCAN_BYTES = 4 * 1024 * 1024;
 
 const ENTROPY_CANDIDATE = /[A-Za-z0-9+/=_-]{16,}/g;
 
@@ -48,15 +58,20 @@ export class NativeDetector implements Detector {
   private readonly minBits: number;
   private readonly minLen: number;
   private readonly contextBoost: boolean;
+  private readonly maxScanBytes: number;
 
   constructor(opts: NativeDetectorOptions = {}) {
     this.entropyOn = opts.entropy !== false;
     this.minBits = opts.minEntropyBits ?? 3.5;
     this.minLen = opts.minEntropyLength ?? 24;
     this.contextBoost = opts.contextBoost !== false;
+    this.maxScanBytes = opts.maxScanBytes ?? DEFAULT_MAX_SCAN_BYTES;
   }
 
-  detect(text: string): Finding[] {
+  detect(full: string): Finding[] {
+    // Bound the scanned text so a pathological body can't drive unbounded regex work
+    // (offsets stay valid — the scan is a prefix, so start/end index the original).
+    const text = full.length > this.maxScanBytes ? full.slice(0, this.maxScanBytes) : full;
     const raw: Finding[] = [];
 
     for (const def of NATIVE_PATTERNS) {
