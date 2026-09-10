@@ -79,6 +79,38 @@ describe('reconcileWithBackend + exportWithBackend', () => {
     expect(await backend.getCredential('id_3')).toBeNull();
   });
 
+  it('round-trips provider residency stamps (region/zdr), emitting them only when set', async () => {
+    const store = new BackendConfigStore(new InMemoryConfigBackend());
+    await store.reconcile(
+      doc({
+        providers: [
+          {
+            kind: 'anthropic',
+            baseUrl: 'https://api.anthropic.com',
+            enabled: true,
+            credential: secretRef(ARN, 'v1'),
+            region: 'eu-central-1',
+            zdr: true,
+          },
+        ],
+      }),
+      { admin, access: allow },
+    );
+    const p = (await store.exportDocument('*')).orgs[0]?.workspaces[0]?.providers[0];
+    expect(p).toMatchObject({ region: 'eu-central-1', zdr: true });
+
+    // A provider with no stamp omits both keys (so a pre-stamp document hashes identically).
+    await store.reconcile(
+      doc({
+        providers: [{ kind: 'anthropic', baseUrl: 'https://api.anthropic.com', enabled: true }],
+      }),
+      { admin, access: allow },
+    );
+    const bare = (await store.exportDocument('*')).orgs[0]?.workspaces[0]?.providers[0];
+    expect(bare?.region).toBeUndefined();
+    expect(bare?.zdr).toBeUndefined();
+  });
+
   it('clears a kept provider credential when the desired doc omits it', async () => {
     const store = new BackendConfigStore(new InMemoryConfigBackend());
     await store.reconcile(doc(), { admin, access: allow });

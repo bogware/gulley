@@ -56,8 +56,19 @@ export interface AuditedWriteArgs<T> {
   mutate: () => T | Promise<T>;
 }
 
-/** Permission-check (deny by default) → mutate → append a hash-chained audit
- *  row. In-memory here; the Postgres path runs mutate + appendTx in one tx. */
+/**
+ * Permission-check (deny by default) → mutate → append a hash-chained audit row.
+ *
+ * NOT atomic: `mutate` targets the in-memory registries (OrgStore/WorkspaceStore/…), which
+ * are not Drizzle operations, so the mutation and the audit append cannot share one
+ * transaction here. If `append` throws AFTER `mutate` has run, the change is applied with
+ * no audit row and the throw surfaces as a 500 (a retry can then duplicate the mutation).
+ * The durable, genuinely-atomic governance path is `configAtomic` (context.ts), which wraps
+ * tx-bound Postgres stores + a tx-bound PostgresAuditSink in one db.transaction — the
+ * config-apply route uses it. Making auditedWrite itself atomic requires first making these
+ * stores tx-aware Postgres stores (tracked as a follow-up); this comment previously claimed
+ * a one-tx Postgres path that does not exist.
+ */
 export async function auditedWrite<T>(
   ctx: ControlContext,
   admin: AdminPrincipal,

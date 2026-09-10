@@ -378,6 +378,11 @@ export const provider = pgTable(
     kind: text('kind').notNull(),
     baseUrl: text('base_url'),
     enabled: boolean('enabled').notNull().default(true),
+    // Data-residency stamp so DB-config-mode routes can satisfy an active residency/ZDR
+    // policy (the env path stamps these from ANTHROPIC_REGION/ZDR etc.). Null region + a
+    // false zdr fail CLOSED under an active policy, matching the env behavior.
+    region: text('region'),
+    zdr: boolean('zdr').notNull().default(false),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('provider_workspace_idx').on(t.workspaceId)],

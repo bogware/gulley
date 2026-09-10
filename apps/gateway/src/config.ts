@@ -354,6 +354,18 @@ const Env = z.object({
   // byte arrives the inactivity watchdog takes over. 0 = off. On breach the client
   // gets a 504 and any partial spend is metered.
   REQUEST_DEADLINE_MS: z.coerce.number().int().nonnegative().default(0),
+  // Post-first-byte inactivity watchdog (ms): abort a proxied stream after this long with
+  // no upstream activity (provider adapters disable undici's bodyTimeout for long SSE, so
+  // this is the only guard against a half-open upstream pinning the client socket + the
+  // budget reservation). Also bounds a buffered cascade leg's idle. Validated (was a raw,
+  // module-load-time process.env read).
+  STREAM_INACTIVITY_MS: z.coerce.number().int().positive().default(120_000),
+  // Graceful-drain backstop (ms): the bounded window a SIGTERM/SIGINT drain (or an
+  // uncaughtException drain) is given before process.exit fires. MUST be strictly LESS than
+  // the platform's stop deadline (ECS stopTimeout / k8s terminationGracePeriodSeconds*1000)
+  // or the backstop fires AFTER SIGKILL and in-flight streams are cut mid-drain — the exact
+  // failure it exists to prevent. Validated + discoverable (was a raw process.env read).
+  SHUTDOWN_GRACE_MS: z.coerce.number().int().positive().default(110_000),
 
   // Same-target retry (pre-first-byte, body already buffered): bounded attempts
   // on transient errors before failing over to the next candidate. Default 1 =

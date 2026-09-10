@@ -51,7 +51,7 @@ import { buildSecretResolver } from './secrets';
 import { DbTenantCredentialResolver } from './tenant';
 import { parseToolPolicy } from './tool-governance';
 import { modelPolicyFromEnv } from './model-policy';
-import { residencyPolicyFromEnv } from './residency-policy';
+import { isEmptyResidencyPolicy, residencyPolicyFromEnv } from './residency-policy';
 import { parseCascadePolicy } from './cascade';
 import { RequestTracer } from './tracer';
 import {
@@ -775,6 +775,25 @@ export function createProductionContext(config: Config): GatewayContext {
     timer.unref?.();
   }
 
+  // Deployment-wide data-residency / ZDR policy (env-config path), computed once.
+  const residencyPolicy = residencyPolicyFromEnv(
+    config.RESIDENCY_ALLOWED_REGIONS,
+    config.RESIDENCY_REQUIRE_ZDR,
+  );
+  // Boot-time residency guard for DB-config mode: DB routes carry per-provider region/ZDR
+  // stamps (provider.region/zdr) that MUST be set for anthropic/openai/azure to satisfy an
+  // active policy — an unstamped provider fails CLOSED (denied) on the first reconcile.
+  // Warn loudly at boot so this surfaces as a config task, not a silent outage later
+  // (Bedrock stamps its region from baseUrl, so it is exempt from the warning).
+  if (config.CONFIG_SOURCE === 'db' && !isEmptyResidencyPolicy(residencyPolicy)) {
+    bootLog.warn(
+      { allowedRegions: residencyPolicy?.allowedRegions, requireZdr: residencyPolicy?.requireZdr },
+      'residency policy is active with CONFIG_SOURCE=db: every non-bedrock provider in the ' +
+        'config document MUST set region (and zdr where required) or its traffic will be ' +
+        'denied (residency_denied) after the next reconcile. Set them on each provider entity.',
+    );
+  }
+
   // Per-model budget caps (multi-level enforcement) keyed by their `model:<model>`
   // scope. The set of governed models is what the hot path checks before reserving
   // the extra scope; the map is the cap source (config, not the DB budget table).
@@ -1001,15 +1020,13 @@ export function createProductionContext(config: Config): GatewayContext {
     envModelPolicy: modelPolicyFromEnv(config.MODEL_ALLOW, config.MODEL_DENY),
     // Deployment-wide data-residency / ZDR policy (env-config path). Enforced at
     // candidate selection on each upstream's declared region/ZDR; fail-closed.
-    residencyPolicy: residencyPolicyFromEnv(
-      config.RESIDENCY_ALLOWED_REGIONS,
-      config.RESIDENCY_REQUIRE_ZDR,
-    ),
+    residencyPolicy,
     // Cascade routing policies (env-config). Empty = off. Parse THROWS on bad JSON so a
     // malformed policy fails boot rather than silently disabling escalation.
     cascade: parseCascadePolicy(config.CASCADE_POLICY),
     models: catalogModels,
     rateResolver,
+    streamInactivityMs: config.STREAM_INACTIVITY_MS,
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,

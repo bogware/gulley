@@ -63,7 +63,7 @@ process.on('unhandledRejection', (reason) => {
 // Bounded graceful drain: stop accepting, let in-flight streams finish, close
 // the upstream pool. A backstop under Fargate's 120s stopTimeout guarantees we
 // exit before SIGKILL; streams cut at the backstop reconnect via Last-Event-ID.
-const SHUTDOWN_GRACE_MS = Number(process.env['SHUTDOWN_GRACE_MS']) || 110_000;
+const SHUTDOWN_GRACE_MS = config.SHUTDOWN_GRACE_MS;
 // After an uncaughtException the process is in an UNDEFINED state, so we must not
 // let in-flight streams keep running the full SIGTERM budget (they may compound the
 // fault). Drain briefly to give the single teardown()s a chance to commit budget +

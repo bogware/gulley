@@ -302,6 +302,16 @@ export async function buildRoutesFromDocument(
         if (!p.enabled || !p.credential) continue;
         const value = await resolver.resolve(p.credential);
         for (const route of routesForProvider(p.kind, p.baseUrl ?? null, value)) {
+          // Stamp the provider's data-residency posture onto its target so DB-config-mode
+          // routes can satisfy an active residency/ZDR policy (the env path stamps from
+          // ANTHROPIC_REGION/ZDR etc.). Explicit region wins; otherwise any adapter-derived
+          // region is kept (Bedrock's baseUrl IS its AWS region). An unstamped provider
+          // still fails CLOSED under an active policy, matching env behavior.
+          if (route.strategy.mode === 'single') {
+            const t = route.strategy.target;
+            if (p.region) t.region = p.region;
+            if (p.zdr) t.zdr = true;
+          }
           if (guardrails) {
             route.guardrails = guardrails.engine;
             // In-stream output enforcement is meaningless on non-cacheable/embedding

@@ -410,7 +410,7 @@ process.on('unhandledRejection', (reason) => {
   app.log.error({ reason }, 'unhandledRejection');
 });
 
-const SHUTDOWN_GRACE_MS = Number(process.env['SHUTDOWN_GRACE_MS']) || 110_000;
+const SHUTDOWN_GRACE_MS = config.SHUTDOWN_GRACE_MS;
 // After an uncaughtException the process state is undefined — drain briefly, then exit
 // non-zero for the orchestrator to restart, rather than dying abruptly mid-write.
 const UNCAUGHT_GRACE_MS = Math.min(SHUTDOWN_GRACE_MS, 5_000);

@@ -104,13 +104,21 @@ export class PostgresConfigBackend implements ConfigBackend {
         kind: provider.kind,
         baseUrl: provider.baseUrl,
         enabled: provider.enabled,
+        region: provider.region,
+        zdr: provider.zdr,
       })
       .from(provider)
       .where(eq(provider.workspaceId, workspaceId));
   }
   async upsertProvider(
     workspaceId: string,
-    p: { kind: string; baseUrl: string | null; enabled: boolean },
+    p: {
+      kind: string;
+      baseUrl: string | null;
+      enabled: boolean;
+      region: string | null;
+      zdr: boolean;
+    },
   ): Promise<BackendProvider> {
     const existing = await this.db
       .select({ id: provider.id })
@@ -119,13 +127,20 @@ export class PostgresConfigBackend implements ConfigBackend {
     if (existing[0]) {
       await this.db
         .update(provider)
-        .set({ baseUrl: p.baseUrl, enabled: p.enabled })
+        .set({ baseUrl: p.baseUrl, enabled: p.enabled, region: p.region, zdr: p.zdr })
         .where(eq(provider.id, existing[0].id));
       return { id: existing[0].id, ...p };
     }
     const [row] = await this.db
       .insert(provider)
-      .values({ workspaceId, kind: p.kind, baseUrl: p.baseUrl, enabled: p.enabled })
+      .values({
+        workspaceId,
+        kind: p.kind,
+        baseUrl: p.baseUrl,
+        enabled: p.enabled,
+        region: p.region,
+        zdr: p.zdr,
+      })
       .returning({ id: provider.id });
     return { id: (row as { id: string }).id, ...p };
   }

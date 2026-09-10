@@ -45,6 +45,8 @@ export interface BackendProvider {
   kind: string;
   baseUrl: string | null;
   enabled: boolean;
+  region: string | null;
+  zdr: boolean;
 }
 export interface BackendEntity {
   id: string;
@@ -61,7 +63,13 @@ export interface ConfigBackend {
   listProviders(workspaceId: string): Promise<BackendProvider[]>;
   upsertProvider(
     workspaceId: string,
-    p: { kind: string; baseUrl: string | null; enabled: boolean },
+    p: {
+      kind: string;
+      baseUrl: string | null;
+      enabled: boolean;
+      region: string | null;
+      zdr: boolean;
+    },
   ): Promise<BackendProvider>;
   deleteProvider(id: string): Promise<void>;
   getCredential(providerId: string): Promise<SecretRef | null>;
@@ -112,6 +120,10 @@ export async function exportWithBackend(
         a.kind.localeCompare(b.kind),
       )) {
         const provider: ConfigProvider = { kind: p.kind, baseUrl: p.baseUrl, enabled: p.enabled };
+        // Emit residency stamps ONLY when set, so a pre-stamp document hashes/diffs
+        // identically (absence ≡ default: no region, zdr false).
+        if (p.region) provider.region = p.region;
+        if (p.zdr) provider.zdr = true;
         const cred = await backend.getCredential(p.id);
         if (cred) provider.credential = cred;
         providers.push(provider);
@@ -190,6 +202,8 @@ export async function reconcileWithBackend(
           kind: dp.kind,
           baseUrl: dp.baseUrl ?? null,
           enabled: dp.enabled,
+          region: dp.region ?? null,
+          zdr: dp.zdr ?? false,
         });
         // Reconcile the credential too: set it, or CLEAR a stale one when the
         // desired provider omits it (a kept provider must not retain an old ARN).
@@ -270,7 +284,13 @@ export class InMemoryConfigBackend implements ConfigBackend {
   }
   async upsertProvider(
     workspaceId: string,
-    p: { kind: string; baseUrl: string | null; enabled: boolean },
+    p: {
+      kind: string;
+      baseUrl: string | null;
+      enabled: boolean;
+      region: string | null;
+      zdr: boolean;
+    },
   ): Promise<BackendProvider> {
     const found = [...this.providers.values()].find(
       (x) => x.workspaceId === workspaceId && x.kind === p.kind,
@@ -278,6 +298,8 @@ export class InMemoryConfigBackend implements ConfigBackend {
     if (found) {
       found.baseUrl = p.baseUrl;
       found.enabled = p.enabled;
+      found.region = p.region;
+      found.zdr = p.zdr;
       const { workspaceId: _w, ...out } = found;
       return { ...out };
     }

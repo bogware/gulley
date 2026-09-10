@@ -97,6 +97,28 @@ describe('buildRoutesFromDocument', () => {
     await expect(buildRoutesFromDocument(doc, resolver)).rejects.toThrow(/no secret value/);
   });
 
+  it('stamps the provider residency posture (region/zdr) onto DB-config targets', async () => {
+    const resolver = new MapSecretResolver(
+      new Map([
+        [ARN_A, 'sk-ant-secret'],
+        [ARN_O, 'sk-openai-secret'],
+      ]),
+    );
+    const stamped: ConfigDocument = structuredClone(doc);
+    const provs = stamped.orgs[0]!.workspaces[0]!.providers;
+    provs[0]!.region = 'eu-central-1'; // anthropic
+    provs[0]!.zdr = true;
+    // openai (provs[1]) left unstamped → fails closed under an active policy.
+    const routes = await buildRoutesFromDocument(stamped, resolver);
+    const target = (p: string) =>
+      routes.map((r) => r.strategy).find((s) => s.mode === 'single' && s.target.provider === p) as
+        { mode: 'single'; target: { region?: string; zdr?: boolean } } | undefined;
+    expect(target('anthropic')?.target).toMatchObject({ region: 'eu-central-1', zdr: true });
+    // Unstamped provider carries no region and zdr stays falsy (fail-closed).
+    expect(target('openai')?.target.region).toBeUndefined();
+    expect(target('openai')?.target.zdr).toBeFalsy();
+  });
+
   it("attaches the workspace's guardrail engine (+ stream-enforce) to every route", async () => {
     const resolver = new MapSecretResolver(
       new Map([

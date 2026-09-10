@@ -13,6 +13,10 @@ const Env = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   CONTROL_API_HOST: z.string().default('0.0.0.0'),
   CONTROL_API_PORT: z.coerce.number().int().positive().default(8081),
+  // Graceful-drain backstop (ms) before process.exit fires. MUST be strictly less than the
+  // platform stop deadline (ECS stopTimeout / k8s terminationGracePeriodSeconds*1000) or
+  // the backstop fires after SIGKILL. Validated + discoverable (was a raw process.env read).
+  SHUTDOWN_GRACE_MS: z.coerce.number().int().positive().default(110_000),
   // Proxy hops to trust for req.ip (X-Forwarded-For). `trustProxy: true` trusts EVERY
   // hop, making req.ip client-spoofable; a fixed hop count (1 = the ALB) is correct for
   // an ALB-fronted deployment. Raise it if you run additional trusted proxies.

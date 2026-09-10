@@ -271,6 +271,12 @@ export interface GatewayContext {
    *  dispatch/failover/retry phase; on breach the request aborts with a 504. Absent
    *  = off (only the post-first-byte inactivity watchdog applies). */
   requestDeadlineMs?: number;
+  /** Post-first-byte inactivity watchdog (ms): a stalled upstream (headers sent, then no
+   *  bytes and no end/error) is aborted after this idle gap so it can't pin the client
+   *  socket + the budget reservation indefinitely. Also bounds a buffered cascade leg's
+   *  idle. Zod-validated in production; absent (tests/smoke scripts) ⇒
+   *  DEFAULT_STREAM_INACTIVITY_MS. */
+  streamInactivityMs?: number;
   /** Request header names whose values are captured as cost-attribution tags on the
    *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
   attributionHeaders?: string[];
@@ -319,10 +325,11 @@ export interface GatewayContext {
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
 /** Cap the best-effort mask-vault persist so a stalled KMS can't hang teardown. */
 const MASK_VAULT_PERSIST_TIMEOUT_MS = 5_000;
-/** Abort a proxied stream after this long with no upstream activity — provider
- *  adapters disable undici's bodyTimeout for long SSE, so this is the only guard
- *  against a half-open upstream that would otherwise pin a budget reservation. */
-const STREAM_INACTIVITY_MS = Number(process.env['STREAM_INACTIVITY_MS']) || 120_000;
+// The post-first-byte inactivity watchdog budget lives on the (Zod-validated)
+// GatewayContext as `streamInactivityMs`, threaded through so it isn't captured from raw
+// process.env at module-load time. This is only the fallback for a context that omits it
+// (tests / smoke scripts); production always sets it from config.STREAM_INACTIVITY_MS.
+const DEFAULT_STREAM_INACTIVITY_MS = 120_000;
 /** Responses over this size are streamed through but never cached. */
 const CACHE_BODY_CAP = 2 * 1024 * 1024;
 /** Hard deadline for the whole cache lookup (exact read + embed + vector query). The
@@ -508,6 +515,7 @@ async function readFully(
   body: Readable,
   limit: number,
   signal: AbortSignal,
+  inactivityMs: number,
 ): Promise<{ chunks: Buffer[]; bytes: number; overflow: boolean }> {
   return await new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -532,7 +540,7 @@ async function readFully(
     // here, and undici's bodyTimeout is disabled for SSE.)
     const arm = (): void => {
       if (timer) clearTimeout(timer);
-      timer = setTimeout(() => fail(new Error('cascade leg idle')), STREAM_INACTIVITY_MS);
+      timer = setTimeout(() => fail(new Error('cascade leg idle')), inactivityMs);
       timer.unref?.();
     };
     const onData = (chunk: Buffer): void => {
@@ -2018,7 +2026,12 @@ async function handleProxy(
     };
     let t0raw: Awaited<ReturnType<typeof readFully>> | undefined;
     try {
-      t0raw = await readFully(upstream.body, capLimit, controller.signal);
+      t0raw = await readFully(
+        upstream.body,
+        capLimit,
+        controller.signal,
+        ctx.streamInactivityMs ?? DEFAULT_STREAM_INACTIVITY_MS,
+      );
     } catch {
       t0raw = undefined; // read error / stall / abort → fail closed below
     }
@@ -2117,7 +2130,12 @@ async function handleProxy(
           );
           let t1raw: Awaited<ReturnType<typeof readFully>> | undefined;
           try {
-            t1raw = await readFully(resp1.body, capLimit, controller.signal);
+            t1raw = await readFully(
+              resp1.body,
+              capLimit,
+              controller.signal,
+              ctx.streamInactivityMs ?? DEFAULT_STREAM_INACTIVITY_MS,
+            );
           } catch {
             t1raw = undefined;
           }
@@ -2857,7 +2875,7 @@ async function handleProxy(
     watchdog = setTimeout(() => {
       request.log.warn('upstream stream idle — aborting');
       controller.abort();
-    }, STREAM_INACTIVITY_MS);
+    }, ctx.streamInactivityMs ?? DEFAULT_STREAM_INACTIVITY_MS);
     watchdog.unref();
   };
   const clearWatchdog = (): void => {

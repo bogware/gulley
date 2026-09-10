@@ -13,6 +13,11 @@ export interface ConfigProvider {
   baseUrl?: string | null;
   enabled: boolean;
   credential?: SecretRef;
+  /** Data-residency stamp so DB-config routes can satisfy an active residency/ZDR policy
+   *  (mirrors the env path's ANTHROPIC_REGION/ZDR etc.). Absent region + false zdr fail
+   *  CLOSED under an active policy. */
+  region?: string | null;
+  zdr?: boolean;
 }
 
 /** Virtual keys are EXPORT-ONLY — the document carries metadata (never the token
