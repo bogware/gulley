@@ -247,7 +247,7 @@ Two tiers, both **partitioned by authz scope** — every exact + semantic key is
 - Access: `virtual_key` (hashed secret ref, scope, expiry, last_used, epoch), `oauth_client`, `oauth_grant`.
 - Routing/policy: `provider`, `provider_credential` (secret ARN ref), `model_alias`, `route`, `route_policy` (allowed auth modes, guardrail set, cache config), `budget`, `rate_limit`, `guardrail`.
 - Ledger/audit: `spend_ledger` (durable truth), `audit_log` (hash-chained), `config_version`.
-- **Recent ops** (`request_log` rollups) — high write volume; **time-partitioned (pg_partman) + per-minute rollups + partition-drop retention** (not `DELETE`), write path isolated from control-plane transactions. (They dropped ClickHouse, so this telemetry lands on Postgres and must be bounded.)
+- **Recent ops** (`request_log`) — high write volume; write path isolated from control-plane transactions. (They dropped ClickHouse, so this telemetry lands on Postgres and must be bounded.) **Retention today:** a bounded, batched DELETE sweep on `created_at` behind `REQUEST_LOG_RETENTION_DAYS` (off = keep forever), run off the hot path on an unref'd timer — mirroring the exact-cache and mask-vault expiry sweeps. Declarative time-partitioning with pg_partman partition-drop retention + per-minute rollups is the planned evolution (not yet delivered); `spend_ledger` (the durable budget/chargeback source of truth) is never swept.
 
 **ElastiCache Redis — split by role onto separate clusters/node-groups** (a single eviction policy can't serve all three):
 

@@ -67,6 +67,10 @@ const Env = z.object({
   OAUTH_REFRESH_TTL_MS: z.coerce.number().int().positive().default(2_592_000_000),
   OAUTH_ABSOLUTE_TTL_MS: z.coerce.number().int().positive().default(7_776_000_000),
   OAUTH_DEVICE_CODE_TTL_MS: z.coerce.number().int().positive().default(900_000),
+  // Housekeeping: periodically DELETE expired device_code / auth_code ephemera (expiry is
+  // already enforced at read time, so this only reclaims space on a long-lived broker).
+  // Seconds; 0 = off. Runs on an unref'd timer only in DB mode with the broker enabled.
+  OAUTH_EPHEMERA_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(3600),
 
   // Ed25519 private key (PEM) that SIGNS onboarding packs (GET .../onboarding-pack).
   // The org publishes the matching public key (served at /.well-known/gulley-onboarding-key)

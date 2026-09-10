@@ -137,8 +137,9 @@ export const spendLedger = pgTable(
   ],
 );
 
-// Per-request operational log. High write volume — a later milestone
-// time-partitions this and drops old partitions rather than DELETE-ing.
+// Per-request operational log. High write volume — bounded today by a batched
+// retention DELETE on created_at (REQUEST_LOG_RETENTION_DAYS, see retention.ts); a
+// later milestone time-partitions this and drops old partitions instead.
 export const requestLog = pgTable(
   'request_log',
   {

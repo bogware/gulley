@@ -10,7 +10,7 @@ import type { RateResolver } from '@gulley/cost';
 import { assertEgressAllowed, setAirGappedEgress } from '@gulley/egress';
 import { EntraGraphIdp } from '@gulley/oauth';
 import { OidcProvider } from '@gulley/oidc';
-import { createListenConnection, PostgresConfigBus } from '@gulley/storage';
+import { createListenConnection, PostgresConfigBus, purgeExpiredOAuthCodes } from '@gulley/storage';
 import { S3AuditMirror } from '@gulley/worm';
 import { type Anchor, HttpAnchor } from './anchor';
 import { buildSiemConnector, type SiemConnector } from './siem';
@@ -378,6 +378,25 @@ if (context?.siemExporter) {
     .catch((err: unknown) => app.log.error({ err }, 'SIEM seed failed'));
 }
 
+// OAuth-ephemera retention: periodically reclaim expired device_code / auth_code rows.
+// Expiry is enforced at read/consume time, so this is pure space reclamation for a
+// long-lived broker deployment. Unref'd + best-effort. Only in DB mode with the broker on.
+let oauthSweepTimer: NodeJS.Timeout | undefined;
+if (context?.db && context.oauthBroker && config.OAUTH_EPHEMERA_SWEEP_INTERVAL_SECONDS > 0) {
+  const sweepDb = context.db;
+  const tick = (): void => {
+    void purgeExpiredOAuthCodes(sweepDb)
+      .then((r) => {
+        if (r.deviceCodes + r.authCodes > 0)
+          app.log.info(r, 'swept expired OAuth device/auth codes');
+      })
+      .catch((err: unknown) => app.log.error({ err }, 'OAuth-ephemera sweep failed'));
+  };
+  oauthSweepTimer = setInterval(tick, config.OAUTH_EPHEMERA_SWEEP_INTERVAL_SECONDS * 1000);
+  oauthSweepTimer.unref();
+  tick();
+}
+
 async function start(): Promise<void> {
   try {
     await app.listen({ host: config.CONTROL_API_HOST, port: config.CONTROL_API_PORT });
@@ -406,6 +425,7 @@ async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 
   if (wormTimer) clearInterval(wormTimer);
   if (anchorTimer) clearInterval(anchorTimer);
   if (siemTimer) clearInterval(siemTimer);
+  if (oauthSweepTimer) clearInterval(oauthSweepTimer);
   try {
     await app.close();
     await configBus?.close();

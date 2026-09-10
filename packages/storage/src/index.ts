@@ -9,6 +9,7 @@ export * from './centroid-store';
 export * from './mask-vault-store';
 export * from './subject-key-store';
 export * from './oauth-stores';
+export * from './retention';
 export * from './admin-session-store';
 export * from './scim-group-store';
 export * from './config-store';

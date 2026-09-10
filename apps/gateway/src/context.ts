@@ -101,6 +101,8 @@ import {
   PostgresMaskVaultStore,
   PostgresRequestLog,
   PostgresSubjectKeyStore,
+  purgeRequestLogsOlderThan,
+  retentionCutoff,
   PostgresVectorIndex,
   RedisExactCache,
   RedisVectorIndex,
@@ -690,14 +692,33 @@ export function createProductionContext(config: Config): GatewayContext {
 
   const basicAuth = buildBasicAuth(config);
 
-  const db = createDatabase(config.DATABASE_URL);
+  // Fail-fast pool options: a bounded statement_timeout turns a hung query into a
+  // rejection instead of a pinned connection (so a stuck sink write can't starve authn),
+  // plus connect/idle bounds that keep the pool lean behind RDS Proxy.
+  const dbTimeouts = {
+    statementTimeoutMs: config.DB_STATEMENT_TIMEOUT_MS,
+    connectTimeoutMs: config.DB_CONNECT_TIMEOUT_MS,
+    idleTimeoutMs: config.DB_IDLE_TIMEOUT_MS,
+  };
+  const db = createDatabase(config.DATABASE_URL, { max: config.DB_POOL_MAX, ...dbTimeouts });
+  // Hot-path auth (KeyStore + brokered-token grant lookups) reads from its OWN small pool,
+  // physically separate from the teardown/durable-sink pool above, so audit/ledger write
+  // pressure — including the single global audit advisory lock — can never exhaust the
+  // connections authentication depends on. Under sink overload the gateway keeps
+  // authenticating and sheds load via /ready 503 rather than blocking new requests on
+  // key lookup.
+  const authDb = createDatabase(config.DATABASE_URL, {
+    max: config.DB_KEYSTORE_POOL_MAX,
+    ...dbTimeouts,
+  });
 
   // Gateway-brokered OAuth inference auth (data plane): verify opaque `gko_at_` access
   // tokens read-only against the shared Postgres grant store, with the same pepper the
-  // control-plane broker minted with. One grant-store instance, reused per request.
+  // control-plane broker minted with. One grant-store instance, reused per request. On the
+  // isolated auth pool — it is a hot-path auth read.
   const brokerPepper = config.GULLEY_KEY_PEPPER;
   const brokerGrants =
-    config.OAUTH_BROKER_ENABLED && brokerPepper ? new PostgresGrantStore(db) : undefined;
+    config.OAUTH_BROKER_ENABLED && brokerPepper ? new PostgresGrantStore(authDb) : undefined;
   const brokerResolver =
     brokerGrants && brokerPepper
       ? (token: string) =>
@@ -726,6 +747,34 @@ export function createProductionContext(config: Config): GatewayContext {
       : masterMaskEncryptor;
   const maskVault =
     config.MASK_VAULT_PERSIST && maskVaultEncryptor ? new PostgresMaskVaultStore(db) : undefined;
+
+  // Mask-vault expiry sweep: every guardrail 'mask' writes a short-TTL (encrypted-PII)
+  // reversal row, so without a sweep the table grows unbounded past its declared TTL — a
+  // data-minimization regression. Mirror the exact-cache sweep: an unref'd best-effort
+  // timer, guarded on the store actually existing and a non-zero interval.
+  if (maskVault && config.MASK_VAULT_SWEEP_INTERVAL_SECONDS > 0) {
+    const timer = setInterval(
+      () => void maskVault.sweepExpired(new Date()).catch(() => {}),
+      config.MASK_VAULT_SWEEP_INTERVAL_SECONDS * 1000,
+    );
+    timer.unref?.();
+  }
+
+  // Request-log retention: bounded batched DELETE of request_log rows past the retention
+  // horizon, off the hot path on an unref'd timer (0 days = keep forever). spend_ledger
+  // (the durable budget/chargeback source of truth) is deliberately NOT swept.
+  if (config.REQUEST_LOG_RETENTION_DAYS > 0) {
+    const retentionDays = config.REQUEST_LOG_RETENTION_DAYS;
+    const timer = setInterval(
+      () =>
+        void purgeRequestLogsOlderThan(db, retentionCutoff(new Date(), retentionDays)).catch(
+          () => {},
+        ),
+      config.REQUEST_LOG_RETENTION_SWEEP_INTERVAL_SECONDS * 1000,
+    );
+    timer.unref?.();
+  }
+
   // Per-model budget caps (multi-level enforcement) keyed by their `model:<model>`
   // scope. The set of governed models is what the hot path checks before reserving
   // the extra scope; the map is the cap source (config, not the DB budget table).
@@ -895,7 +944,7 @@ export function createProductionContext(config: Config): GatewayContext {
 
   return {
     routes,
-    keyStore: new PostgresKeyStore(db),
+    keyStore: new PostgresKeyStore(authDb),
     pepper: config.GULLEY_KEY_PEPPER,
     ledger: new PostgresLedger(db),
     requestLog,

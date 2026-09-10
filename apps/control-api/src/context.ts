@@ -209,6 +209,10 @@ export interface ControlContext {
   /** This process's origin id, stamped on emitted signals so a subscriber that
    *  is also a publisher can ignore its own writes. */
   originId: string;
+  /** The durable Postgres handle when running in DB mode; absent = in-memory. Exposed so
+   *  process-level maintenance (e.g. the OAuth-ephemera retention sweep) can run against
+   *  the same pool. */
+  db?: Database;
 }
 
 export interface OidcSessionConfig {
@@ -578,5 +582,6 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     oidc: opts.oidc,
     notifier: opts.notifier,
     originId: newOriginId(),
+    db,
   };
 }

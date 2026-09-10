@@ -180,6 +180,24 @@ const Env = z.object({
   CUSTOM_PROVIDERS: z.string().optional(),
 
   DATABASE_URL: z.string().url().optional(),
+  // Postgres pool + fail-fast timeouts (data plane). The gateway's queries are all short
+  // single-row auth reads + best-effort teardown-sink writes, so a bounded
+  // statement_timeout means a hung query REJECTS instead of pinning a connection and
+  // starving the pool authn depends on (the gateway then sheds via /ready 503 rather than
+  // hanging). The hot-path KeyStore read runs on its OWN small pool, isolated from the
+  // teardown/durable-sink pool, so audit/ledger write pressure (incl. the audit advisory
+  // lock) can't starve authentication.
+  DB_POOL_MAX: z.coerce.number().int().positive().default(10),
+  DB_KEYSTORE_POOL_MAX: z.coerce.number().int().positive().default(4),
+  DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
+  DB_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+  DB_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  // Request-log retention: bounded batched DELETE of request_log rows older than this many
+  // days (0 = off, keep forever). Runs off the hot path on an unref'd timer. NOTE: only
+  // request_log (the operational log) is swept — spend_ledger is the durable source of
+  // truth for budget re-derivation + chargeback and is NEVER deleted here.
+  REQUEST_LOG_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(0),
+  REQUEST_LOG_RETENTION_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().positive().default(3600),
   // Config source. 'env' (default) builds routes from env once at boot. 'db'
   // enables M13 hot-reload: the gateway builds routes from the config document in
   // Postgres and reconciles live when a control-plane apply broadcasts a change.
@@ -288,6 +306,11 @@ const Env = z.object({
   // in prod, else the in-memory dev cipher) and refuses to store cleartext.
   MASK_VAULT_PERSIST: envBool(false),
   MASK_VAULT_TTL_SECONDS: z.coerce.number().int().positive().default(604_800), // 7 days
+  // Expiry sweep for the mask-vault reversal table: every guardrail 'mask' action writes
+  // a short-TTL row, so without a sweep the (encrypted-PII) table grows unbounded past its
+  // declared TTL — a data-minimization/retention regression. Deletes rows whose expires_at
+  // has passed, on an unref'd timer (0 = off). Only active when MASK_VAULT_PERSIST is on.
+  MASK_VAULT_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(3600),
   // KMS key ARN that wraps the mask-vault data keys (ARN only, never a value). Absent
   // in dev ⇒ the in-memory AES cipher (same envelope shape). Region = BEDROCK_REGION.
   GULLEY_KMS_KEY_ARN: z.string().optional(),
