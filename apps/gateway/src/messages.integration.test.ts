@@ -331,6 +331,64 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
   });
 
+  it('releases the half-open probe token on a terminal 4xx so a reachable upstream is not shed (W8 regression)', async () => {
+    // A 404-returning upstream: a client error the upstream itself ANSWERS, so it is
+    // demonstrably reachable. A terminal 4xx is neither <400 nor a failover status, so it
+    // must still resolve a half-open probe (recordSuccess) — otherwise the probe token
+    // strands until probeTimeoutMs and every follow-up request is shed with 503.
+    const notFound = http.createServer((_req, res) => {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{"type":"error","error":{"type":"not_found_error","message":"nope"}}');
+    });
+    await new Promise<void>((r) => notFound.listen(0, '127.0.0.1', r));
+    const nfUrl = `http://127.0.0.1:${(notFound.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', nfUrl) },
+      },
+    ];
+    // Clock-controlled breaker: open it, then step past the cooldown → half-open.
+    let now = 0;
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownMs: 1000,
+      probeTimeoutMs: 10_000,
+      now: () => now,
+    });
+    ctx.breaker = breaker;
+    breaker.recordFailure('anthropic'); // ejections=1, openUntil=1000
+    expect(breaker.isOpen('anthropic')).toBe(true);
+    now = 1001; // cooldown elapsed → half-open (isOpen false, ejections>0)
+    expect(breaker.isOpen('anthropic')).toBe(false);
+
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 10, messages: [] }),
+      });
+
+    // The half-open probe: admitted, receives the upstream's 404, which releases the token.
+    const r1 = await send();
+    await r1.text();
+    expect(r1.status).toBe(404);
+    // Follow-up: must be served (404 again), NOT shed with 503 — the probe was released and
+    // the ejection state reset because the upstream proved reachable.
+    const r2 = await send();
+    await r2.text();
+    expect(r2.status).toBe(404);
+
+    await app.close();
+    await new Promise<void>((r) => notFound.close(() => r()));
+  });
+
   it('authenticates a brokered gko_at_ token and fails closed on a bad one', async () => {
     const { store } = seededStore();
     const { ctx, ledger } = buildContext(store);

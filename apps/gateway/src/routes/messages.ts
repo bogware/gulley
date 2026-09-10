@@ -1647,9 +1647,17 @@ async function handleProxy(
       scoreboardHeld = true;
     }
     if (limiterAcquired) limiterHeld = true;
-    if (resp.statusCode < 400) ctx.breaker.recordSuccess(target.name);
-    else if (isFailoverStatus(strategy, resp.statusCode)) {
+    // A committed response RESOLVES a half-open probe (if this dispatch won one), so the
+    // breaker must always record an outcome here or the probe token strands until its
+    // self-heal timeout — shedding a healthy upstream with 503 for that window. A
+    // failover-status upstream fault re-opens (recordFailure); ANY other committed status
+    // — 2xx OR a terminal 4xx (400/401/403/404) — means the upstream is reachable, so it
+    // counts as a success (the breaker tracks UPSTREAM faults only; a client 4xx is not
+    // one), which clears the probe and, on a half-open target, resets the ejection backoff.
+    if (isFailoverStatus(strategy, resp.statusCode)) {
       ctx.breaker.recordFailure(target.name, parseRetryAfterMs(resp.headers));
+    } else {
+      ctx.breaker.recordSuccess(target.name);
     }
   };
 
@@ -2172,6 +2180,11 @@ async function handleProxy(
           // Classify the status against TIER-1's own strategy (it selected this target).
           if (isFailoverStatus(cascade.strategy, resp1.statusCode)) {
             ctx.breaker.recordFailure(t1.name, parseRetryAfterMs(resp1.headers));
+          } else {
+            // A terminal (non-failover) 4xx means t1 is reachable — record a breaker
+            // success so a half-open probe token claimed for t1 is released (else it
+            // strands until probeTimeoutMs and sheds t1). Not an upstream fault.
+            ctx.breaker.recordSuccess(t1.name);
           }
           // Free the admission slot — a failover-status response adapts the limit down.
           if (t1LimiterAcquired) ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, true);
