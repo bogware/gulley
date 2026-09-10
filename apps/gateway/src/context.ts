@@ -95,6 +95,7 @@ import {
   type Database,
   PostgresAuditSink,
   PostgresExactCache,
+  PostgresGrantStore,
   PostgresKeyStore,
   PostgresLedger,
   PostgresMaskVaultStore,
@@ -104,6 +105,7 @@ import {
   RedisExactCache,
   RedisVectorIndex,
 } from '@gulley/storage';
+import { resolveBrokerAccessToken } from '@gulley/oauth';
 import {
   type Encryptor,
   InMemoryAesCipher,
@@ -689,6 +691,19 @@ export function createProductionContext(config: Config): GatewayContext {
   const basicAuth = buildBasicAuth(config);
 
   const db = createDatabase(config.DATABASE_URL);
+
+  // Gateway-brokered OAuth inference auth (data plane): verify opaque `gko_at_` access
+  // tokens read-only against the shared Postgres grant store, with the same pepper the
+  // control-plane broker minted with. One grant-store instance, reused per request.
+  const brokerPepper = config.GULLEY_KEY_PEPPER;
+  const brokerGrants =
+    config.OAUTH_BROKER_ENABLED && brokerPepper ? new PostgresGrantStore(db) : undefined;
+  const brokerResolver =
+    brokerGrants && brokerPepper
+      ? (token: string) =>
+          resolveBrokerAccessToken(token, { grants: brokerGrants, pepper: brokerPepper })
+      : undefined;
+
   // Durable mask-reversal store (M22 D): only wired when MASK_VAULT_PERSIST is on, and
   // ALWAYS with an encryptor (KMS in prod, the in-memory dev twin otherwise) — the
   // store never receives plaintext. Reveal (control-api) must use the same key, so
@@ -953,6 +968,7 @@ export function createProductionContext(config: Config): GatewayContext {
     externalAuthzSendBody: config.EXTERNAL_AUTHZ_SEND_BODY,
     transformer,
     jwtAuth,
+    brokerResolver,
     basicAuth,
     scoreboard: config.LB_LEAST_LOAD ? new LoadScoreboard() : undefined,
     sessionAffinityHeader: config.LB_SESSION_AFFINITY_HEADER,

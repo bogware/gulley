@@ -165,6 +165,23 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     return true;
   };
 
+  // Revoke a subject's ACTIVE admin sessions. OIDC SSO bakes group/App-Role memberships
+  // into the signed session token, and the durable membership loader is UNIONed with the
+  // token's memberships (it can only ADD grants, never remove one the token asserts). So
+  // deleting the admin_user row alone leaves an SSO'd admin with full access until their
+  // token's exp. Revoking the sessions closes that window on the SCIM offboard path.
+  const revokeSubjectSessions = async (subject: string): Promise<number> => {
+    const all = (await ctx.sessions.list?.()) ?? [];
+    let revoked = 0;
+    for (const s of all) {
+      if (s.subject === subject && !s.revoked) {
+        await ctx.sessions.revoke?.(s.jti);
+        revoked++;
+      }
+    }
+    return revoked;
+  };
+
   app.post(
     '/scim/v2/Users',
     adminRoute(ctx, async (request, reply, admin) => {
@@ -224,11 +241,12 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
       // accepted as no-ops so a provisioner's sync doesn't error.
       if (patchDeactivates(body(request))) {
         await users.delete(id);
+        const revokedSessions = await revokeSubjectSessions(row.subject);
         await ctx.audit.append({
           actor: admin.subject,
           action: 'scim.user.deprovision',
           target: id,
-          payload: { userName: row.subject, via: 'patch-active-false' },
+          payload: { userName: row.subject, via: 'patch-active-false', revokedSessions },
         });
         return reply.header('content-type', SCIM_CT).send(toScimUser(row, false));
       }
@@ -244,11 +262,12 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
       const row = await users.get(id);
       if (!row) return scimError(reply, 404, 'user not found');
       await users.delete(id);
+      const revokedSessions = await revokeSubjectSessions(row.subject);
       await ctx.audit.append({
         actor: admin.subject,
         action: 'scim.user.deprovision',
         target: id,
-        payload: { userName: row.subject, via: 'delete' },
+        payload: { userName: row.subject, via: 'delete', revokedSessions },
       });
       return reply.code(204).send();
     }),

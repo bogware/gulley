@@ -13,6 +13,14 @@ const Env = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   CONTROL_API_HOST: z.string().default('0.0.0.0'),
   CONTROL_API_PORT: z.coerce.number().int().positive().default(8081),
+  // Proxy hops to trust for req.ip (X-Forwarded-For). `trustProxy: true` trusts EVERY
+  // hop, making req.ip client-spoofable; a fixed hop count (1 = the ALB) is correct for
+  // an ALB-fronted deployment. Raise it if you run additional trusted proxies.
+  CONTROL_API_TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(1),
+  // Per-IP request budget (per minute) on the unauthenticated OAuth/OIDC protocol
+  // surface (/oauth/*, /auth/*) — brute-force / flood protection on the highest-value
+  // control-plane paths. In-memory per instance; 0 disables. Default 60/min.
+  CONTROL_API_AUTH_RATE_LIMIT_PER_MIN: z.coerce.number().int().min(0).default(60),
 
   // Virtual-key pepper (KMS-held in prod) — needed to mint keys.
   GULLEY_KEY_PEPPER: z.string().min(16).optional(),

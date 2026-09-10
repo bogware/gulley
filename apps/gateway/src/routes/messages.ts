@@ -21,7 +21,7 @@ import {
   semanticText,
 } from '@gulley/cache';
 import { computeCost, emptyUsage, rankPrice, type RateResolver, toMicroUsd } from '@gulley/cost';
-import { isErr } from '@gulley/core';
+import { isErr, type Result } from '@gulley/core';
 import {
   filterByPolicy,
   type GuardrailEngine,
@@ -237,6 +237,10 @@ export interface GatewayContext {
   transformer?: CelTransformer;
   /** Inbound JWT/JWKS auth mode; absent = virtual keys only. */
   jwtAuth?: JwtAuthConfig;
+  /** Gateway-brokered OAuth resolver: verifies an opaque `gko_at_` access token (minted
+   *  by the control-plane broker) read-only against the shared grant store and returns a
+   *  data-plane Principal. Absent = brokered inference auth disabled. Fail-closed. */
+  brokerResolver?: (token: string) => Promise<Result<Principal, { reason: string }>>;
   /** Inbound HTTP Basic auth (htpasswd-backed); absent = Basic disabled. */
   basicAuth?: BasicAuthConfig;
   /** In-flight load scoreboard for power-of-two-choices least-load balancing. */
@@ -696,6 +700,21 @@ async function handleProxy(
       return;
     }
     principal = jwtPrincipal;
+  } else if (ctx.brokerResolver && bearer && bearer.startsWith('gko_at_')) {
+    // Gateway-brokered OAuth: an opaque `gko_at_` access token is its own credential
+    // channel (distinct prefix), so this is deterministic and FAILS CLOSED with no
+    // fall-through to the virtual-key path. Read-only verify (lookup + secret + expiry).
+    const brokered = await ctx.brokerResolver(bearer);
+    if (isErr(brokered)) {
+      request.log.info({ reason: brokered.error.reason }, 'broker token rejected');
+      recordDenied(401);
+      await reply.code(401).send({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'invalid credentials' },
+      });
+      return;
+    }
+    principal = brokered.value;
   } else {
     const auth = await resolveVirtualKey(
       { apiKey: headerValue(request, 'x-api-key'), bearer },

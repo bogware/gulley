@@ -91,6 +91,13 @@ const Env = z.object({
   JWT_DEFAULT_WORKSPACE_ID: z.string().optional(),
   JWT_DEFAULT_ORG_ID: z.string().optional(),
 
+  // Gateway-brokered OAuth inference auth (data plane): accept opaque `gko_at_` access
+  // tokens minted by the control-plane OAuth broker (device / auth-code+PKCE flow). The
+  // gateway verifies them read-only against the shared Postgres grant store using the
+  // same GULLEY_KEY_PEPPER the broker minted with — no refresh/rotation on the hot path.
+  // Requires DATABASE_URL + GULLEY_KEY_PEPPER. Off by default.
+  OAUTH_BROKER_ENABLED: envBool(false),
+
   // Inbound HTTP Basic auth (data plane) — front the gateway with a standard
   // htpasswd file (bcrypt/apr1/SHA/plaintext). Enabled when BASIC_AUTH_HTPASSWD
   // (inline file body) or BASIC_AUTH_HTPASSWD_FILE (path) plus the default

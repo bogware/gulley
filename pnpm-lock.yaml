@@ -159,6 +159,9 @@ importers:
       '@gulley/metrics':
         specifier: workspace:*
         version: link:../../packages/metrics
+      '@gulley/oauth':
+        specifier: workspace:*
+        version: link:../../packages/oauth
       '@gulley/oidc':
         specifier: workspace:*
         version: link:../../packages/oidc

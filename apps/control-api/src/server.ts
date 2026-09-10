@@ -17,9 +17,32 @@ import { registerOidcRoutes } from './oidc-routes';
 import { registerScimRoutes } from './scim';
 import { registerAdminRoutes } from './routes';
 
+/** In-memory per-IP sliding-window limiter for the unauthenticated auth surface. Bounds
+ *  brute-force / flood volume without a dependency. Per-instance (a multi-task deployment
+ *  limits per task); a Redis-backed bucket would be needed for strict cross-task limits. */
+function makeAuthThrottle(maxPerWindow: number, windowMs: number) {
+  const buckets = new Map<string, { count: number; resetAt: number }>();
+  return (ip: string, now: number): boolean => {
+    if (buckets.size > 20_000)
+      for (const [k, v] of buckets) if (v.resetAt <= now) buckets.delete(k);
+    let b = buckets.get(ip);
+    if (!b || b.resetAt <= now) {
+      b = { count: 0, resetAt: now + windowMs };
+      buckets.set(ip, b);
+    }
+    b.count += 1;
+    return b.count <= maxPerWindow;
+  };
+}
+
+// The unauthenticated OAuth/OIDC protocol surface — the highest-value brute-force target.
+const AUTH_SURFACE = /^\/(oauth|auth)\//;
+
 export function buildServer(config: Config, ctx?: ControlContext): FastifyInstance {
   const app = Fastify({
-    trustProxy: true,
+    // Trust a FIXED number of proxy hops (1 = the ALB), not every hop — `trustProxy:true`
+    // lets a client spoof req.ip via X-Forwarded-For, defeating any IP-based control.
+    trustProxy: config.CONTROL_API_TRUST_PROXY_HOPS,
     logger: {
       level: config.LOG_LEVEL,
       redact: {
@@ -35,6 +58,24 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
   });
 
   registerHttpEdge(app, config);
+
+  // Brute-force / flood guard on the unauthenticated OAuth/OIDC endpoints (token
+  // exchange, device authorization, OIDC callback). Registered before the routes so it
+  // sheds excess volume with a 429 + Retry-After before any handler runs.
+  if (config.CONTROL_API_AUTH_RATE_LIMIT_PER_MIN > 0) {
+    const throttle = makeAuthThrottle(config.CONTROL_API_AUTH_RATE_LIMIT_PER_MIN, 60_000);
+    app.addHook('onRequest', (req, reply, done) => {
+      const path = req.url.split('?')[0] ?? req.url;
+      if (AUTH_SURFACE.test(path) && !throttle(req.ip, Date.now())) {
+        void reply
+          .code(429)
+          .header('retry-after', '60')
+          .send({ error: 'rate_limited', error_description: 'too many requests' });
+        return; // do not call done() — the request is shed
+      }
+      done();
+    });
+  }
 
   app.get('/health', async () => ({
     status: 'ok',

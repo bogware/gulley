@@ -1,7 +1,8 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import zlib from 'node:zlib';
-import { generateVirtualKey, InMemoryKeyStore, parseHtpasswd } from '@gulley/auth';
+import { generateVirtualKey, InMemoryKeyStore, parseHtpasswd, type Principal } from '@gulley/auth';
+import { err, ok } from '@gulley/core';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
 import { InMemoryAesCipher } from '@gulley/crypto';
@@ -326,6 +327,52 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     // Load-shed, not a served request: nothing metered, but teardown still logged it.
     expect(ledger.entries).toHaveLength(0);
     expect(requestLog.entries.some((e) => e.statusCode === 503)).toBe(true);
+
+    await app.close();
+  });
+
+  it('authenticates a brokered gko_at_ token and fails closed on a bad one', async () => {
+    const { store } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    const brokerPrincipal: Principal = {
+      kind: 'oauth-broker',
+      id: 'user_broker',
+      displayName: 'Broker User',
+      authMode: 'oauth-broker',
+      scope: {
+        orgId: 'org_1',
+        workspaceId: 'ws_1',
+        allowedProviders: '*',
+        allowedModels: '*',
+      },
+    };
+    ctx.brokerResolver = (t) =>
+      Promise.resolve(t === 'gko_at_good.secret' ? ok(brokerPrincipal) : err({ reason: 'bad' }));
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    // A valid brokered access token authenticates a /v1/messages call end-to-end.
+    const okRes = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer gko_at_good.secret' },
+      body,
+    });
+    expect(okRes.status).toBe(200);
+    expect(ledger.entries[0]?.principalId).toBe('user_broker');
+
+    // A bad brokered token is a generic 401 — fail-closed, no fall-through to virtual keys.
+    const badRes = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer gko_at_bad.secret' },
+      body,
+    });
+    expect(badRes.status).toBe(401);
 
     await app.close();
   });

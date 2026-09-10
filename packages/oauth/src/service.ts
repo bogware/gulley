@@ -394,25 +394,51 @@ export class BrokerService {
   // --- data-plane resolution ---
 
   async resolveBrokerToken(token: string): Promise<Result<Principal, { reason: string }>> {
-    const at = parseAccess(token);
-    if (!at) return err({ reason: 'malformed' });
-    const g = await this.deps.grants.get(at.handle);
-    if (!g || g.status !== 'active') return err({ reason: 'inactive' });
-    if (this.now() >= g.accessTokenExpiresAt) return err({ reason: 'expired' });
-    if (!verifyHash(this.cfg.pepper, at.secret, g.accessTokenHash))
-      return err({ reason: 'bad-secret' });
-    if (!g.orgId || !g.workspaceId) return err({ reason: 'no-tenancy' }); // deny by default
-    return ok({
-      kind: 'oauth-broker',
-      id: g.principalId,
-      displayName: g.displayName,
-      authMode: 'oauth-broker',
-      scope: {
-        orgId: g.orgId,
-        workspaceId: g.workspaceId,
-        allowedProviders: '*',
-        allowedModels: '*',
-      },
+    return resolveBrokerAccessToken(token, {
+      grants: this.deps.grants,
+      pepper: this.cfg.pepper,
+      now: () => this.now(),
     });
   }
+}
+
+/** Dependencies the stateless data-plane resolver needs — a read-only grant lookup and
+ *  the same token pepper the broker minted with. */
+export interface BrokerResolveDeps {
+  grants: Pick<GrantStore, 'get'>;
+  pepper: string;
+  now?: () => number;
+}
+
+/**
+ * Verify a brokered access token (`gko_at_<handle>.<secret>`) and resolve it to a
+ * data-plane {@link Principal}. Read-only (a lookup + secret verify + expiry/active
+ * check — no refresh, no rotation, no state change) and FAIL-CLOSED on every miss, so
+ * it is safe to call from the stateless gateway hot path with only a grant-store read
+ * adapter + the shared pepper. Shared with {@link BrokerService.resolveBrokerToken}.
+ */
+export async function resolveBrokerAccessToken(
+  token: string,
+  deps: BrokerResolveDeps,
+): Promise<Result<Principal, { reason: string }>> {
+  const now = deps.now ?? Date.now;
+  const at = parseAccess(token);
+  if (!at) return err({ reason: 'malformed' });
+  const g = await deps.grants.get(at.handle);
+  if (!g || g.status !== 'active') return err({ reason: 'inactive' });
+  if (now() >= g.accessTokenExpiresAt) return err({ reason: 'expired' });
+  if (!verifyHash(deps.pepper, at.secret, g.accessTokenHash)) return err({ reason: 'bad-secret' });
+  if (!g.orgId || !g.workspaceId) return err({ reason: 'no-tenancy' }); // deny by default
+  return ok({
+    kind: 'oauth-broker',
+    id: g.principalId,
+    displayName: g.displayName,
+    authMode: 'oauth-broker',
+    scope: {
+      orgId: g.orgId,
+      workspaceId: g.workspaceId,
+      allowedProviders: '*',
+      allowedModels: '*',
+    },
+  });
 }
