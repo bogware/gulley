@@ -296,6 +296,12 @@ const Env = z.object({
   GUARDRAILS_WEBHOOK_FAIL_CLOSED: envBool(false),
   GUARDRAILS_WEBHOOK_ALLOW_INTERNAL: envBool(false),
   // Managed guardrail plugins (composed with the native detectors + webhook).
+  // These are DLP/moderation ENFORCEMENT controls, so they fail CLOSED by default: on a
+  // provider timeout/outage the response is withheld rather than served un-scanned (a
+  // slowloris against the DLP endpoint must not silently disable enforcement). Set to
+  // false to trade that safety for availability.
+  GUARDRAILS_MODERATION_FAIL_CLOSED: envBool(true),
+  GUARDRAILS_MODEL_ARMOR_FAIL_CLOSED: envBool(true),
   GUARDRAILS_MODERATION_API_KEY: z.string().optional(),
   GUARDRAILS_MODERATION_BASE_URL: z.string().url().optional(),
   GUARDRAILS_MODERATION_MODEL: z.string().optional(),

@@ -143,6 +143,7 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
         apiKey: config.GUARDRAILS_MODERATION_API_KEY,
         baseUrl: config.GUARDRAILS_MODERATION_BASE_URL,
         model: config.GUARDRAILS_MODERATION_MODEL,
+        failClosed: config.GUARDRAILS_MODERATION_FAIL_CLOSED, // enforcement: fail closed by default
       }),
     );
   }
@@ -176,6 +177,7 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
         location: config.GUARDRAILS_MODEL_ARMOR_LOCATION,
         template: config.GUARDRAILS_MODEL_ARMOR_TEMPLATE,
         accessToken: config.GUARDRAILS_MODEL_ARMOR_ACCESS_TOKEN,
+        failClosed: config.GUARDRAILS_MODEL_ARMOR_FAIL_CLOSED, // enforcement: fail closed by default
       }),
     );
   }

@@ -171,6 +171,16 @@ describe('StreamingScanner', () => {
     scanner.push('oe@example.com today');
     expect(scanner.findings().map((f) => f.category)).toContain('email');
   });
+
+  it('records a long PEM key that far exceeds the window (anchor-hold, audit completeness)', () => {
+    // A private key body longer than the window streamed in small chunks: without the
+    // open-anchor hold the BEGIN line is dropped from the overlap before END arrives and
+    // the leak is never recorded. Window intentionally tiny to force the straddle.
+    const scanner = new StreamingScanner(det, 32);
+    const pem = `-----BEGIN RSA PRIVATE KEY-----\n${'MIIBVerYlongBody'.repeat(60)}\n-----END RSA PRIVATE KEY-----`;
+    for (let i = 0; i < pem.length; i += 16) scanner.push(pem.slice(i, i + 16));
+    expect(scanner.findings().map((f) => f.category)).toContain('private_key');
+  });
 });
 
 describe('StreamingRedactor', () => {

@@ -94,6 +94,7 @@ export class StreamingScanner {
   private overlap = '';
   private base = 0;
   private readonly window: number;
+  private readonly maxBuffer: number;
   private readonly seen = new Map<string, Finding>();
 
   constructor(
@@ -101,23 +102,63 @@ export class StreamingScanner {
     windowChars = 1024,
   ) {
     this.window = windowChars;
+    // Room for a forming long secret (a multi-line PEM key) to complete before the
+    // anchor-hold is released; beyond this it is recorded as a possible truncated secret.
+    this.maxBuffer = Math.max(this.window * 8, 8192);
   }
 
   push(chunk: string): void {
     const text = this.overlap + chunk;
-    for (const f of this.detector.detect(text)) {
+    const raw = this.detector.detect(text);
+    for (const f of raw) {
       const absStart = this.base + f.start;
       const key = `${absStart}:${f.category}`;
       if (!this.seen.has(key)) {
         this.seen.set(key, { ...f, start: absStart, end: this.base + f.end });
       }
     }
-    if (text.length > this.window) {
-      this.base += text.length - this.window;
-      this.overlap = text.slice(text.length - this.window);
-    } else {
-      this.overlap = text;
+    // Normally retain a flat `window` tail. But if a LONG-match anchor (a PEM/JWT start)
+    // has appeared WITHOUT its full match completing, retain from that anchor instead —
+    // else a secret longer than the window loses its opening bytes from the overlap
+    // before the closing bytes arrive, so detect() never sees BEGIN and END together and
+    // the leak is NEVER recorded (a SOC 2 audit-completeness gap for the worst leak
+    // class). The scanner is a passive observer, so this holds only its OWN state — the
+    // client-bound bytes are piped separately and are unaffected.
+    let keepFrom = Math.max(0, text.length - this.window);
+    let heldCategory: string | undefined;
+    for (const { start, category } of LONG_MATCH_ANCHORS) {
+      start.lastIndex = 0;
+      for (let m = start.exec(text); m !== null; m = start.exec(text)) {
+        if (m[0].length === 0) {
+          start.lastIndex++;
+          continue;
+        }
+        const idx = m.index;
+        const complete = raw.some((f) => f.category === category && f.start <= idx && f.end > idx);
+        if (!complete && idx < keepFrom) {
+          keepFrom = idx;
+          heldCategory = category;
+        }
+      }
     }
+    // A held anchor that never completes must not grow memory without bound: on overflow
+    // record a (lower-confidence) finding under its category so the audit trail still
+    // reflects a possible truncated secret, then release the hold to the window tail.
+    if (heldCategory && text.length - keepFrom > this.maxBuffer) {
+      const key = `${this.base + keepFrom}:${heldCategory}`;
+      if (!this.seen.has(key)) {
+        this.seen.set(key, {
+          category: heldCategory as Finding['category'],
+          start: this.base + keepFrom,
+          end: this.base + text.length,
+          source: 'secret',
+          confidence: 0.5,
+        });
+      }
+      keepFrom = Math.max(0, text.length - this.window);
+    }
+    this.base += keepFrom;
+    this.overlap = text.slice(keepFrom);
   }
 
   findings(): Finding[] {
