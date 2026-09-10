@@ -1505,9 +1505,15 @@ async function handleProxy(
 
   // Keep the worst-case reservation from being reaped by the orphan-sweep while a long
   // stream is still in flight: refresh its expiry on a throttled interval (well under
-  // the reservation lifetime), fire-and-forget, never per-chunk. Cleared in teardown.
-  // A fast request's interval never fires (it's > the request duration).
+  // the reservation lifetime), fire-and-forget, never per-chunk. A fast request's
+  // interval never fires (it's > the request duration).
   let reserveRefresh: ReturnType<typeof setInterval> | undefined;
+  const stopReserveRefresh = (): void => {
+    if (reserveRefresh) {
+      clearInterval(reserveRefresh);
+      reserveRefresh = undefined;
+    }
+  };
   if (ctx.budgets.refresh && ctx.budgetReserveRefreshMs && reservedScopes.length > 0) {
     const refreshFn = ctx.budgets.refresh.bind(ctx.budgets);
     reserveRefresh = setInterval(() => {
@@ -1517,7 +1523,15 @@ async function handleProxy(
   }
 
   const controller = new AbortController();
+  // CRITICAL: this 'close' handler is registered BEFORE the throwing stream setup
+  // (rewriter/detector construction, reply.hijack, writeHead), so it is the reliable
+  // cleanup even when teardown() is bypassed. If handleProxy throws after the refresh
+  // interval is armed but before the stream 'end'/'error' handlers (which drive
+  // teardown) are wired, the socket still closes → this fires → the interval is cleared.
+  // Without it, an unref'd interval would refresh the reservation FOREVER, so the
+  // orphan-sweep could never reclaim it (a permanent reservation leak → budget DoS).
   reply.raw.on('close', () => {
+    stopReserveRefresh();
     if (!reply.raw.writableEnded && !controller.signal.aborted) controller.abort();
   });
 
@@ -2199,7 +2213,7 @@ async function handleProxy(
     if (settled) return;
     settled = true;
     if (deadlineTimer) clearTimeout(deadlineTimer);
-    if (reserveRefresh) clearInterval(reserveRefresh);
+    stopReserveRefresh();
     if (scoreboardHeld && served) {
       scoreboardHeld = false;
       ctx.scoreboard?.end(served.name);
