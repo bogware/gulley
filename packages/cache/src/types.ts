@@ -50,6 +50,10 @@ export interface VectorMatch {
 /** Approximate-nearest-neighbor index over embeddings, partitioned by scope.
  *  In-memory (brute force) here; pgvector / Redis Stack adapters in storage. */
 export interface VectorIndex {
-  upsert(scope: string, id: string, embedding: number[]): Promise<void>;
+  /** Insert/update an embedding. `ttlSeconds`, when given, bounds the entry's lifetime
+   *  so it self-reclaims in step with the exact-cache entry — REQUIRED for a Redis
+   *  vector backend (noeviction; an un-expired hash would grow without bound). Backends
+   *  with their own reclamation (pgvector cascade sweep, in-memory) may ignore it. */
+  upsert(scope: string, id: string, embedding: number[], ttlSeconds?: number): Promise<void>;
   query(scope: string, embedding: number[], topK: number): Promise<VectorMatch[]>;
 }

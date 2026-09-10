@@ -91,6 +91,7 @@ import {
   loadBudgetHealData,
   createRateLimitResolver,
   createRedisClient,
+  checkEvictionPolicy,
   type Database,
   PostgresAuditSink,
   PostgresExactCache,
@@ -198,6 +199,11 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
   );
 }
 
+/** Boot-time warnings sink (the Fastify logger isn't wired yet at context build). */
+const bootLog = {
+  warn: (obj: object, msg: string): void => console.warn(`[gulley] ${msg}`, obj),
+};
+
 /** Assemble the two-tier cache from config: pluggable exact store + optional
  *  semantic tier (embeddings + vector index). pgvector is the vector default. */
 export function buildCache(config: Config, db: Database): CacheEngine {
@@ -206,11 +212,14 @@ export function buildCache(config: Config, db: Database): CacheEngine {
     case 'memory':
       exact = new InMemoryExactCache();
       break;
-    case 'redis':
+    case 'redis': {
       if (!config.REDIS_CACHE_URL)
         throw new Error('REDIS_CACHE_URL required for the redis exact cache');
-      exact = new RedisExactCache(createRedisClient(config.REDIS_CACHE_URL));
+      const cacheClient = createRedisClient(config.REDIS_CACHE_URL);
+      void checkEvictionPolicy(cacheClient, 'cache', bootLog);
+      exact = new RedisExactCache(cacheClient);
       break;
+    }
     default: {
       const pg = new PostgresExactCache(db);
       exact = pg;
@@ -239,14 +248,14 @@ export function buildCache(config: Config, db: Database): CacheEngine {
       case 'memory':
         index = new InMemoryVectorIndex();
         break;
-      case 'redis':
+      case 'redis': {
         if (!config.REDIS_VECTOR_URL)
           throw new Error('REDIS_VECTOR_URL required for the redis vector index');
-        index = new RedisVectorIndex(
-          createRedisClient(config.REDIS_VECTOR_URL),
-          config.EMBEDDINGS_DIMENSIONS,
-        );
+        const vectorClient = createRedisClient(config.REDIS_VECTOR_URL);
+        void checkEvictionPolicy(vectorClient, 'vector', bootLog);
+        index = new RedisVectorIndex(vectorClient, config.EMBEDDINGS_DIMENSIONS);
         break;
+      }
       default:
         index = new PostgresVectorIndex(db);
     }
@@ -739,6 +748,17 @@ export function createProductionContext(config: Config): GatewayContext {
           : dbCapResolver(scopeKey),
       )
     : new InMemoryBudgetStore(configCapResolver);
+
+  // One-time eviction-policy check on the counters Redis (budget + rate-limit + the
+  // shared breaker all use it). Pointing it at an `allkeys-lru` instance silently
+  // evicts counters under memory pressure → under-charging + cap bypass with no error.
+  // A transient probe client keeps the check off the long-lived store clients.
+  if (config.REDIS_COUNTERS_URL) {
+    const probe = createRedisClient(config.REDIS_COUNTERS_URL);
+    void checkEvictionPolicy(probe, 'counters', bootLog).finally(() => {
+      void probe.quit().catch(() => {});
+    });
+  }
 
   // Self-heal LOST committed budget counters from the durable ledger on boot: a
   // counters-Redis flush resets them to 0 and would over-admit past the hard cap

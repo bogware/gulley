@@ -173,6 +173,15 @@ export function openaiChatSseToAnthropic(upstream: Readable, model: string): Rea
     } catch {
       /* best-effort */
     }
+    // Propagate backpressure: consumed via 'data' (not .pipe), so a full `out` buffer
+    // won't pause the upstream on its own. Without this a slow client lets the
+    // PassThrough buffer the entire translated stream in memory (an OOM vector).
+    if (out.writableNeedDrain && !upstream.destroyed) {
+      upstream.pause();
+      out.once('drain', () => {
+        if (!upstream.destroyed) upstream.resume();
+      });
+    }
   });
   upstream.on('end', () => {
     try {

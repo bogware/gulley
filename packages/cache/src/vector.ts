@@ -24,7 +24,13 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 export class InMemoryVectorIndex implements VectorIndex {
   private readonly byScope = new Map<string, Map<string, number[]>>();
 
-  async upsert(scope: string, id: string, embedding: number[]): Promise<void> {
+  async upsert(
+    scope: string,
+    id: string,
+    embedding: number[],
+    _ttlSeconds?: number,
+  ): Promise<void> {
+    // In-memory index is CI/test-scale; no TTL needed (it dies with the process).
     let m = this.byScope.get(scope);
     if (!m) {
       m = new Map();

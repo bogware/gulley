@@ -154,6 +154,15 @@ export function bedrockToSse(upstream: Readable): Readable {
         out.write(`event: error\ndata: ${f.payload.toString('utf8')}\n\n`);
       }
     }
+    // Propagate backpressure: the upstream is consumed via 'data' (not .pipe), so a
+    // full `out` buffer won't pause it on its own. Without this a slow client lets the
+    // PassThrough buffer the entire decoded Bedrock stream in memory (an OOM vector).
+    if (out.writableNeedDrain && !upstream.destroyed) {
+      upstream.pause();
+      out.once('drain', () => {
+        if (!upstream.destroyed) upstream.resume();
+      });
+    }
   });
   upstream.on('end', () => out.end());
   upstream.on('error', (err: Error) => out.destroy(err));

@@ -546,12 +546,38 @@ function decodeForEval(buf: Buffer, encoding: string | string[] | undefined): Bu
   return buf;
 }
 
+/** Emit a request metric without ever letting a telemetry fault escape into the
+ *  request/teardown path (a throw here must not turn a clean 4xx into a 500, nor
+ *  reject the fire-and-forget teardown promise and skip the tracer/span close). */
+function safeRecord(
+  ctx: GatewayContext,
+  log: { error: (obj: object, msg?: string) => void },
+  args: Parameters<Telemetry['recordRequest']>[0],
+): void {
+  try {
+    ctx.telemetry.recordRequest(args);
+  } catch (err) {
+    log.error({ err }, 'telemetry recordRequest failed');
+  }
+}
+
 async function handleProxy(
   ctx: GatewayContext,
   route: ProviderRoute,
   request: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> {
+  // Append an audit row without letting a sink fault escape the request path: a
+  // pre-stream denial (401/402/403/429) awaits its audit BEFORE the reply is sent,
+  // so a throwing audit.append would turn a clean 4xx into a 500 with the denial
+  // unlogged. Log and continue — the denial (and its status) still reaches the client.
+  const auditSafe = async (entry: Parameters<AuditSink['append']>[0]): Promise<void> => {
+    try {
+      await ctx.audit.append(entry);
+    } catch (err) {
+      request.log.error({ err, action: entry.action }, 'audit append failed');
+    }
+  };
   const started = Date.now();
   const requestId = request.id;
   // Cost-attribution tags from configured request headers (repo/branch/PR/session/
@@ -720,7 +746,7 @@ async function handleProxy(
   // second, config-managed gate beyond the per-key scope, so an admin can deny a
   // model org-wide without touching every key. Audited so a denial is traceable.
   if (ctx.modelPolicy && !modelAllowedByPolicy(ctx.modelPolicy, requestedModel)) {
-    await ctx.audit.append({
+    await auditSafe({
       orgId: principal.scope.orgId,
       actor: principal.id,
       action: 'policy.model_denied',
@@ -773,7 +799,7 @@ async function handleProxy(
         scoped.length > 0 &&
         !scoped.some((t) => residencyCompliant(t, allowedRegions, requireZdr))
       ) {
-        await ctx.audit.append({
+        await auditSafe({
           orgId: principal.scope.orgId,
           actor: principal.id,
           action: 'policy.residency_denied',
@@ -867,14 +893,14 @@ async function handleProxy(
       : undefined;
 
   const denyByPolicy = async (reason: string | undefined): Promise<void> => {
-    await ctx.audit.append({
+    await auditSafe({
       orgId: principal.scope.orgId,
       actor: principal.id,
       action: 'authz.denied',
       target: provider0,
       payload: { model: requestedModel, reason },
     });
-    ctx.telemetry.recordRequest({
+    safeRecord(ctx, request.log, {
       provider: provider0,
       requestModel: requestedModel,
       responseModel: requestedModel,
@@ -992,7 +1018,7 @@ async function handleProxy(
     rlRules = rules;
     rlHeaders = rateLimitHeaders(outcome);
     if (!outcome.allowed) {
-      await ctx.audit.append({
+      await auditSafe({
         orgId: principal.scope.orgId,
         actor: principal.id,
         action: 'ratelimit.rejected',
@@ -1004,7 +1030,7 @@ async function handleProxy(
           limit: outcome.limiting?.rule.limit,
         },
       });
-      ctx.telemetry.recordRequest({
+      safeRecord(ctx, request.log, {
         provider: provider0,
         requestModel: requestedModel,
         responseModel: requestedModel,
@@ -1050,7 +1076,7 @@ async function handleProxy(
     const gr = await engine.inspectInput(body.toString('utf8'));
     inputFindings = gr.summary.total;
     if (gr.blocked) {
-      await ctx.audit.append({
+      await auditSafe({
         orgId: principal.scope.orgId,
         actor: principal.id,
         action: 'guardrail.blocked',
@@ -1061,7 +1087,7 @@ async function handleProxy(
           categories: gr.summary.categories,
         },
       });
-      ctx.telemetry.recordRequest({
+      safeRecord(ctx, request.log, {
         provider: provider0,
         requestModel: requestedModel,
         responseModel: requestedModel,
@@ -1185,7 +1211,7 @@ async function handleProxy(
       { scope, cap: decision.capMicroUsd, used: decision.usedMicroUsd },
       'budget exceeded',
     );
-    await ctx.audit.append({
+    await auditSafe({
       orgId: principal.scope.orgId,
       actor: principal.id,
       action: 'budget.rejected',
@@ -1198,7 +1224,7 @@ async function handleProxy(
         worstCaseMicroUsd: worstCase,
       },
     });
-    ctx.telemetry.recordRequest({
+    safeRecord(ctx, request.log, {
       provider: provider0,
       requestModel: requestedModel,
       responseModel: requestedModel,
@@ -1770,7 +1796,7 @@ async function handleProxy(
       const t0ex = createExtractor();
       try {
         if (tier0Streamed) {
-          const p = new SSEParser();
+          const p = new SSEParser({ onOverflow: 'reset' }); // metering: drop, never throw
           t0ex.ingestSse(p.push(t0text));
           t0ex.ingestSse(p.push('\n\n'));
         } else if (t0text.length > 0) {
@@ -1874,7 +1900,11 @@ async function handleProxy(
   const streamed = served?.alwaysStream === true || parsed['stream'] === true;
   const provider = served?.provider ?? provider0;
 
-  const parserSse = new SSEParser();
+  // Metering parser: bound its internal buffer and DROP a pathological oversized event
+  // (resyncing to the next boundary) rather than throw — metering is best-effort and
+  // must never kill the client stream. (The M17/M18 enforcing rewriters keep the
+  // default fail-closed policy so an un-inspectable event terminates the stream.)
+  const parserSse = new SSEParser({ onOverflow: 'reset' });
   const usage = createExtractor();
   // A pre-first-byte deadline breach (no upstream served, we aborted) is a 504
   // Gateway Timeout, distinct from a generic 502 no-usable-upstream.
@@ -1885,6 +1915,12 @@ async function handleProxy(
       ? 'ok'
       : 'error';
   let settled = false;
+  // Set when the M17 windowed enforcer terminates a stream in-band (block / withhold /
+  // fail-closed). The abort it triggers would otherwise be indistinguishable from a
+  // client disconnect ('aborted'), so this records the guardrail action on the ledger/
+  // audit/telemetry rows AND stops the limiter from penalizing the target for a policy
+  // decision that is not an upstream fault.
+  let streamGuardrailAction: 'block' | 'redact' | undefined;
 
   // Output guardrails: a windowed audit scanner (never mutates) + an optional
   // detokenizer that restores masked values in the client-bound stream. Output
@@ -1997,7 +2033,9 @@ async function handleProxy(
     if (limiterHeld && served) {
       limiterHeld = false;
       // RTT for concurrency = full request duration; drop = fault (5xx) or abort.
-      const dropped = status === 'aborted' || statusCode >= 500;
+      // An M17 guardrail block aborts the stream but is a POLICY decision, not an
+      // upstream fault — don't penalize the target's concurrency/latency score for it.
+      const dropped = (status === 'aborted' || statusCode >= 500) && !streamGuardrailAction;
       ctx.limiter?.record(served.name, Date.now() - (dispatchMs ?? started), dropped);
     }
 
@@ -2043,6 +2081,10 @@ async function handleProxy(
           ? filterByPolicy(outScanner.findings(), engine.outputPolicy)
           : [];
     const outputSensitive = outFindings.some((f) => f.confidence >= CACHE_SENSITIVE_CONFIDENCE);
+    // The single guardrail-action label for the durable/telemetry rows: an input
+    // mask/redact wins, else the M17 in-stream action, else a buffered-output block.
+    const reportedGuardrailAction =
+      guardrailAction ?? streamGuardrailAction ?? (outputEnforced?.blocked ? 'block' : undefined);
 
     // Cache ↔ output-enforcement coexistence. Enforcement normally disables caching
     // (storeCache requires !outputEnforcing) because fullChunks holds the RAW upstream
@@ -2139,6 +2181,14 @@ async function handleProxy(
           createdAt,
         });
       }
+    } catch (err) {
+      request.log.error({ err, sink: 'ledger' }, 'durable sink write failed');
+    }
+    // Each durable sink is isolated below: a failure in one (a DB blip, hash-chain
+    // contention) must not skip the others. SOC 2 audit-completeness requires the
+    // audit row to be written even when the ledger/request-log write fails. The
+    // reservation was already released above, so none of these can leak it.
+    try {
       await ctx.requestLog.write({
         requestId,
         principalId: principal.id,
@@ -2162,11 +2212,15 @@ async function handleProxy(
           ...(attribution ?? {}),
           cache: cacheLookup?.status ?? 'bypass',
           target: served?.name ?? provider,
-          ...(guardrailAction ? { guardrailAction } : {}),
+          ...(reportedGuardrailAction ? { guardrailAction: reportedGuardrailAction } : {}),
           ...(outFindings.length > 0 ? { guardrailOutputFindings: outFindings.length } : {}),
           ...(unpriced ? { unpriced: true } : {}),
         },
       });
+    } catch (err) {
+      request.log.error({ err, sink: 'request-log' }, 'durable sink write failed');
+    }
+    try {
       // Operator-configurable access log (credential-free record → CEL field
       // engine → structured log line). Fail-open; never carries headers/content.
       if (ctx.accessLog) {
@@ -2190,7 +2244,7 @@ async function handleProxy(
           costMicroUsd,
           latencyMs: Date.now() - started,
           cache: cacheLookup?.status ?? 'bypass',
-          guardrailAction: guardrailAction ?? null,
+          guardrailAction: reportedGuardrailAction ?? null,
           guardrailInputFindings: inputFindings,
           guardrailOutputFindings: outFindings.length,
           ...(trace ? { traceId: trace.traceId } : {}),
@@ -2200,37 +2254,40 @@ async function handleProxy(
           ctx.accessLogSink?.emit(record); // also ship to the OTLP logs backend
         }
       }
-      // Isolate the audit append: it shares this teardown block with the cache
-      // store and mask-vault persist below, so a failure here (a DB blip, or the
-      // now-serialized chain contending) must NOT cascade to skip those durable
-      // sinks. Log and continue; the reservation was already released above.
-      try {
-        await ctx.audit.append({
-          orgId: principal.scope.orgId,
-          actor: principal.id,
-          action: 'proxy.request',
-          target: served?.name ?? provider,
-          payload: {
-            provider,
-            model: meteredModel,
-            status,
-            statusCode,
-            streamed,
-            inputTokens: cost.totalInputTokens,
-            outputTokens: cost.outputTokens,
-            costMicroUsd,
-            guardrailInputFindings: inputFindings,
-            guardrailOutputFindings: outFindings.length,
-            cache: cacheLookup?.status ?? 'bypass',
-            ...(served?.region ? { servedRegion: served.region } : {}),
-            ...(cascadeEscalatedFrom ? { cascadeEscalatedFrom } : {}),
-            ...(unpriced ? { unpriced: true } : {}),
-            ...(attribution ? { attribution } : {}),
-          },
-        });
-      } catch (err) {
-        request.log.error({ err }, 'audit append failed');
-      }
+    } catch (err) {
+      request.log.error({ err, sink: 'access-log' }, 'durable sink write failed');
+    }
+    // The audit append keeps its own isolation so a chain-contention/DB failure
+    // here does not skip the cache store + mask-vault persist that follow it.
+    try {
+      await ctx.audit.append({
+        orgId: principal.scope.orgId,
+        actor: principal.id,
+        action: 'proxy.request',
+        target: served?.name ?? provider,
+        payload: {
+          provider,
+          model: meteredModel,
+          status,
+          statusCode,
+          streamed,
+          inputTokens: cost.totalInputTokens,
+          outputTokens: cost.outputTokens,
+          costMicroUsd,
+          guardrailInputFindings: inputFindings,
+          guardrailOutputFindings: outFindings.length,
+          cache: cacheLookup?.status ?? 'bypass',
+          ...(served?.region ? { servedRegion: served.region } : {}),
+          ...(cascadeEscalatedFrom ? { cascadeEscalatedFrom } : {}),
+          ...(unpriced ? { unpriced: true } : {}),
+          ...(attribution ? { attribution } : {}),
+        },
+      });
+    } catch (err) {
+      request.log.error({ err, sink: 'audit' }, 'audit append failed');
+    }
+    // Cache store + mask-vault persist run after the audit row is secured.
+    try {
       // Persist to cache — only clean, non-sensitive, non-truncated 2xx bodies.
       if (
         cacheableMiss &&
@@ -2330,10 +2387,12 @@ async function handleProxy(
         );
       }
     } catch (err) {
-      request.log.error({ err }, 'metering/audit teardown failed');
+      request.log.error({ err, sink: 'cache/mask-vault' }, 'durable sink write failed');
     }
 
-    ctx.telemetry.recordRequest({
+    // Telemetry emit is isolated (safeRecord) so a metrics fault can't reject this
+    // fire-and-forget teardown and skip the tracer feed below.
+    safeRecord(ctx, request.log, {
       provider,
       requestModel: requestedModel,
       responseModel: meteredModel,
@@ -2353,7 +2412,7 @@ async function handleProxy(
       cacheStatus: cacheLookup?.status ?? 'bypass',
       guardrailInputFindings: engine ? inputFindings : undefined,
       guardrailOutputFindings: engine ? outFindings.length : undefined,
-      guardrailAction: guardrailAction ?? (outputEnforced?.blocked ? 'block' : undefined),
+      guardrailAction: reportedGuardrailAction,
       traceId: trace?.traceId,
       stages:
         dispatchMs !== undefined && firstByteMs !== undefined
@@ -2378,7 +2437,7 @@ async function handleProxy(
       latencyMs: Date.now() - started,
       costMicroUsd,
       cache: cacheLookup?.status ?? 'bypass',
-      guardrailAction: guardrailAction ?? (outputEnforced?.blocked ? 'block' : undefined),
+      guardrailAction: reportedGuardrailAction,
       ts: Date.now(),
     });
   };
@@ -2426,9 +2485,14 @@ async function handleProxy(
   let upstreamBody: Readable = upstream.body;
   if (decompressor) {
     const source = upstream.body;
-    // pipe() doesn't forward source errors — bridge them so a broken upstream
-    // tears the decompressor (and thus the response) down instead of hanging.
+    // pipe() bridges neither direction's errors. Bridge BOTH so a fault on either
+    // end tears down the whole chain instead of leaking a socket/fd:
+    //   • a broken upstream (source) must destroy the decompressor (and thus the
+    //     response), else the client hangs;
+    //   • a decompressor fault (e.g. malformed gzip) must destroy the source, else
+    //     the undici upstream socket is never released and leaks for the pool's life.
     source.on('error', (e: Error) => decompressor.destroy(e));
+    decompressor.on('error', () => source.destroy());
     upstreamBody = source.pipe(decompressor);
   }
   const passthroughEncoding =
@@ -2488,7 +2552,16 @@ async function handleProxy(
       text = decoder.write(chunk);
       // The windowed enforcer (redactor) supersedes the raw audit scanner: it
       // detects on logical text and its findings() feed the audit trail.
-      if (outScanner && text && !redactor) outScanner.push(text);
+      // The audit scanner does NOT shape client bytes, so a throw here is SWALLOWED
+      // and streaming continues — a choking audit detector must not sever a live,
+      // otherwise-valid response (unlike the enforce/detok transforms below).
+      if (outScanner && text && !redactor) {
+        try {
+          outScanner.push(text);
+        } catch (err) {
+          request.log.warn({ err }, 'output audit scan failed — continuing');
+        }
+      }
     }
 
     if (streamed) {
@@ -2502,10 +2575,22 @@ async function handleProxy(
     if (bufferOutput) return; // hold bytes; enforce + write once at end
 
     let outBuf = chunk;
-    if (enforcer && text !== undefined) {
-      outBuf = Buffer.from(enforcer.push(text), 'utf8'); // windowed redact/block
-    } else if (detok && text !== undefined) {
-      outBuf = Buffer.from(detok.push(text), 'utf8');
+    // These transforms SHAPE the bytes emitted to the client (windowed redact/block,
+    // or detokenization). A throw here must FAIL CLOSED — abort rather than forward
+    // unenforced/partial content. A synchronous throw in a stream 'data' listener is
+    // NOT converted to a stream 'error'; it would escape as an uncaughtException (now
+    // backstopped in main.ts, but aborting keeps THIS request's single teardown intact
+    // without taking down peers).
+    try {
+      if (enforcer && text !== undefined) {
+        outBuf = Buffer.from(enforcer.push(text), 'utf8'); // windowed redact/block
+      } else if (detok && text !== undefined) {
+        outBuf = Buffer.from(detok.push(text), 'utf8');
+      }
+    } catch (err) {
+      request.log.error({ err }, 'stream output transform failed — withholding');
+      controller.abort();
+      return;
     }
     try {
       if (!reply.raw.writableEnded) {
@@ -2523,6 +2608,10 @@ async function handleProxy(
         // prefix was emitted — a terminal SSE error, then abort → single teardown.
         // `enforcer.failClosed` covers the OpenAI rewriter refusing an n>1 stream.
         if (redactor && (redactor.blocked || redactor.failClosed || enforcer?.failClosed)) {
+          // Record this as a guardrail action (not a bare client abort) so teardown
+          // meters it with guardrailAction + status 'error' and the limiter doesn't
+          // count the target as having dropped a request.
+          streamGuardrailAction = redactor.blocked ? 'block' : 'redact';
           reply.raw.write(
             providerErrorFrame(
               clientDialect,
@@ -2593,7 +2682,15 @@ async function handleProxy(
   async function onUpstreamEnd(): Promise<void> {
     clearWatchdog();
     const tail = decoder ? decoder.end() : '';
-    if (tail && outScanner) outScanner.push(tail);
+    if (tail && outScanner) {
+      // Audit-only scan of the final decoded tail — swallow a throw (best-effort);
+      // it must not fail-close an otherwise-complete response.
+      try {
+        outScanner.push(tail);
+      } catch (err) {
+        request.log.warn({ err }, 'output audit scan (tail) failed — continuing');
+      }
+    }
 
     // Reassemble the model's tool calls for governance: from the buffered SSE on a
     // streamed response, or from the parsed JSON on a non-streamed one. Either way
@@ -2847,7 +2944,9 @@ async function handleProxy(
 
   upstreamBody.on('error', (err: Error) => {
     clearWatchdog();
-    status = controller.signal.aborted ? 'aborted' : 'error';
+    // An M17 in-stream guardrail block also aborts the controller, but it is a policy
+    // outcome, not a client disconnect — record it as 'error', not 'aborted'.
+    status = controller.signal.aborted && !streamGuardrailAction ? 'aborted' : 'error';
     request.log.error({ err }, 'upstream stream error');
     if (!reply.raw.writableEnded) {
       if (!reply.raw.headersSent) {
@@ -3060,7 +3159,7 @@ async function serveFromCache(
     request.log.error({ err }, 'cache-hit teardown failed');
   }
 
-  ctx.telemetry.recordRequest({
+  safeRecord(ctx, request.log, {
     provider,
     requestModel,
     responseModel: cached.model,

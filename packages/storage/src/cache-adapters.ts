@@ -71,7 +71,14 @@ export class PostgresExactCache implements ExactCacheStore {
 export class PostgresVectorIndex implements VectorIndex {
   constructor(private readonly db: Database) {}
 
-  async upsert(scope: string, id: string, embedding: number[]): Promise<void> {
+  async upsert(
+    scope: string,
+    id: string,
+    embedding: number[],
+    _ttlSeconds?: number,
+  ): Promise<void> {
+    // Postgres vectors are reclaimed by the cascade sweep (semantic_vector rows are
+    // deleted when their exact-cache row expires), so no per-row TTL is applied here.
     await this.db
       .insert(semanticVector)
       .values({ key: id, scope, embedding })
@@ -165,13 +172,19 @@ export class RedisVectorIndex implements VectorIndex {
     return Buffer.from(new Float32Array(embedding).buffer);
   }
 
-  async upsert(scope: string, id: string, embedding: number[]): Promise<void> {
+  async upsert(scope: string, id: string, embedding: number[], ttlSeconds?: number): Promise<void> {
     await this.ensureIndex();
-    await this.redis.hset(this.prefix + id, {
-      scope,
-      key: id,
-      embedding: RedisVectorIndex.toBlob(embedding),
-    });
+    const key = this.prefix + id;
+    const fields = { scope, key: id, embedding: RedisVectorIndex.toBlob(embedding) };
+    // The vector Redis runs `noeviction`, so an un-expired hash grows without bound.
+    // Give each vector the exact-cache entry's lifetime via a pipelined HSET+EXPIRE —
+    // RediSearch drops expired hash keys from the FT index automatically, so orphaned
+    // vectors self-reclaim (no bespoke sweeper needed).
+    if (ttlSeconds && ttlSeconds > 0) {
+      await this.redis.pipeline().hset(key, fields).expire(key, Math.ceil(ttlSeconds)).exec();
+    } else {
+      await this.redis.hset(key, fields);
+    }
   }
 
   async query(scope: string, embedding: number[], topK: number): Promise<VectorMatch[]> {
