@@ -1,4 +1,11 @@
-import { context, SpanKind, SpanStatusCode, trace, type Tracer } from '@opentelemetry/api';
+import {
+  type Attributes,
+  context,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+  type Tracer,
+} from '@opentelemetry/api';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
@@ -58,6 +65,48 @@ export interface Telemetry {
   recordRequest(data: RequestSpanData): void;
   forceFlush(): Promise<void>;
   shutdown(): Promise<void>;
+}
+
+/**
+ * The COMPLETE set of attributes attached to a request span, built purely from the
+ * structured {@link RequestSpanData} (which carries no header or content field). Every
+ * key is in the gen_ai.* / gulley.* / http.* allowlist and every value is a structured
+ * datum — never a header, credential, or request/response body — so the always-on
+ * no-credential-logging invariant (ARCHITECTURE §12) holds independent of the no-content
+ * toggle. Exported so a regression test can assert that directly: a later change that
+ * added a header-bearing or content attribute would fail the allowlist/absence assertions.
+ */
+export function spanAttributes(data: RequestSpanData): Attributes {
+  return {
+    'gen_ai.operation.name': 'chat',
+    'gen_ai.provider.name': data.provider,
+    'gen_ai.system': data.provider,
+    'gen_ai.request.model': data.requestModel,
+    'gen_ai.response.model': data.responseModel,
+    'gen_ai.usage.input_tokens': data.inputTokens,
+    'gen_ai.usage.output_tokens': data.outputTokens,
+    'gulley.cost.micro_usd': data.costMicroUsd,
+    ...(data.cacheReadTokens
+      ? { 'gen_ai.usage.cache_read.input_tokens': data.cacheReadTokens }
+      : {}),
+    ...(data.cacheWriteTokens
+      ? { 'gen_ai.usage.cache_creation.input_tokens': data.cacheWriteTokens }
+      : {}),
+    'gulley.route': data.route,
+    'gulley.streamed': data.streamed,
+    'http.response.status_code': data.statusCode,
+    ...(data.stopReason ? { 'gen_ai.response.finish_reasons': [data.stopReason] } : {}),
+    ...(data.servedRegion ? { 'gulley.served.region': data.servedRegion } : {}),
+    ...(data.cacheStatus ? { 'gulley.cache.status': data.cacheStatus } : {}),
+    ...(data.guardrailInputFindings !== undefined
+      ? { 'gulley.guardrail.input.findings': data.guardrailInputFindings }
+      : {}),
+    ...(data.guardrailOutputFindings !== undefined
+      ? { 'gulley.guardrail.output.findings': data.guardrailOutputFindings }
+      : {}),
+    ...(data.guardrailAction ? { 'gulley.guardrail.action': data.guardrailAction } : {}),
+    ...(data.traceId ? { 'gulley.trace_id': data.traceId } : {}),
+  };
 }
 
 const NOOP: Telemetry = {
@@ -123,39 +172,7 @@ export function initTelemetry(opts: TelemetryOptions): Telemetry {
         { kind: SpanKind.CLIENT, startTime: data.startedAtMs },
         parentCtx,
       );
-      span.setAttributes({
-        'gen_ai.operation.name': 'chat',
-        'gen_ai.provider.name': data.provider,
-        'gen_ai.system': data.provider,
-        'gen_ai.request.model': data.requestModel,
-        'gen_ai.response.model': data.responseModel,
-        'gen_ai.usage.input_tokens': data.inputTokens,
-        'gen_ai.usage.output_tokens': data.outputTokens,
-        'gulley.cost.micro_usd': data.costMicroUsd,
-        // Cache/read/write breakdown of the inclusive input total (semconv-aligned).
-        ...(data.cacheReadTokens
-          ? { 'gen_ai.usage.cache_read.input_tokens': data.cacheReadTokens }
-          : {}),
-        ...(data.cacheWriteTokens
-          ? { 'gen_ai.usage.cache_creation.input_tokens': data.cacheWriteTokens }
-          : {}),
-        'gulley.route': data.route,
-        'gulley.streamed': data.streamed,
-        'http.response.status_code': data.statusCode,
-      });
-      if (data.stopReason) {
-        span.setAttribute('gen_ai.response.finish_reasons', [data.stopReason]);
-      }
-      if (data.servedRegion) span.setAttribute('gulley.served.region', data.servedRegion);
-      if (data.cacheStatus) span.setAttribute('gulley.cache.status', data.cacheStatus);
-      if (data.guardrailInputFindings !== undefined) {
-        span.setAttribute('gulley.guardrail.input.findings', data.guardrailInputFindings);
-      }
-      if (data.guardrailOutputFindings !== undefined) {
-        span.setAttribute('gulley.guardrail.output.findings', data.guardrailOutputFindings);
-      }
-      if (data.guardrailAction) span.setAttribute('gulley.guardrail.action', data.guardrailAction);
-      if (data.traceId) span.setAttribute('gulley.trace_id', data.traceId);
+      span.setAttributes(spanAttributes(data));
       if (data.status !== 'ok') {
         span.setStatus({ code: SpanStatusCode.ERROR, message: data.status });
       }

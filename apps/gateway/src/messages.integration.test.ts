@@ -389,6 +389,147 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await new Promise<void>((r) => notFound.close(() => r()));
   });
 
+  it('post-first-byte watchdog: aborts a stalled upstream, meters partial spend, releases the reservation', async () => {
+    // A half-open upstream: 200 + SSE headers + message_start (carries input usage) + one
+    // partial frame, then it NEVER ends — only the inactivity watchdog can terminate it.
+    let upstreamClosed = false;
+    const hung = http.createServer((req, res) => {
+      req.on('close', () => {
+        upstreamClosed = true;
+      });
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":1}}}\n\n',
+      );
+      // deliberately no res.end() — hang.
+    });
+    await new Promise<void>((r) => hung.listen(0, '127.0.0.1', r));
+    const hungUrl = `http://127.0.0.1:${(hung.address() as AddressInfo).port}`;
+
+    const CAP = 10_000_000;
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: CAP }]]));
+    const { ctx, requestLog } = buildContext(store, budgets);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', hungUrl) },
+      },
+    ];
+    ctx.streamInactivityMs = 150; // low watchdog (threaded via ctx — no module-const capture)
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text(); // resolves once the watchdog aborts + the stream terminates
+
+    // The upstream socket was destroyed and teardown ran (a request-log row exists).
+    await vi.waitFor(() => expect(upstreamClosed).toBe(true));
+    await vi.waitFor(() => expect(requestLog.entries.length).toBeGreaterThan(0));
+    // Partial spend metered from the message_start input usage (meter-on-abort invariant).
+    expect(budgets.committed('ws_1')).toBeGreaterThan(0);
+    // Reservation RELEASED, not leaked: reserving the exact remaining headroom is admitted,
+    // which is only possible if reservedTotal is back to 0 (a leak would deny it).
+    const probe = await budgets.reserve('ws_1', 'probe', CAP - budgets.committed('ws_1'));
+    expect(probe?.allowed).toBe(true);
+
+    await app.close();
+    await new Promise<void>((r) => hung.close(() => r()));
+  });
+
+  it('client disconnect mid-stream aborts the upstream and meters partial spend', async () => {
+    // Upstream: message_start (input usage) + one text delta, then holds. The client
+    // aborts after the first byte; the gateway must abort upstream and still meter the
+    // partial spend (the common Ctrl-C case — never lose spend on a client cancel).
+    let upstreamClosed = false;
+    const sockets = new Set<import('node:net').Socket>();
+    const holding = http.createServer((req, res) => {
+      req.on('close', () => {
+        upstreamClosed = true;
+      });
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":1}}}\n\n',
+      );
+      res.write(
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+      );
+      // hold — the client will abort.
+    });
+    holding.on('connection', (s) => sockets.add(s));
+    await new Promise<void>((r) => holding.listen(0, '127.0.0.1', r));
+    const holdingUrl = `http://127.0.0.1:${(holding.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', holdingUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    // Raw http client for precise mid-stream disconnect control: destroy the request
+    // socket on the first response byte (or a fallback timer), simulating a client
+    // Ctrl-C. Fastify/undici's AbortController semantics against a hijacked streaming
+    // proxy are too finicky to drive this reliably.
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    await new Promise<void>((resolve) => {
+      const u = new URL(`${base}/v1/messages`);
+      const req = http.request(
+        {
+          hostname: u.hostname,
+          port: u.port,
+          path: u.pathname,
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': token },
+        },
+        (res) => {
+          const disconnect = (): void => {
+            req.destroy();
+            resolve();
+          };
+          res.once('data', disconnect); // first byte flowed → cancel mid-stream
+          res.on('error', () => {});
+          // Fallback so the test can never hang if the first byte is slow.
+          setTimeout(disconnect, 1500);
+        },
+      );
+      req.on('error', () => resolve()); // destroy() surfaces an error — expected
+      req.end(body);
+    });
+
+    // A ledger row was metered with the partial input spend and an aborted status.
+    await vi.waitFor(() => expect(ledger.entries.length).toBeGreaterThan(0), { timeout: 5000 });
+    const row = ledger.entries[0];
+    expect(row?.cost.totalInputTokens).toBeGreaterThan(0);
+    expect(row?.status).toBe('aborted');
+    // The gateway tore the upstream connection down (Ctrl-C must not leak upstreams).
+    await vi.waitFor(() => expect(upstreamClosed).toBe(true), { timeout: 5000 });
+
+    await app.close();
+    for (const s of sockets) s.destroy(); // free any lingering held socket before close
+    await new Promise<void>((r) => holding.close(() => r()));
+  }, 20000);
+
   it('authenticates a brokered gko_at_ token and fails closed on a bad one', async () => {
     const { store } = seededStore();
     const { ctx, ledger } = buildContext(store);
