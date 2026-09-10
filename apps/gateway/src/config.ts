@@ -386,6 +386,13 @@ const Env = z.object({
   // the classification hot path).
   SMART_ROUTING_SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6),
   SMART_ROUTING_EMBED_TIMEOUT_MS: z.coerce.number().int().positive().default(1500),
+  // The OUTER classifier race budget: the total time a classification (embed or LLM)
+  // may take before the request falls back to the model router. MUST be strictly greater
+  // than SMART_ROUTING_EMBED_TIMEOUT_MS (and any classifier LLM's own HTTP timeout), or
+  // the outer race fires first and classification always aborts — semantic routing then
+  // silently never reroutes and adds dead latency. Default 2000 > the 1500 embed default.
+  // Trades up to this much added first-byte latency on the classification hot path.
+  SMART_ROUTING_CLASSIFY_TIMEOUT_MS: z.coerce.number().int().positive().default(2000),
   // Persist embedded exemplar centroids to Postgres (DB config mode only) so a
   // fresh replica reuses them instead of re-embedding on boot. Fail-open: a store
   // error degrades to in-process embedding, never blocking a reconcile.

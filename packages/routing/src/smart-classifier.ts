@@ -62,16 +62,38 @@ export interface ClassifierBreaker {
   record(key: string, ok: boolean): void;
 }
 
+/** The resolved outcome of one classification attempt, for observability. `timeout`
+ *  specifically means the outer race budget fired before the embed/completer replied —
+ *  a sustained rate of it means the classify budget is mis-tuned and semantic routing
+ *  is silently dead-on-arrival (the failure the HIGH finding describes). */
+export type ClassifierOutcome = 'ok' | 'abstain' | 'timeout' | 'error';
+
 export interface ClassifierDeps {
   embedder?: ClassifierEmbedder;
   centroids?: CentroidIndex;
   completer?: ClassifierCompleter;
   /** Cosine-similarity floor for `embedding-nearest-label` (default 0.6). */
   similarityThreshold?: number;
-  /** Default classifier timeout in ms when a policy omits one (default 200). */
+  /** Default classifier timeout in ms when a policy omits one (default 200). NOTE:
+   *  this OUTER race budget must be strictly GREATER than the embedder/completer's own
+   *  inner HTTP timeout, or the two race and classification aborts before the upstream
+   *  can reply. The gateway wires a dedicated SMART_ROUTING_CLASSIFY_TIMEOUT_MS. */
   timeoutMs?: number;
   /** Optional breaker; when open the classifier is skipped without a call. */
   breaker?: ClassifierBreaker;
+  /** Fire-and-forget observability hook, invoked once per classification with its
+   *  outcome. Never throws into the classifier (called in a try/catch). */
+  onOutcome?: (outcome: ClassifierOutcome) => void;
+}
+
+/** Distinguishes an outer-race timeout from any other upstream error, so callers /
+ *  observability can tell a mis-tuned budget (routing silently dead) apart from a
+ *  genuine classifier fault. */
+export class ClassifierTimeoutError extends Error {
+  constructor() {
+    super('classifier timeout');
+    this.name = 'ClassifierTimeoutError';
+  }
 }
 
 const DEFAULT_TIMEOUT_MS = 200;
@@ -136,7 +158,7 @@ async function withTimeout<T>(
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       controller.abort();
-      reject(new Error('classifier timeout'));
+      reject(new ClassifierTimeoutError());
     }, timeoutMs);
   });
   try {
@@ -176,7 +198,11 @@ async function embeddingClassify(
   signal: AbortSignal,
 ): Promise<string | undefined> {
   if (!deps.embedder || !deps.centroids) return undefined;
-  const embedding = await deps.embedder.embed(text, signal);
+  // Cap the egressed text like the rules/LLM paths — an adversarial or simply large
+  // prompt must not force an unbounded embedding-API payload (extra cost + latency on
+  // the hot path, and a larger unmasked-prompt egress than the other backends allow).
+  const capped = text.length > TEXT_CAP ? text.slice(0, TEXT_CAP) : text;
+  const embedding = await deps.embedder.embed(capped, signal);
   const matches = await deps.centroids.nearest(policy.name, embedding, 1);
   const top = matches[0];
   const threshold = deps.similarityThreshold ?? DEFAULT_SIMILARITY;
@@ -226,9 +252,21 @@ export async function classifyRequest(
       );
     }
     deps.breaker?.record(key, true);
+    emitOutcome(deps, category !== undefined ? 'ok' : 'abstain');
     return category;
-  } catch {
+  } catch (err) {
     deps.breaker?.record(key, false);
+    emitOutcome(deps, err instanceof ClassifierTimeoutError ? 'timeout' : 'error');
     return undefined;
+  }
+}
+
+/** Fire the observability hook without ever letting it perturb classification. */
+function emitOutcome(deps: ClassifierDeps, outcome: ClassifierOutcome): void {
+  if (!deps.onOutcome) return;
+  try {
+    deps.onOutcome(outcome);
+  } catch {
+    /* observability hook must never affect the classifier */
   }
 }

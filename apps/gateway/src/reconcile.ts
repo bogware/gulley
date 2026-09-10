@@ -1,9 +1,15 @@
 import type { ConfigStore, ConfigVersionStore } from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
-import type { CentroidIndex, ClassifierBreaker, ClassifierEmbedder } from '@gulley/routing';
+import type {
+  CentroidIndex,
+  ClassifierBreaker,
+  ClassifierEmbedder,
+  ClassifierOutcome,
+} from '@gulley/routing';
 import { type CentroidStore, type ConfigSubscriber, SignalGate } from '@gulley/storage';
 import { buildModelRouterFromDocument, buildRoutesFromDocument } from './config-builder';
 import { buildModelPolicy, unionModelPolicy } from './model-policy';
+import { isEmptyResidencyPolicy, residencyAllowedRegions } from './residency-policy';
 import type { RouteHolder } from './routes/messages';
 import {
   buildEmbeddingCentroids,
@@ -24,6 +30,13 @@ export interface SmartRoutingReconcile {
   breaker?: ClassifierBreaker;
   /** Cosine-similarity floor for embedding classification (engine default 0.6). */
   similarityThreshold?: number;
+  /** Outer classifier race budget (ms). MUST exceed the embedder/completer inner HTTP
+   *  timeout, or every classification aborts before the upstream replies (semantic
+   *  routing silently dead). Absent ⇒ the engine default (200ms) — too low for a real
+   *  embed/LLM call, so the gateway always wires SMART_ROUTING_CLASSIFY_TIMEOUT_MS. */
+  classifyTimeoutMs?: number;
+  /** Observability hook for each classification outcome (ok|abstain|timeout|error). */
+  onOutcome?: (outcome: ClassifierOutcome) => void;
   /** Durable centroid store; present ⇒ exemplar embeddings are persisted/reused
    *  across replicas (requires `model`) instead of re-embedded every reconcile. */
   store?: CentroidStore;
@@ -90,18 +103,52 @@ export class GatewayReconciler {
       let smartRouter;
       if (this.smartRouting?.enabled) {
         const policies = parseSmartRoutingPolicies(doc);
-        const { embedder, store, model, annIndex } = this.smartRouting;
+        const { store, model, annIndex } = this.smartRouting;
+        // Data residency (re-evaluated on EVERY reconcile so a later policy/route change
+        // re-checks): the embeddings provider (EMBEDDINGS_*) carries no region/ZDR
+        // metadata, so its compliance cannot be PROVEN. Under an active residency policy
+        // we therefore disable the embedding classifier entirely — skip exemplar
+        // embedding AND request-time classification — so embedding-nearest-label policies
+        // abstain to the model router rather than egressing prompt/exemplar content to an
+        // unprovable region. (llm-router targets ARE RouteTargets with region/zdr, so
+        // buildSmartRouter checks those against `residency` below instead of dropping them
+        // wholesale.)
+        const residency = this.holder.ctx.residencyPolicy;
+        const residencyActive = !isEmptyResidencyPolicy(residency);
+        const embedder = residencyActive ? undefined : this.smartRouting.embedder;
+        if (
+          residencyActive &&
+          this.smartRouting.embedder &&
+          policies.some((p) => p.classifier.mode === 'embedding-nearest-label')
+        ) {
+          this.log?.info(
+            'residency policy active: embedding-nearest-label classifier disabled ' +
+              '(embeddings provider region/ZDR is unprovable); those policies abstain to the model router',
+          );
+        }
         const centroids = embedder
           ? store && model
             ? await buildPersistentCentroids(policies, embedder, store, model, annIndex)
             : await buildEmbeddingCentroids(policies, embedder, this.embedCache)
           : undefined;
-        smartRouter = buildSmartRouter(policies, routes, {
-          embedder: this.smartRouting.embedder,
-          centroids,
-          breaker: this.smartRouting.breaker,
-          similarityThreshold: this.smartRouting.similarityThreshold,
-        });
+        smartRouter = buildSmartRouter(
+          policies,
+          routes,
+          {
+            embedder,
+            centroids,
+            breaker: this.smartRouting.breaker,
+            similarityThreshold: this.smartRouting.similarityThreshold,
+            timeoutMs: this.smartRouting.classifyTimeoutMs,
+            onOutcome: this.smartRouting.onOutcome,
+          },
+          residencyActive
+            ? {
+                allowedRegions: residencyAllowedRegions(residency),
+                requireZdr: residency?.requireZdr ?? false,
+              }
+            : undefined,
+        );
       }
       // Build the model router from the document's aliases BEFORE swapping, so a
       // malformed alias throws here (caught → current config kept), never partial.

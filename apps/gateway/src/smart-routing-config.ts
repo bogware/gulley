@@ -51,8 +51,25 @@ const policyConfigSchema = z
     defaultCategory: z.string().optional(),
     selector: selectorSchema.default({}),
     priority: z.number().optional(),
+    // Availability opt-in (default deny): downgrade an out-of-scope rerouted model to
+    // the original rather than 403'ing. Off by default so a security/residency reroute
+    // is never silently served through the model the caller lacks scope for.
+    downgradeOnScopeDenied: z.boolean().optional(),
   })
-  .strict();
+  .strict()
+  // meterClassifier is a NO-OP for embedding-nearest-label (the embeddings API's usage
+  // is not surfaced and @gulley/cost has no embedding-model pricing), so accepting it
+  // there would give false assurance the spend is tracked. Reject it at validation and
+  // document that meterClassifier covers llm-router / rules-then-llm escalation only.
+  .refine(
+    (p) =>
+      !(p.classifier.mode === 'embedding-nearest-label' && p.classifier.meterClassifier === true),
+    {
+      message:
+        'meterClassifier is not supported for embedding-nearest-label policies (embedding-API spend is not metered); it applies to llm-router and rules-then-llm escalation only',
+      path: ['classifier', 'meterClassifier'],
+    },
+  );
 
 export type SmartRoutingPolicyConfig = z.infer<typeof policyConfigSchema>;
 

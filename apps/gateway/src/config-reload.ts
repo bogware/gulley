@@ -78,6 +78,12 @@ export function buildConfigWatcher(
     embedder,
     breaker: config.SMART_ROUTING_ENABLED ? breaker : undefined,
     similarityThreshold: config.SMART_ROUTING_SIMILARITY_THRESHOLD,
+    // Outer race budget (> the embed/LLM inner HTTP timeout) so classification can
+    // actually complete before falling back — without it the engine default (200ms)
+    // aborts every real embed/LLM call.
+    classifyTimeoutMs: config.SMART_ROUTING_CLASSIFY_TIMEOUT_MS,
+    // Surface classifier outcomes (esp. a mis-tuned-budget `timeout` rate) as a metric.
+    onOutcome: (outcome) => holder.ctx.metrics?.recordClassifierOutcome(outcome),
     store: persistCentroids ? new PostgresCentroidStore(db) : undefined,
     model: persistCentroids ? config.EMBEDDINGS_MODEL : undefined,
     annIndex: annEligible ? new PostgresCentroidIndex(db, config.EMBEDDINGS_MODEL) : undefined,

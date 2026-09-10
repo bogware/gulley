@@ -170,6 +170,21 @@ describe('classifyRequest — embedding-nearest-label', () => {
     ).toBeUndefined();
     expect(await classifyRequest(p, 'x', { embedder })).toBeUndefined(); // no centroids
   });
+
+  it('caps the text egressed to the embedder at TEXT_CAP', async () => {
+    let embedded = '';
+    const capturing = {
+      embed: async (t: string) => {
+        embedded = t;
+        return [0.1, 0.2, 0.3];
+      },
+    };
+    await classifyRequest(p, 'z'.repeat(9000), {
+      embedder: capturing,
+      centroids: { nearest: async () => [{ label: 'safe', score: 0.9 }] },
+    });
+    expect(embedded.length).toBe(4096); // sliced to the 4096-char cap, not the full 9000
+  });
 });
 
 describe('classifyRequest — resilience', () => {
@@ -255,6 +270,54 @@ describe('classifyRequest — resilience', () => {
   it('caps the text fed to rules at TEXT_CAP (a rule matching only past the cap does not fire)', () => {
     const long = 'a'.repeat(5000) + 'NEEDLE'; // NEEDLE sits past the 4096-char cap
     expect(runRules([{ category: 'x', regex: 'NEEDLE' }], long)).toBeUndefined();
+  });
+
+  it('reports classification outcomes (ok/abstain/timeout/error) to onOutcome', async () => {
+    const seen: string[] = [];
+    const onOutcome = (o: string): void => void seen.push(o);
+    const p = policy({ mode: 'llm-router', model: 'm', timeoutMs: 15 }, { a: 'x' });
+
+    // ok: a completion that matches a label
+    await classifyRequest(p, 'x', {
+      completer: { complete: async () => ({ text: 'a' }) },
+      onOutcome,
+    });
+    // abstain: a completion that matches no label
+    await classifyRequest(p, 'x', {
+      completer: { complete: async () => ({ text: 'nope' }) },
+      onOutcome,
+    });
+    // timeout: a completer that only rejects on abort → the outer race fires
+    await classifyRequest(p, 'x', {
+      completer: {
+        complete: (_m, _pr, signal) =>
+          new Promise((_res, rej) => {
+            signal?.addEventListener('abort', () => rej(new Error('aborted')), { once: true });
+          }),
+      },
+      onOutcome,
+    });
+    // error: the completer throws synchronously (not a timeout)
+    await classifyRequest(p, 'x', {
+      completer: {
+        complete: async () => {
+          throw new Error('upstream 500');
+        },
+      },
+      onOutcome,
+    });
+
+    expect(seen).toEqual(['ok', 'abstain', 'timeout', 'error']);
+  });
+
+  it('never lets a throwing onOutcome perturb the classification result', async () => {
+    const cat = await classifyRequest(policy({ mode: 'llm-router', model: 'm' }, { a: 'x' }), 'x', {
+      completer: { complete: async () => ({ text: 'a' }) },
+      onOutcome: () => {
+        throw new Error('metrics backend down');
+      },
+    });
+    expect(cat).toBe('a'); // result stands despite the hook throwing
   });
 
   it('reports usage to the sink on a rules-then-llm ESCALATION', async () => {

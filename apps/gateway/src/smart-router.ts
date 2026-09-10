@@ -5,6 +5,7 @@ import {
   classifyRequest,
   type ClassifierSpendSink,
   MapSmartRouteResolver,
+  residencyCompliant,
   type RouteTarget,
   type RoutingStrategy,
   type SmartRouteResolver,
@@ -27,6 +28,9 @@ export interface SmartRouteDecision {
   strategy?: RoutingStrategy;
   createExtractor?: () => UsageExtractor;
   model?: string;
+  /** Copied from the resolved policy: when true, an out-of-scope rerouted model is
+   *  downgraded to the original (availability) rather than 403'd. See the policy field. */
+  downgradeOnScopeDenied?: boolean;
 }
 
 /**
@@ -70,7 +74,11 @@ export class SmartRouter {
     const chosen =
       category !== undefined && byCategory.has(category) ? category : policy.defaultCategory;
     if (chosen === undefined) return undefined;
-    return byCategory.get(chosen);
+    const decision = byCategory.get(chosen);
+    if (!decision) return undefined;
+    // Carry the policy's downgrade opt-in onto the decision so the hot-path caller can
+    // decide (deny by default) how to handle a rerouted-but-out-of-scope model.
+    return policy.downgradeOnScopeDenied ? { ...decision, downgradeOnScopeDenied: true } : decision;
   }
 }
 
@@ -100,16 +108,26 @@ function resolveRef(
   return provider ? { ...provider } : { model: ref };
 }
 
+/** Data-residency constraint for the classifier sub-call. When present, a classifier
+ *  target that cannot be PROVEN compliant is dropped so the classifier abstains rather
+ *  than egressing prompt content to a possibly out-of-region / non-ZDR provider. */
+export interface ClassifierResidency {
+  allowedRegions?: ReadonlySet<string>;
+  requireZdr: boolean;
+}
+
 /**
  * Build a live `SmartRouter` from validated policies + the current route table.
  * Each provider's FIRST built route is its primary target (chat/messages), which
  * is what a category reroute translates to. Returns `undefined` when there are no
- * policies (feature off).
+ * policies (feature off). Under an active `residency` constraint, an llm-router
+ * classifier target that cannot be proven compliant is dropped (fail-closed egress).
  */
 export function buildSmartRouter(
   policies: readonly SmartRoutingPolicy<string>[],
   routes: readonly ProviderRoute[],
   deps: ClassifierDeps = {},
+  residency?: ClassifierResidency,
 ): SmartRouter | undefined {
   if (policies.length === 0) return undefined;
 
@@ -140,7 +158,17 @@ export function buildSmartRouter(
     const c = p.classifier;
     if (c.model && c.providerRef && !byModel.has(c.model)) {
       const target = singleTarget(byProvider.get(c.providerRef));
-      if (target) byModel.set(c.model, { target, provider: c.providerRef });
+      // Residency: an llm-router / rules-then-llm classifier egresses the (pre-guardrail)
+      // prompt to this target, so it must satisfy the same region/ZDR policy as a served
+      // upstream. A target that cannot be proven compliant is DROPPED — the completer
+      // then abstains for that model and the policy falls back to local rules / the model
+      // router — rather than leaking prompt content to a non-compliant region.
+      if (
+        target &&
+        (!residency || residencyCompliant(target, residency.allowedRegions, residency.requireZdr))
+      ) {
+        byModel.set(c.model, { target, provider: c.providerRef });
+      }
     }
   }
 

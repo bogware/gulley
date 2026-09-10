@@ -37,6 +37,34 @@ describe('parseSmartRoutingPolicyConfig', () => {
       }),
     ).toThrow();
   });
+
+  it('rejects meterClassifier on an embedding-nearest-label policy (it is a silent no-op there)', () => {
+    expect(() =>
+      parseSmartRoutingPolicyConfig({
+        objective: 'safety-risk',
+        classifier: { mode: 'embedding-nearest-label', meterClassifier: true },
+        categoryRoutes: { safe: 'a' },
+      }),
+    ).toThrow(/meterClassifier is not supported for embedding-nearest-label/);
+    // ...but is accepted for llm-router (where the sub-call usage IS surfaced).
+    expect(() =>
+      parseSmartRoutingPolicyConfig({
+        objective: 'cost-tier',
+        classifier: { mode: 'llm-router', model: 'm', meterClassifier: true },
+        categoryRoutes: { a: 'x' },
+      }),
+    ).not.toThrow();
+  });
+
+  it('accepts the downgradeOnScopeDenied availability opt-in', () => {
+    const cfg = parseSmartRoutingPolicyConfig({
+      objective: 'domain-skill',
+      classifier: { mode: 'rules-then-llm', rules: [{ category: 'c', maxChars: 10 }] },
+      categoryRoutes: { c: 'small' },
+      downgradeOnScopeDenied: true,
+    });
+    expect(cfg.downgradeOnScopeDenied).toBe(true);
+  });
 });
 
 const doc = (policies: ConfigEntity[] | undefined): ConfigDocument => ({

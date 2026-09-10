@@ -2189,6 +2189,36 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await app.close();
   });
 
+  it('downgrades an out-of-scope smart reroute to the original when the policy opts in', async () => {
+    // Same out-of-scope reroute as above, but the policy opts into an availability
+    // downgrade: rather than 403'ing, the reroute is dropped and the ORIGINAL in-scope
+    // model is served (200) — and the downgrade is audited so it stays observable.
+    const { store, token } = scopedStore({
+      allowedProviders: '*',
+      allowedModels: ['claude-sonnet-4-6'],
+    });
+    const { ctx, requestLog, audit } = buildContext(store);
+    ctx.smartRouter = buildSmartRouter(
+      [costTierPolicy({ downgradeOnScopeDenied: true })],
+      ctx.routes,
+    ); // 'hi' → claude-haiku-4-5 (out of scope) → downgraded to claude-sonnet-4-6
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: smartReq('hi'),
+    });
+    await res.text();
+
+    expect(res.status).toBe(200); // served, not 403
+    expect(JSON.parse(received.body).model).toBe('claude-sonnet-4-6'); // original, not the reroute
+    expect(requestLog.entries).toHaveLength(1); // dispatched
+    expect(audit.rows.some((e) => e.action === 'policy.smart_route_downgraded')).toBe(true);
+    await app.close();
+  });
+
   it('deny-by-default authz still filters a smart-rerouted PROVIDER', async () => {
     // Key allows only anthropic; a policy reroutes 'cheap' to openai.
     const { store, token } = scopedStore({ allowedProviders: ['anthropic'], allowedModels: '*' });

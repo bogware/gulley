@@ -84,6 +84,17 @@ export interface SmartRoutingPolicy<TRoute = string> {
   selector: SmartSelector;
   /** Tie-break among equally-specific matches (higher wins; default 0). */
   priority?: number;
+  /**
+   * Availability opt-in (default false = prefer-deny). When a successful classification
+   * reroutes to a model the caller's key is NOT scoped for (or that the model policy
+   * denies), the reroute is DOWNGRADED — the original model/strategy is kept and served
+   * — instead of letting the out-of-scope rewrite hit the authz gate and 403. Off by
+   * default because a silent downgrade could defeat a SECURITY- or RESIDENCY-motivated
+   * reroute (serving the very model the policy steered away from); the safe default is
+   * to deny. Any downgrade is audited so it stays observable. Authz always runs on the
+   * RESOLVED (served) model regardless of this flag.
+   */
+  downgradeOnScopeDenied?: boolean;
 }
 
 /** The request identity a policy is resolved against. */

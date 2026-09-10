@@ -105,6 +105,68 @@ describe('GatewayReconciler', () => {
     expect(holder.ctx.modelPolicy?.deny).toContain('claude-opus-*'); // env floor retained
   });
 
+  it('disables the embedding classifier under an active residency policy (fail-closed egress)', async () => {
+    const embed = vi.fn(async () => [0.1, 0.2, 0.3]);
+    const smartDoc = (): ConfigDocument => {
+      const d = docWith('anthropic');
+      d.orgs[0]!.workspaces[0]!.smartRoutingPolicies = [
+        {
+          name: 'emb',
+          config: {
+            objective: 'safety-risk',
+            classifier: {
+              mode: 'embedding-nearest-label',
+              exemplars: { safe: ['hello there'], risky: ['danger ahead'] },
+            },
+            categoryRoutes: { safe: 'anthropic', risky: 'anthropic' },
+          },
+        },
+      ];
+      return d;
+    };
+    const smartOpts = {
+      enabled: true,
+      embedder: { embed },
+      breaker: undefined,
+      classifyTimeoutMs: 2000,
+    };
+
+    // Residency active: the exemplars are NEVER embedded — the embedding classifier is
+    // disabled so no prompt/exemplar content egresses to the unprovable embeddings region.
+    const secured = {
+      routes: [],
+      breaker: new CircuitBreaker(),
+      scoreboard: new LoadScoreboard(),
+      residencyPolicy: { allowedRegions: ['eu-central-1'], requireZdr: false },
+    } as unknown as GatewayContext;
+    const securedHolder = new RouteHolder(secured);
+    const ok = await new GatewayReconciler(
+      securedHolder,
+      storeReturning(smartDoc()),
+      new MapSecretResolver(new Map([[ARN, 'sk-ant-x']])),
+      undefined,
+      smartOpts,
+    ).reconcile();
+    expect(ok).toBe(true);
+    expect(embed).not.toHaveBeenCalled();
+
+    // No residency: the embedding classifier is live, so exemplars ARE embedded.
+    embed.mockClear();
+    const open = {
+      routes: [],
+      breaker: new CircuitBreaker(),
+      scoreboard: new LoadScoreboard(),
+    } as unknown as GatewayContext;
+    await new GatewayReconciler(
+      new RouteHolder(open),
+      storeReturning(smartDoc()),
+      new MapSecretResolver(new Map([[ARN, 'sk-ant-x']])),
+      undefined,
+      smartOpts,
+    ).reconcile();
+    expect(embed).toHaveBeenCalled();
+  });
+
   it('reports success/failure so the watcher advances the cursor only on success', async () => {
     const { holder } = holderWithState();
     const ok = new GatewayReconciler(

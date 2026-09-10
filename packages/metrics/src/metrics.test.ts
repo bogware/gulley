@@ -78,6 +78,16 @@ describe('GatewayMetrics', () => {
     expect(m.render()).toContain('gulley_failovers_total{target="anthropic"} 2');
   });
 
+  it('counts smart-routing classifier outcomes by outcome (bounded label set)', () => {
+    const m = new GatewayMetrics();
+    m.recordClassifierOutcome('timeout');
+    m.recordClassifierOutcome('timeout');
+    m.recordClassifierOutcome('ok');
+    const out = m.render();
+    expect(out).toContain('gulley_classifier_outcomes_total{outcome="timeout"} 2');
+    expect(out).toContain('gulley_classifier_outcomes_total{outcome="ok"} 1');
+  });
+
   it('labels saved cost by source (prompt_cache default, response_cache on a hit)', () => {
     const m = new GatewayMetrics();
     const base = {

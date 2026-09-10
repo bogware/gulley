@@ -63,6 +63,7 @@ export class GatewayMetrics {
   private readonly breakerStateChanges: Counter;
   private readonly hedges: Counter;
   private readonly classifierCost: Counter;
+  private readonly classifierOutcomes: Counter;
   private readonly duration: Histogram;
   private readonly budgetUtilization: Histogram;
   /** Distinct verified model labels seen, to bound cardinality (see MAX_MODEL_LABELS). */
@@ -116,6 +117,11 @@ export class GatewayMetrics {
     this.classifierCost = this.registry.counter(
       'gulley_classifier_cost_micro_usd_total',
       'Smart-routing classifier sub-call spend in micro-USD.',
+    );
+    this.classifierOutcomes = this.registry.counter(
+      'gulley_classifier_outcomes_total',
+      'Smart-routing classifier outcomes by outcome (ok|abstain|timeout|error) — a ' +
+        'rising timeout rate means the classify budget is mis-tuned (routing silently dead).',
     );
     this.duration = this.registry.histogram(
       'gulley_request_duration_seconds',
@@ -190,6 +196,13 @@ export class GatewayMetrics {
   /** Smart-routing classifier sub-call spend (micro-USD). */
   recordClassifierCost(microUsd: number): void {
     if (microUsd > 0) this.classifierCost.inc({}, microUsd);
+  }
+
+  /** Smart-routing classifier outcome (bounded 4-label set). A sustained `timeout`
+   *  rate means the classify budget is below the embed/completer HTTP timeout, so
+   *  classification aborts and semantic routing silently falls open. */
+  recordClassifierOutcome(outcome: 'ok' | 'abstain' | 'timeout' | 'error'): void {
+    this.classifierOutcomes.inc({ outcome });
   }
 
   /** Budget headroom at admission (used/cap), bucketed — no per-workspace label. */

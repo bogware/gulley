@@ -792,12 +792,38 @@ async function handleProxy(
       );
     }
     if (decision) {
-      if (decision.strategy) strategy = decision.strategy;
-      if (decision.createExtractor) createExtractor = decision.createExtractor;
-      if (decision.model && decision.model !== requestedModel) {
-        requestedModel = decision.model;
-        parsed['model'] = decision.model;
-        body = Buffer.from(JSON.stringify(parsed), 'utf8');
+      const reroutedModel = decision.model;
+      // A successful classification can reroute to a model the caller's key is NOT scoped
+      // for (or that the model policy denies) — which would turn a valid request into a
+      // spurious 403 (fail-CLOSED from a fail-open feature). Guard it: compute whether the
+      // rerouted model is denied by the caller's scope or the model policy.
+      const reroutedModelDenied =
+        reroutedModel !== undefined &&
+        reroutedModel !== requestedModel &&
+        (!scopeAllowsModel(principal.scope, reroutedModel) ||
+          (ctx.modelPolicy !== undefined && !modelAllowedByPolicy(ctx.modelPolicy, reroutedModel)));
+      if (reroutedModelDenied && decision.downgradeOnScopeDenied) {
+        // Opt-in availability downgrade: keep the ORIGINAL model/strategy and audit the
+        // downgrade, rather than applying a reroute the authz gate would 403. Never a
+        // silent default — a downgrade could otherwise defeat a security/residency reroute.
+        await auditSafe({
+          orgId: principal.scope.orgId,
+          actor: principal.id,
+          action: 'policy.smart_route_downgraded',
+          target: requestedModel,
+          payload: { rerouted_to: reroutedModel, reason: 'scope_or_policy_denied' },
+        });
+      } else {
+        // Default (prefer-deny) or an in-scope reroute: apply the decision. If the model
+        // is out of scope and the policy did NOT opt into downgrade, the authz gate below
+        // returns 403 — authz always runs on the RESOLVED model, never the original.
+        if (decision.strategy) strategy = decision.strategy;
+        if (decision.createExtractor) createExtractor = decision.createExtractor;
+        if (reroutedModel !== undefined && reroutedModel !== requestedModel) {
+          requestedModel = reroutedModel;
+          parsed['model'] = reroutedModel;
+          body = Buffer.from(JSON.stringify(parsed), 'utf8');
+        }
       }
     }
   }

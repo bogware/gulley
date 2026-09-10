@@ -164,6 +164,41 @@ describe('buildSmartRouter', () => {
     expect(await buildSmartRouter([p], ROUTES)!.route(IDENTITY, 'short')).toBeUndefined();
   });
 
+  it('drops a residency-non-compliant llm classifier target so the classifier abstains', async () => {
+    // The classifier egresses the prompt to the 'openai' target, which carries no region
+    // stamp. Under an active residency allowlist it cannot be proven compliant, so
+    // buildSmartRouter drops it: no completer is wired → llm classification abstains →
+    // the decision falls to defaultCategory (fail-closed on the residency dimension).
+    const p = policy({
+      classifier: { mode: 'llm-router', model: 'router-mini', providerRef: 'openai' },
+      categoryRoutes: { cheap: 'haiku-3-5', hard: 'openai' },
+      defaultCategory: 'cheap',
+    });
+    const sr = buildSmartRouter(
+      [p],
+      ROUTES,
+      {},
+      {
+        allowedRegions: new Set(['eu-central-1']),
+        requireZdr: false,
+      },
+    );
+    // Abstained (target dropped) → defaultCategory 'cheap' → the model-only rewrite.
+    expect(await sr!.route(IDENTITY, 'anything long enough to skip any rule')).toEqual({
+      model: 'haiku-3-5',
+    });
+  });
+
+  it('stamps downgradeOnScopeDenied from the policy onto the decision (default: absent)', async () => {
+    const withFlag = buildSmartRouter([policy({ downgradeOnScopeDenied: true })], ROUTES);
+    expect(await withFlag!.route(IDENTITY, 'short')).toEqual({
+      model: 'haiku-3-5',
+      downgradeOnScopeDenied: true,
+    });
+    const without = buildSmartRouter([policy({})], ROUTES);
+    expect(await without!.route(IDENTITY, 'short')).toEqual({ model: 'haiku-3-5' });
+  });
+
   it('does not bleed routes between workspaces that share a policy name', async () => {
     // Two workspaces each define a policy named "cost" (names are only unique
     // within a workspace). Each request must get ITS workspace's categoryRoutes.
