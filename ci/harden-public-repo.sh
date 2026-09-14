@@ -35,4 +35,19 @@ gh api -X PUT "repos/${REPO}/branches/main/protection" --input - >/dev/null <<'J
 }
 JSON
 
-echo "Done. Verify in Settings -> Branches and Settings -> Code security."
+echo "-> code scanning (CodeQL) runs from .github/workflows/codeql.yml; results appear under Security -> Code scanning."
+
+# GHCR package visibility: the container package at ghcr.io/${REPO} is created by
+# the first release run and defaults to PRIVATE. Flip it to public so self-hosters
+# can pull. It cannot be set before the package exists, so this is a best-effort
+# nudge, not a hard step.
+PKG="${REPO##*/}"
+echo "-> GHCR package visibility (best effort; only works once the first release has pushed the image)"
+if gh api -X PATCH "user/packages/container/${PKG}" -f visibility=public >/dev/null 2>&1; then
+  echo "   set ghcr.io/${REPO} package to public"
+else
+  echo "   NOTE: could not set it automatically. After the first release, make it public in"
+  echo "   the package settings: https://github.com/users/${REPO%%/*}/packages/container/${PKG}/settings"
+fi
+
+echo "Done. Verify in Settings -> Branches, Settings -> Code security, and the package's visibility."

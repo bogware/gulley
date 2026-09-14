@@ -4,7 +4,7 @@
 # Dockerfile builds an equivalent image whose default command is the control-api,
 # for setups that prefer a dedicated image per service. Node is PID 1.
 # Build for the ECS task platform: --platform linux/arm64.
-FROM node:22-slim AS base
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
 RUN corepack enable
 WORKDIR /app

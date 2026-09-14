@@ -1,0 +1,36 @@
+name: CodeQL
+
+# Static analysis (SAST) for the JS/TS sources. Runs on push to main and on every
+# pull request. No `schedule:` trigger — consistent with this repo's no-cron posture
+# (see docs/CI_SECURITY.md); add one if you want periodic re-scans of unchanged code.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege by default; the analyze job elevates only what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload results to the Security tab (code scanning)
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: github/codeql-action/init@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      # No build step: CodeQL analyzes JS/TS sources directly (no autobuild needed).
+      - uses: github/codeql-action/analyze@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3
+        with:
+          category: '/language:javascript-typescript'

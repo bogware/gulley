@@ -5,7 +5,7 @@
 # hardening (tsup/esbuild bundle + gcr.io/distroless/nodejs22 base, no tsx/pnpm at
 # runtime) is a documented follow-up. Build for the ECS task platform:
 #   docker buildx build --platform linux/arm64 -f apps/gateway/Dockerfile .
-FROM node:22-slim AS base
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
 RUN corepack enable
 WORKDIR /app

@@ -5,7 +5,7 @@
 # The browser talks only to this origin: NEXT_PUBLIC_CONTROL_API_URL defaults to
 # the same-origin `/control`, and next.config.mjs rewrites /control/* to the
 # control-api given by the runtime CONTROL_API_URL env. Node is PID 1.
-FROM node:22-slim AS base
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
 RUN corepack enable
 WORKDIR /app

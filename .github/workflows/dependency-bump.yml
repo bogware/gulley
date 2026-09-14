@@ -29,9 +29,14 @@ jobs:
         with:
           node-version: 22
       - name: Update dependencies
+        # `scope` is passed through the environment, never interpolated into the
+        # shell, to avoid Actions script injection. Left unquoted so an empty
+        # default updates everything and a multi-flag value word-splits as intended.
+        env:
+          SCOPE: ${{ inputs.scope }}
         run: |
           corepack enable
-          pnpm update -r ${{ inputs.scope }}
+          pnpm update -r $SCOPE
           pnpm install --lockfile-only
       - name: Verify
         run: |
