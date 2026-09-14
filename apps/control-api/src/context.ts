@@ -32,6 +32,7 @@ import {
   PostgresDeviceCodeStore,
   PostgresAuthCodeStore,
   PostgresOAuthClientStore,
+  PostgresTenancyStore,
   readAuditRows,
   type MaskVaultStore,
 } from '@gulley/storage';
@@ -88,12 +89,16 @@ import {
   ProviderCredentialStore,
   ProviderStore,
   ScopedCollection,
+  type TenancyPersistence,
   WorkspaceStore,
 } from './stores';
 
 export interface ControlContext {
   orgs: OrgStore;
   workspaces: WorkspaceStore;
+  /** DB mode: reload the org/workspace read models from Postgres (boot + after a
+   *  config apply that may have created tenancy rows). Absent ⇒ in-memory only. */
+  hydrateTenancy?: () => Promise<{ orgs: number; workspaces: number }>;
   projects: ProjectStore;
   memberships: MembershipStore;
   providers: ProviderStore;
@@ -198,6 +203,14 @@ export interface ControlContext {
   /** The gateway's public base URL for generated client configs; absent ⇒ the
    *  client-config endpoint is not served. */
   gatewayPublicUrl?: string;
+  /** This control plane's own public base URL (the OAuth broker's issuer, e.g.
+   *  https://api.gulley.acme.internal). Used for RFC 8414 metadata, the device-flow
+   *  verification URI fallback, and OAuth-mode client configs. Absent ⇒ derived per
+   *  request from the (proxy-trusted) Host header. */
+  controlApiPublicUrl?: string;
+  /** The admin console's public base URL; when set, device-flow consent points at
+   *  the console's /oauth/device page (else the control-api's minimal page). */
+  consolePublicUrl?: string;
   /** Ed25519 private key (PEM) that signs onboarding packs; absent ⇒ the
    *  onboarding-pack + public-key endpoints are not served. */
   onboardingSigningKey?: string;
@@ -236,8 +249,13 @@ export interface InMemoryContextOptions {
   sessionSecrets: readonly string[];
   maxSessionTtlMs: number;
   outboundAllowlist?: ReadonlySet<string>;
+  /** Inject a tenancy persistence port (tests); DB mode builds PostgresTenancyStore. */
+  tenancy?: TenancyPersistence;
   /** Gateway public base URL for generated client configs. */
   gatewayPublicUrl?: string;
+  /** Control-plane (broker issuer) + console public base URLs; see ControlContext. */
+  controlApiPublicUrl?: string;
+  consolePublicUrl?: string;
   /** Ed25519 private key (PEM) that signs onboarding packs. */
   onboardingSigningKey?: string;
   /** Inject a pre-seeded query backend (tests); defaults to a fresh in-memory log. */
@@ -501,9 +519,19 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
         )
     : undefined;
 
+  // Tenancy registries: durable write-through + boot hydration in DB mode (see
+  // PostgresTenancyStore) so console-created orgs/workspaces exist in Postgres before
+  // keys / OAuth clients reference them, and survive a restart.
+  const tenancy = opts.tenancy ?? (db ? new PostgresTenancyStore(db) : undefined);
+  const orgs = new OrgStore(tenancy);
+  const workspaces = new WorkspaceStore(tenancy);
+
   return {
-    orgs: new OrgStore(),
-    workspaces: new WorkspaceStore(),
+    orgs,
+    workspaces,
+    hydrateTenancy: tenancy
+      ? async () => ({ orgs: await orgs.hydrate(), workspaces: await workspaces.hydrate() })
+      : undefined,
     projects: new ProjectStore(),
     memberships: new MembershipStore(),
     providers: new ProviderStore(),
@@ -590,6 +618,8 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     rolloutPromoter: opts.rolloutPromoter,
     outboundAllowlist: opts.outboundAllowlist ?? new Set(),
     gatewayPublicUrl: opts.gatewayPublicUrl,
+    controlApiPublicUrl: opts.controlApiPublicUrl,
+    consolePublicUrl: opts.consolePublicUrl,
     onboardingSigningKey: opts.onboardingSigningKey,
     oidc: opts.oidc,
     notifier: opts.notifier,

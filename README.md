@@ -103,6 +103,11 @@ export ANTHROPIC_API_KEY=gk_...        # the printed token
 # now Claude Code, Codex, or curl all flow through Gulley
 ```
 
+Prefer short-lived, identity-bound tokens over static keys? Turn on the OAuth broker
+(`OAUTH_BROKER_ENABLED=true` on both apps), register a client in the console, and have
+developers run `pnpm gulley login` — Claude Code and Codex then fetch tokens through
+`gulley token`. See [`docs/HARNESS_OAUTH.md`](docs/HARNESS_OAUTH.md).
+
 ## Deploy
 
 - **AWS (Terraform)** — one adaptable module, `test` and `prod` tiers, with an exact

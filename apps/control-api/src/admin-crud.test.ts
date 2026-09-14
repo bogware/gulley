@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
 import { createInMemoryControlContext } from './context';
-import { verifyOnboardingPack } from './onboarding';
+import { verifyOnboardingPack } from '@gulley/cli';
 import { buildServer } from './server';
 
 let app: FastifyInstance;
@@ -160,18 +160,37 @@ describe('generated client config', () => {
         headers: { authorization: `Bearer ${g}` },
       });
       expect(cc.statusCode).toBe(200);
-      const claudeCfg = (cc.json() as { config: { content: string; path: string } }).config;
+      const claudeCfg = (
+        cc.json() as { config: { content: string; path: string; notes: string[]; auth: string } }
+      ).config;
       expect(claudeCfg.path).toBe('.claude/settings.json');
+      expect(claudeCfg.auth).toBe('virtual-key');
       expect(claudeCfg.content).toContain('https://gulley.acme.internal');
-      expect(claudeCfg.content).toContain('claude-*'); // allowed models surfaced
+      expect(claudeCfg.notes.join(' ')).toContain('claude-*'); // allowed models surfaced
+      expect(claudeCfg.content).not.toContain('${'); // never a literal placeholder token
 
       const codex = await app2.inject({
         method: 'GET',
         url: `/admin/workspaces/${wid}/client-config?agent=codex`,
         headers: { authorization: `Bearer ${g}` },
       });
-      expect((codex.json() as { config: { content: string } }).config.content).toContain(
-        '/openai/v1',
+      const codexCfg = (codex.json() as { config: { content: string } }).config.content;
+      expect(codexCfg).toContain('/openai/v1');
+      expect(codexCfg).toContain('wire_api = "responses"');
+
+      // OAuth mode: the token helper is wired and the broker URL is THIS control plane's
+      // public origin (derived from the request when CONTROL_API_PUBLIC_URL is unset).
+      const oauth = await app2.inject({
+        method: 'GET',
+        url: `/admin/workspaces/${wid}/client-config?agent=claude-code&auth=oauth&clientId=cc-team`,
+        headers: { authorization: `Bearer ${g}`, host: 'api.internal:8081' },
+      });
+      const oauthCfg = (oauth.json() as { config: { content: string; notes: string[] } }).config;
+      expect(JSON.parse(oauthCfg.content)).toMatchObject({
+        apiKeyHelper: 'gulley token --profile cc-team',
+      });
+      expect(oauthCfg.notes.join('\n')).toContain(
+        'gulley login --broker http://api.internal:8081 --client cc-team',
       );
     } finally {
       await app2.close();

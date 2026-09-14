@@ -208,6 +208,8 @@ function buildContext(config: Config): ControlContext | undefined {
     maxSessionTtlMs: config.ADMIN_SESSION_MAX_MS,
     outboundAllowlist: outboundAllowlist(config),
     gatewayPublicUrl: config.GATEWAY_PUBLIC_URL,
+    controlApiPublicUrl: config.CONTROL_API_PUBLIC_URL,
+    consolePublicUrl: config.CONSOLE_PUBLIC_URL,
     onboardingSigningKey: config.ONBOARDING_SIGNING_KEY,
     providerUsageSources,
     shadowSpendFlagBps: config.SHADOW_SPEND_FLAG_BPS,
@@ -303,8 +305,14 @@ if (!context) {
   );
 } else {
   app.log.info(
-    { oidc: Boolean(context.oidc) },
-    'control-api serving admin routes (in-memory stores)',
+    {
+      oidc: Boolean(context.oidc),
+      durable: Boolean(context.db),
+      oauthBroker: Boolean(context.oauthBroker),
+    },
+    context.db
+      ? 'control-api serving admin routes (Postgres-backed stores)'
+      : 'control-api serving admin routes (in-memory stores)',
   );
 }
 
@@ -399,6 +407,13 @@ if (context?.db && context.oauthBroker && config.OAUTH_EPHEMERA_SWEEP_INTERVAL_S
 
 async function start(): Promise<void> {
   try {
+    // DB mode: load the org/workspace read models from Postgres BEFORE serving, so the
+    // console lists the durable tenancy (seeded / config-applied / created earlier) and
+    // scope checks resolve against it from the first request.
+    if (context?.hydrateTenancy) {
+      const counts = await context.hydrateTenancy();
+      app.log.info(counts, 'tenancy hydrated from database');
+    }
     await app.listen({ host: config.CONTROL_API_HOST, port: config.CONTROL_API_PORT });
   } catch (error) {
     app.log.error(error);

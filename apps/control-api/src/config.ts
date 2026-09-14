@@ -57,6 +57,13 @@ const Env = z.object({
   // The gateway's PUBLIC base URL, used to generate turnkey client configs
   // (GET /admin/workspaces/:id/client-config). Absent ⇒ the endpoint 501s.
   GATEWAY_PUBLIC_URL: z.string().url().optional(),
+  // This control plane's PUBLIC base URL = the OAuth broker's issuer (RFC 8414
+  // metadata, device-flow verification URI fallback, OAuth-mode client configs). Absent
+  // ⇒ derived per request from the proxy-trusted Host header.
+  CONTROL_API_PUBLIC_URL: z.string().url().optional(),
+  // The admin console's PUBLIC base URL. When set, the device flow sends users to the
+  // console's /oauth/device consent page (else the control-api's minimal page).
+  CONSOLE_PUBLIC_URL: z.string().url().optional(),
 
   // The gateway's Prometheus /metrics URL (its SEPARATE management listener, e.g.
   // http://gateway:9090/metrics). The control-api fetches + parses it for the console's

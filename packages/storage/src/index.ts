@@ -13,3 +13,4 @@ export * from './retention';
 export * from './admin-session-store';
 export * from './scim-group-store';
 export * from './config-store';
+export * from './tenancy-store';

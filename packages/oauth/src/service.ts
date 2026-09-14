@@ -28,6 +28,15 @@ export interface OAuthError {
   error: OAuthErrorCode;
 }
 
+/** Consent-page preview of a pending device authorization (never the device_code). */
+export interface DevicePreview {
+  clientId: string;
+  clientName: string;
+  orgId: string;
+  workspaceId: string;
+  expiresAt: number;
+}
+
 export interface TokenResponse {
   access_token: string;
   token_type: 'Bearer';
@@ -81,6 +90,14 @@ function genUserCode(): string {
 
 const e = (code: OAuthErrorCode): Result<never, OAuthError> => err({ error: code });
 
+/** User codes are shown as `XXXX-XXXX` but people type them lowercase, without the
+ *  dash, or with stray whitespace; canonicalize before lookup (the alphabet is
+ *  upper-case + digits, so this is lossless). */
+export function normalizeUserCode(input: string): string {
+  const raw = input.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return raw.length === 8 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : input.trim().toUpperCase();
+}
+
 export class BrokerService {
   constructor(
     private readonly cfg: BrokerConfig,
@@ -128,12 +145,23 @@ export class BrokerService {
 
   // --- device flow ---
 
-  async deviceAuthorization(clientId: string): Promise<
+  /**
+   * RFC 8628 §3.2 device authorization response. `verificationUri` MUST be an absolute
+   * URL the end user can open (the console's consent page); the caller (control-api)
+   * derives it from CONSOLE_PUBLIC_URL / its own public origin. The
+   * `verification_uri_complete` variant carries the user code so a harness can offer a
+   * one-click / QR path (the user still confirms the code on the page).
+   */
+  async deviceAuthorization(
+    clientId: string,
+    opts: { verificationUri?: string } = {},
+  ): Promise<
     Result<
       {
         device_code: string;
         user_code: string;
         verification_uri: string;
+        verification_uri_complete: string;
         expires_in: number;
         interval: number;
       },
@@ -146,23 +174,72 @@ export class BrokerService {
     }
     const now = this.now();
     const deviceCode = randomBytes(24).toString('base64url');
+    const userCode = genUserCode();
     await this.deps.devices.create({
       deviceCode,
-      userCode: genUserCode(),
+      userCode,
       clientId,
       status: 'pending',
       expiresAt: now + this.cfg.deviceCodeTtlMs,
       lastPolledAt: 0,
       intervalMs: this.cfg.deviceIntervalMs,
     });
-    const d = await this.deps.devices.getByDeviceCode(deviceCode);
+    const verificationUri = opts.verificationUri ?? '/oauth/device';
+    const sep = verificationUri.includes('?') ? '&' : '?';
     return ok({
       device_code: deviceCode,
-      user_code: d?.userCode ?? '',
-      verification_uri: '/oauth/device',
+      user_code: userCode,
+      verification_uri: verificationUri,
+      verification_uri_complete: `${verificationUri}${sep}user_code=${encodeURIComponent(userCode)}`,
       expires_in: Math.floor(this.cfg.deviceCodeTtlMs / 1000),
       interval: Math.floor(this.cfg.deviceIntervalMs / 1000),
     });
+  }
+
+  /** Look up a pending device authorization by its user code (consent-page preview:
+   *  which client is asking, for which tenancy). Never returns the device_code. */
+  async devicePreview(userCode: string): Promise<Result<DevicePreview, OAuthError>> {
+    const d = await this.deps.devices.getByUserCode(normalizeUserCode(userCode));
+    if (!d) return e('invalid_request');
+    if (this.now() >= d.expiresAt) return e('expired_token');
+    if (d.status !== 'pending') return e('invalid_request');
+    const client = await this.deps.clients.get(d.clientId);
+    if (!client) return e('invalid_client');
+    return ok({
+      clientId: client.clientId,
+      clientName: client.name,
+      orgId: client.orgId,
+      workspaceId: client.workspaceId,
+      expiresAt: d.expiresAt,
+    });
+  }
+
+  /** The end user declines at the consent page: the polling client gets
+   *  `access_denied` on its next poll. Identity is the (validated) session, as for
+   *  approve; the same tenancy guard applies so an out-of-tenant admin cannot deny
+   *  someone else's authorization either. */
+  async deviceDeny(userCode: string, guard?: ConsentGuard): Promise<Result<void, OAuthError>> {
+    const d = await this.deps.devices.getByUserCode(normalizeUserCode(userCode));
+    if (!d) return e('invalid_request');
+    if (this.now() >= d.expiresAt) return e('expired_token');
+    if (d.status !== 'pending') return e('invalid_request');
+    if (guard) {
+      const client = await this.deps.clients.get(d.clientId);
+      if (!client) return e('invalid_client');
+      if (
+        !(await guard({
+          clientId: client.clientId,
+          orgId: client.orgId,
+          workspaceId: client.workspaceId,
+        }))
+      ) {
+        return e('access_denied');
+      }
+    }
+    if (!(await this.deps.devices.transition(d.deviceCode, 'pending', 'denied'))) {
+      return e('invalid_request');
+    }
+    return ok(undefined);
   }
 
   /** Consent step — identity comes ONLY from the (validated) IdP session, never
@@ -172,7 +249,7 @@ export class BrokerService {
     identity: { subject: string; displayName: string },
     guard?: ConsentGuard,
   ): Promise<Result<void, OAuthError>> {
-    const d = await this.deps.devices.getByUserCode(userCode);
+    const d = await this.deps.devices.getByUserCode(normalizeUserCode(userCode));
     if (!d) return e('invalid_request');
     if (this.now() >= d.expiresAt) return e('expired_token');
     if (d.status !== 'pending') return e('invalid_request');
@@ -389,6 +466,26 @@ export class BrokerService {
         await this.deps.grants.revoke(at.handle);
       }
     }
+  }
+
+  // --- introspection (RFC 7662, access tokens only) ---
+
+  /** Active ⇒ the grant's identity/expiry; null for any inactive/unknown/forged token.
+   *  Read-only, constant-time secret verify, no state change. */
+  async introspectAccessToken(
+    token: string,
+  ): Promise<{ clientId: string; principalId: string; accessTokenExpiresAt: number } | null> {
+    const at = parseAccess(token);
+    if (!at) return null;
+    const g = await this.deps.grants.get(at.handle);
+    if (!g || g.status !== 'active') return null;
+    if (this.now() >= g.accessTokenExpiresAt) return null;
+    if (!verifyHash(this.cfg.pepper, at.secret, g.accessTokenHash)) return null;
+    return {
+      clientId: g.clientId,
+      principalId: g.principalId,
+      accessTokenExpiresAt: g.accessTokenExpiresAt,
+    };
   }
 
   // --- data-plane resolution ---

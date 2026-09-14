@@ -62,6 +62,22 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
 
   registerHttpEdge(app, config);
 
+  // RFC 6749 §4.1.3 / RFC 8628 §3.4: every standards-conformant OAuth client (and the
+  // `gulley` CLI) sends token / device-authorization / revocation requests as
+  // application/x-www-form-urlencoded. Parse it into the same plain object shape the
+  // JSON routes read via body(), bounded by the server body limit.
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string' },
+    (_req, body, done) => {
+      try {
+        done(null, Object.fromEntries(new URLSearchParams(body as string)));
+      } catch (err) {
+        done(err as Error, undefined);
+      }
+    },
+  );
+
   // Brute-force / flood guard on the unauthenticated OAuth/OIDC endpoints (token
   // exchange, device authorization, OIDC callback). Registered before the routes so it
   // sheds excess volume with a 429 + Retry-After before any handler runs.

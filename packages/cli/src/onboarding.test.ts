@@ -1,6 +1,6 @@
 import { generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { type CliIo, runOnboardingCli } from './onboarding-cli';
+import { type CliIo, runCli } from './cli';
 import {
   buildOnboardingManifest,
   canonicalize,
@@ -67,7 +67,7 @@ describe('onboarding pack sign/verify', () => {
   });
 });
 
-describe('gulley onboarding CLI (runOnboardingCli)', () => {
+describe('gulley verify / init (signed onboarding packs)', () => {
   function fakeIo(files: Record<string, string>): {
     io: CliIo;
     logs: string[];
@@ -76,34 +76,39 @@ describe('gulley onboarding CLI (runOnboardingCli)', () => {
     const logs: string[] = [];
     const writes: Record<string, string> = {};
     const io: CliIo = {
-      readText: (p) => {
-        if (!(p in files)) throw new Error(`ENOENT ${p}`);
-        return files[p]!;
-      },
+      readText: (p) => writes[p] ?? files[p],
       writeText: (p, c) => {
         writes[p] = c;
       },
+      deleteFile: () => undefined,
       log: (l) => logs.push(l),
+      error: (l) => logs.push(l),
+      fetch: () => Promise.reject(new Error('no network in this test')),
+      sleep: () => Promise.resolve(),
+      now: () => 0,
+      homeDir: '/home/dev',
+      env: {},
+      lock: async () => () => undefined,
     };
     return { io, logs, writes };
   }
 
-  it('verify: 0 for a valid pack, 1 for a tampered one', () => {
+  it('verify: 0 for a valid pack, 1 for a tampered one', async () => {
     const pack = signOnboardingPack(manifest(), privPem);
     const ok = fakeIo({ 'pack.json': JSON.stringify(pack), 'key.pem': pubPem });
-    expect(runOnboardingCli(['verify', 'pack.json', '--pubkey', 'key.pem'], ok.io)).toBe(0);
+    expect(await runCli(['verify', 'pack.json', '--pubkey', 'key.pem'], ok.io)).toBe(0);
     expect(ok.logs.join(' ')).toContain('signature valid');
 
     const tampered = { ...pack, manifest: { ...pack.manifest, gatewayUrl: 'https://evil' } };
     const bad = fakeIo({ 'pack.json': JSON.stringify(tampered), 'key.pem': pubPem });
-    expect(runOnboardingCli(['verify', 'pack.json', '--pubkey', 'key.pem'], bad.io)).toBe(1);
+    expect(await runCli(['verify', 'pack.json', '--pubkey', 'key.pem'], bad.io)).toBe(1);
     expect(bad.logs.join(' ')).toContain('INVALID');
   });
 
-  it('init: writes the verified config (and unwraps a { pack } response)', () => {
+  it('init: writes the verified config (and unwraps a { pack } response)', async () => {
     const pack = signOnboardingPack(manifest(), privPem);
     const f = fakeIo({ 'pack.json': JSON.stringify({ pack }), 'key.pem': pubPem });
-    const code = runOnboardingCli(
+    const code = await runCli(
       ['init', 'pack.json', '--pubkey', 'key.pem', '--out', 'out.json'],
       f.io,
     );
@@ -111,9 +116,28 @@ describe('gulley onboarding CLI (runOnboardingCli)', () => {
     expect(f.writes['out.json']).toContain('https://gulley.acme.internal');
   });
 
-  it('refuses without a --pubkey and with a bad command', () => {
+  it('init: merges into an existing settings.json instead of clobbering it', async () => {
+    const pack = signOnboardingPack(manifest(), privPem);
+    const f = fakeIo({
+      'pack.json': JSON.stringify(pack),
+      'key.pem': pubPem,
+      '.claude/settings.json': JSON.stringify({
+        permissions: { allow: ['Read'] },
+        env: { A: '1' },
+      }),
+    });
+    expect(await runCli(['init', 'pack.json', '--pubkey', 'key.pem'], f.io)).toBe(0);
+    const merged = JSON.parse(f.writes['.claude/settings.json']!) as Record<string, unknown>;
+    expect(merged['permissions']).toEqual({ allow: ['Read'] });
+    expect(merged['env']).toMatchObject({
+      A: '1',
+      ANTHROPIC_BASE_URL: 'https://gulley.acme.internal',
+    });
+  });
+
+  it('refuses without a --pubkey and with a bad command', async () => {
     const f = fakeIo({ 'pack.json': '{}' });
-    expect(runOnboardingCli(['verify', 'pack.json'], f.io)).toBe(2); // no pubkey
-    expect(runOnboardingCli(['bogus'], f.io)).toBe(2);
+    expect(await runCli(['verify', 'pack.json'], f.io)).toBe(2); // no pubkey
+    expect(await runCli(['bogus'], f.io)).toBe(2);
   });
 });

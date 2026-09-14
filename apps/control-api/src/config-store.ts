@@ -115,11 +115,11 @@ export class ControlConfigStore implements ConfigStore {
     for (const dOrg of desired.orgs) {
       const org =
         this.ctx.orgs.list('*').find((o) => o.name === dOrg.name) ??
-        this.ctx.orgs.create(dOrg.name);
+        (await this.ctx.orgs.create(dOrg.name));
       for (const dWs of dOrg.workspaces) {
         const ws =
           this.ctx.workspaces.list('*').find((w) => w.orgId === org.id && w.name === dWs.name) ??
-          this.ctx.workspaces.create(org.id, dWs.name);
+          (await this.ctx.workspaces.create(org.id, dWs.name));
 
         for (const dp of dWs.providers) {
           const exists = this.ctx.providers

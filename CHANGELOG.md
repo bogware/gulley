@@ -6,6 +6,52 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Coding-harness OAuth, end to end.** A developer-side `gulley` CLI
+  (`packages/cli`: `login` / `token` / `logout` / `status`, plus the signed-pack
+  `verify` / `init`) runs the RFC 8628 device flow against the broker and acts as
+  Claude Code's `apiKeyHelper` / Codex's `[model_providers.gulley.auth]` command,
+  refreshing `gko_at_` tokens ahead of expiry under a cross-process lock. The broker
+  publishes RFC 8414 metadata, accepts form-encoded requests and the RFC device-code
+  grant-type URN, returns absolute `verification_uri` / `verification_uri_complete`,
+  and serves a consent page (console `/oauth/device` + a minimal control-api page)
+  with preview, approve and deny. The console can register OAuth clients and pick
+  agent + auth mode when generating configs. Docs: `docs/HARNESS_OAUTH.md`.
+- **Durable tenancy in DB mode.** Orgs/workspaces created in the console are written
+  through to Postgres and hydrated at boot (and after a config apply), so key minting
+  and OAuth-client registration no longer fail on a foreign key and the workspace list
+  survives a restart.
+- **Terraform:** `enable_oauth_broker` (default on), `enable_onboarding_packs`,
+  `gateway_extra_env` / `control_extra_env`; the control-api gets
+  `CONTROL_API_PUBLIC_URL` / `CONSOLE_PUBLIC_URL`.
+
+### Fixed
+
+- Generated Claude Code config embedded a literal `${GULLEY_API_KEY}` in settings
+  `env` (Claude Code does not expand it, and a settings value overrides a shell
+  export) — every generated config produced a 401. Configs now never carry a
+  credential; OAuth mode uses `apiKeyHelper`, key mode instructs an export.
+- Generated Codex config used `wire_api = "chat"`, which current Codex rejects (only
+  `responses` exists) — the whole config file failed to parse.
+- The gateway accepts a brokered `gko_at_` token on `x-api-key` as well as the
+  bearer (Claude Code's `apiKeyHelper` sends both).
+- IPv6 loopback redirects (`http://[::1]:port/…`) were never accepted for PKCE
+  clients (WHATWG URL reports the bracketed host).
+- `gulley init` merges into an existing `.claude/settings.json` / `config.toml`
+  instead of overwriting it.
+- **Gateway metering:** a passthrough OpenAI-wire chat-completions stream whose
+  client omitted `stream_options.include_usage` was billed $0 (no usage frame, budget
+  unenforced). The gateway now asks the backend for usage on the client's behalf
+  (`METER_INJECT_STREAM_USAGE`, default on), after every request transform.
+- **Gateway DLP:** the input-guardrail mask replaced the outbound bytes but not the
+  parsed request, so a budget-aware model downshift (and a cascade escalation, which
+  used a copy taken before masking/CEL transforms) re-sent the **unmasked** prompt
+  upstream. Both now forward the final masked/transformed body.
+- **OAuth broker:** RFC 7662 `POST /oauth/introspect`; `gulley token` introspects its
+  cached token so an admin revocation or reuse-triggered family kill surfaces as
+  "run `gulley login`" at the agent's next helper run instead of opaque 401s.
+
 ## [0.1.0] — 2026-09-08
 
 First public release. Gulley is a self-hostable, enterprise LLM gateway: one

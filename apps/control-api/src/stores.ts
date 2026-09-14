@@ -17,41 +17,109 @@ import type {
 
 const nowIso = (): string => new Date().toISOString();
 
+/**
+ * Durable write-through port for the tenancy registries (Postgres in DB mode). The
+ * registries below remain the synchronous READ model every route / RBAC scope check
+ * uses; with a port attached, `create`/`delete` persist FIRST (so a failure leaves no
+ * phantom in-memory row) and `hydrate` reloads the maps from the durable rows at
+ * boot and after a config apply. Absent ⇒ pure in-memory (tests, no-DB dev).
+ */
+export interface TenancyPersistence {
+  listOrgs(): Promise<Array<{ id: string; name: string; createdAt: Date }>>;
+  listWorkspaces(): Promise<Array<{ id: string; orgId: string; name: string; createdAt: Date }>>;
+  insertOrg(row: { id: string; name: string; createdAt: Date }): Promise<void>;
+  insertWorkspace(row: { id: string; orgId: string; name: string; createdAt: Date }): Promise<void>;
+  deleteOrg(id: string): Promise<boolean>;
+  deleteWorkspace(id: string): Promise<boolean>;
+}
+
 export class OrgStore {
   private readonly byId = new Map<string, Org>();
-  create(name: string): Org {
+  constructor(private readonly durable?: TenancyPersistence) {}
+
+  async create(name: string): Promise<Org> {
     const o: Org = { id: randomUUID(), name, createdAt: nowIso() };
+    if (this.durable) await this.durable.insertOrg({ ...o, createdAt: new Date(o.createdAt) });
     this.byId.set(o.id, o);
     return o;
+  }
+  /** Hydration / write-through mirror: upsert a row by id (no persistence call). */
+  add(o: Org): void {
+    this.byId.set(o.id, { ...o });
   }
   get(id: string): Org | undefined {
     return this.byId.get(id);
   }
-  delete(id: string): boolean {
+  async delete(id: string): Promise<boolean> {
+    if (this.durable) await this.durable.deleteOrg(id);
     return this.byId.delete(id);
   }
   list(orgIds: readonly string[] | '*'): Org[] {
     const all = [...this.byId.values()];
     return orgIds === '*' ? all : all.filter((o) => orgIds.includes(o.id));
   }
+  /** Replace the in-memory set with the durable rows (a no-op without a port). */
+  async hydrate(): Promise<number> {
+    if (!this.durable) return this.byId.size;
+    const rows = await this.durable.listOrgs();
+    this.byId.clear();
+    for (const r of rows) {
+      this.byId.set(r.id, { id: r.id, name: r.name, createdAt: r.createdAt.toISOString() });
+    }
+    return this.byId.size;
+  }
 }
 
 export class WorkspaceStore {
   private readonly byId = new Map<string, Workspace>();
-  create(orgId: string, name: string): Workspace {
+  constructor(private readonly durable?: TenancyPersistence) {}
+
+  async create(orgId: string, name: string): Promise<Workspace> {
     const w: Workspace = { id: randomUUID(), orgId, name, createdAt: nowIso() };
+    if (this.durable) {
+      await this.durable.insertWorkspace({ ...w, createdAt: new Date(w.createdAt) });
+    }
     this.byId.set(w.id, w);
     return w;
+  }
+  add(w: Workspace): void {
+    this.byId.set(w.id, { ...w });
   }
   get(id: string): Workspace | undefined {
     return this.byId.get(id);
   }
-  delete(id: string): boolean {
+  async delete(id: string): Promise<boolean> {
+    if (this.durable) await this.durable.deleteWorkspace(id);
     return this.byId.delete(id);
+  }
+  /** Mirror an org delete's cascade in the read model. */
+  deleteByOrg(orgId: string): number {
+    let n = 0;
+    for (const [id, w] of this.byId) {
+      if (w.orgId === orgId) {
+        this.byId.delete(id);
+        n += 1;
+      }
+    }
+    return n;
   }
   list(orgIds: readonly string[] | '*'): Workspace[] {
     const all = [...this.byId.values()];
     return orgIds === '*' ? all : all.filter((w) => orgIds.includes(w.orgId));
+  }
+  async hydrate(): Promise<number> {
+    if (!this.durable) return this.byId.size;
+    const rows = await this.durable.listWorkspaces();
+    this.byId.clear();
+    for (const r of rows) {
+      this.byId.set(r.id, {
+        id: r.id,
+        orgId: r.orgId,
+        name: r.name,
+        createdAt: r.createdAt.toISOString(),
+      });
+    }
+    return this.byId.size;
   }
 }
 

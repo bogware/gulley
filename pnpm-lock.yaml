@@ -41,6 +41,9 @@ importers:
       '@gulley/catalog':
         specifier: workspace:*
         version: link:../../packages/catalog
+      '@gulley/cli':
+        specifier: workspace:*
+        version: link:../../packages/cli
       '@gulley/config':
         specifier: workspace:*
         version: link:../../packages/config
@@ -325,6 +328,22 @@ importers:
         version: 2.1.9(@types/node@22.20.1)(jsdom@25.0.1)
 
   packages/cel:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.2
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.1)(jsdom@25.0.1)
+
+  packages/cli:
+    dependencies:
+      tsx:
+        specifier: ^4.19.2
+        version: 4.23.12
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

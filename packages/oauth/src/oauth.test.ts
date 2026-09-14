@@ -78,6 +78,49 @@ describe('device flow + tenancy', () => {
     if (!r.ok) expect(r.error.error).toBe('authorization_pending');
   });
 
+  it('returns an absolute verification_uri (+ _complete) and accepts a sloppily typed code', async () => {
+    const { broker } = makeBroker();
+    const da = await broker.deviceAuthorization('claude-code', {
+      verificationUri: 'https://console.acme.internal/oauth/device',
+    });
+    if (!da.ok) throw new Error('device auth');
+    expect(da.value.verification_uri).toBe('https://console.acme.internal/oauth/device');
+    expect(da.value.verification_uri_complete).toBe(
+      `https://console.acme.internal/oauth/device?user_code=${encodeURIComponent(da.value.user_code)}`,
+    );
+    expect(da.value.user_code).toMatch(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+    // The consent page can preview which client/tenancy is asking, and the user may
+    // type the code lowercase without the dash.
+    const sloppy = ` ${da.value.user_code.toLowerCase().replace('-', '')} `;
+    const preview = await broker.devicePreview(sloppy);
+    expect(preview.ok).toBe(true);
+    if (preview.ok)
+      expect(preview.value).toMatchObject({ clientId: 'claude-code', orgId: 'org_live' });
+    const ok = await broker.deviceApprove(sloppy, { subject: 'u', displayName: 'U' });
+    expect(ok.ok).toBe(true);
+    const tok = await broker.tokenDeviceCode(da.value.device_code, 'claude-code');
+    expect(tok.ok).toBe(true);
+  });
+
+  it('a user denial at the consent page surfaces as access_denied to the poller', async () => {
+    const { broker } = makeBroker();
+    const da = await broker.deviceAuthorization('claude-code');
+    if (!da.ok) throw new Error('device auth');
+    // The tenancy guard applies to deny as well (an out-of-tenant admin cannot deny).
+    const guarded = await broker.deviceDeny(da.value.user_code, async () => false);
+    expect(guarded.ok).toBe(false);
+    if (!guarded.ok) expect(guarded.error.error).toBe('access_denied');
+    const denied = await broker.deviceDeny(da.value.user_code, async () => true);
+    expect(denied.ok).toBe(true);
+    const poll = await broker.tokenDeviceCode(da.value.device_code, 'claude-code');
+    expect(poll.ok).toBe(false);
+    if (!poll.ok) expect(poll.error.error).toBe('access_denied');
+    // A denied code cannot be approved afterwards, nor previewed.
+    const late = await broker.deviceApprove(da.value.user_code, { subject: 'u', displayName: 'U' });
+    expect(late.ok).toBe(false);
+    expect((await broker.devicePreview(da.value.user_code)).ok).toBe(false);
+  });
+
   it('consent is denied when the authorization guard rejects the tenancy', async () => {
     const { broker } = makeBroker();
     const da = await broker.deviceAuthorization('claude-code');
@@ -188,6 +231,11 @@ describe('authorization code + PKCE (S256 only)', () => {
       clientId: 'claude-code',
     });
     expect(bad.ok).toBe(false); // code consumed; and verifier was wrong
+  });
+
+  it('validateLoopbackRedirect accepts the bracketed IPv6 loopback WHATWG URL reports', () => {
+    expect(validateLoopbackRedirect('http://[::1]:5555/callback', ['/callback'])).toBe(true);
+    expect(validateLoopbackRedirect('http://[::2]:5555/callback', ['/callback'])).toBe(false);
   });
 
   it('validateLoopbackRedirect enforces loopback + exact path', () => {

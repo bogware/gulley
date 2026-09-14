@@ -1,6 +1,7 @@
 import { createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
 import {
   type ClientAgent,
+  type ClientAuthMode,
   generateClientConfig,
   type GeneratedClientConfig,
 } from './client-config';
@@ -17,7 +18,12 @@ import {
 
 export interface OnboardingManifest {
   agent: ClientAgent;
+  /** `virtual-key` (static gk_ key) or `oauth` (gateway-brokered device login). */
+  auth: ClientAuthMode;
   gatewayUrl: string;
+  /** OAuth mode: the broker (control-api) public URL + registered client id. */
+  brokerUrl?: string;
+  clientId?: string;
   allowedModels: string[];
   /** Who/what the pack was issued for (workspace / team), for traceability. */
   issuedFor: string;
@@ -52,18 +58,31 @@ export interface BuildPackInput {
   issuedFor: string;
   issuedAt: string;
   keyPrefix?: string;
+  auth?: ClientAuthMode;
+  brokerUrl?: string;
+  clientId?: string;
+  profile?: string;
 }
 
 export function buildOnboardingManifest(input: BuildPackInput): OnboardingManifest {
+  const auth: ClientAuthMode = input.auth ?? 'virtual-key';
   const config = generateClientConfig({
     agent: input.agent,
     gatewayUrl: input.gatewayUrl,
     allowedModels: input.allowedModels,
     keyPrefix: input.keyPrefix,
+    auth,
+    brokerUrl: input.brokerUrl,
+    clientId: input.clientId,
+    profile: input.profile,
   });
   return {
     agent: input.agent,
+    auth,
     gatewayUrl: input.gatewayUrl,
+    ...(auth === 'oauth'
+      ? { brokerUrl: input.brokerUrl, clientId: input.clientId ?? input.agent }
+      : {}),
     allowedModels: input.allowedModels ?? [],
     issuedFor: input.issuedFor,
     issuedAt: input.issuedAt,

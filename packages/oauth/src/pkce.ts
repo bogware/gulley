@@ -27,7 +27,9 @@ export function validateLoopbackRedirect(
     return false;
   }
   if (url.protocol !== 'http:') return false;
-  if (!['127.0.0.1', '::1', 'localhost'].includes(url.hostname)) return false;
+  // WHATWG URL reports an IPv6 host WITH its brackets (`[::1]`), so match that form
+  // too — otherwise the IPv6 loopback a native harness may bind is never accepted.
+  if (!['127.0.0.1', '::1', '[::1]', 'localhost'].includes(url.hostname)) return false;
   if (url.username || url.password || url.search || url.hash) return false;
   return allowlist.includes(url.pathname);
 }

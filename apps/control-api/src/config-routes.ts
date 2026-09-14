@@ -79,6 +79,16 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
           : undefined,
       });
       if (r.ok) {
+        // DB mode: the durable config store may have created org/workspace rows;
+        // refresh the in-memory tenancy read model so the console / RBAC scopes see
+        // them immediately rather than after the next restart.
+        if (ctx.hydrateTenancy) {
+          try {
+            await ctx.hydrateTenancy();
+          } catch (err) {
+            request.log.warn({ err }, 'tenancy re-hydration after config apply failed');
+          }
+        }
         return reply.send({
           version: r.value.version,
           contentHash: r.value.contentHash,

@@ -5,6 +5,14 @@ import {
   verifyAttestationWithPublicKey,
 } from '@gulley/pipeline';
 import { MissingVariablesError, PromptNameConflictError, renderPrompt } from '@gulley/prompts';
+import {
+  type ClientAgent,
+  type ClientAuthMode,
+  buildOnboardingManifest,
+  generateClientConfig,
+  publicKeyOf,
+  signOnboardingPack,
+} from '@gulley/cli';
 import { GULLEY_VERSION, secretRef } from '@gulley/core';
 import { assertEgressAllowed } from '@gulley/egress';
 import {
@@ -30,12 +38,11 @@ import {
 } from './admin';
 import { detectChainRewrite } from './anchor';
 import { signCtxAttestation } from './audit-signing';
-import { type ClientAgent, generateClientConfig } from './client-config';
 import { buildEvidenceBundle } from './evidence-bundle';
-import { buildOnboardingManifest, publicKeyOf, signOnboardingPack } from './onboarding';
 import type { ControlContext } from './context';
+import { publicOrigin } from './oauth-routes';
 import type { CollectionKind } from './domain';
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 function invalid(reply: FastifyReply, message: string): FastifyReply {
   return reply.code(422).send({ error: { type: 'validation', message } });
@@ -191,7 +198,12 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         action: 'org.delete',
         target: id,
         diff: { orgId: id },
-        mutate: () => ctx.orgs.delete(id),
+        mutate: async () => {
+          const deleted = await ctx.orgs.delete(id);
+          // Postgres cascades org → workspace; mirror that in the read model.
+          if (deleted) ctx.workspaces.deleteByOrg(id);
+          return deleted;
+        },
       });
       return r.ok ? reply.send({ deleted: r.value }) : forbidden(reply);
     }),
@@ -431,6 +443,40 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       return reply.send({ keys });
     }),
   );
+  // The union of a workspace's model-policy allow-lists (surfaced to the developer;
+  // the gateway is the authority that enforces the policy).
+  const allowedModelsFor = (c: ControlContext, workspaceId: string): string[] => {
+    const allow = new Set<string>();
+    for (const e of c.collections['policy'].all()) {
+      if (e.workspaceId !== workspaceId) continue;
+      const a = e.config['allow'];
+      if (Array.isArray(a)) for (const m of a) if (typeof m === 'string') allow.add(m);
+    }
+    return [...allow];
+  };
+  // ?agent=claude-code|codex  ?auth=virtual-key|oauth  ?clientId=...  ?profile=...
+  // OAuth mode points the agent's token helper at THIS control plane (the broker).
+  const clientSelection = (
+    c: ControlContext,
+    request: FastifyRequest,
+  ): {
+    agent: ClientAgent;
+    auth: ClientAuthMode;
+    brokerUrl: string;
+    clientId?: string;
+    profile?: string;
+  } => {
+    const q = (request.query ?? {}) as Record<string, unknown>;
+    const agent: ClientAgent = str(q['agent']) === 'codex' ? 'codex' : 'claude-code';
+    const auth: ClientAuthMode = str(q['auth']) === 'oauth' ? 'oauth' : 'virtual-key';
+    return {
+      agent,
+      auth,
+      brokerUrl: publicOrigin(c, request),
+      clientId: str(q['clientId']),
+      profile: str(q['profile']),
+    };
+  };
   // Generate a turnkey client config (Claude Code / Codex) for a workspace: the
   // gateway base URL + the team's allowed models (union of its model-access policy
   // allow-lists). The gateway is the authority that enforces the policy; this just
@@ -447,20 +493,11 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       const ws = ctx.workspaces.get(workspaceId);
       if (!ws) return notFound(reply, 'workspace');
       if (!visibleWorkspaceIds(ctx, admin).has(workspaceId)) return forbidden(reply);
-      const agent: ClientAgent =
-        str((request.query as Record<string, unknown>)?.['agent']) === 'codex'
-          ? 'codex'
-          : 'claude-code';
-      const allow = new Set<string>();
-      for (const e of ctx.collections['policy'].all()) {
-        if (e.workspaceId !== workspaceId) continue;
-        const a = e.config['allow'];
-        if (Array.isArray(a)) for (const m of a) if (typeof m === 'string') allow.add(m);
-      }
+      const sel = clientSelection(ctx, request);
       const config = generateClientConfig({
-        agent,
+        ...sel,
         gatewayUrl: ctx.gatewayPublicUrl,
-        allowedModels: [...allow],
+        allowedModels: allowedModelsFor(ctx, workspaceId),
       });
       return reply.send({ config });
     }),
@@ -485,20 +522,11 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       const ws = ctx.workspaces.get(workspaceId);
       if (!ws) return notFound(reply, 'workspace');
       if (!visibleWorkspaceIds(ctx, admin).has(workspaceId)) return forbidden(reply);
-      const agent: ClientAgent =
-        str((request.query as Record<string, unknown>)?.['agent']) === 'codex'
-          ? 'codex'
-          : 'claude-code';
-      const allow = new Set<string>();
-      for (const e of ctx.collections['policy'].all()) {
-        if (e.workspaceId !== workspaceId) continue;
-        const a = e.config['allow'];
-        if (Array.isArray(a)) for (const m of a) if (typeof m === 'string') allow.add(m);
-      }
+      const sel = clientSelection(ctx, request);
       const manifest = buildOnboardingManifest({
-        agent,
+        ...sel,
         gatewayUrl: ctx.gatewayPublicUrl,
-        allowedModels: [...allow],
+        allowedModels: allowedModelsFor(ctx, workspaceId),
         issuedFor: ws.name,
         issuedAt: new Date().toISOString(),
       });
@@ -508,7 +536,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         actor: admin.subject,
         action: 'onboarding.pack.issue',
         target: workspaceId,
-        payload: { agent, issuedFor: ws.name },
+        payload: { agent: sel.agent, auth: sel.auth, issuedFor: ws.name },
       });
       return reply.send({ pack });
     }),

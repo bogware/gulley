@@ -7,7 +7,6 @@
     "dev": "tsx watch src/main.ts",
     "start": "tsx src/main.ts",
     "seed": "tsx src/seed.ts",
-    "gulley": "tsx src/onboarding-cli.ts",
     "rbac:check": "tsx src/rbac-check.ts",
     "oauth:check": "tsx src/oauth-check.ts",
     "config:check": "tsx src/config-check.ts",
@@ -23,6 +22,7 @@
   "dependencies": {
     "@gulley/auth": "workspace:*",
     "@gulley/catalog": "workspace:*",
+    "@gulley/cli": "workspace:*",
     "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
