@@ -419,7 +419,7 @@ export function Td({ children, className }: { children?: ReactNode; className?: 
 
 /* --------------------------------------------------------------- extras (parity) */
 
-/** 34×16 platinum toggle (design_handoff): on = blue gradient, knob right. */
+/** 34×16 platinum toggle: on = blue gradient, knob right. */
 export function Toggle({
   checked,
   onChange,

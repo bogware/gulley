@@ -89,7 +89,7 @@ export function parseSmartRoutingPolicyConfig(config: unknown): SmartRoutingPoli
  * policy with no `selector.workspace` is GLOBAL. That is correct for v1
  * (single-tenant per deployment); a MULTI-TENANT deployment MUST pin
  * `selector.workspace` (the workspace id) on each policy, or it applies to every
- * tenant. See docs/M15_SMART_ROUTING.md.
+ * tenant. See the smart-routing design in docs/ARCHITECTURE.md.
  */
 export function parseSmartRoutingPolicies(doc: ConfigDocument): SmartRoutingPolicy<string>[] {
   const out: SmartRoutingPolicy<string>[] = [];

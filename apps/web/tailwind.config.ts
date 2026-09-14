@@ -4,7 +4,7 @@ import type { Config } from 'tailwindcss';
  * The "Platinum" design system — a dense early-Apple/Snow-White industrial palette:
  * warm platinum greys, hairline 1px borders, 3–4px radii, IBM Plex type. Light-only by
  * intent (`darkMode: 'class'` with no `.dark` root ever added neutralises legacy `dark:`
- * variants). Tokens are lifted verbatim from design_handoff_gulley_console.
+ * variants). Tokens follow the Gulley console design system.
  */
 export default {
   content: ['./app/**/*.{ts,tsx}', './components/**/*.{ts,tsx}'],

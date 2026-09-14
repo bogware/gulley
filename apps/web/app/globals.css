@@ -18,7 +18,7 @@ body {
 }
 
 /* Focus: a 1px accent ring plus a 2px tint halo on interactive elements only —
-   no browser default outline (design_handoff §Interactions). */
+   no browser default outline (per the console design system). */
 :where(a, button, input, select, textarea, [tabindex]):focus-visible {
   outline: none;
   box-shadow:

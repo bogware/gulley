@@ -116,7 +116,7 @@ Non-negotiable invariants baked into that flow (do not regress them):
   (non-streamed only) UNLESS the opt-in windowed streaming enforcer is on (M17,
   `STREAMING_ENFORCE`), which redacts / reversibly masks / blocks in-stream on Anthropic
   Messages **and** OpenAI `chat.completions` responses (M18) — relaxing raw-byte-fidelity
-  for that mode only (`docs/M17_STREAMING_ENFORCEMENT.md`).
+  for that mode only (see the streaming-enforcement design in `docs/ARCHITECTURE.md`).
 - **Budget = reserve/commit.** Reserve worst-case at admission; commit actual (or refund) in
   teardown, released _first and independently_ of the best-effort durable sinks so a failed
   audit/ledger write can't leak a reservation and DoS the workspace budget. Always meter partial

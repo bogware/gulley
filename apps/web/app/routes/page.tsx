@@ -94,7 +94,7 @@ export default function RoutesPage() {
             <span className="font-mono text-ink">routes</span> entry (strategy + weighted targets)
             via GitOps config apply and it will appear here as an editable strategy builder.
             <div className="mt-3 rounded-control border border-line-soft bg-inset px-3 py-2 font-mono text-[10.5px] text-secondary">
-              docs/M13_CONFIG_HOTRELOAD.md · docs/M15_SMART_ROUTING.md
+              docs/ARCHITECTURE.md — Routing &amp; config
             </div>
           </div>
         </Panel>

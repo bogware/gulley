@@ -47,3 +47,6 @@ Thumbs.db
 
 # internal design handoff — not for public release
 design_handoff_gulley_console/
+
+# internal development notes — not for public release (history-purged; local-only)
+docs/internal/
