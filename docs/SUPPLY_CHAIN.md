@@ -11,7 +11,20 @@ Every released image carries three artifacts, produced by the shared
    mutable tag), with the signing identity being the CI's OIDC token and the
    signature transparency-logged in Rekor.
 
-The image is also scanned with Trivy (build fails on fixable HIGH/CRITICAL).
+The image is also scanned with Trivy (build fails on fixable HIGH/CRITICAL),
+**before** the public multi-arch push.
+
+### One documented scanning exception
+
+The runtime currently executes TypeScript via `tsx`, which bundles the **esbuild**
+Go binary as a transpiler. Trivy flags esbuild's embedded Go-stdlib CVEs
+(`net/http`, `net/mail`, `encoding/xml`, `crypto/tls` DoS/XSS), but those code
+paths are not reachable here — esbuild runs no server and parses no untrusted
+input; it only transpiles local source. The scan therefore excludes the esbuild
+build-tool binary (`--skip-dirs '**/@esbuild'`) while staying strict on OS
+packages and every other library. The durable fix — pre-bundling to JS and
+running plain `node` on a distroless base, so `tsx`/esbuild are absent from the
+runtime — is a tracked follow-up.
 
 ## The public image (GHCR)
 

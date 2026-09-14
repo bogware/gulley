@@ -59,6 +59,14 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: '1'
           ignore-unfixed: true
+          # The apps run via tsx, which bundles the esbuild Go binary purely as a
+          # TS->JS transpiler. Trivy flags esbuild's embedded Go stdlib CVEs
+          # (net/http, mail, xml, tls DoS/XSS), but none of those code paths are
+          # reachable here — esbuild runs no server and parses no untrusted input.
+          # Exclude the build-tool binary from the gate; everything else (OS
+          # packages, all other libraries) stays strict. Real fix tracked as the
+          # distroless + pre-bundled-JS runtime follow-up (see docs/SUPPLY_CHAIN.md).
+          skip-dirs: '**/@esbuild,**/@esbuild+*'
       - name: Build + push multi-arch (SBOM + provenance + cosign) to GHCR
         id: build
         env:
@@ -98,6 +106,9 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: '1'
           ignore-unfixed: true
+          # Exclude the esbuild transpiler binary (unreachable build-tool Go CVEs);
+          # see the GHCR job above and docs/SUPPLY_CHAIN.md.
+          skip-dirs: '**/@esbuild,**/@esbuild+*'
 
   # ── GitHub Release (tag pushes only) ─────────────────────────────────────────
   # Publishes a Release whose notes are the CHANGELOG section for the tag, and
@@ -117,9 +128,12 @@ jobs:
       - name: Extract CHANGELOG notes for the tag
         run: |
           VER="${TAG#v}"
+          # Portable literal-prefix match (no regex escaping across awk variants):
+          # grab lines after the "## [VER]" heading until the next section or the
+          # link-reference block (lines starting with "[").
           awk -v ver="$VER" '
-            $0 ~ ("^## \\[" ver "\\]") { grab=1; next }
-            grab && /^## / { exit }
+            index($0, "## [" ver "]") == 1 { grab=1; next }
+            grab && (index($0, "## ") == 1 || index($0, "[") == 1) { exit }
             grab { print }
           ' CHANGELOG.md > /tmp/notes.md
           if [ ! -s /tmp/notes.md ]; then

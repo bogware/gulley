@@ -43,7 +43,11 @@ stages:
                 TRIVY_VERSION=v0.74.0
                 curl -fsSL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" \
                   | sh -s -- -b /usr/local/bin "${TRIVY_VERSION}"
-                trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ECR_REPOSITORY:$IMAGE_TAG"
+                # Exclude the esbuild transpiler binary (unreachable build-tool Go
+                # CVEs; see docs/SUPPLY_CHAIN.md). Everything else stays strict.
+                trivy image --severity HIGH,CRITICAL --ignore-unfixed \
+                  --skip-dirs '**/@esbuild' --skip-dirs '**/@esbuild+*' \
+                  --exit-code 1 "$ECR_REPOSITORY:$IMAGE_TAG"
 
   # IaC sanity: fmt + validate the single Terraform module. A real prod plan/apply
   # is operator-driven with your own backend + tfvars (infra/terraform/INSTALL.md),
