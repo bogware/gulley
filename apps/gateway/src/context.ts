@@ -1052,6 +1052,7 @@ export function createProductionContext(config: Config): GatewayContext {
     responseBufferLimit: config.RESPONSE_BUFFER_LIMIT_BYTES,
     bufferFailClosed: config.BUFFER_FAIL_CLOSED,
     chargeOnMissingUsage: config.METER_CHARGE_ON_MISSING_USAGE,
+    injectStreamUsage: config.METER_INJECT_STREAM_USAGE,
     meterFailClosedOnUnpriced: config.METER_FAIL_CLOSED_ON_UNPRICED,
     requestDeadlineMs: config.REQUEST_DEADLINE_MS > 0 ? config.REQUEST_DEADLINE_MS : undefined,
     attributionHeaders: config.ATTRIBUTION_HEADERS

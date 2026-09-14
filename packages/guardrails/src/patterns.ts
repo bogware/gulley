@@ -170,8 +170,11 @@ export const PII_PATTERNS: PatternDef[] = [
   {
     category: 'url',
     source: 'pattern',
-    // http(s) URLs (may carry tokens / tracking params). Bounded, linear-time.
-    regex: /\bhttps?:\/\/[^\s<>"'()]{3,2048}/g,
+    // http(s) URLs (may carry tokens / tracking params). Bounded, linear-time. The
+    // backslash is excluded so a URL quoted inside a JSON string (`"https://x\"`)
+    // never swallows the escape of the closing quote — masking must stay
+    // structure-preserving on a JSON request body.
+    regex: /\bhttps?:\/\/[^\s<>"'()\\]{3,2048}/g,
     confidence: 0.35,
   },
 ];

@@ -47,7 +47,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Gateway DLP:** the input-guardrail mask replaced the outbound bytes but not the
   parsed request, so a budget-aware model downshift (and a cascade escalation, which
   used a copy taken before masking/CEL transforms) re-sent the **unmasked** prompt
-  upstream. Both now forward the final masked/transformed body.
+  upstream. Both now forward the final masked/transformed body, and a mask whose
+  output cannot be mirrored into the parsed request is refused (422,
+  `guardrail.transform_unforwardable`) rather than forwarded unmasked. The URL
+  detector no longer swallows the escape backslash of a quoted URL inside JSON.
 - **OAuth broker:** RFC 7662 `POST /oauth/introspect`; `gulley token` introspects its
   cached token so an admin revocation or reuse-triggered family kill surfaces as
   "run `gulley login`" at the agent's next helper run instead of opaque 401s.

@@ -494,6 +494,14 @@ const Env = z.object({
   // fully refund its reservation — leaving budgets unenforced for that backend.
   // Opt-in: charge the worst-case reservation instead so the cap still bites.
   METER_CHARGE_ON_MISSING_USAGE: envBool(false),
+  // OpenAI-wire chat-completions streams carry usage ONLY when the client asked for it
+  // (`stream_options.include_usage`). A passthrough client that omits it (most SDK
+  // defaults) would stream unmetered — $0 billed, reservation refunded, budget not
+  // enforced — so the gateway asks on the client's behalf. The one extra final chunk
+  // (empty `choices` + `usage`) is spec-compliant and the OpenAI SDKs tolerate it.
+  // Turn off only for a backend that rejects `stream_options` (then rely on the knob
+  // above). Default on.
+  METER_INJECT_STREAM_USAGE: envBool(true),
 
   // A served model absent from the price catalog meters $0 (priced:false), silently
   // bypassing the budget. Off-catalog requests are always observed (a warn log +

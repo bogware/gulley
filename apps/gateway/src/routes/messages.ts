@@ -262,6 +262,10 @@ export interface GatewayContext {
    *  (rather than billing $0 + refunding), so budgets stay enforced on backends that
    *  omit stream usage. Default false. */
   chargeOnMissingUsage?: boolean;
+  /** Ask OpenAI-wire backends for stream usage on the client's behalf
+   *  (`stream_options.include_usage: true` on a streamed chat completion) so a
+   *  passthrough client that omitted it is still metered. Default true. */
+  injectStreamUsage?: boolean;
   /** Charge the worst-case reservation when a served 2xx model is absent from the
    *  price catalog (priced:false, so it would otherwise meter $0 and slip the
    *  budget). Off-catalog requests are always observed; this makes them fail closed.
@@ -677,12 +681,14 @@ async function handleProxy(
       startedAtMs: started,
     });
 
-  // --- authn: Basic (if enabled) OR inbound JWT (bearer is a JWT) OR virtual key ---
+  // --- authn: Basic (if enabled) OR inbound JWT (bearer is a JWT) OR brokered
+  // OAuth (`gko_at_` on either header) OR virtual key ---
   // Deterministic mode selection by credential channel — no fall-through: the
-  // `Basic ` scheme, a JWT-shaped bearer, and the `gk_` virtual-key prefix are
-  // mutually exclusive.
+  // `Basic ` scheme, a JWT-shaped bearer, the `gko_at_` broker prefix, and the `gk_`
+  // virtual-key prefix are mutually exclusive.
   const authHeader = headerValue(request, 'authorization');
   const bearer = bearerToken(request);
+  const brokeredToken = brokeredAccessToken(bearer, headerValue(request, 'x-api-key'));
   let principal: Principal;
   if (ctx.basicAuth && authHeader && /^basic\s/i.test(authHeader)) {
     const basic = resolveBasicPrincipal(authHeader, ctx.basicAuth);
@@ -708,11 +714,13 @@ async function handleProxy(
       return;
     }
     principal = jwtPrincipal;
-  } else if (ctx.brokerResolver && bearer && bearer.startsWith('gko_at_')) {
+  } else if (ctx.brokerResolver && brokeredToken) {
     // Gateway-brokered OAuth: an opaque `gko_at_` access token is its own credential
     // channel (distinct prefix), so this is deterministic and FAILS CLOSED with no
     // fall-through to the virtual-key path. Read-only verify (lookup + secret + expiry).
-    const brokered = await ctx.brokerResolver(bearer);
+    // Accepted on either header a harness uses: `Authorization: Bearer` (Claude Code's
+    // ANTHROPIC_AUTH_TOKEN / apiKeyHelper, Codex) or `x-api-key` (ANTHROPIC_API_KEY).
+    const brokered = await ctx.brokerResolver(brokeredToken);
     if (isErr(brokered)) {
       request.log.info({ reason: brokered.error.reason }, 'broker token rejected');
       recordDenied(401);
@@ -1171,6 +1179,31 @@ async function handleProxy(
     }
   }
 
+  // --- stream-usage injection (OpenAI wire) ---
+  // OpenAI-wire chat-completions streams only carry usage when the client asked for
+  // it. A passthrough client that omitted `stream_options.include_usage` would
+  // otherwise stream UNMETERED ($0 billed, reservation refunded, budget unenforced),
+  // so ask on its behalf. Placed AFTER every request mutation that can touch `stream`
+  // or `stream_options` (model router, shaping, the CEL body patch, spotlighting) and
+  // BEFORE the input guardrail + cache key, so what is scanned/keyed is what is sent.
+  // Metering still reads only the raw provider usage frame; the response bytes are
+  // untouched (one extra spec-compliant final chunk).
+  if (
+    parseOk &&
+    ctx.injectStreamUsage !== false &&
+    parsed['stream'] === true &&
+    route.clientPaths.some((p) => p.endsWith('/v1/chat/completions'))
+  ) {
+    const so =
+      parsed['stream_options'] && typeof parsed['stream_options'] === 'object'
+        ? (parsed['stream_options'] as Record<string, unknown>)
+        : {};
+    if (so['include_usage'] !== true) {
+      parsed['stream_options'] = { ...so, include_usage: true };
+      body = Buffer.from(JSON.stringify(parsed), 'utf8');
+    }
+  }
+
   // --- guardrails (input): audit by default; block / mask / redact per policy ---
   const engine = route.guardrails ?? ctx.guardrails;
   let inputFindings = 0;
@@ -1214,6 +1247,58 @@ async function handleProxy(
       return;
     }
     if (gr.transformedText !== undefined) {
+      // Keep the parsed view in step with the masked bytes: later stages that
+      // re-serialize `parsed` (budget-aware downshift, cascade escalation) must
+      // forward the MASKED request, never restore the original PII/secret. A
+      // transform that does not yield a JSON object (a plugin returning prose, a
+      // span that ate a JSON delimiter) cannot be mirrored — and forwarding the
+      // original `parsed` instead would be a silent DLP bypass while the audit row
+      // says "mask". DLP enforcement fails CLOSED: refuse the request (no
+      // reservation has been taken yet, nothing to release).
+      let masked: Record<string, unknown> | undefined;
+      if (parseOk) {
+        try {
+          const p = JSON.parse(gr.transformedText) as unknown;
+          if (p && typeof p === 'object' && !Array.isArray(p)) {
+            masked = p as Record<string, unknown>;
+          }
+        } catch {
+          /* handled below */
+        }
+        if (!masked) {
+          await auditSafe({
+            orgId: principal.scope.orgId,
+            actor: principal.id,
+            action: 'guardrail.transform_unforwardable',
+            target: provider0,
+            payload: { direction: 'input', categories: gr.summary.categories },
+          });
+          safeRecord(ctx, request.log, {
+            provider: provider0,
+            requestModel: requestedModel,
+            responseModel: requestedModel,
+            route: candidates[0]?.upstreamPath ?? '',
+            statusCode: 422,
+            status: 'error',
+            inputTokens: 0,
+            outputTokens: 0,
+            costMicroUsd: 0,
+            streamed: false,
+            startedAtMs: started,
+            guardrailInputFindings: inputFindings,
+            guardrailAction: gr.vault ? 'mask' : 'redact',
+          });
+          await reply.code(422).send({
+            type: 'error',
+            error: {
+              type: 'guardrail_transform_error',
+              message: 'the masked request could not be re-serialized; refusing to forward',
+            },
+          });
+          return;
+        }
+        parsed = masked;
+      }
       body = Buffer.from(gr.transformedText, 'utf8');
       inputMasked = true;
       guardrailAction = gr.vault ? 'mask' : 'redact';
@@ -1306,11 +1391,13 @@ async function handleProxy(
   // reserve worst-case for both up front (TOCTOU-safe); teardown commits the actual sum
   // (and refunds the tier-1 portion when no escalation happens). Held separately so it
   // survives a budget-downshift reprice below (which replaces the tier-0 term).
+  // Sized on the FINAL body (post CEL/spotlight/mask/injection) — the bytes tier-1
+  // actually forwards — not the arming-time copy.
   const cascadeReserveMicroUsd = cascade
     ? estimateWorstCaseMicroUsd(
         cascade.provider,
         cascade.model,
-        cascade.body.length,
+        body.length,
         maxOutput,
         ctx.rateResolver,
       )
@@ -2103,9 +2190,12 @@ async function handleProxy(
           try {
             resp1 = await t1.adapter.forward({
               path: t1.upstreamPath,
-              // cascade.body already carries the escalation model; a per-target arbitrage
-              // map (keyed by that model) still rewrites it to the upstream's id.
-              body: bodyForTarget(t1, cascade.body, cascade.model),
+              // The tier-1 body is the FINAL forwarded body (after guardrail masking,
+              // CEL/spotlight transforms, usage injection) with the escalation model —
+              // not the copy taken at arming time, which predates those stages and
+              // would re-send the unmasked/untransformed request. A per-target
+              // arbitrage map (keyed by that model) still rewrites it to the upstream id.
+              body: bodyForTarget(t1, withModel(body, cascade.model), cascade.model),
               headers: forwardHeaders,
               credential: await credentialFor(t1),
               signal: controller.signal,
@@ -2192,7 +2282,7 @@ async function handleProxy(
             // charge it at worst-case and fall back to serving tier-0. The upstream itself
             // was healthy (the cap is ours), so release the slot without a fault penalty.
             if (t1LimiterAcquired) ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, false);
-            chargeDiscarded('cascade-tier1', cascade.provider, cascade.model, cascade.body.length);
+            chargeDiscarded('cascade-tier1', cascade.provider, cascade.model, body.length);
           }
         } else if (resp1) {
           // Classify the status against TIER-1's own strategy (it selected this target).
@@ -3627,6 +3717,31 @@ function numField(v: unknown): number | undefined {
 function headerValue(request: FastifyRequest, name: string): string | undefined {
   const v = request.headers[name];
   return Array.isArray(v) ? v[0] : v;
+}
+
+/** Re-serialize the FINAL forwarded JSON body with a different `model`. A cascade is
+ *  only armed on a parseable request, and every later transform keeps the body a JSON
+ *  object (a non-mirrorable mask is refused up front), so the parse cannot fail here;
+ *  if it somehow did, forward the final bytes as-is rather than any earlier copy. */
+function withModel(body: Buffer, model: string): Buffer {
+  try {
+    const obj = JSON.parse(body.toString('utf8')) as Record<string, unknown>;
+    return Buffer.from(JSON.stringify({ ...obj, model }), 'utf8');
+  } catch {
+    return body;
+  }
+}
+
+/** The `gko_at_` prefix is reserved for broker-minted access tokens, so its presence on
+ *  either credential header selects the broker mode deterministically (a virtual key
+ *  is `gk_`, never `gko_at_`). The bearer wins when both carry one. */
+function brokeredAccessToken(
+  bearer: string | undefined,
+  apiKey: string | undefined,
+): string | undefined {
+  if (bearer && bearer.startsWith('gko_at_')) return bearer;
+  if (apiKey && apiKey.startsWith('gko_at_')) return apiKey;
+  return undefined;
 }
 
 function bearerToken(request: FastifyRequest): string | undefined {

@@ -89,6 +89,27 @@ describe('NativeDetector', () => {
     expect(cats('visit https://acme.example.com/path?token=abc')).toContain('url');
   });
 
+  it('masks a URL quoted inside a JSON string without breaking the JSON', async () => {
+    // The url pattern must not swallow the backslash that escapes the closing quote:
+    // a masked request body has to stay a JSON object (the gateway mirrors it into
+    // its parsed view; a non-mirrorable mask is refused fail-closed).
+    const engine = new GuardrailEngine([new NativeDetector({})], {
+      input: { action: 'mask', minConfidence: 0.3 },
+      output: { action: 'audit' },
+    });
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'visit "https://acme.example.com/x?token=abc" now' }],
+    });
+    const r = await engine.inspectInput(body);
+    expect(r.transformedText).toBeDefined();
+    expect(r.summary.categories['url']).toBeGreaterThan(0);
+    const parsed = JSON.parse(r.transformedText!) as {
+      messages: Array<{ content: string }>;
+    };
+    expect(parsed.messages[0]!.content).toContain('<<GULLEY_URL_');
+    expect(parsed.messages[0]!.content).not.toContain('acme.example.com');
+  });
+
   it('boosts confidence when a category context word sits nearby', () => {
     const find = (text: string, category: string) =>
       det.detect(text).find((f) => f.category === category);

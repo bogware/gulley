@@ -9,7 +9,7 @@ import { InMemoryAesCipher } from '@gulley/crypto';
 import type { MaskVaultRecord } from '@gulley/storage';
 import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
 import { CacheEngine, InMemoryExactCache } from '@gulley/cache';
-import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
+import { GuardrailEngine, type GuardrailPlugin, NativeDetector } from '@gulley/guardrails';
 import { RequestMirror } from '@gulley/http-edge';
 import { RequestTracer } from './tracer';
 import { parseToolPolicy } from './tool-governance';
@@ -573,6 +573,22 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     });
     expect(badRes.status).toBe(401);
 
+    // The same token on `x-api-key` (Claude Code's ANTHROPIC_API_KEY channel) is the
+    // broker mode too — the reserved prefix selects it, never the header.
+    const apiKeyRes = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'gko_at_good.secret' },
+      body,
+    });
+    expect(apiKeyRes.status).toBe(200);
+    expect(ledger.entries[1]?.principalId).toBe('user_broker');
+    const apiKeyBad = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'gko_at_bad.secret' },
+      body,
+    });
+    expect(apiKeyBad.status).toBe(401);
+
     await app.close();
   });
 
@@ -1051,6 +1067,96 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     }).then((r) => r.text());
     // Near the cap, the expensive model is rewritten to the cheaper one upstream.
     expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5');
+    await app.close();
+  });
+
+  it('forwards the MASKED body when a budget downshift re-serializes the request', async () => {
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+    await budgets.reserve('ws_1', 'seed', 8_200_000);
+    await budgets.commit('ws_1', 'seed', 8_200_000); // 82% used — above the 0.8 threshold
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+    ctx.routes = [
+      {
+        ...ctx.routes[0]!,
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'contact jane@example.com please' }],
+      }),
+    }).then((r) => r.text());
+    // Downshifted AND still masked: the re-serialized body must not restore the PII.
+    const forwarded = JSON.parse(received.body) as { model: string };
+    expect(forwarded.model).toBe('claude-haiku-4-5');
+    expect(received.body).toContain('<<GULLEY_EMAIL_');
+    expect(received.body).not.toContain('jane@example.com');
+    await app.close();
+  });
+
+  it('refuses (422) a masked request that cannot be re-serialized instead of forwarding the original', async () => {
+    // A guardrail plugin whose masked output is not a JSON object cannot be mirrored
+    // into the parsed view; with a downshift armed, the old behaviour re-serialized the
+    // UNMASKED original upstream while the audit row said "mask". DLP fails closed.
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+    await budgets.reserve('ws_1', 'seed', 8_200_000);
+    await budgets.commit('ws_1', 'seed', 8_200_000); // downshift armed
+    const { ctx, audit, requestLog } = buildContext(store, budgets);
+    ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+    received = { body: '' }; // the capture is only written by an upstream request
+    const plugin: GuardrailPlugin = {
+      name: 'prose-masker',
+      async inspect(text) {
+        return {
+          action: 'masked',
+          findings: [
+            { category: 'email', start: 0, end: text.length, source: 'plugin', confidence: 0.9 },
+          ],
+          maskedText: 'REDACTED BY PROVIDER',
+        };
+      },
+    };
+    ctx.routes = [
+      {
+        ...ctx.routes[0]!,
+        guardrails: new GuardrailEngine(
+          [],
+          { input: { action: 'mask', minConfidence: 0.5 }, output: { action: 'audit' } },
+          plugin,
+        ),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'contact jane@example.com please' }],
+      }),
+    });
+    expect(res.status).toBe(422);
+    expect(received.body).toBe(''); // nothing reached the upstream
+    expect(audit.rows.some((r) => r.action === 'guardrail.transform_unforwardable')).toBe(true);
+    expect(requestLog.entries).toHaveLength(0); // never dispatched, like a 401/403 denial
+    // Nothing was reserved, so nothing leaks: the workspace is still at its seed usage.
+    expect(budgets.committed('ws_1')).toBe(8_200_000);
+    expect((await budgets.reserve('ws_1', 'probe', 1_800_000))?.allowed).toBe(true); // headroom intact
     await app.close();
   });
 
@@ -3745,6 +3851,174 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await new Promise<void>((r) => server.close(() => r()));
   });
 
+  it('asks an OpenAI-wire backend for stream usage on the client’s behalf so a passthrough stream is metered', async () => {
+    // A faithful OpenAI-compatible backend: it emits the final usage chunk ONLY when
+    // the request carried stream_options.include_usage (as the real API does). A
+    // client that omitted it used to stream unmetered ($0, reservation refunded).
+    const seenBodies: Array<Record<string, unknown>> = [];
+    const server = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', (c: Buffer) => (raw += c.toString('utf8')));
+      req.on('end', () => {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        seenBodies.push(parsed);
+        const includeUsage =
+          (parsed['stream_options'] as { include_usage?: boolean } | undefined)?.include_usage ===
+          true;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(
+          'data: {"id":"c","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}\n\n' +
+            'data: {"id":"c","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        );
+        if (includeUsage) {
+          res.write(
+            'data: {"id":"c","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n',
+          );
+        }
+        res.end('data: [DONE]\n\n');
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const route = (): ProviderRoute => ({
+      clientPaths: ['/v1/chat/completions'],
+      createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'usage-on-request',
+          provider: 'openai',
+          adapter: new AnthropicAdapter({ baseUrl: url }),
+          credential: { scheme: 'bearer', value: UPSTREAM_KEY },
+          upstreamPath: '/v1/chat/completions',
+        },
+      },
+    });
+    const send = async (base: string, token: string, body: Record<string, unknown>) => {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(200);
+      return res.text();
+    };
+    const chat = {
+      model: 'gpt-4o-mini',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+
+    // Default (inject on): the backend saw include_usage and the request was metered
+    // from the raw usage frame; the client's own stream_options are preserved.
+    {
+      const { store, token } = seededStore();
+      const { ctx, ledger } = buildContext(store);
+      ctx.routes = [route()];
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      const text = await send(base, token, { ...chat, stream_options: { other: 1 } });
+      expect(seenBodies.at(-1)?.['stream_options']).toEqual({ other: 1, include_usage: true });
+      expect(text).toContain('"usage"'); // the extra final chunk reaches the client unchanged
+      expect(ledger.entries).toHaveLength(1);
+      expect(ledger.entries[0]?.cost.inputTokens).toBe(11);
+      expect(ledger.entries[0]?.cost.outputTokens).toBe(7);
+      await app.close();
+    }
+    // Knob off: the body is forwarded verbatim (no stream_options) and the backend
+    // emits no usage — the pre-existing $0 behaviour an operator opts back into.
+    {
+      const { store, token } = seededStore();
+      const { ctx, ledger } = buildContext(store);
+      ctx.routes = [route()];
+      ctx.injectStreamUsage = false;
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      await send(base, token, chat);
+      expect(seenBodies.at(-1)?.['stream_options']).toBeUndefined();
+      expect(ledger.entries[0]?.cost.inputTokens ?? 0).toBe(0);
+      await app.close();
+    }
+    // A non-streamed request is never touched.
+    {
+      const { store, token } = seededStore();
+      const { ctx } = buildContext(store);
+      ctx.routes = [route()];
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      await send(base, token, { ...chat, stream: false });
+      expect(seenBodies.at(-1)?.['stream_options']).toBeUndefined();
+      await app.close();
+    }
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('injects stream usage AFTER a CEL body transform flips `stream` (ordering)', async () => {
+    // A faithful OpenAI-compatible backend: usage chunk only with include_usage.
+    const seen: Array<Record<string, unknown>> = [];
+    const server = http.createServer((req, res) => {
+      let raw = '';
+      req.on('data', (c: Buffer) => (raw += c.toString('utf8')));
+      req.on('end', () => {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        seen.push(parsed);
+        const includeUsage =
+          (parsed['stream_options'] as { include_usage?: boolean } | undefined)?.include_usage ===
+          true;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(
+          'data: {"id":"c","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n',
+        );
+        if (includeUsage) {
+          res.write(
+            'data: {"id":"c","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n',
+          );
+        }
+        res.end('data: [DONE]\n\n');
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/chat/completions'],
+        createExtractor: () => new OpenAIUsageExtractor(),
+        strategy: {
+          mode: 'single',
+          target: {
+            name: 'cel-stream',
+            provider: 'openai',
+            adapter: new AnthropicAdapter({ baseUrl: url }),
+            credential: { scheme: 'bearer', value: UPSTREAM_KEY },
+            upstreamPath: '/v1/chat/completions',
+          },
+        },
+      },
+    ];
+    // Operator policy: force streaming (e.g. for the inactivity watchdog).
+    ctx.transformer = new CelTransformer(
+      { requestBody: [{ field: 'stream', value: 'true' }] },
+      { declaredVars: ['request', 'principal'] },
+    );
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    // The client did NOT ask to stream; CEL did — and the injection still saw it.
+    expect(seen.at(-1)?.['stream']).toBe(true);
+    expect(seen.at(-1)?.['stream_options']).toEqual({ include_usage: true });
+    expect(ledger.entries[0]?.cost.inputTokens).toBe(5);
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
   it('redacts a secret in a streamed Anthropic response (windowed in-stream enforcement)', async () => {
     const { app, base, server, ledger, token } = await streamEnforceRoute(
       [
@@ -4884,6 +5158,56 @@ describe('cascade routing', () => {
 
     await app.close();
     await up.close();
+  });
+
+  it('escalates with the MASKED body, never the pre-guardrail copy', async () => {
+    const bodies: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        bodies.push(b);
+        const model = String((JSON.parse(b) as { model?: string }).model ?? '');
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(model.includes('haiku') ? REFUSAL_SSE : STRONG_SSE);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    armCascade(ctx, url);
+    ctx.routes = [
+      {
+        ...ctx.routes[0]!,
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'contact jane@example.com about the hard question' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(bodies).toHaveLength(2); // tier-0 then the escalation
+    for (const b of bodies) {
+      expect(b).toContain('<<GULLEY_EMAIL_');
+      expect(b).not.toContain('jane@example.com');
+    }
+    expect((JSON.parse(bodies[1]!) as { model: string }).model).toBe('claude-sonnet-4-6');
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
   });
 
   it('does NOT escalate when the cheap model answers adequately', async () => {
