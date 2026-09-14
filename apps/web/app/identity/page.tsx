@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useState } from 'react';
 import {
   Button,
@@ -15,6 +16,7 @@ import {
   PageHeader,
   Panel,
   PanelHeader,
+  SegmentedControl,
   Select,
   Spinner,
   StatusChip,
@@ -24,7 +26,16 @@ import { isNotConfigured } from '../../lib/api';
 import { useAdmin } from '../../lib/admin-context';
 import { formatTime } from '../../lib/format';
 import { useAdminQuery } from '../../lib/hooks';
-import type { AdminSessionInfo, Membership, OAuthClient, OAuthGrant } from '../../lib/types';
+import type {
+  AdminSessionInfo,
+  ClientAgent,
+  ClientAuthMode,
+  DeviceCodeView,
+  GeneratedClientConfig,
+  Membership,
+  OAuthClient,
+  OAuthGrant,
+} from '../../lib/types';
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 type Tab = 'people' | 'access' | 'oauth' | 'onboarding';
@@ -296,8 +307,19 @@ function OAuthTab() {
   const { api } = useAdmin();
   const clients = useAdminQuery((a) => a.oauthClients(), []);
   const grants = useAdminQuery((a) => a.oauthGrants(), []);
+  const devices = useAdminQuery((a) => a.oauthDeviceCodes(), []);
   const reuse = useAdminQuery((a) => a.refreshReuse(), []);
+  const workspaces = useAdminQuery((a) => a.workspaces(), []);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [draft, setDraft] = useState({
+    clientId: 'claude-code',
+    name: 'Claude Code',
+    workspaceId: '',
+    device: true,
+    authCode: false,
+    redirects: '/callback',
+  });
+  const [saving, setSaving] = useState(false);
 
   if (clients.error && isNotConfigured(clients.error)) {
     return (
@@ -323,6 +345,136 @@ function OAuthTab() {
           affected token families were auto-revoked.
         </InlineResult>
       ) : null}
+
+      <Panel>
+        <PanelHeader
+          title="Device consent"
+          meta="RFC 8628"
+          right={
+            <Link href="/oauth/device" className="text-[11.5px] text-ink underline">
+              Open the consent page
+            </Link>
+          }
+        />
+        <div className="p-3.5 text-[11.5px] leading-[1.7] text-body">
+          A developer runs <span className="font-mono text-ink">gulley login</span>; the agent shows
+          a code and this console&apos;s <span className="font-mono text-ink">/oauth/device</span>{' '}
+          page. Approving binds a short-lived token family to the approver&apos;s identity — Claude
+          Code and Codex then fetch tokens through{' '}
+          <span className="font-mono text-ink">gulley token</span>.
+          {(devices.data?.deviceCodes.filter((d: DeviceCodeView) => d.status === 'pending')
+            .length ?? 0) > 0 ? (
+            <div className="mt-2">
+              <StatusChip tone="blue">
+                {devices.data?.deviceCodes.filter((d) => d.status === 'pending').length} pending
+                authorization(s)
+              </StatusChip>
+            </div>
+          ) : null}
+        </div>
+      </Panel>
+
+      <Panel>
+        <PanelHeader title="Register a client" meta="which agent may ask for tokens" />
+        <form
+          className="grid grid-cols-1 gap-3 p-3.5 md:grid-cols-2"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (!api || !draft.workspaceId) return;
+            const ws = workspaces.data?.workspaces.find((w) => w.id === draft.workspaceId);
+            if (!ws) return;
+            setSaving(true);
+            setError(undefined);
+            try {
+              await api.saveOAuthClient({
+                clientId: draft.clientId.trim(),
+                name: draft.name.trim(),
+                orgId: ws.orgId,
+                workspaceId: ws.id,
+                grantTypes: [
+                  ...(draft.device ? ['device_code'] : []),
+                  ...(draft.authCode ? ['authorization_code'] : []),
+                  'refresh_token',
+                ],
+                redirectAllowlist: draft.redirects
+                  .split(',')
+                  .map((r) => r.trim())
+                  .filter(Boolean),
+                enabled: true,
+              });
+              clients.refetch();
+            } catch (err) {
+              setError(msg(err));
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          <Field label="Client id">
+            <Input
+              value={draft.clientId}
+              onChange={(e) => setDraft({ ...draft, clientId: e.target.value })}
+              placeholder="claude-code"
+            />
+          </Field>
+          <Field label="Display name">
+            <Input
+              value={draft.name}
+              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+              placeholder="Claude Code"
+            />
+          </Field>
+          <Field label="Workspace (tenancy the tokens are scoped to)">
+            <Select
+              value={draft.workspaceId}
+              onChange={(e) => setDraft({ ...draft, workspaceId: e.target.value })}
+            >
+              <option value="">workspace…</option>
+              {workspaces.data?.workspaces.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Loopback redirect paths (auth-code + PKCE)">
+            <Input
+              value={draft.redirects}
+              onChange={(e) => setDraft({ ...draft, redirects: e.target.value })}
+              placeholder="/callback"
+            />
+          </Field>
+          <div className="flex items-center gap-4 text-[11.5px] text-body">
+            <label className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={draft.device}
+                onChange={(e) => setDraft({ ...draft, device: e.target.checked })}
+              />
+              device flow (CLI / headless)
+            </label>
+            <label className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={draft.authCode}
+                onChange={(e) => setDraft({ ...draft, authCode: e.target.checked })}
+              />
+              auth-code + PKCE
+            </label>
+          </div>
+          <div className="flex justify-end">
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={
+                saving || !draft.clientId.trim() || !draft.name.trim() || !draft.workspaceId
+              }
+            >
+              {saving ? 'Saving…' : 'Register client'}
+            </Button>
+          </div>
+        </form>
+      </Panel>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Panel className="overflow-hidden">
@@ -448,9 +600,12 @@ function OnboardingTab() {
   const { api } = useAdmin();
   const workspaces = useAdminQuery((a) => a.workspaces(), []);
   const [ws, setWs] = useState('');
-  const [config, setConfig] = useState<unknown>(null);
+  const [agent, setAgent] = useState<ClientAgent>('claude-code');
+  const [auth, setAuth] = useState<ClientAuthMode>('oauth');
+  const [config, setConfig] = useState<GeneratedClientConfig | null>(null);
   const [pack, setPack] = useState<unknown>(null);
   const [error, setError] = useState<string | undefined>(undefined);
+  const opts = { agent, auth };
 
   return (
     <div className="flex flex-col gap-4">
@@ -470,6 +625,24 @@ function OnboardingTab() {
             </Select>
           }
         />
+        <div className="flex flex-wrap items-center gap-3 px-3.5 pt-3.5">
+          <SegmentedControl<ClientAgent>
+            value={agent}
+            onChange={setAgent}
+            options={[
+              { value: 'claude-code', label: 'Claude Code' },
+              { value: 'codex', label: 'Codex' },
+            ]}
+          />
+          <SegmentedControl<ClientAuthMode>
+            value={auth}
+            onChange={setAuth}
+            options={[
+              { value: 'oauth', label: 'OAuth (device login)' },
+              { value: 'virtual-key', label: 'Virtual key' },
+            ]}
+          />
+        </div>
         <div className="flex gap-2 p-3.5">
           <Button
             disabled={!ws}
@@ -477,7 +650,7 @@ function OnboardingTab() {
               if (!api || !ws) return;
               setError(undefined);
               try {
-                setConfig(await api.clientConfig(ws));
+                setConfig((await api.clientConfig(ws, opts)).config);
               } catch (e) {
                 setError(
                   isNotConfigured(msg(e)) ? 'Client config needs GATEWAY_PUBLIC_URL.' : msg(e),
@@ -493,7 +666,7 @@ function OnboardingTab() {
               if (!api || !ws) return;
               setError(undefined);
               try {
-                setPack(await api.onboardingPack(ws));
+                setPack(await api.onboardingPack(ws, opts));
               } catch (e) {
                 setError(isNotConfigured(msg(e)) ? 'Onboarding pack needs a signing key.' : msg(e));
               }
@@ -506,9 +679,19 @@ function OnboardingTab() {
 
       {config ? (
         <Panel>
-          <PanelHeader title="Client config" />
+          <PanelHeader
+            title={`Client config — ${config.path}`}
+            meta={config.auth === 'oauth' ? 'OAuth device login' : 'virtual key'}
+          />
           <div className="p-3">
-            <CodeBlock className="max-h-[280px]">{JSON.stringify(config, null, 2)}</CodeBlock>
+            <CodeBlock className="max-h-[280px]">{config.content}</CodeBlock>
+            <ul className="mt-3 list-disc pl-5 text-[11.5px] leading-[1.7] text-body">
+              {config.notes.map((n) => (
+                <li key={n} className="font-mono">
+                  {n}
+                </li>
+              ))}
+            </ul>
           </div>
         </Panel>
       ) : null}

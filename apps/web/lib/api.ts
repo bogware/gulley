@@ -10,7 +10,11 @@ import type {
   CollectionKind,
   ConfigVersion,
   CryptoShredState,
+  ClientConfigOptions,
+  DeviceCodePreview,
   DeviceCodeView,
+  GeneratedClientConfig,
+  OAuthMetadata,
   DriftReport,
   EvalSuite,
   GatewayMetricsSummary,
@@ -446,19 +450,37 @@ export class GulleyAdminApi {
   oauthDeviceCodes() {
     return this.req<{ deviceCodes: DeviceCodeView[] }>('GET', '/admin/oauth/device-codes');
   }
+  // --- device-flow consent (the broker's /oauth/device page, console edition) ---
+  deviceCodePreview(userCode: string) {
+    return this.req<DeviceCodePreview>(
+      'GET',
+      `/oauth/device/preview?user_code=${encodeURIComponent(userCode)}`,
+    );
+  }
+  approveDeviceCode(userCode: string) {
+    return this.req<{ approved: boolean }>('POST', '/oauth/device/authorize', {
+      user_code: userCode,
+    });
+  }
+  denyDeviceCode(userCode: string) {
+    return this.req<{ denied: boolean }>('POST', '/oauth/device/deny', { user_code: userCode });
+  }
+  oauthMetadata() {
+    return this.req<OAuthMetadata>('GET', '/.well-known/oauth-authorization-server');
+  }
   refreshReuse() {
     return this.req<{ alerts: ReuseAlert[] }>('GET', '/admin/security/refresh-reuse');
   }
-  clientConfig(workspaceId: string) {
-    return this.req<Record<string, unknown>>(
+  clientConfig(workspaceId: string, opts: ClientConfigOptions = {}) {
+    return this.req<{ config: GeneratedClientConfig }>(
       'GET',
-      `/admin/workspaces/${encodeURIComponent(workspaceId)}/client-config`,
+      `/admin/workspaces/${encodeURIComponent(workspaceId)}/client-config${this.qs(opts)}`,
     );
   }
-  onboardingPack(workspaceId: string) {
+  onboardingPack(workspaceId: string, opts: ClientConfigOptions = {}) {
     return this.req<Record<string, unknown>>(
       'GET',
-      `/admin/workspaces/${encodeURIComponent(workspaceId)}/onboarding-pack`,
+      `/admin/workspaces/${encodeURIComponent(workspaceId)}/onboarding-pack${this.qs(opts)}`,
     );
   }
 }

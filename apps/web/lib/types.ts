@@ -290,6 +290,41 @@ export interface DeviceCodeView {
   displayName?: string;
   expiresAt: string;
 }
+/** Consent-page preview of a pending device authorization (secret-free). */
+export interface DeviceCodePreview {
+  userCode: string;
+  clientId: string;
+  clientName: string;
+  orgId: string;
+  orgName?: string;
+  workspaceId: string;
+  workspaceName?: string;
+  expiresAt: string;
+}
+/** RFC 8414 metadata published by the broker (+ Gulley's consent-page extension). */
+export interface OAuthMetadata {
+  issuer: string;
+  token_endpoint: string;
+  device_authorization_endpoint: string;
+  revocation_endpoint: string;
+  device_verification_uri?: string;
+}
+export type ClientAgent = 'claude-code' | 'codex';
+export type ClientAuthMode = 'virtual-key' | 'oauth';
+export interface ClientConfigOptions {
+  agent?: ClientAgent;
+  auth?: ClientAuthMode;
+  clientId?: string;
+  profile?: string;
+}
+export interface GeneratedClientConfig {
+  agent: ClientAgent;
+  auth: ClientAuthMode;
+  path: string;
+  format: 'json' | 'toml';
+  content: string;
+  notes: string[];
+}
 export interface ReuseAlert {
   seq: number;
   handle: string;
