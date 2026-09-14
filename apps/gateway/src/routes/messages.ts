@@ -795,7 +795,7 @@ async function handleProxy(
       // BEFORE authz/rate-limit/input-guardrails run — so a masking guardrail does
       // not cover the classifier sub-call, and it is not rate-limited. Use
       // `rules-then-llm` with local rules (no egress) where that matters. See
-      // docs/M15_SMART_ROUTING.md.
+      // the smart-routing design in docs/ARCHITECTURE.md.
       void meterClassifierSpend(
         ctx,
         {
