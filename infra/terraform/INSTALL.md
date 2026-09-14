@@ -99,9 +99,15 @@ aws ecr get-login-password --region "$AWS_REGION" \
 ( cd ../.. && docker buildx build --platform linux/arm64 \
     -f apps/gateway/Dockerfile -t "$ECR_API:latest" --push . )
 
+# The console proxies /control/* to the control-api at BUILD time (Next.js bakes the
+# rewrite destination), so the api host MUST be passed as a build arg:
 ( cd ../.. && docker buildx build --platform linux/arm64 \
+    --build-arg CONTROL_API_URL="https://$API_DOMAIN" \
     -f apps/web/Dockerfile     -t "$ECR_WEB:latest" --push . )
 ```
+
+(Host is x86_64? Set `cpu_architecture = "X86_64"` in tfvars and build
+`--platform linux/amd64` — native builds are much faster than QEMU cross-builds.)
 
 (`ci/build-image.sh` does the API build with SBOM/provenance + cosign signing for
 CI; `SKIP_SIGN=1` for a local build. The plain buildx commands above are fine for a
@@ -186,9 +192,24 @@ curl -fsS -H "authorization: Bearer $ADMIN_TOKEN" "$API/admin/status" | head -c 
 curl -fsS -o /dev/null -w '%{http_code}\n' "$CONSOLE"   # web console -> 200
 ```
 
-Then open `$CONSOLE`, paste `ADMIN_TOKEN` into the sign-in gate. Send a real LLM
-request through the gateway with a **virtual key** minted in the console (Keys page),
-pointing your client's base URL at `$API` (Anthropic Messages: `POST $API/v1/messages`).
+Then open `$CONSOLE`, paste `ADMIN_TOKEN` into the sign-in gate. Create an org and a
+workspace (Orgs & workspaces — they are written through to Postgres and survive a
+restart), mint a **virtual key** (Keys page), and send a real LLM request through the
+gateway pointing your client's base URL at `$API` (Anthropic Messages:
+`POST $API/v1/messages`).
+
+**Coding-harness OAuth** (on by default: `enable_oauth_broker = true`): register a
+client under Identity → OAuth broker, then on a developer machine run
+`pnpm gulley login --broker $API --client claude-code`, approve the code at
+`$CONSOLE/oauth/device`, and point Claude Code / Codex at the gateway with the config
+from Identity → Onboarding (auth = OAuth). Runbook: `docs/HARNESS_OAUTH.md`.
+
+Signed onboarding packs need an Ed25519 key: set `enable_onboarding_packs = true`,
+then populate the extra secret in step 5:
+
+```sh
+put gulley/onboarding-signing-key "$(openssl genpkey -algorithm ed25519)"
+```
 
 ## 9. Teardown (clean, complete)
 

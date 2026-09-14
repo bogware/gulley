@@ -211,7 +211,13 @@ locals {
   ecs_stop_timeout_seconds = 120
   shutdown_grace_ms        = (local.ecs_stop_timeout_seconds - 10) * 1000
 
-  gateway_env = {
+  # Gateway-brokered OAuth inference auth: BOTH planes carry the flag (the control-api
+  # mints gko_at_ tokens; the gateway verifies them against the shared grant table with
+  # the same key pepper). Extra env maps let an operator add any documented knob
+  # (.env.example) without editing the module.
+  oauth_env = var.enable_oauth_broker ? { OAUTH_BROKER_ENABLED = "true" } : {}
+
+  gateway_env = merge({
     NODE_ENV           = "production"
     GATEWAY_PORT       = tostring(local.ports.gateway)
     BEDROCK_REGION     = var.aws_region
@@ -219,7 +225,7 @@ locals {
     REDIS_CACHE_URL    = "rediss://${local.redis_endpoints["cache"]}:6379"
     REDIS_COUNTERS_URL = "rediss://${local.redis_endpoints["counters"]}:6379"
     REDIS_VECTOR_URL   = "rediss://${local.redis_endpoints["vector"]}:6379"
-  }
+  }, local.oauth_env, var.gateway_extra_env)
   gateway_secrets = {
     GULLEY_KEY_PEPPER          = aws_secretsmanager_secret.this["gulley/key-pepper"].arn
     DATABASE_URL               = aws_secretsmanager_secret.this["gulley/db-url"].arn
@@ -229,19 +235,26 @@ locals {
   }
 
   control_env = merge({
-    NODE_ENV           = "production"
-    CONTROL_API_PORT   = tostring(local.ports.control)
-    GATEWAY_PUBLIC_URL = local.api_base_url
-    SHUTDOWN_GRACE_MS  = tostring(local.shutdown_grace_ms)
+    NODE_ENV         = "production"
+    CONTROL_API_PORT = tostring(local.ports.control)
+    # The gateway + control-api share the api host; the console is the base host. The
+    # control-api needs all three: client configs point agents at the gateway, the OAuth
+    # broker publishes its issuer (RFC 8414), and device-flow consent goes to the console.
+    GATEWAY_PUBLIC_URL     = local.api_base_url
+    CONTROL_API_PUBLIC_URL = local.api_base_url
+    CONSOLE_PUBLIC_URL     = var.enable_web ? local.base_url : local.api_base_url
+    SHUTDOWN_GRACE_MS      = tostring(local.shutdown_grace_ms)
     }, var.bootstrap_admin_token_sha256 != "" ? {
     CONTROL_API_BOOTSTRAP_ENABLED       = "true"
     GULLEY_BOOTSTRAP_ADMIN_TOKEN_SHA256 = var.bootstrap_admin_token_sha256
-  } : {})
-  control_secrets = {
+  } : {}, local.oauth_env, var.control_extra_env)
+  control_secrets = merge({
     GULLEY_KEY_PEPPER           = aws_secretsmanager_secret.this["gulley/key-pepper"].arn
     GULLEY_ADMIN_SESSION_SECRET = aws_secretsmanager_secret.this["gulley/admin-session-secret"].arn
     DATABASE_URL                = aws_secretsmanager_secret.this["gulley/db-url"].arn
-  }
+    }, var.enable_onboarding_packs ? {
+    ONBOARDING_SIGNING_KEY = aws_secretsmanager_secret.this["gulley/onboarding-signing-key"].arn
+  } : {})
 
   web_env = {
     NODE_ENV        = "production"

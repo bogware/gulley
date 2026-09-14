@@ -132,12 +132,13 @@ locals {
   worm_bucket_name = "${var.name}-audit-worm-${local.account_id}"
   worm_bucket_arn  = "arn:aws:s3:::${local.worm_bucket_name}"
 
-  secret_names = [
+  secret_names = concat([
     "gulley/key-pepper",
     "gulley/admin-session-secret",
     "gulley/db-url",
     "gulley/provider-anthropic",
     "gulley/provider-openai",
     "gulley/provider-bedrock",
-  ]
+    # Ed25519 PEM that signs onboarding packs (populate it like the others; see INSTALL.md).
+  ], var.enable_onboarding_packs ? ["gulley/onboarding-signing-key"] : [])
 }

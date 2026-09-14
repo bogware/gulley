@@ -275,3 +275,29 @@ variable "log_retention_days" {
   type        = number
   default     = null
 }
+
+# --- coding-harness OAuth + operator escape hatches -------------------------
+
+variable "enable_oauth_broker" {
+  description = "Mount the gateway-brokered OAuth surface (device + auth-code/PKCE) on the control-api and accept gko_at_ tokens on the gateway. Needs the DB + key pepper (always present here)."
+  type        = bool
+  default     = true
+}
+
+variable "enable_onboarding_packs" {
+  description = "Create the gulley/onboarding-signing-key secret (an Ed25519 private key PEM you populate) and wire it as ONBOARDING_SIGNING_KEY so signed onboarding packs are served."
+  type        = bool
+  default     = false
+}
+
+variable "gateway_extra_env" {
+  description = "Additional plain (non-secret) environment for the gateway task — any knob documented in .env.example."
+  type        = map(string)
+  default     = {}
+}
+
+variable "control_extra_env" {
+  description = "Additional plain (non-secret) environment for the control-api task — any knob documented in .env.example."
+  type        = map(string)
+  default     = {}
+}
