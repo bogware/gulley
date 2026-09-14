@@ -110,6 +110,10 @@ developers run `pnpm gulley login` — Claude Code and Codex then fetch tokens t
 
 ## Deploy
 
+The release image is published multi-arch (amd64 + arm64) at
+**`ghcr.io/bogware/gulley`**, cosign-signed with an SBOM + SLSA provenance
+(`docker pull ghcr.io/bogware/gulley` — [how to verify](docs/SUPPLY_CHAIN.md)).
+
 - **AWS (Terraform)** — one adaptable module, `test` and `prod` tiers, with an exact
   agent/operator runbook: [`infra/terraform/INSTALL.md`](infra/terraform/INSTALL.md).
 - **Kubernetes** — [`deploy/helm/gulley`](deploy/helm/gulley).

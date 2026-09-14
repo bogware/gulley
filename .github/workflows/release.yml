@@ -1,8 +1,8 @@
 name: Release
 
-# Manual or tag-driven only — never scheduled, never on pull_request. Only these
-# TRUSTED (non-fork) jobs may run on a self-hosted runner if you choose to; they
-# are gated to the upstream repo so a fork can never reach the credentialed steps.
+# Manual or tag-driven only — never scheduled, never on pull_request. These are
+# TRUSTED (non-fork) jobs; every credentialed job is gated to the upstream repo so a
+# fork can never reach the credentialed steps. See docs/CI_SECURITY.md.
 on:
   workflow_dispatch:
     inputs:
@@ -13,23 +13,72 @@ on:
   push:
     tags: ['v*']
 
+# Least privilege by default; each job elevates only what it needs.
 permissions:
   contents: read
-  id-token: write # OIDC federation to AWS (no long-lived keys)
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false # never interrupt a deploy mid-push
-
-env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  cancel-in-progress: false # never interrupt a publish mid-push
 
 jobs:
-  image:
-    # Trusted-only: never run the credentialed build on a fork.
+  # ── Public image → GitHub Container Registry (GHCR) ───────────────────────────
+  # Multi-arch (amd64+arm64), SBOM + provenance, keyless cosign signature. Auth is
+  # the job's GITHUB_TOKEN (no external credentials), so this is the artifact public
+  # self-hosters pull. Scanned BEFORE the multi-arch publish.
+  ghcr:
     if: github.repository == 'bogware/gulley'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io/bogware/gulley
+      id-token: write # cosign keyless (OIDC), transparency-logged in Rekor
+    env:
+      IMAGE: ghcr.io/bogware/gulley
+      TAG: ${{ inputs.image_tag || github.ref_name }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build amd64 image locally for scanning
+        run: |
+          docker buildx build --platform linux/amd64 \
+            --file apps/gateway/Dockerfile --load --tag gulley-scan:${{ env.TAG }} .
+      - name: Scan image (fail on HIGH/CRITICAL) before publishing
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
+        with:
+          image-ref: gulley-scan:${{ env.TAG }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+      - name: Build + push multi-arch (SBOM + provenance + cosign) to GHCR
+        id: build
+        env:
+          IMAGE_TAG: ${{ env.TAG }}
+          PLATFORMS: linux/amd64,linux/arm64
+          TAG_LATEST: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+        run: bash ci/build-image.sh
+
+  # ── Private image → ECR (AWS deploy path; opt-in) ────────────────────────────
+  # Only runs when a repo variable ECR_REPOSITORY is set, so the public release
+  # never fails on missing AWS configuration. ARM64 (the documented Fargate target).
+  ecr:
+    if: github.repository == 'bogware/gulley' && vars.ECR_REPOSITORY != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC federation to AWS (no long-lived keys)
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
@@ -50,9 +99,59 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
 
-  # IaC sanity at release time: format + validate the single Terraform module. A
-  # real prod `terraform plan/apply` is operator-driven with your own backend +
-  # tfvars (see infra/terraform/INSTALL.md), so this step needs no cloud creds.
+  # ── GitHub Release (tag pushes only) ─────────────────────────────────────────
+  # Publishes a Release whose notes are the CHANGELOG section for the tag, and
+  # attaches the image SBOM (best effort). Uses the first-party gh CLI.
+  github-release:
+    if: github.repository == 'bogware/gulley' && startsWith(github.ref, 'refs/tags/v')
+    needs: ghcr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the Release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      DIGEST: ${{ needs.ghcr.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Extract CHANGELOG notes for the tag
+        run: |
+          VER="${TAG#v}"
+          awk -v ver="$VER" '
+            $0 ~ ("^## \\[" ver "\\]") { grab=1; next }
+            grab && /^## / { exit }
+            grab { print }
+          ' CHANGELOG.md > /tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "No CHANGELOG section for $VER; using a generic note."
+            printf 'Release %s. See CHANGELOG.md.\n' "$TAG" > /tmp/notes.md
+          fi
+          {
+            echo ''
+            echo '## Container image'
+            echo ''
+            echo '```'
+            echo "docker pull ghcr.io/bogware/gulley:${TAG}"
+            echo "# digest: ${DIGEST}"
+            echo '```'
+            echo ''
+            echo 'The image is multi-arch (amd64+arm64), carries SBOM + provenance attestations, and is cosign-signed. See docs/SUPPLY_CHAIN.md to verify.'
+          } >> /tmp/notes.md
+      - name: Attach SBOM (best effort)
+        continue-on-error: true
+        run: |
+          docker buildx imagetools inspect "ghcr.io/bogware/gulley@${DIGEST}" \
+            --format '{{ json .SBOM }}' > sbom.spdx.json || true
+          if [ -s sbom.spdx.json ]; then echo "SBOM extracted"; else rm -f sbom.spdx.json; fi
+      - name: Create GitHub Release
+        run: |
+          assets=()
+          [ -f sbom.spdx.json ] && assets+=(sbom.spdx.json)
+          gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md --verify-tag "${assets[@]}"
+
+  # IaC sanity at release time: fmt + validate the single Terraform module. A real
+  # prod plan/apply is operator-driven with your own backend + tfvars (see
+  # infra/terraform/INSTALL.md), so this needs no cloud creds.
   terraform-validate:
     if: github.repository == 'bogware/gulley'
     runs-on: ubuntu-latest

@@ -13,6 +13,37 @@ Every released image carries three artifacts, produced by the shared
 
 The image is also scanned with Trivy (build fails on fixable HIGH/CRITICAL).
 
+## The public image (GHCR)
+
+The public release image is multi-arch (`linux/amd64` + `linux/arm64`) and lives at
+`ghcr.io/bogware/gulley`, built and signed by `.github/workflows/release.yml` on a
+`v*` tag:
+
+```bash
+docker pull ghcr.io/bogware/gulley:v0.3.0     # or :latest
+```
+
+Verify the signature and inspect the attestations by digest before running it:
+
+```bash
+IMAGE=ghcr.io/bogware/gulley:v0.3.0
+DIGEST="ghcr.io/bogware/gulley@$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')"
+
+# 1) Signature: assert it was signed by THIS repo's release workflow via GitHub OIDC.
+cosign verify \
+  --certificate-identity-regexp '^https://github.com/bogware/gulley/\.github/workflows/release\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$DIGEST"
+
+# 2) SBOM + SLSA provenance attestations (attached by buildx).
+docker buildx imagetools inspect "$DIGEST" --format '{{ json .SBOM }}'
+docker buildx imagetools inspect "$DIGEST" --format '{{ json .Provenance }}'
+```
+
+Pin the identity to `bogware/gulley` so a signature from any other repo/workflow is
+rejected — the basis for a cluster admission policy that only runs images this
+pipeline built and signed.
+
 ## Verifying a deployment
 
 Before (or in admission control for) a deploy, verify the signature and inspect
