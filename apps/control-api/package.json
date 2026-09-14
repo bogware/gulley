@@ -37,7 +37,7 @@
     "@gulley/redact": "workspace:*",
     "@gulley/storage": "workspace:*",
     "@gulley/worm": "workspace:*",
-    "drizzle-orm": "^0.38.2",
+    "drizzle-orm": "^0.45.2",
     "fastify": "^5.2.0",
     "zod": "^3.24.1"
   },
