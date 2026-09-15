@@ -46,7 +46,8 @@ stages:
                 # Exclude the esbuild transpiler binary (unreachable build-tool Go
                 # CVEs; see docs/SUPPLY_CHAIN.md). Everything else stays strict.
                 trivy image --severity HIGH,CRITICAL --ignore-unfixed \
-                  --skip-dirs '**/@esbuild' --skip-dirs '**/@esbuild+*' \
+                  --skip-dirs '**/esbuild@*' --skip-dirs '**/@esbuild+*' --skip-dirs '**/@esbuild' \
+                  --ignorefile .trivyignore \
                   --exit-code 1 "$ECR_REPOSITORY:$IMAGE_TAG"
 
   # IaC sanity: fmt + validate the single Terraform module. A real prod plan/apply

@@ -7,7 +7,8 @@
 #   docker buildx build --platform linux/arm64 -f apps/gateway/Dockerfile .
 FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
-RUN corepack enable
+# Pull Debian security fixes into the base layer, then enable pnpm.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* && corepack enable
 WORKDIR /app
 
 FROM base AS deps

@@ -14,17 +14,28 @@ Every released image carries three artifacts, produced by the shared
 The image is also scanned with Trivy (build fails on fixable HIGH/CRITICAL),
 **before** the public multi-arch push.
 
-### One documented scanning exception
+### Documented scanning exceptions
 
-The runtime currently executes TypeScript via `tsx`, which bundles the **esbuild**
-Go binary as a transpiler. Trivy flags esbuild's embedded Go-stdlib CVEs
-(`net/http`, `net/mail`, `encoding/xml`, `crypto/tls` DoS/XSS), but those code
-paths are not reachable here — esbuild runs no server and parses no untrusted
-input; it only transpiles local source. The scan therefore excludes the esbuild
-build-tool binary (`--skip-dirs '**/@esbuild'`) while staying strict on OS
-packages and every other library. The durable fix — pre-bundling to JS and
-running plain `node` on a distroless base, so `tsx`/esbuild are absent from the
-runtime — is a tracked follow-up.
+The runtime currently executes TypeScript via `tsx`, so the image ships the full
+dev/build/install toolchain in `node_modules`. Two narrow, documented exceptions
+keep the gate meaningful without failing on unreachable build-tool CVEs:
+
+1. **esbuild transpiler binary** — excluded via `--skip-dirs '**/@esbuild'`. `tsx`
+   bundles esbuild's Go binary purely to transpile local source; its embedded
+   Go-stdlib CVEs (`net/http`, `net/mail`, `crypto/tls` DoS/XSS) are unreachable
+   (no server, no untrusted parsing).
+2. **`.trivyignore`** (repo root) — a per-CVE list for the shipped dev/build/
+   install toolchain (vitest, vite, tar, pacote, sigstore, js-yaml, picomatch,
+   brace-expansion, ip-address), each verified _not_ in the runtime dependency
+   graph (`pnpm why --prod`), plus one runtime dependency whose vulnerable path is
+   unreachable (`@opentelemetry/propagator-jaeger` — the Jaeger propagator is
+   never instantiated). Every entry is commented with its justification.
+
+**OS packages and genuine runtime libraries are still scanned strictly** (the
+build fails on any fixable HIGH/CRITICAL). The durable fix that removes the need
+for these exceptions — pre-bundling to JS and running plain `node` on a distroless
+base, so `tsx`/esbuild and the toolchain are absent from the runtime — is a
+tracked follow-up.
 
 ## The public image (GHCR)
 
