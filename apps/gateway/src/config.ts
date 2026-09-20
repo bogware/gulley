@@ -1,15 +1,35 @@
 import { z } from 'zod';
 
-/** Env booleans: unset -> default; otherwise truthy only for 1/true/yes/on.
+/** Env booleans: unset (or empty) -> default; otherwise truthy only for 1/true/yes/on.
  *  (z.coerce.boolean treats any non-empty string as true, including "false".) */
 const envBool = (def: boolean) =>
   z.preprocess(
     (v) =>
-      v === undefined ? def : typeof v === 'string' ? /^(1|true|yes|on)$/i.test(v) : Boolean(v),
+      v === undefined || (typeof v === 'string' && v.trim() === '')
+        ? def
+        : typeof v === 'string'
+          ? /^(1|true|yes|on)$/i.test(v)
+          : Boolean(v),
     z.boolean(),
   );
 
-const Env = z.object({
+/**
+ * Drop unset AND empty-string entries before validation. Compose `env_file`, Helm
+ * templates and ECS task definitions all render an unset value as `KEY=` (an empty
+ * string), which Zod would otherwise treat as a *present* value: a `.default()` never
+ * applies, `z.coerce.number()` turns "" into 0 (sweeps/polls silently off, thresholds
+ * silently 0), and a `.min(1)`/`.url()` string fails boot with a ZodError instead of
+ * the intended health-only degrade. Whitespace-only values are treated the same way.
+ */
+export function normalizeEnv(source: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(source)) {
+    if (typeof v === 'string' && v.trim() !== '') out[k] = v;
+  }
+  return out;
+}
+
+const EnvShape = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   // Air-gapped deployment: fail-closed egress. Any guarded outbound call without an
@@ -312,8 +332,14 @@ const Env = z.object({
   // has passed, on an unref'd timer (0 = off). Only active when MASK_VAULT_PERSIST is on.
   MASK_VAULT_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(3600),
   // KMS key ARN that wraps the mask-vault data keys (ARN only, never a value). Absent
-  // in dev ⇒ the in-memory AES cipher (same envelope shape). Region = BEDROCK_REGION.
+  // in dev ⇒ the in-memory AES cipher (same envelope shape). In production with
+  // MASK_VAULT_PERSIST on, the ARN is REQUIRED: the in-memory cipher's keys are
+  // per-process, so rows it wrote could never be revealed by the control plane.
   GULLEY_KMS_KEY_ARN: z.string().optional(),
+  // Region of the KMS client used for the mask-vault envelope. Must match the
+  // control-api's GULLEY_KMS_REGION (it decrypts the same rows). Defaults to
+  // BEDROCK_REGION for backward compatibility.
+  GULLEY_KMS_REGION: z.string().optional(),
   // BYOK crypto-shred: when on (with MASK_VAULT_PERSIST + DATABASE_URL), each mask-vault
   // record is encrypted under a per-subject key (subject = the virtual key's principal)
   // held wrapped by GULLEY_KMS_KEY_ARN, so the control plane can crypto-shred one
@@ -560,10 +586,61 @@ const Env = z.object({
   EMBEDDINGS_BASE_URL: z.string().url().default('https://api.openai.com'),
   EMBEDDINGS_MODEL: z.string().default('text-embedding-3-small'),
   EMBEDDINGS_DIMENSIONS: z.coerce.number().int().positive().default(256),
+
+  // Hard deadline for the whole cache lookup (exact read + embed + vector query). The
+  // cache is best-effort, so a hung store degrades to a plain proxy rather than
+  // stalling the request before budget/dispatch.
+  CACHE_LOOKUP_TIMEOUT_MS: z.coerce.number().int().positive().default(2_000),
+  // Upstream time-to-response-headers budget. Streaming responses return headers in
+  // seconds, but a NON-streamed long generation (large max_tokens on a frontier model)
+  // can legitimately take minutes before the first byte; a short budget turns those
+  // into 502s that are counted as upstream faults and replayed on retry (the provider
+  // still bills the abandoned generation). Default 10 min; the pre-first-byte
+  // REQUEST_DEADLINE_MS remains the per-request operator cap.
+  UPSTREAM_HEADERS_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
+  // HTTP keep-alive idle timeout for the listener. MUST exceed the load balancer's idle
+  // timeout (ALB default 60 s, the shipped Terraform sets 300 s) — when the target
+  // closes an idle keep-alive connection first, the LB can reuse it a moment later and
+  // surface a spurious 502. Default 310 s.
+  HTTP_KEEPALIVE_TIMEOUT_MS: z.coerce.number().int().positive().default(310_000),
+});
+
+/** Every environment variable the gateway reads, for documentation/CI checks. */
+export const ENV_KEYS: readonly string[] = Object.keys(EnvShape.shape);
+
+const Env = EnvShape.superRefine((c, ctx) => {
+  if (c.SMART_ROUTING_CLASSIFY_TIMEOUT_MS <= c.SMART_ROUTING_EMBED_TIMEOUT_MS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['SMART_ROUTING_CLASSIFY_TIMEOUT_MS'],
+      message:
+        'must be strictly greater than SMART_ROUTING_EMBED_TIMEOUT_MS (else the outer classification race always aborts first and semantic routing silently never reroutes)',
+    });
+  }
+  if (
+    c.CACHE_SEMANTIC_ENABLED &&
+    c.CACHE_VECTOR_BACKEND === 'pgvector' &&
+    c.EMBEDDINGS_DIMENSIONS !== 256
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['EMBEDDINGS_DIMENSIONS'],
+      message:
+        'the pgvector semantic index column is vector(256); a different embedding width fails every insert/query (the tier would silently never hit)',
+    });
+  }
+  if (c.NODE_ENV === 'production' && c.MASK_VAULT_PERSIST && !c.GULLEY_KMS_KEY_ARN) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['GULLEY_KMS_KEY_ARN'],
+      message:
+        'required in production when MASK_VAULT_PERSIST is on (the in-memory dev cipher is per-process, so persisted mask rows could never be revealed)',
+    });
+  }
 });
 
 export type Config = z.infer<typeof Env>;
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
-  return Env.parse(source);
+  return Env.parse(normalizeEnv(source));
 }

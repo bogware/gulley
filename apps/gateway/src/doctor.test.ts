@@ -45,15 +45,25 @@ describe('gulley doctor', () => {
     expect(find(fs, 'cache-backends')?.level).toBe('error');
   });
 
-  it('errors on prod mask-vault persistence without KMS', () => {
-    const fs = runDoctor(
+  it('errors on prod mask-vault persistence without KMS (loadConfig now refuses it outright)', () => {
+    // The schema refinement rejects this combination at boot; the doctor keeps its own
+    // check for a config assembled by other means (e.g. a dev config promoted to prod).
+    expect(() =>
       loadConfig({
         NODE_ENV: 'production',
         LOG_LEVEL: 'silent',
         ANTHROPIC_UPSTREAM_API_KEY: 'sk-x',
         MASK_VAULT_PERSIST: 'true',
       } as NodeJS.ProcessEnv),
-    );
+    ).toThrow(/GULLEY_KMS_KEY_ARN/);
+    const fs = runDoctor({
+      ...loadConfig({
+        LOG_LEVEL: 'silent',
+        ANTHROPIC_UPSTREAM_API_KEY: 'sk-x',
+      } as NodeJS.ProcessEnv),
+      NODE_ENV: 'production',
+      MASK_VAULT_PERSIST: true,
+    });
     expect(find(fs, 'mask-vault')?.level).toBe('error');
   });
 

@@ -1,14 +1,32 @@
 import { z } from 'zod';
 
-/** Env booleans: unset -> default; truthy only for 1/true/yes/on. */
+/** Env booleans: unset (or empty) -> default; truthy only for 1/true/yes/on. */
 const envBool = (def: boolean) =>
   z.preprocess(
     (v) =>
-      v === undefined ? def : typeof v === 'string' ? /^(1|true|yes|on)$/i.test(v) : Boolean(v),
+      v === undefined || (typeof v === 'string' && v.trim() === '')
+        ? def
+        : typeof v === 'string'
+          ? /^(1|true|yes|on)$/i.test(v)
+          : Boolean(v),
     z.boolean(),
   );
 
-const Env = z.object({
+/**
+ * Drop unset AND empty-string entries before validation (see the gateway's
+ * normalizeEnv): compose `env_file` / Helm / ECS render an unset value as `KEY=`,
+ * which would otherwise defeat every `.default()`, coerce numbers to 0, and fail
+ * boot on a constrained string instead of degrading to health-only.
+ */
+export function normalizeEnv(source: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(source)) {
+    if (typeof v === 'string' && v.trim() !== '') out[k] = v;
+  }
+  return out;
+}
+
+const EnvShape = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   CONTROL_API_HOST: z.string().default('0.0.0.0'),
@@ -258,12 +276,25 @@ const Env = z.object({
   // mapped role (orgId "*" = platform-wide). A group not in the map is tracked but
   // grants nothing. Empty {} => SCIM Groups accepted but no role provisioning.
   SCIM_GROUP_ROLE_MAP: z.string().default('{}'),
+
+  // Postgres connect timeout for the control-plane pool. The statement timeout is
+  // deliberately left off (long audit-chain scans), but a connect attempt must fail
+  // fast so an unreachable database surfaces as a quick 5xx, not a 30 s hang per call.
+  DB_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  // HTTP keep-alive idle timeout for the listener; must exceed the load balancer's idle
+  // timeout (see the gateway knob of the same name). Default 310 s.
+  HTTP_KEEPALIVE_TIMEOUT_MS: z.coerce.number().int().positive().default(310_000),
 });
+
+/** Every environment variable the control-api reads, for documentation/CI checks. */
+export const ENV_KEYS: readonly string[] = Object.keys(EnvShape.shape);
+
+const Env = EnvShape;
 
 export type Config = z.infer<typeof Env>;
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
-  return Env.parse(source);
+  return Env.parse(normalizeEnv(source));
 }
 
 export function sessionSecrets(config: Config): string[] {

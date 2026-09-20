@@ -281,6 +281,8 @@ export interface GatewayContext {
    *  idle. Zod-validated in production; absent (tests/smoke scripts) ⇒
    *  DEFAULT_STREAM_INACTIVITY_MS. */
   streamInactivityMs?: number;
+  /** Hard deadline for the whole cache lookup (config.CACHE_LOOKUP_TIMEOUT_MS). */
+  cacheLookupTimeoutMs?: number;
   /** Request header names whose values are captured as cost-attribution tags on the
    *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
   attributionHeaders?: string[];
@@ -338,8 +340,9 @@ const DEFAULT_STREAM_INACTIVITY_MS = 120_000;
 const CACHE_BODY_CAP = 2 * 1024 * 1024;
 /** Hard deadline for the whole cache lookup (exact read + embed + vector query). The
  *  cache is best-effort, so a hung store must degrade to a plain proxy, not stall the
- *  request forever before budget/dispatch. */
-const CACHE_LOOKUP_TIMEOUT_MS = Number(process.env['CACHE_LOOKUP_TIMEOUT_MS']) || 2_000;
+ *  request forever before budget/dispatch. Production threads the Zod-validated
+ *  CACHE_LOOKUP_TIMEOUT_MS through the context; this is the fallback for a bare context. */
+const DEFAULT_CACHE_LOOKUP_TIMEOUT_MS = 2_000;
 /** Findings at or above this confidence make a response too sensitive to cache. */
 const CACHE_SENSITIVE_CONFIDENCE = 0.8;
 
@@ -1337,7 +1340,7 @@ async function handleProxy(
       // proxy exactly like the error path (the cache is best-effort).
       cacheLookup = await withTimeout(
         ctx.cache.lookup(cacheReq),
-        CACHE_LOOKUP_TIMEOUT_MS,
+        ctx.cacheLookupTimeoutMs ?? DEFAULT_CACHE_LOOKUP_TIMEOUT_MS,
         'cache lookup',
       );
     } catch (err) {

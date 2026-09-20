@@ -16,18 +16,25 @@ let metricsServer: MetricsServerHandle | undefined;
 let configWatcher: ConfigWatcher | undefined;
 
 let context: GatewayContext | undefined;
+let degradedReason: string | undefined;
 try {
   context = createProductionContext(config);
 } catch (err) {
   // Boot health-only so the container stays inspectable while config is finished.
-  // The messages route is simply not registered until the context is complete.
-  console.warn(`[gateway] proxy disabled — ${(err as Error).message}`);
+  // The messages route is simply not registered until the context is complete. The
+  // reason is kept and surfaced on /ready so an operator debugging a 503 sees it
+  // without hunting for the boot line.
+  degradedReason = (err as Error).message;
 }
 
 // Shared drain flag: /ready flips to 503 the instant a SIGTERM drain begins, so the pod
 // deregisters from Service/ALB endpoints before app.close() (see server.ts /ready).
 const drainState = { active: false };
-const app = buildServer(config, context, { isDraining: () => drainState.active });
+const app = buildServer(config, context, {
+  isDraining: () => drainState.active,
+  degradedReason: () => degradedReason,
+});
+if (degradedReason) app.log.warn({ reason: degradedReason }, 'proxy disabled — health-only boot');
 
 async function start(): Promise<void> {
   try {
@@ -58,9 +65,11 @@ async function start(): Promise<void> {
 }
 
 // Safety net: a stray rejection (e.g. best-effort bookkeeping) must never
-// terminate the process and cut in-flight streams.
+// terminate the process and cut in-flight streams. Serialize under `err` so pino
+// emits message + stack (an Error under any other key logs as `{}`).
 process.on('unhandledRejection', (reason) => {
-  app.log.error({ reason }, 'unhandledRejection');
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  app.log.error({ err }, 'unhandledRejection');
 });
 
 // Bounded graceful drain: stop accepting, let in-flight streams finish, close
@@ -74,32 +83,60 @@ const SHUTDOWN_GRACE_MS = config.SHUTDOWN_GRACE_MS;
 const UNCAUGHT_GRACE_MS = Math.min(SHUTDOWN_GRACE_MS, 5_000);
 let shuttingDown = false;
 
+/** Run one drain step; a failure is logged and the remaining steps still run (a
+ *  rejected app.close() must not skip the log/telemetry flushes behind it). */
+async function settle(step: string, fn: () => Promise<unknown> | unknown): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    app.log.error({ err, step }, 'shutdown step failed');
+  }
+}
+
 async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   drainState.active = true; // /ready → 503 so endpoints deregister before app.close()
   app.log.info({ signal, graceMs }, 'draining');
+  // Two-stage backstop. Stage 1 (a few seconds before the deadline): sever every
+  // connection still open — a long or stalled stream that outlives the grace period —
+  // so each hijacked socket's 'close' path runs its single teardown() (budget commit +
+  // ledger/audit rows) and app.close() can resolve, leaving the reserve for the sink
+  // flushes below. Stage 2 (the deadline): exit regardless. Without stage 1 the old
+  // single backstop exited with the streams' teardowns and every buffered sink
+  // (request log, OTLP batches) unflushed.
+  const flushReserveMs = Math.min(5_000, Math.max(1_000, Math.floor(graceMs / 4)));
+  const sever = setTimeout(
+    () => {
+      app.log.warn({ flushReserveMs }, 'drain grace nearly elapsed — severing open connections');
+      try {
+        app.server.closeAllConnections();
+      } catch (err) {
+        app.log.error({ err }, 'closeAllConnections failed');
+      }
+    },
+    Math.max(0, graceMs - flushReserveMs),
+  );
+  sever.unref();
   const backstop = setTimeout(() => {
     app.log.warn('drain grace elapsed, forcing exit');
     process.exit(exitCode);
   }, graceMs);
   backstop.unref();
-  try {
-    await configWatcher?.stop(); // stop reloads before draining so none races the close
-    context?.breakerSync?.stop(); // stop the cross-replica breaker refresh timer
-    await app.close();
-    // Drain the upstream pool BEFORE flushing the log sinks: closeUpstreamPool()
-    // completes in-flight streams, and their single teardown writes the request/
-    // access-log/audit rows — so flushing first would drop those late teardowns.
-    await closeUpstreamPool();
-    await context?.flushLogs?.(); // drain buffered request logs before exit
-    await context?.accessLogSink?.shutdown(); // flush the OTLP access-log batch
-    await context?.telemetry?.shutdown(); // flush the OTel span pipeline (was dropped every deploy)
-    await metricsServer?.close();
-  } catch (err) {
-    app.log.error({ err }, 'shutdown error');
-  }
+  await settle('config-watcher', () => configWatcher?.stop()); // stop reloads before draining
+  await settle('breaker-sync', () => context?.breakerSync?.stop()); // cross-replica refresh timer
+  await settle('http-close', () => app.close());
+  // Drain the upstream pool BEFORE flushing the log sinks: closeUpstreamPool()
+  // completes in-flight streams, and their single teardown writes the request/
+  // access-log/audit rows — so flushing first would drop those late teardowns.
+  await settle('upstream-pool', () => closeUpstreamPool());
+  await settle('request-log', () => context?.flushLogs?.()); // buffered request logs
+  await settle('access-log', () => context?.accessLogSink?.shutdown()); // OTLP access-log batch
+  await settle('telemetry', () => context?.telemetry?.shutdown()); // OTel span pipeline
+  await settle('metrics', () => metricsServer?.close());
+  clearTimeout(sever);
   clearTimeout(backstop);
+  app.log.info({ signal }, 'drained');
   process.exit(exitCode);
 }
 

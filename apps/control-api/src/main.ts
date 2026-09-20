@@ -215,6 +215,7 @@ function buildContext(config: Config): ControlContext | undefined {
     shadowSpendFlagBps: config.SHADOW_SPEND_FLAG_BPS,
     oidc,
     databaseUrl: config.DATABASE_URL,
+    dbConnectTimeoutMs: config.DB_CONNECT_TIMEOUT_MS,
     notifier: configBus,
     attestationKey: config.AUDIT_ATTESTATION_KEY,
     attestationSubject: config.AUDIT_ATTESTATION_SUBJECT,
@@ -422,7 +423,9 @@ async function start(): Promise<void> {
 }
 
 process.on('unhandledRejection', (reason) => {
-  app.log.error({ reason }, 'unhandledRejection');
+  // Serialize under `err` so pino emits message + stack (any other key logs `{}`).
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  app.log.error({ err }, 'unhandledRejection');
 });
 
 const SHUTDOWN_GRACE_MS = config.SHUTDOWN_GRACE_MS;
@@ -431,23 +434,32 @@ const SHUTDOWN_GRACE_MS = config.SHUTDOWN_GRACE_MS;
 const UNCAUGHT_GRACE_MS = Math.min(SHUTDOWN_GRACE_MS, 5_000);
 let shuttingDown = false;
 
+/** Run one drain step; a failure is logged and the remaining steps still run. */
+async function settle(step: string, fn: () => Promise<unknown> | unknown): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    app.log.error({ err, step }, 'shutdown step failed');
+  }
+}
+
 async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   app.log.info({ signal, graceMs }, 'draining');
-  const backstop = setTimeout(() => process.exit(exitCode), graceMs);
+  const backstop = setTimeout(() => {
+    app.log.warn('drain grace elapsed, forcing exit');
+    process.exit(exitCode);
+  }, graceMs);
   backstop.unref();
   if (wormTimer) clearInterval(wormTimer);
   if (anchorTimer) clearInterval(anchorTimer);
   if (siemTimer) clearInterval(siemTimer);
   if (oauthSweepTimer) clearInterval(oauthSweepTimer);
-  try {
-    await app.close();
-    await configBus?.close();
-  } catch (err) {
-    app.log.error({ err }, 'shutdown error');
-  }
+  await settle('http-close', () => app.close());
+  await settle('config-bus', () => configBus?.close());
   clearTimeout(backstop);
+  app.log.info({ signal }, 'drained');
   process.exit(exitCode);
 }
 

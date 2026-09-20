@@ -23,13 +23,20 @@ export function parseTrustProxy(value: string): boolean | number | string {
 export function buildServer(
   config: Config,
   context?: GatewayContext,
-  opts?: { isDraining?: () => boolean },
+  opts?: {
+    isDraining?: () => boolean;
+    /** Why the proxy is disabled (health-only boot), surfaced on /ready. */
+    degradedReason?: () => string | undefined;
+  },
 ): GatewayServer {
   const app = Fastify({
     // Cap the inbound body (Fastify defaults to 1 MiB, which 413s real coding-agent
     // requests). The custom application/json buffer parser respects this limit.
     bodyLimit: config.MAX_REQUEST_BYTES,
     trustProxy: parseTrustProxy(config.TRUST_PROXY),
+    // Keep idle keep-alive connections open LONGER than the load balancer does: if the
+    // target closes first, the LB may reuse the half-closed socket and answer 502.
+    keepAliveTimeout: config.HTTP_KEEPALIVE_TIMEOUT_MS,
     // Fastify's default request id is a per-process counter (`req-1`, ...) that
     // resets on restart and repeats across tasks — NOT unique across a multi-task
     // fleet over one Postgres. requestId keys the ledger, request log, audit rows,
@@ -48,6 +55,19 @@ export function buildServer(
         remove: true,
       },
     },
+  });
+
+  // Node closes a connection whose headers arrive slower than headersTimeout; keep it
+  // above the keep-alive idle window so an idle-then-reused connection is never cut
+  // mid-request (the classic ALB/Node 502 pairing).
+  app.server.headersTimeout = config.HTTP_KEEPALIVE_TIMEOUT_MS + 1_000;
+
+  // Every non-hijacked reply (denials, 5xx, health) carries the request id so a client
+  // or operator can correlate it with the log/audit rows. Hijacked streams bypass
+  // onSend and set the header themselves at writeHead.
+  app.addHook('onSend', (request, reply, payload, done) => {
+    if (!reply.hasHeader('x-gulley-request-id')) reply.header('x-gulley-request-id', request.id);
+    done(null, payload);
   });
 
   // The proxy forwards raw bytes upstream, so capture the body verbatim rather
@@ -77,7 +97,10 @@ export function buildServer(
     // and only routes traffic once the route table is populated.
     if (!holder || providers.length === 0) {
       reply.code(503);
-      return { status: 'degraded', providers };
+      const reason =
+        opts?.degradedReason?.() ??
+        (!holder ? 'no gateway context (health-only boot)' : 'no routes loaded yet');
+      return { status: 'degraded', reason, providers };
     }
     return { status: 'ready', providers };
   });

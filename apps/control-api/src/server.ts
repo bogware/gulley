@@ -1,4 +1,5 @@
 import { GULLEY_VERSION } from '@gulley/core';
+import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { registerConfigRoutes } from './config-routes';
@@ -46,6 +47,11 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     // Explicit body cap: generous enough for a large GitOps config-apply document, but
     // bounded (Fastify defaults to 1 MB, which would reject a big-fleet apply).
     bodyLimit: config.CONTROL_API_BODY_LIMIT_BYTES,
+    // Fleet-unique request ids (Fastify's default `req-N` counter repeats across
+    // tasks/restarts); every admin log line and error body carries this id.
+    genReqId: () => `req_${randomUUID()}`,
+    // Outlive the load balancer's idle timeout so it never reuses a socket we closed.
+    keepAliveTimeout: config.HTTP_KEEPALIVE_TIMEOUT_MS,
     logger: {
       level: config.LOG_LEVEL,
       redact: {
@@ -58,6 +64,14 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
         remove: true,
       },
     },
+  });
+
+  app.server.headersTimeout = config.HTTP_KEEPALIVE_TIMEOUT_MS + 1_000;
+
+  // Echo the request id on every reply so a client can quote it to an operator.
+  app.addHook('onSend', (request, reply, payload, done) => {
+    if (!reply.hasHeader('x-gulley-request-id')) reply.header('x-gulley-request-id', request.id);
+    done(null, payload);
   });
 
   registerHttpEdge(app, config);

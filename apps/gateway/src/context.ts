@@ -731,7 +731,10 @@ export function createProductionContext(config: Config): GatewayContext {
   // prod requires the shared KMS key; the in-memory cipher is per-process (dev/tests).
   const masterMaskEncryptor: Encryptor | undefined = config.MASK_VAULT_PERSIST
     ? config.GULLEY_KMS_KEY_ARN
-      ? new KmsEnvelopeEncryptor(config.GULLEY_KMS_KEY_ARN, config.BEDROCK_REGION)
+      ? new KmsEnvelopeEncryptor(
+          config.GULLEY_KMS_KEY_ARN,
+          config.GULLEY_KMS_REGION ?? config.BEDROCK_REGION,
+        )
       : new InMemoryAesCipher()
     : undefined;
   // BYOK crypto-shred: when on, each mask-vault record is encrypted under a PER-SUBJECT
@@ -1027,6 +1030,7 @@ export function createProductionContext(config: Config): GatewayContext {
     models: catalogModels,
     rateResolver,
     streamInactivityMs: config.STREAM_INACTIVITY_MS,
+    cacheLookupTimeoutMs: config.CACHE_LOOKUP_TIMEOUT_MS,
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,

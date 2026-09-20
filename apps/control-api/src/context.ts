@@ -266,6 +266,8 @@ export interface InMemoryContextOptions {
   /** Postgres URL; when set, the config path is durable (persists to the tables
    *  the gateway reads) instead of in-memory. */
   databaseUrl?: string;
+  /** Connect timeout for the pool built from databaseUrl (config.DB_CONNECT_TIMEOUT_MS). */
+  dbConnectTimeoutMs?: number;
   /** Inject a pre-built Database (tests); overrides databaseUrl. */
   db?: Database;
   /** HMAC key that signs auditor attestations; absent = attestation export off. */
@@ -342,7 +344,15 @@ export interface InMemoryContextOptions {
 export function createInMemoryControlContext(opts: InMemoryContextOptions): ControlContext {
   // Durable config path (opt-in): when a DB is available, config apply persists
   // to the Postgres tables the gateway reads, and versions are durable too.
-  const db = opts.db ?? (opts.databaseUrl ? createDatabase(opts.databaseUrl) : undefined);
+  // Connect fast-fail + idle reclaim; the statement timeout stays off (long chain scans).
+  const db =
+    opts.db ??
+    (opts.databaseUrl
+      ? createDatabase(opts.databaseUrl, {
+          connectTimeoutMs: opts.dbConnectTimeoutMs ?? 5_000,
+          idleTimeoutMs: 30_000,
+        })
+      : undefined);
 
   const inner = new InMemoryAuditSink();
   // Admin mutations AND mask-vault PII reveals audit through ctx.audit. With a DB,
