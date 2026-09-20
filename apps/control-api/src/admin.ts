@@ -1,5 +1,7 @@
 import { resolveAdmin } from '@gulley/auth';
+import { canonicalize } from '@gulley/pipeline';
 import { type AdminPrincipal, coversWorkspace, type Permission, type ScopeRef } from '@gulley/rbac';
+import { createHash } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { ControlContext } from './context';
 import { parseCookies, SESSION_COOKIE } from './oidc-gate';
@@ -114,4 +116,37 @@ export function body(request: FastifyRequest): Record<string, unknown> {
 
 export function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
+/** A bounded string field: present, non-empty, at most `max` chars. */
+export function strMax(v: unknown, max: number): string | undefined {
+  const s = str(v);
+  return s !== undefined && s.length <= max ? s : undefined;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isUuid(s: string): boolean {
+  return UUID_RE.test(s);
+}
+
+/** The `:id` path param when it is a well-formed uuid, else undefined. Every durable
+ *  id column is a uuid: a malformed value must be a clean 404, not a Postgres cast
+ *  error surfacing as a 500 (and breaking SCIM's 404 contract). In-memory ids are
+ *  uuids too, so the check is uniform across modes. */
+export function uuidParam(request: { params: unknown }, name = 'id'): string | undefined {
+  const v = (request.params as Record<string, unknown>)[name];
+  return typeof v === 'string' && isUuid(v) ? v : undefined;
+}
+
+/** Content hash of a config object (stable key order) for audit diffs. */
+export function configHash(config: Record<string, unknown>): string {
+  return createHash('sha256').update(canonicalize(config)).digest('hex');
+}
+
+/** Clamp a caller-supplied session TTL (seconds) into [60, max]; NaN/negative → default. */
+export function clampTtlSeconds(raw: unknown, defaultSeconds: number, maxSeconds: number): number {
+  const n = Number(raw);
+  const want = Number.isFinite(n) && n > 0 ? Math.floor(n) : defaultSeconds;
+  return Math.max(60, Math.min(want, Math.max(60, Math.floor(maxSeconds))));
 }

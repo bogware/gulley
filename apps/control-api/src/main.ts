@@ -151,8 +151,20 @@ function buildContext(config: Config): ControlContext | undefined {
 
   let oidc: OidcSessionConfig | undefined;
   if (config.OIDC_ISSUER && config.OIDC_CLIENT_ID) {
+    // Every IdP URL (discovery, JWKS, the advertised token/authorize endpoints) goes
+    // through the same SSRF/air-gap egress guard as any other control-plane outbound,
+    // and production requires https end to end (the client secret rides token_endpoint).
+    const assertOidcEgress = (url: string): void => {
+      assertEgressAllowed(url, { allowlist: outboundAllowlist(config) });
+    };
     oidc = {
-      provider: new OidcProvider(config.OIDC_ISSUER),
+      provider: new OidcProvider(config.OIDC_ISSUER, {
+        fetchTimeoutMs: config.OIDC_FETCH_TIMEOUT_MS,
+        guard: {
+          assertAllowed: assertOidcEgress,
+          requireHttps: config.NODE_ENV === 'production' && !config.OIDC_ALLOW_INSECURE_HTTP,
+        },
+      }),
       clientId: config.OIDC_CLIENT_ID,
       clientSecret: config.OIDC_CLIENT_SECRET,
       redirectUri: config.OIDC_REDIRECT_URI,
@@ -161,6 +173,9 @@ function buildContext(config: Config): ControlContext | undefined {
       roleRules: parseRoleMap(config.OIDC_ROLE_MAP),
       postLoginRedirect: config.OIDC_POST_LOGIN_REDIRECT,
       cookieSecure: config.OIDC_COOKIE_SECURE,
+      subjectClaim: config.OIDC_SUBJECT_CLAIM,
+      exchangeTimeoutMs: config.OIDC_FETCH_TIMEOUT_MS,
+      assertEgress: assertOidcEgress,
     };
   }
 
@@ -267,6 +282,7 @@ function buildContext(config: Config): ControlContext | undefined {
                     graphBase: config.ENTRA_GRAPH_BASE,
                     loginBase: config.ENTRA_LOGIN_BASE,
                     cacheTtlMs: config.ENTRA_ACTIVE_CACHE_MS,
+                    timeoutMs: config.ENTRA_GRAPH_TIMEOUT_MS,
                     assertAllowed: (url) =>
                       assertEgressAllowed(url, { allowlist: outboundAllowlist(config) }),
                   }),
@@ -275,6 +291,13 @@ function buildContext(config: Config): ControlContext | undefined {
           }
         : undefined,
     scimGroupRoleMap: parseScimGroupRoleMap(config.SCIM_GROUP_ROLE_MAP),
+    // A failing durable membership loader degrades a session to its token grants; that
+    // used to be silent. Log it structured so a broken directory is visible.
+    onLoaderError: (subject, err) =>
+      log.error(
+        { err, subject, event: 'membership_loader_failed' },
+        'durable membership loader failed; session limited to token memberships',
+      ),
   });
 }
 

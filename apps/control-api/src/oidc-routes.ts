@@ -1,4 +1,4 @@
-import { resolveAdmin, signAdminSession } from '@gulley/auth';
+import { resolveAdmin, signAdminSession, verifyAdminSession } from '@gulley/auth';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { sessionToken } from './admin';
 import type { ControlContext } from './context';
@@ -47,7 +47,8 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
     try {
       md = await oidc.provider.metadataDoc();
     } catch (e) {
-      return oidcError(reply, 502, `OIDC discovery failed: ${(e as Error).message}`);
+      _req.log.error({ err: e }, 'OIDC discovery failed');
+      return oidcError(reply, 502, 'identity provider discovery failed');
     }
     const url = buildAuthorizeUrl(md, {
       clientId: oidc.clientId,
@@ -98,9 +99,12 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
           verifier: flow.verifier,
         },
         oidc.fetchImpl,
+        { timeoutMs: oidc.exchangeTimeoutMs, assertAllowed: oidc.assertEgress },
       );
     } catch (e) {
-      return oidcError(reply, 502, `token exchange failed: ${(e as Error).message}`);
+      // The detail (IdP host, status, driver text) goes to the log, not the browser.
+      request.log.error({ err: e }, 'OIDC token exchange failed');
+      return oidcError(reply, 502, 'identity provider token exchange failed');
     }
     if (!tokens.id_token) return oidcError(reply, 502, 'no id_token returned');
 
@@ -126,16 +130,27 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
     const ttlSec = Math.floor(ctx.resolverDeps.maxSessionTtlMs / 1000);
     const iat = Math.floor(now() / 1000);
     const jti = randomUUID();
-    const subject = claims.sub ?? 'oidc-user';
+    // The admin subject is the configured claim (default `sub`); an IdP whose SCIM
+    // userName is the UPN/email sets OIDC_SUBJECT_CLAIM so SSO + SCIM + RBAC grants +
+    // session revocation all key on ONE identity. Fail closed on a missing claim.
+    const subjectClaim = oidc.subjectClaim ?? 'sub';
+    const rawSubject = (claims as Record<string, unknown>)[subjectClaim];
+    const subject =
+      typeof rawSubject === 'string' && rawSubject.length > 0 ? rawSubject : undefined;
+    if (!subject) {
+      request.log.warn({ claim: subjectClaim }, 'OIDC login: subject claim missing from id_token');
+      return oidcError(reply, 401, 'id_token has no usable subject claim');
+    }
     const token = signAdminSession(secret, {
       sub: subject,
-      name: claims.name ?? claims.preferred_username ?? claims.email ?? claims.sub ?? 'user',
+      name: claims.name ?? claims.preferred_username ?? claims.email ?? subject,
       jti,
       memberships,
       iat,
       exp: iat + ttlSec,
       typ: 'admin-session',
       ver: 1,
+      src: 'oidc',
     });
     await ctx.sessions.record?.({
       jti,
@@ -163,10 +178,10 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
 
     await ctx.audit.append({
       orgId: null,
-      actor: claims.sub ?? 'oidc-user',
+      actor: subject,
       action: 'admin.session.oidc',
-      target: claims.sub ?? '',
-      payload: { memberships: memberships.length, groups: groups.length, overage },
+      target: subject,
+      payload: { jti, memberships: memberships.length, groups: groups.length, overage },
     });
 
     reply.header('set-cookie', [
@@ -190,7 +205,27 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
     });
   });
 
-  app.post('/auth/logout', async (_req: FastifyRequest, reply: FastifyReply) => {
+  // Logout REVOKES the session (by jti) as well as clearing the cookie: a copied cookie
+  // or bearer used to stay valid until exp after "sign out". Best-effort — an
+  // unverifiable/absent token still clears the cookie (idempotent 204).
+  app.post('/auth/logout', async (request: FastifyRequest, reply: FastifyReply) => {
+    const token = sessionToken(request);
+    if (token) {
+      const v = verifyAdminSession(ctx.resolverDeps.sessionSecrets, token, {
+        now: now(),
+        maxTtlMs: ctx.resolverDeps.maxSessionTtlMs,
+      });
+      if (v.ok) {
+        await ctx.sessions.revoke(v.value.jti);
+        await ctx.audit.append({
+          orgId: null,
+          actor: v.value.principal.subject,
+          action: 'admin.session.logout',
+          target: v.value.jti,
+          payload: { jti: v.value.jti, source: v.value.source },
+        });
+      }
+    }
     reply.header('set-cookie', clearCookie(SESSION_COOKIE, { secure: ctx.oidc?.cookieSecure }));
     return reply.code(204).send();
   });

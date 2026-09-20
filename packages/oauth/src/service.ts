@@ -392,15 +392,18 @@ export class BrokerService {
       await this.deps.grants.revoke(grant.handle);
       return e('invalid_grant');
     }
-    if (!(await this.deps.idp.isPrincipalActive(grant.principalId))) {
-      await this.deps.grants.revoke(grant.handle); // revoke on deprovision
-      return e('invalid_grant');
-    }
 
+    // Verify the presented secret BEFORE consulting the IdP: a caller who only knows a
+    // handle (it is not secret — it appears in admin listings and logs) must not be able
+    // to drive a Graph call per request (an amplification + directory-probe oracle).
     const isCurrent =
       parsed.generation === grant.refreshGeneration &&
       verifyHash(this.cfg.pepper, parsed.secret, grant.refreshTokenHash);
     if (isCurrent) {
+      if (!(await this.deps.idp.isPrincipalActive(grant.principalId))) {
+        await this.deps.grants.revoke(grant.handle); // revoke on deprovision
+        return e('invalid_grant');
+      }
       const newGen = grant.refreshGeneration + 1;
       const at = mintAccessToken(this.cfg.pepper, grant.handle);
       const rt = mintRefreshToken(this.cfg.pepper, grant.handle, newGen);

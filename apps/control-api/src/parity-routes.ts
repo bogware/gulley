@@ -10,6 +10,7 @@ import {
   notFound,
   scopeForProvider,
   str,
+  uuidParam,
 } from './admin';
 import type { ControlContext } from './context';
 
@@ -27,13 +28,11 @@ export function registerParityRoutes(app: FastifyInstance, ctx: ControlContext):
       if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
       const q = request.query as Record<string, string | undefined>;
       const limit = Math.min(Math.max(Number(q['limit']) || 100, 1), 500);
-      const before = q['before'] !== undefined ? Number(q['before']) : undefined;
-      const rows = (await ctx.auditRows?.()) ?? [];
-      // Newest first; keyset by seq (before = exclusive upper bound).
-      const filtered = rows
-        .filter((r) => (before === undefined ? true : r.seq < before))
-        .sort((a, b) => b.seq - a.seq);
-      const page = filtered.slice(0, limit);
+      const beforeRaw = q['before'] !== undefined ? Number(q['before']) : undefined;
+      const before = beforeRaw !== undefined && Number.isFinite(beforeRaw) ? beforeRaw : undefined;
+      // Newest first; keyset by seq (before = exclusive upper bound). One bounded page
+      // from the backend — the whole chain is no longer read per request.
+      const page = await ctx.auditPage({ before, limit });
       return reply.send({
         events: page.map((r) => ({
           seq: r.seq,
@@ -98,8 +97,8 @@ export function registerParityRoutes(app: FastifyInstance, ctx: ControlContext):
     '/admin/users/:id/memberships',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!(await ctx.access.can(admin, 'membership:read', {}))) return forbidden(reply);
-      const id = (request.params as { id: string }).id;
-      const user = ctx.adminUsers ? await ctx.adminUsers.get(id) : undefined;
+      const id = uuidParam(request);
+      const user = id && ctx.adminUsers ? await ctx.adminUsers.get(id) : undefined;
       if (!user) return notFound(reply, 'user');
       const grants = ctx.durableMemberships
         ? await ctx.durableMemberships.membershipsForSubject(user.subject)
@@ -122,7 +121,13 @@ export function registerParityRoutes(app: FastifyInstance, ctx: ControlContext):
           assertEgressAllowed(baseUrl, { allowlist: ctx.outboundAllowlist });
         } catch (e) {
           if (e instanceof EgressError)
-            return reply.code(422).send({ error: { type: 'egress', message: e.message } });
+            return reply.code(422).send({
+              error: {
+                type: 'egress',
+                message: 'baseUrl is not an allowed egress destination',
+                reason: e.reason,
+              },
+            });
           throw e;
         }
       }

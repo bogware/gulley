@@ -1,6 +1,6 @@
 import type { AdminUserRow, ScimGroupRow } from '@gulley/storage';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { adminRoute, body, str } from './admin';
+import { adminRoute, body, isUuid, str, uuidParam } from './admin';
 import type { ControlContext } from './context';
 
 /**
@@ -95,6 +95,32 @@ function memberValues(v: unknown): string[] {
     .filter((x): x is string => typeof x === 'string' && x.length > 0);
 }
 
+/** RFC 7644 §3.4.2.4 paging: 1-based startIndex, count ≤ 500 (0 = count only). */
+function paging(q: Record<string, string | undefined>): { startIndex: number; count: number } {
+  const si = Number(q['startIndex']);
+  const c = Number(q['count']);
+  return {
+    startIndex: Number.isFinite(si) && si >= 1 ? Math.floor(si) : 1,
+    count: Number.isFinite(c) && c >= 0 ? Math.min(Math.floor(c), 500) : 100,
+  };
+}
+
+function listResponse<T>(
+  all: T[],
+  q: Record<string, string | undefined>,
+  map: (t: T) => Record<string, unknown>,
+): Record<string, unknown> {
+  const { startIndex, count } = paging(q);
+  const page = all.slice(startIndex - 1, startIndex - 1 + count);
+  return {
+    schemas: [LIST_SCHEMA],
+    totalResults: all.length,
+    startIndex,
+    itemsPerPage: page.length,
+    Resources: page.map(map),
+  };
+}
+
 /** Parse a SCIM Group PatchOp into member adds/removes/replace (the shapes Entra/Okta
  *  send for group membership sync). */
 function parseGroupPatch(b: Record<string, unknown>): {
@@ -170,16 +196,62 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
   // token's memberships (it can only ADD grants, never remove one the token asserts). So
   // deleting the admin_user row alone leaves an SSO'd admin with full access until their
   // token's exp. Revoking the sessions closes that window on the SCIM offboard path.
-  const revokeSubjectSessions = async (subject: string): Promise<number> => {
-    const all = (await ctx.sessions.list?.()) ?? [];
+  // Uses the store's set-based revokeBySubject (the old list() scan was capped at the
+  // 500 newest rows, so an offboarded user's older sessions could survive). The row's
+  // email is revoked too: an SSO session keyed on `email`/UPN (OIDC_SUBJECT_CLAIM) must
+  // die with the SCIM row whose userName is that same address.
+  const revokeSubjectSessions = async (
+    sessions: ControlContext['sessions'],
+    row: AdminUserRow,
+  ): Promise<number> => {
+    const subjects = [...new Set([row.subject, row.email].filter((x): x is string => !!x))];
     let revoked = 0;
-    for (const s of all) {
-      if (s.subject === subject && !s.revoked) {
-        await ctx.sessions.revoke?.(s.jti);
-        revoked++;
+    for (const subject of subjects) {
+      if (sessions.revokeBySubject) {
+        revoked += await sessions.revokeBySubject(subject);
+        continue;
+      }
+      const all = (await sessions.list?.()) ?? [];
+      for (const s of all) {
+        if (s.subject === subject && !s.revoked) {
+          await sessions.revoke(s.jti);
+          revoked++;
+        }
       }
     }
     return revoked;
+  };
+
+  /** Deprovision: delete the admin_user (cascading its grants), revoke its sessions and
+   *  audit — in ONE transaction in DB mode, so a crash cannot leave a deleted user with
+   *  no audit row (or live sessions). */
+  const deprovision = async (
+    row: AdminUserRow,
+    actor: string,
+    via: string,
+  ): Promise<{ revokedSessions: number }> => {
+    if (ctx.durableAtomic) {
+      return ctx.durableAtomic(async (tx) => {
+        await tx.adminUsers.delete(row.id);
+        const revokedSessions = await revokeSubjectSessions(tx.sessions, row);
+        await tx.audit.append({
+          actor,
+          action: 'scim.user.deprovision',
+          target: row.id,
+          payload: { userName: row.subject, via, revokedSessions },
+        });
+        return { revokedSessions };
+      });
+    }
+    await users!.delete(row.id);
+    const revokedSessions = await revokeSubjectSessions(ctx.sessions, row);
+    await ctx.audit.append({
+      actor,
+      action: 'scim.user.deprovision',
+      target: row.id,
+      payload: { userName: row.subject, via, revokedSessions },
+    });
+    return { revokedSessions };
   };
 
   app.post(
@@ -205,8 +277,8 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     '/scim/v2/Users/:id',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!users || !(await guard(request, reply, admin))) return reply;
-      const id = (request.params as { id: string }).id;
-      const row = await users.get(id);
+      const id = uuidParam(request);
+      const row = id ? await users.get(id) : undefined;
       if (!row) return scimError(reply, 404, 'user not found');
       return reply.header('content-type', SCIM_CT).send(toScimUser(row));
     }),
@@ -216,16 +288,13 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     '/scim/v2/Users',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!users || !(await guard(request, reply, admin))) return reply;
-      const filterName = parseUserNameEq((request.query as Record<string, string>)?.['filter']);
+      const q = (request.query ?? {}) as Record<string, string | undefined>;
+      const filterName = parseUserNameEq(q['filter']);
       const all = await users.list();
       const matched = filterName ? all.filter((u) => u.subject === filterName) : all;
-      return reply.header('content-type', SCIM_CT).send({
-        schemas: [LIST_SCHEMA],
-        totalResults: matched.length,
-        startIndex: 1,
-        itemsPerPage: matched.length,
-        Resources: matched.map((u) => toScimUser(u)),
-      });
+      return reply
+        .header('content-type', SCIM_CT)
+        .send(listResponse(matched, q, (u) => toScimUser(u)));
     }),
   );
 
@@ -233,21 +302,14 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     '/scim/v2/Users/:id',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!users || !(await guard(request, reply, admin))) return reply;
-      const id = (request.params as { id: string }).id;
-      const row = await users.get(id);
+      const id = uuidParam(request);
+      const row = id ? await users.get(id) : undefined;
       if (!row) return scimError(reply, 404, 'user not found');
       // The only PatchOp we act on is deactivation — an IdP deprovision. It DELETES
       // the admin_user, cascading its grants (immediate deauthz). Other patches are
       // accepted as no-ops so a provisioner's sync doesn't error.
       if (patchDeactivates(body(request))) {
-        await users.delete(id);
-        const revokedSessions = await revokeSubjectSessions(row.subject);
-        await ctx.audit.append({
-          actor: admin.subject,
-          action: 'scim.user.deprovision',
-          target: id,
-          payload: { userName: row.subject, via: 'patch-active-false', revokedSessions },
-        });
+        await deprovision(row, admin.subject, 'patch-active-false');
         return reply.header('content-type', SCIM_CT).send(toScimUser(row, false));
       }
       return reply.header('content-type', SCIM_CT).send(toScimUser(row));
@@ -258,17 +320,10 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     '/scim/v2/Users/:id',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!users || !(await guard(request, reply, admin))) return reply;
-      const id = (request.params as { id: string }).id;
-      const row = await users.get(id);
+      const id = uuidParam(request);
+      const row = id ? await users.get(id) : undefined;
       if (!row) return scimError(reply, 404, 'user not found');
-      await users.delete(id);
-      const revokedSessions = await revokeSubjectSessions(row.subject);
-      await ctx.audit.append({
-        actor: admin.subject,
-        action: 'scim.user.deprovision',
-        target: id,
-        payload: { userName: row.subject, via: 'delete', revokedSessions },
-      });
+      await deprovision(row, admin.subject, 'delete');
       return reply.code(204).send();
     }),
   );
@@ -298,6 +353,8 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
       const b = body(request);
       const displayName = str(b['displayName']);
       if (!displayName) return scimError(reply, 400, 'displayName is required', 'invalidValue');
+      if (!memberValues(b['members']).every(isUuid))
+        return scimError(reply, 400, 'members[].value must be a User id', 'invalidValue');
       const g = await groups.create(displayName, str(b['externalId']) ?? null);
       for (const userId of memberValues(b['members'])) {
         await groups.addMember(g.id, userId, displayName);
@@ -317,7 +374,8 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     '/scim/v2/Groups/:id',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!groups || !(await groupGuard(reply, admin))) return reply;
-      const g = await groups.get((request.params as { id: string }).id);
+      const id = uuidParam(request);
+      const g = id ? await groups.get(id) : undefined;
       if (!g) return scimError(reply, 404, 'group not found');
       return reply.header('content-type', SCIM_CT).send(toScimGroup(g));
     }),
@@ -327,16 +385,13 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     '/scim/v2/Groups',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!groups || !(await groupGuard(reply, admin))) return reply;
-      const filterName = parseDisplayNameEq((request.query as Record<string, string>)?.['filter']);
+      const q = (request.query ?? {}) as Record<string, string | undefined>;
+      const filterName = parseDisplayNameEq(q['filter']);
       const all = await groups.list();
       const matched = filterName ? all.filter((g) => g.displayName === filterName) : all;
-      return reply.header('content-type', SCIM_CT).send({
-        schemas: [LIST_SCHEMA],
-        totalResults: matched.length,
-        startIndex: 1,
-        itemsPerPage: matched.length,
-        Resources: matched.map((g) => toScimGroup(g)),
-      });
+      return reply
+        .header('content-type', SCIM_CT)
+        .send(listResponse(matched, q, (g) => toScimGroup(g)));
     }),
   );
 
@@ -344,10 +399,12 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     '/scim/v2/Groups/:id',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!groups || !(await groupGuard(reply, admin))) return reply;
-      const id = (request.params as { id: string }).id;
-      const g = await groups.get(id);
-      if (!g) return scimError(reply, 404, 'group not found');
+      const id = uuidParam(request);
+      const g = id ? await groups.get(id) : undefined;
+      if (!g || !id) return scimError(reply, 404, 'group not found');
       const patch = parseGroupPatch(body(request));
+      if (![...patch.adds, ...patch.removes, ...(patch.replace ?? [])].every(isUuid))
+        return scimError(reply, 400, 'members[].value must be a User id', 'invalidValue');
       // `replace` sets the exact member set: remove those not in the new list, add new.
       if (patch.replace) {
         const next = new Set(patch.replace);
@@ -373,8 +430,8 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     '/scim/v2/Groups/:id',
     adminRoute(ctx, async (request, reply, admin) => {
       if (!groups || !(await groupGuard(reply, admin))) return reply;
-      const id = (request.params as { id: string }).id;
-      if (!(await groups.delete(id))) return scimError(reply, 404, 'group not found');
+      const id = uuidParam(request);
+      if (!id || !(await groups.delete(id))) return scimError(reply, 404, 'group not found');
       await ctx.audit.append({
         actor: admin.subject,
         action: 'scim.group.deprovision',

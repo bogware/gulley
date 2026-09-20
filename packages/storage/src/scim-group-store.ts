@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, asc, eq, inArray } from 'drizzle-orm';
 import type { Database } from './db';
 import { membership, scimGroup, scimGroupMember } from './schema';
 
@@ -51,22 +51,31 @@ export class PostgresScimGroupStore {
     };
   }
 
+  /** Every group with its members — two queries total (was one per group). */
   async list(): Promise<ScimGroupRow[]> {
-    const groups = await this.db.select().from(scimGroup);
-    const out: ScimGroupRow[] = [];
-    for (const g of groups) {
-      const members = await this.db
-        .select({ userId: scimGroupMember.userId })
-        .from(scimGroupMember)
-        .where(eq(scimGroupMember.groupId, g.id));
-      out.push({
-        id: g.id,
-        externalId: g.externalId,
-        displayName: g.displayName,
-        members: members.map((m) => m.userId),
-      });
+    const groups = await this.db.select().from(scimGroup).orderBy(asc(scimGroup.displayName));
+    if (groups.length === 0) return [];
+    const members = await this.db
+      .select({ groupId: scimGroupMember.groupId, userId: scimGroupMember.userId })
+      .from(scimGroupMember)
+      .where(
+        inArray(
+          scimGroupMember.groupId,
+          groups.map((g) => g.id),
+        ),
+      );
+    const byGroup = new Map<string, string[]>();
+    for (const m of members) {
+      const arr = byGroup.get(m.groupId) ?? [];
+      arr.push(m.userId);
+      byGroup.set(m.groupId, arr);
     }
-    return out;
+    return groups.map((g) => ({
+      id: g.id,
+      externalId: g.externalId,
+      displayName: g.displayName,
+      members: byGroup.get(g.id) ?? [],
+    }));
   }
 
   /** Grant the group's role to a user (idempotent) and track the membership row.

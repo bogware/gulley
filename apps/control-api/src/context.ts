@@ -33,7 +33,11 @@ import {
   PostgresAuthCodeStore,
   PostgresOAuthClientStore,
   PostgresTenancyStore,
+  auditHeadSeq,
+  iterateAuditRows,
+  readAuditPage,
   readAuditRows,
+  readAuditRowsByAction,
   type MaskVaultStore,
 } from '@gulley/storage';
 import {
@@ -69,6 +73,8 @@ import {
 } from './shadow-spend';
 import type { OidcRoleRule } from './oidc-gate';
 import {
+  AuditChainWalker,
+  type AuditEventInput,
   type AuditRow,
   type AuditSink,
   GuardedAuditSink,
@@ -92,6 +98,44 @@ import {
   type TenancyPersistence,
   WorkspaceStore,
 } from './stores';
+
+/**
+ * Thrown by the control plane's audit sink when an append fails. Every admin mutation
+ * audits AFTER it mutates (the in-memory registries are not transactional), so this
+ * error means "the change may have been applied but no audit row exists" — the server's
+ * error handler turns it into a structured `audit_lost` log line + an `audit_unavailable`
+ * 500 (instead of the generic 500 that hid the compliance gap).
+ */
+export class AuditUnavailableError extends Error {
+  constructor(
+    readonly event: AuditEventInput,
+    override readonly cause: unknown,
+  ) {
+    super('audit append failed');
+    this.name = 'AuditUnavailableError';
+  }
+}
+
+/** Wraps a sink so an append failure surfaces as {@link AuditUnavailableError}. */
+export class SignalingAuditSink implements AuditSink {
+  constructor(private readonly inner: AuditSink) {}
+  async append(event: AuditEventInput): Promise<AuditRow> {
+    try {
+      return await this.inner.append(event);
+    } catch (err) {
+      throw new AuditUnavailableError(event, err);
+    }
+  }
+}
+
+/** Tx-bound durable stores for a mutation that must commit atomically with its audit
+ *  row (DB mode). Built per call by {@link ControlContext.durableAtomic}. */
+export interface DurableTx {
+  adminUsers: PostgresAdminUserStore;
+  memberships: PostgresMembershipStore;
+  sessions: PostgresAdminSessionStore;
+  audit: AuditSink;
+}
 
 export interface ControlContext {
   orgs: OrgStore;
@@ -163,6 +207,15 @@ export interface ControlContext {
   /** Read the full audit chain (ordered) for an attestation export; absent = not
    *  supported by this backend. */
   auditRows?: () => Promise<AuditRow[]>;
+  /** One page of the chain, newest first, keyset-paged by seq (the console browser). */
+  auditPage: (opts: { before?: number; limit: number }) => Promise<AuditRow[]>;
+  /** The newest rows of one action, bounded (security feeds). */
+  auditByAction: (action: string, limit: number) => Promise<AuditRow[]>;
+  /** The chain head seq (0 when empty) without reading the chain. */
+  auditHeadSeq: () => Promise<number>;
+  /** DB mode: run a durable mutation + its audit row in ONE transaction, over tx-bound
+   *  stores. Absent ⇒ in-memory stores (mutate, then audit; see auditedWrite). */
+  durableAtomic?: <T>(fn: (tx: DurableTx) => Promise<T>) => Promise<T>;
   /** HMAC key that signs auditor attestations; absent = attestation export off. */
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
@@ -240,6 +293,12 @@ export interface OidcSessionConfig {
   cookieSecure: boolean;
   /** Injected HTTP for the token exchange (tests); defaults to global fetch. */
   fetchImpl?: typeof fetch;
+  /** id_token claim that becomes the admin subject (default `sub`). */
+  subjectClaim?: string;
+  /** Deadline for the authorization-code exchange (ms). Default 10 s. */
+  exchangeTimeoutMs?: number;
+  /** Egress guard for the token_endpoint the discovery document advertises. */
+  assertEgress?: (url: string) => void;
 }
 
 export interface InMemoryContextOptions {
@@ -270,6 +329,8 @@ export interface InMemoryContextOptions {
   dbConnectTimeoutMs?: number;
   /** Inject a pre-built Database (tests); overrides databaseUrl. */
   db?: Database;
+  /** Structured hook for a failing durable membership loader (see AdminResolverDeps). */
+  onLoaderError?: (subject: string, err: unknown) => void;
   /** HMAC key that signs auditor attestations; absent = attestation export off. */
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
@@ -358,7 +419,11 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   // Admin mutations AND mask-vault PII reveals audit through ctx.audit. With a DB,
   // back it with the durable, hash-chained Postgres sink (was in-memory even when
   // a DB was configured, so a restart wiped the record of who revealed which PII).
-  const audit = new GuardedAuditSink(db ? new PostgresAuditSink(db) : inner);
+  // The outer SignalingAuditSink turns an append failure into AuditUnavailableError so
+  // a lost audit row is a structured, alertable event rather than an anonymous 500.
+  const audit = new SignalingAuditSink(
+    new GuardedAuditSink(db ? new PostgresAuditSink(db) : inner),
+  );
   const keyStore = new InMemoryKeyStore();
   // Durable session registry (DB mode) so the console can list + revoke live admin
   // sessions; in-memory otherwise (revocation + per-process listing only).
@@ -413,6 +478,22 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
       : Promise.resolve(
           sinceSeq === undefined ? inner.rows : inner.rows.filter((r) => r.seq > sinceSeq),
         );
+  const headSeq = (): Promise<number> =>
+    db ? auditHeadSeq(db) : Promise.resolve(inner.rows.reduce((m, r) => Math.max(m, r.seq), 0));
+  const auditPage = async (opts: { before?: number; limit: number }): Promise<AuditRow[]> => {
+    if (db) return readAuditPage(db, opts);
+    return inner.rows
+      .filter((r) => (opts.before === undefined ? true : r.seq < opts.before))
+      .sort((a, b) => b.seq - a.seq)
+      .slice(0, opts.limit);
+  };
+  const auditByAction = async (action: string, limit: number): Promise<AuditRow[]> => {
+    if (db) return readAuditRowsByAction(db, action, limit);
+    return inner.rows
+      .filter((r) => r.action === action)
+      .sort((a, b) => b.seq - a.seq)
+      .slice(0, limit);
+  };
 
   // WORM-live shipper: ships that complete durable chain to the immutable mirror.
   const wormShipper = opts.worm
@@ -430,6 +511,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     ? new SiemExporter({
         connector: opts.siem.connector,
         readRows: auditRowsSince,
+        headSeq,
         ...(opts.siem.batchMax !== undefined ? { batchMax: opts.siem.batchMax } : {}),
       })
     : undefined;
@@ -529,6 +611,21 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
         )
     : undefined;
 
+  // DB mode: a durable mutation and its audit row commit in one transaction (the
+  // stores are all `constructor(db)`, so tx-bound copies are cheap to build per call).
+  const durableAtomic = db
+    ? <T>(fn: (tx: DurableTx) => Promise<T>): Promise<T> =>
+        db.transaction((tx) => {
+          const h = tx as unknown as Database;
+          return fn({
+            adminUsers: new PostgresAdminUserStore(h),
+            memberships: new PostgresMembershipStore(h),
+            sessions: new PostgresAdminSessionStore(h),
+            audit: new SignalingAuditSink(new GuardedAuditSink(new PostgresAuditSink(h))),
+          });
+        })
+    : undefined;
+
   // Tenancy registries: durable write-through + boot hydration in DB mode (see
   // PostgresTenancyStore) so console-created orgs/workspaces exist in Postgres before
   // keys / OAuth clients reference them, and survive a restart.
@@ -592,6 +689,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
       sessionStore,
       maxSessionTtlMs: opts.maxSessionTtlMs,
       membershipLoader,
+      onLoaderError: opts.onLoaderError,
     },
     adminUsers,
     durableMemberships,
@@ -599,14 +697,25 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     // Verify the durable chain when a DB is present (the same rows attestation
     // reads), else the in-memory sink — so a DB-backed deploy no longer reports the
     // empty in-memory chain while admin/PII-reveal audits land in Postgres.
+    // Streams the durable chain in bounded batches through the incremental walker,
+    // so verifying a multi-million-row chain no longer materialises every row.
     verifyAudit: async () => {
-      const rows = db ? await readAuditRows(db) : inner.rows;
-      const r = verifyAuditChain(rows);
+      if (!db) {
+        const r = verifyAuditChain(inner.rows);
+        return { verified: r.verified, count: r.count };
+      }
+      const walker = new AuditChainWalker();
+      for await (const row of iterateAuditRows(db)) walker.push(row);
+      const r = walker.report();
       return { verified: r.verified, count: r.count };
     },
     // Attestation reads the durable chain when a DB is present (the auditor-facing
     // source of truth), else the in-memory sink (dev/test) — same core verifier.
     auditRows,
+    auditPage,
+    auditByAction,
+    auditHeadSeq: headSeq,
+    durableAtomic,
     attestationKey: opts.attestationKey,
     attestationSubject: opts.attestationSubject,
     auditSigner: opts.auditSigner,

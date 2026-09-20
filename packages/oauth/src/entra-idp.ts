@@ -15,6 +15,9 @@ export interface EntraGraphConfig {
   /** How long a last-known-good result may be reused if Graph is transiently
    *  unavailable (ms). Default 10 min. A hard error with no fresh cache fails closed. */
   cacheTtlMs?: number;
+  /** Per-request deadline for the token + Graph calls (ms). Default 5 s. Without it
+   *  a stalled Graph endpoint would hold every refresh for undici's ~300 s. */
+  timeoutMs?: number;
   fetchImpl?: typeof fetch;
   assertAllowed?: (url: string) => void;
   now?: () => number;
@@ -40,6 +43,7 @@ export class EntraGraphIdp implements IdentityProvider {
   private readonly graphBase: string;
   private readonly loginBase: string;
   private readonly cacheTtlMs: number;
+  private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private token?: TokenState;
@@ -49,6 +53,7 @@ export class EntraGraphIdp implements IdentityProvider {
     this.graphBase = (cfg.graphBase ?? 'https://graph.microsoft.com').replace(/\/$/, '');
     this.loginBase = (cfg.loginBase ?? 'https://login.microsoftonline.com').replace(/\/$/, '');
     this.cacheTtlMs = cfg.cacheTtlMs ?? 600_000;
+    this.timeoutMs = cfg.timeoutMs ?? 5_000;
     this.fetchImpl = cfg.fetchImpl ?? fetch;
     this.now = cfg.now ?? Date.now;
   }
@@ -63,6 +68,7 @@ export class EntraGraphIdp implements IdentityProvider {
       const res = await this.fetchImpl(url, {
         headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
         redirect: 'error',
+        signal: AbortSignal.timeout(this.timeoutMs),
       });
       if (res.status === 404) {
         // Deleted from the directory — definitively inactive.
@@ -97,6 +103,7 @@ export class EntraGraphIdp implements IdentityProvider {
       headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body,
       redirect: 'error',
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!res.ok) throw new Error(`entra client-credentials token ${res.status}`);
     const j = (await res.json()) as { access_token: string; expires_in?: number };

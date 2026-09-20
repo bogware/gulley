@@ -22,32 +22,57 @@ export interface AuditChainReport {
  *  for both the in-memory sink's `verify()` and the audit-verify CLI. Rows MUST be
  *  ordered by seq ascending. */
 export function verifyAuditChain(rows: readonly AuditRow[]): AuditChainReport {
-  const first = rows[0];
-  const last = rows[rows.length - 1];
-  const base: AuditChainReport = {
-    verified: true,
-    count: rows.length,
-    firstSeq: first?.seq ?? null,
-    lastSeq: last?.seq ?? null,
-    firstHash: first?.rowHash ?? null,
-    lastHash: last?.rowHash ?? null,
-    firstAt: first ? first.createdAt.toISOString() : null,
-    lastAt: last ? last.createdAt.toISOString() : null,
-  };
+  const walker = new AuditChainWalker();
+  for (const row of rows) walker.push(row);
+  return walker.report();
+}
 
-  let prev: string | null = null;
-  let prevSeq = 0;
-  for (const row of rows) {
+/**
+ * Incremental chain verifier: feed rows seq-ascending one (or one batch) at a time and
+ * read the report at the end. Same semantics as {@link verifyAuditChain} — that function
+ * is now a thin wrapper — but lets a durable backend re-walk a chain of any size in
+ * bounded batches instead of materialising every row. After the first broken link the
+ * walker stops re-hashing (the report is final); `push` stays cheap.
+ */
+export class AuditChainWalker {
+  private prev: string | null = null;
+  private prevSeq = 0;
+  private count = 0;
+  private first: AuditRow | undefined;
+  private last: AuditRow | undefined;
+  private brokenAtSeq: number | undefined;
+
+  push(row: AuditRow): void {
+    this.count++;
+    this.first ??= row;
+    this.last = row;
+    if (this.brokenAtSeq !== undefined) return;
     const content = rowContent(row);
-    const linkBroken = row.prevHash !== prev || computeRowHash(prev, content) !== row.rowHash;
-    const seqBroken = row.seq <= prevSeq;
+    const linkBroken =
+      row.prevHash !== this.prev || computeRowHash(this.prev, content) !== row.rowHash;
+    const seqBroken = row.seq <= this.prevSeq;
     if (linkBroken || seqBroken) {
-      return { ...base, verified: false, brokenAtSeq: row.seq };
+      this.brokenAtSeq = row.seq;
+      return;
     }
-    prev = row.rowHash;
-    prevSeq = row.seq;
+    this.prev = row.rowHash;
+    this.prevSeq = row.seq;
   }
-  return base;
+
+  report(): AuditChainReport {
+    const { first, last } = this;
+    const base: AuditChainReport = {
+      verified: this.brokenAtSeq === undefined,
+      count: this.count,
+      firstSeq: first?.seq ?? null,
+      lastSeq: last?.seq ?? null,
+      firstHash: first?.rowHash ?? null,
+      lastHash: last?.rowHash ?? null,
+      firstAt: first ? first.createdAt.toISOString() : null,
+      lastAt: last ? last.createdAt.toISOString() : null,
+    };
+    return this.brokenAtSeq === undefined ? base : { ...base, brokenAtSeq: this.brokenAtSeq };
+  }
 }
 
 /** A tamper-evidence attestation over an audit chain — what an auditor receives. */

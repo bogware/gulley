@@ -28,9 +28,10 @@ export function registerObservabilityRoutes(app: FastifyInstance, ctx: ControlCo
       try {
         return reply.send({ metrics: await provider.summary(new Date().toISOString()) });
       } catch (e) {
-        return reply.code(502).send({
-          error: { type: 'upstream', message: e instanceof Error ? e.message : String(e) },
-        });
+        _req.log.warn({ err: e }, 'gateway metrics fetch failed');
+        return reply
+          .code(502)
+          .send({ error: { type: 'upstream', message: 'gateway metrics listener unreachable' } });
       }
     }),
   );
@@ -44,9 +45,10 @@ export function registerObservabilityRoutes(app: FastifyInstance, ctx: ControlCo
       try {
         return reply.type('text/plain; version=0.0.4; charset=utf-8').send(await provider.raw());
       } catch (e) {
-        return reply.code(502).send({
-          error: { type: 'upstream', message: e instanceof Error ? e.message : String(e) },
-        });
+        _req.log.warn({ err: e }, 'gateway metrics fetch failed');
+        return reply
+          .code(502)
+          .send({ error: { type: 'upstream', message: 'gateway metrics listener unreachable' } });
       }
     }),
   );

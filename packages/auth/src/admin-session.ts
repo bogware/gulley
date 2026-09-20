@@ -2,8 +2,15 @@ import { err, ok, type Result } from '@gulley/core';
 import { type AdminPrincipal, isRole, type Membership } from '@gulley/rbac';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
+/** How a session was minted. `exchange` = an admin delegated a scoped token
+ *  (its memberships are the whole authority — the durable loader is NOT unioned in,
+ *  so a delegated token can never widen to the minter's other grants); `oidc` = SSO
+ *  login; `break-glass` = the audited bootstrap elevation. Tokens minted before this
+ *  claim existed carry none and resolve as `legacy`. */
+export type AdminSessionSource = 'exchange' | 'oidc' | 'break-glass' | 'legacy';
+
 export interface AdminSessionClaims {
-  /** subject (Entra oid, or a session-scoped id). */
+  /** subject (Entra oid, or the minting admin's own subject for a delegated token). */
   sub: string;
   name: string;
   /** session id — the revocation key. */
@@ -14,6 +21,8 @@ export interface AdminSessionClaims {
   exp: number;
   typ: 'admin-session';
   ver: 1;
+  /** Mint path (see AdminSessionSource). Optional for backward compatibility. */
+  src?: Exclude<AdminSessionSource, 'legacy'>;
 }
 
 const PREFIX = 'gses_';
@@ -47,6 +56,8 @@ export interface VerifyOptions {
 export interface VerifiedSession {
   principal: AdminPrincipal;
   jti: string;
+  /** Mint path carried in the claims (`legacy` when the token predates the claim). */
+  source: AdminSessionSource;
 }
 
 /**
@@ -98,6 +109,10 @@ export function verifyAdminSession(
   const memberships = (Array.isArray(claims.memberships) ? claims.memberships : []).filter(
     (m): m is Membership => !!m && isRole((m as Membership).role),
   );
+  const source: AdminSessionSource =
+    claims.src === 'exchange' || claims.src === 'oidc' || claims.src === 'break-glass'
+      ? claims.src
+      : 'legacy';
   return ok({
     principal: {
       kind: 'admin',
@@ -107,5 +122,6 @@ export function verifyAdminSession(
       memberships,
     },
     jti: claims.jti,
+    source,
   });
 }

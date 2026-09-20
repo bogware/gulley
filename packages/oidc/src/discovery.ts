@@ -22,23 +22,67 @@ export interface OidcMetadata {
  *  signing-key rotation. Bound every metadata/JWKS fetch. */
 export const DEFAULT_OIDC_FETCH_TIMEOUT_MS = 5_000;
 
-/** fetch with a total-request deadline; a timeout surfaces as a normal fetch error. */
-function timedFetch(url: string, fetchImpl: typeof fetch, timeoutMs: number): Promise<Response> {
-  return fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
+/** Outbound guard applied to every URL the provider fetches (discovery, JWKS) and
+ *  to the endpoints the document advertises. `assertAllowed` throws to deny (the
+ *  control plane wires its SSRF/air-gap egress guard here); `requireHttps` rejects a
+ *  plaintext issuer or advertised endpoint (an attacker who can inject an `http://`
+ *  token_endpoint into discovery would otherwise receive the client secret). */
+export interface OidcFetchGuard {
+  assertAllowed?: (url: string) => void;
+  requireHttps?: boolean;
+}
+
+/** fetch with a total-request deadline; a timeout surfaces as a normal fetch error.
+ *  Redirects are refused: a redirecting IdP endpoint is a rebind vector. */
+function timedFetch(
+  url: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+  guard?: OidcFetchGuard,
+): Promise<Response> {
+  guard?.assertAllowed?.(url);
+  return fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'error' });
+}
+
+const normalizeIssuer = (s: string): string => s.replace(/\/+$/, '');
+
+function assertEndpoint(name: string, url: string, guard: OidcFetchGuard | undefined): void {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new Error(`OIDC discovery: ${name} is not a valid URL`);
+  }
+  if (guard?.requireHttps && u.protocol !== 'https:') {
+    throw new Error(`OIDC discovery: ${name} must be https`);
+  }
+  guard?.assertAllowed?.(url);
 }
 
 export async function fetchDiscovery(
   issuer: string,
   fetchImpl: typeof fetch = fetch,
   timeoutMs: number = DEFAULT_OIDC_FETCH_TIMEOUT_MS,
+  guard?: OidcFetchGuard,
 ): Promise<OidcMetadata> {
-  const url = `${issuer.replace(/\/$/, '')}/.well-known/openid-configuration`;
-  const res = await timedFetch(url, fetchImpl, timeoutMs);
+  if (guard?.requireHttps && !/^https:\/\//i.test(issuer)) {
+    throw new Error('OIDC issuer must be https');
+  }
+  const url = `${normalizeIssuer(issuer)}/.well-known/openid-configuration`;
+  const res = await timedFetch(url, fetchImpl, timeoutMs, guard);
   if (!res.ok) throw new Error(`OIDC discovery failed: ${res.status}`);
   const d = (await res.json()) as Partial<OidcMetadata>;
   if (!d.issuer || !d.authorization_endpoint || !d.token_endpoint || !d.jwks_uri) {
     throw new Error('OIDC discovery document is missing required endpoints');
   }
+  // RFC 8414 §3.3: the document's issuer MUST match the one it was fetched for —
+  // otherwise a compromised/misrouted discovery host could redirect the whole flow.
+  if (normalizeIssuer(d.issuer) !== normalizeIssuer(issuer)) {
+    throw new Error('OIDC discovery issuer does not match the configured issuer');
+  }
+  assertEndpoint('authorization_endpoint', d.authorization_endpoint, guard);
+  assertEndpoint('token_endpoint', d.token_endpoint, guard);
+  assertEndpoint('jwks_uri', d.jwks_uri, guard);
   return {
     issuer: d.issuer,
     authorization_endpoint: d.authorization_endpoint,
@@ -51,8 +95,9 @@ export async function fetchJwks(
   jwksUri: string,
   fetchImpl: typeof fetch = fetch,
   timeoutMs: number = DEFAULT_OIDC_FETCH_TIMEOUT_MS,
+  guard?: OidcFetchGuard,
 ): Promise<Jwk[]> {
-  const res = await timedFetch(jwksUri, fetchImpl, timeoutMs);
+  const res = await timedFetch(jwksUri, fetchImpl, timeoutMs, guard);
   if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
   const d = (await res.json()) as { keys?: Jwk[] };
   return Array.isArray(d.keys) ? d.keys : [];
@@ -65,6 +110,8 @@ export interface OidcProviderOptions {
   now?: () => number;
   /** Per-request timeout for discovery/JWKS fetches (ms). Default 5s. */
   fetchTimeoutMs?: number;
+  /** Egress guard + https policy for every URL fetched or advertised. */
+  guard?: OidcFetchGuard;
 }
 
 /**
@@ -81,6 +128,7 @@ export class OidcProvider {
   private readonly ttlMs: number;
   private readonly nowFn: () => number;
   private readonly fetchTimeoutMs: number;
+  private readonly guard: OidcFetchGuard | undefined;
   // Single-flight the network fetches: on a cold cache (boot) or a rotation refresh,
   // N concurrent JWT verifications would otherwise each fire an independent fetch.
   private metadataInflight?: Promise<OidcMetadata>;
@@ -94,12 +142,18 @@ export class OidcProvider {
     this.ttlMs = opts.ttlMs ?? 3_600_000;
     this.nowFn = opts.now ?? Date.now;
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? DEFAULT_OIDC_FETCH_TIMEOUT_MS;
+    this.guard = opts.guard;
   }
 
   async metadataDoc(): Promise<OidcMetadata> {
     if (this.metadata && this.nowFn() - this.metadata.at < this.ttlMs) return this.metadata.value;
     if (this.metadataInflight) return this.metadataInflight;
-    this.metadataInflight = fetchDiscovery(this.issuer, this.fetchImpl, this.fetchTimeoutMs)
+    this.metadataInflight = fetchDiscovery(
+      this.issuer,
+      this.fetchImpl,
+      this.fetchTimeoutMs,
+      this.guard,
+    )
       .then((value) => {
         this.metadata = { value, at: this.nowFn() };
         return value;
@@ -115,7 +169,7 @@ export class OidcProvider {
     if (this.keysInflight) return this.keysInflight;
     this.keysInflight = (async () => {
       const md = await this.metadataDoc();
-      const keys = await fetchJwks(md.jwks_uri, this.fetchImpl, this.fetchTimeoutMs);
+      const keys = await fetchJwks(md.jwks_uri, this.fetchImpl, this.fetchTimeoutMs, this.guard);
       this.jwks = { keys, at: this.nowFn() };
       return keys;
     })().finally(() => {

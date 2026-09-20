@@ -14,7 +14,7 @@ import {
   signOnboardingPack,
 } from '@gulley/cli';
 import { GULLEY_VERSION, secretRef } from '@gulley/core';
-import { assertEgressAllowed } from '@gulley/egress';
+import { assertEgressAllowed, EgressError } from '@gulley/egress';
 import {
   can,
   coveredOrgIds,
@@ -29,11 +29,16 @@ import {
   adminRoute,
   auditedWrite,
   body,
+  clampTtlSeconds,
+  configHash,
   forbidden,
+  isUuid,
   notFound,
   scopeForProvider,
   scopeForWorkspace,
   str,
+  strMax,
+  uuidParam,
   visibleWorkspaceIds,
 } from './admin';
 import { detectChainRewrite } from './anchor';
@@ -52,17 +57,35 @@ function paramId(request: { params: unknown }): string {
   return (request.params as { id: string }).id;
 }
 
+const MAX_LABEL = 128;
+const MAX_REASON = 1_024;
+const MAX_DELEGATED_MEMBERSHIPS = 50;
+
 export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): void {
-  // --- admin session minting (owner→session exchange; no amplification) ---
+  // --- admin session minting (delegated, scoped tokens; no amplification) ---
+  // The token's subject is ALWAYS the minting admin: a caller-chosen `subject` used to
+  // become the session's identity, so an org admin could mint `{subject: <platform
+  // owner>, memberships: []}` — no permission check ran (the loop was empty), the
+  // durable membership loader then unioned the named subject's grants in, and every
+  // audit row it wrote named someone else. Now: sub = minter, the delegated
+  // memberships are the token's whole authority (the resolver skips the loader for
+  // `exchange` tokens), at least one membership is required (so a can() check always
+  // runs), and the caller's label survives only as the display name.
   app.post(
     '/admin/sessions',
     adminRoute(ctx, async (request, reply, admin) => {
       const b = body(request);
-      const subject = str(b['subject']) ?? `sess-${randomUUID()}`;
-      const name = str(b['name']) ?? subject;
+      const label = strMax(b['name'] ?? b['subject'], MAX_LABEL);
+      if ((b['name'] !== undefined || b['subject'] !== undefined) && label === undefined)
+        return invalid(reply, `name must be 1..${MAX_LABEL} characters`);
+      const subject = admin.subject;
+      const name = label ?? `delegated:${admin.displayName}`;
       const maxTtl = ctx.resolverDeps.maxSessionTtlMs / 1000;
-      const ttlSeconds = Math.min(Number(b['ttlSeconds']) || 900, maxTtl);
+      const ttlSeconds = clampTtlSeconds(b['ttlSeconds'], 900, maxTtl);
       const rawMemberships = Array.isArray(b['memberships']) ? b['memberships'] : [];
+      if (rawMemberships.length === 0) return invalid(reply, 'at least one membership is required');
+      if (rawMemberships.length > MAX_DELEGATED_MEMBERSHIPS)
+        return invalid(reply, `at most ${MAX_DELEGATED_MEMBERSHIPS} memberships`);
 
       const memberships: RbacMembership[] = [];
       for (const m of rawMemberships) {
@@ -93,6 +116,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         exp: iat + ttlSeconds,
         typ: 'admin-session',
         ver: 1,
+        src: 'exchange',
       };
       const token = signAdminSession(secret, claims);
       await ctx.sessions.record?.({
@@ -107,7 +131,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         actor: admin.subject,
         action: 'admin.session.mint',
         target: subject,
-        payload: { jti, memberships },
+        payload: { jti, label: name, memberships, ttlSeconds },
       });
       return reply.code(201).send({ token, expiresAt: new Date(claims.exp * 1000).toISOString() });
     }),
@@ -125,19 +149,20 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     adminRoute(ctx, async (request, reply, admin) => {
       if (admin.source !== 'bootstrap') return forbidden(reply);
       const b = body(request);
-      const reason = str(b['reason']);
-      if (!reason) return invalid(reply, 'reason required');
+      const reason = strMax(b['reason'], MAX_REASON);
+      if (!reason) return invalid(reply, `reason required (1..${MAX_REASON} characters)`);
       const secret = ctx.resolverDeps.sessionSecrets[0];
       if (!secret)
         return reply.code(500).send({ error: { type: 'config', message: 'no session secret' } });
       const cap = ctx.resolverDeps.maxSessionTtlMs / 1000;
-      const ttlSeconds = Math.min(Number(b['ttlSeconds']) || 900, cap);
+      const ttlSeconds = clampTtlSeconds(b['ttlSeconds'], 900, cap);
       const now = ctx.resolverDeps.now ?? Date.now();
       const iat = Math.floor(now / 1000);
       const jti = randomUUID();
       const claims: AdminSessionClaims = {
         sub: `break-glass:${admin.subject}`,
         name: 'break-glass',
+        src: 'break-glass',
         jti,
         memberships: [{ role: 'owner', orgId: '*' }],
         iat,
@@ -261,7 +286,13 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         try {
           assertEgressAllowed(baseUrl, { allowlist: ctx.outboundAllowlist });
         } catch (e) {
-          return reply.code(422).send({ error: { type: 'egress', message: (e as Error).message } });
+          return reply.code(422).send({
+            error: {
+              type: 'egress',
+              message: 'baseUrl is not an allowed egress destination',
+              reason: e instanceof EgressError ? e.reason : 'blocked',
+            },
+          });
         }
       }
       const r = await auditedWrite(ctx, admin, {
@@ -319,37 +350,64 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       // auth. The in-memory path keeps the legacy opaque `userId`. Either way the
       // grant requires membership:create, owner needs grant_owner, and no role may
       // exceed the granter's rank at the scope (anti-amplification).
-      const subject = str(b['subject']);
+      const subject = strMax(b['subject'], 512);
       const userId = str(b['userId']);
       const role = b['role'];
       const orgId = str(b['orgId']);
       const workspaceId = str(b['workspaceId']) ?? null;
       if (!isRole(role) || !orgId) return invalid(reply, 'role, orgId required');
-      const at = { orgId, workspaceId };
+      // orgId "*" is a PLATFORM grant: it is checked at the empty deployment scope (only
+      // a platform-wide membership covers it) and persisted as NULL org (the uuid column
+      // cannot hold the sentinel — it used to 500 in DB mode).
+      const platform = orgId === '*';
+      if (platform && workspaceId) return invalid(reply, 'a platform grant has no workspace');
+      const at = platform ? {} : { orgId, workspaceId };
       if (!can(admin, 'membership:create', at)) return forbidden(reply);
       if (role === 'owner' && !can(admin, 'membership:grant_owner', at)) return forbidden(reply);
       if (roleRank[role] > maxRankAt(admin, at)) return forbidden(reply);
+      if (!platform && !isUuid(orgId) && ctx.durableMemberships)
+        return invalid(reply, 'orgId must be a uuid');
+      if (workspaceId && !isUuid(workspaceId) && ctx.durableMemberships)
+        return invalid(reply, 'workspaceId must be a uuid');
 
       if (ctx.durableMemberships && ctx.adminUsers) {
-        const uid = subject
-          ? (await ctx.adminUsers.upsertBySubject(subject, str(b['displayName']) ?? subject)).id
-          : userId;
-        if (!uid) return invalid(reply, 'subject (or userId) required');
-        const created = await ctx.durableMemberships.create(uid, role, orgId, workspaceId);
-        await ctx.audit.append({
-          orgId,
-          actor: admin.subject,
-          action: 'membership.create',
-          target: subject ?? uid,
-          payload: { role, orgId, workspaceId, subject },
-        });
+        if (!subject && !userId) return invalid(reply, 'subject (or userId) required');
+        if (!subject && userId && !isUuid(userId)) return invalid(reply, 'userId must be a uuid');
+        const durableOrg = platform ? null : orgId;
+        const displayName = strMax(b['displayName'], 256) ?? subject;
+        // The grant and its audit row commit together (DB mode).
+        const run = async (tx: {
+          adminUsers: typeof ctx.adminUsers;
+          memberships: typeof ctx.durableMemberships;
+          audit: typeof ctx.audit;
+        }) => {
+          const uid = subject
+            ? (await tx.adminUsers!.upsertBySubject(subject, displayName ?? subject)).id
+            : userId!;
+          const created = await tx.memberships!.create(uid, role, durableOrg, workspaceId);
+          await tx.audit.append({
+            orgId: durableOrg,
+            actor: admin.subject,
+            action: 'membership.create',
+            target: subject ?? uid,
+            payload: { role, orgId, workspaceId, subject },
+          });
+          return created;
+        };
+        const created = ctx.durableAtomic
+          ? await ctx.durableAtomic((tx) => run(tx))
+          : await run({
+              adminUsers: ctx.adminUsers,
+              memberships: ctx.durableMemberships,
+              audit: ctx.audit,
+            });
         return reply.code(201).send({ membership: created });
       }
 
       if (!userId) return invalid(reply, 'userId required');
       const created = ctx.memberships.create({ userId, role, orgId, workspaceId });
       await ctx.audit.append({
-        orgId,
+        orgId: platform ? null : orgId,
         actor: admin.subject,
         action: 'membership.create',
         target: userId,
@@ -381,15 +439,33 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         });
       }
       if (!can(admin, 'membership:delete', {})) return forbidden(reply);
-      const id = paramId(request);
-      const ok = await ctx.durableMemberships.delete(id);
-      if (!ok) return notFound(reply, 'membership');
-      await ctx.audit.append({
-        actor: admin.subject,
-        action: 'membership.delete',
-        target: id,
-        payload: {},
-      });
+      const id = uuidParam(request);
+      if (!id) return notFound(reply, 'membership');
+      const durable = ctx.durableMemberships;
+      const deleted = ctx.durableAtomic
+        ? await ctx.durableAtomic(async (tx) => {
+            const ok = await tx.memberships.delete(id);
+            if (ok)
+              await tx.audit.append({
+                actor: admin.subject,
+                action: 'membership.delete',
+                target: id,
+                payload: {},
+              });
+            return ok;
+          })
+        : await (async () => {
+            const ok = await durable.delete(id);
+            if (ok)
+              await ctx.audit.append({
+                actor: admin.subject,
+                action: 'membership.delete',
+                target: id,
+                payload: {},
+              });
+            return ok;
+          })();
+      if (!deleted) return notFound(reply, 'membership');
       return reply.send({ deleted: true });
     }),
   );
@@ -422,7 +498,8 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   app.get(
     '/keys/:id',
     adminRoute(ctx, async (request, reply, admin) => {
-      const view = await ctx.keys.get(paramId(request));
+      const id = uuidParam(request);
+      const view = id ? await ctx.keys.get(id) : undefined;
       if (!view) return notFound(reply, 'key');
       const at = scopeForWorkspace(ctx, view.workspaceId) ?? {};
       if (!(await ctx.access.can(admin, 'key:read', at))) return forbidden(reply);
@@ -554,13 +631,14 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   app.post(
     '/keys/:id/disable',
     adminRoute(ctx, async (request, reply, admin) => {
-      const view = await ctx.keys.get(paramId(request));
+      const id = uuidParam(request);
+      const view = id ? await ctx.keys.get(id) : undefined;
       if (!view) return notFound(reply, 'key');
       const at = scopeForWorkspace(ctx, view.workspaceId) ?? {};
       if (!(await ctx.access.can(admin, 'key:create', at))) return forbidden(reply);
       const updated = await ctx.keys.disable(view.id);
       await ctx.audit.append({
-        orgId: at.orgId ?? '',
+        orgId: at.orgId ?? null,
         actor: admin.subject,
         action: 'key.disable',
         target: view.id,
@@ -573,13 +651,14 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   app.post(
     '/keys/:id/rotate',
     adminRoute(ctx, async (request, reply, admin) => {
-      const view = await ctx.keys.get(paramId(request));
+      const id = uuidParam(request);
+      const view = id ? await ctx.keys.get(id) : undefined;
       if (!view) return notFound(reply, 'key');
       const at = scopeForWorkspace(ctx, view.workspaceId) ?? {};
       if (!(await ctx.access.can(admin, 'key:create', at))) return forbidden(reply);
       const rotated = await ctx.keys.rotate(view.id);
       await ctx.audit.append({
-        orgId: at.orgId ?? '',
+        orgId: at.orgId ?? null,
         actor: admin.subject,
         action: 'key.rotate',
         target: view.id,
@@ -665,12 +744,23 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         }
         if (patch.name === undefined && patch.config === undefined)
           return invalid(reply, 'name or config required');
+        // The audit diff names WHAT changed (a name and/or config content hash before →
+        // after) — it used to record only the name, so a config edit left a row that
+        // said nothing about the change.
+        const beforeHash = configHash(existing.config);
+        const afterHash = patch.config ? configHash(patch.config) : beforeHash;
         const r = await auditedWrite(ctx, admin, {
           perm: `${c.resource}:update` as Permission,
           at,
           action: `${c.kind}.update`,
           target: id,
-          diff: { name: patch.name ?? existing.name },
+          diff: {
+            name: patch.name ?? existing.name,
+            nameChanged: patch.name !== undefined && patch.name !== existing.name,
+            configChanged: afterHash !== beforeHash,
+            configHashBefore: beforeHash,
+            configHashAfter: afterHash,
+          },
           mutate: () => ctx.collections[c.kind].update(id, patch),
         });
         return r.ok ? reply.send({ entity: r.value }) : forbidden(reply);
@@ -1007,9 +1097,13 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       try {
         return reply.send(await ctx.wormShipper.ship());
       } catch (err) {
-        return reply
-          .code(409)
-          .send({ error: { type: 'worm_integrity', message: (err as Error).message } });
+        _req.log.warn({ err }, 'WORM ship refused');
+        return reply.code(409).send({
+          error: {
+            type: 'worm_integrity',
+            message: 'WORM mirror integrity check failed; see GET /audit/worm/verify',
+          },
+        });
       }
     }),
   );
@@ -1109,9 +1203,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       try {
         return reply.send(await ctx.siemExporter.export());
       } catch (err) {
+        _req.log.warn({ err }, 'SIEM export failed');
         return reply
           .code(502)
-          .send({ error: { type: 'siem_error', message: (err as Error).message } });
+          .send({ error: { type: 'siem_error', message: 'SIEM connector delivery failed' } });
       }
     }),
   );

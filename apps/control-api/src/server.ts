@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { registerConfigRoutes } from './config-routes';
-import type { ControlContext } from './context';
+import { AuditUnavailableError, type ControlContext } from './context';
 import { registerCryptoShredRoutes } from './crypto-shred-routes';
 import { registerDebugRoutes } from './debug-routes';
 import { registerEvalRolloutRoutes } from './eval-rollout-routes';
@@ -77,6 +77,49 @@ export function buildServer(
   app.addHook('onSend', (request, reply, payload, done) => {
     if (!reply.hasHeader('x-gulley-request-id')) reply.header('x-gulley-request-id', request.id);
     done(null, payload);
+  });
+
+  // Uniform error bodies. Fastify's default handler echoes `error.message` for every
+  // thrown error — a Postgres cast error, a driver's host:port, a stack-adjacent
+  // detail — to the client. 5xx bodies are now generic (the detail goes to the log
+  // with the request id); 4xx keep their message (body-parse/validation text is the
+  // caller's own input). A lost audit row is its own, alertable shape.
+  app.setErrorHandler((err, request, reply) => {
+    const e = err as Error & { statusCode?: number; code?: string; validation?: unknown };
+    if (e instanceof AuditUnavailableError) {
+      request.log.error(
+        {
+          err: e.cause,
+          event: 'audit_lost',
+          action: e.event.action,
+          target: e.event.target ?? null,
+          actor: e.event.actor,
+        },
+        'audit append failed after the mutation ran — the change may be applied but unaudited',
+      );
+      return reply.code(500).send({
+        error: {
+          type: 'audit_unavailable',
+          message: 'the change could not be audited and may have been applied',
+          requestId: request.id,
+        },
+      });
+    }
+    const status = typeof e.statusCode === 'number' && e.statusCode >= 400 ? e.statusCode : 500;
+    if (status >= 500) {
+      request.log.error({ err: e, event: 'unhandled_error' }, 'request failed');
+      return reply.code(status).send({
+        error: { type: 'internal', message: 'internal error', requestId: request.id },
+      });
+    }
+    request.log.info({ statusCode: status, code: e.code, reason: e.message }, 'request rejected');
+    return reply.code(status).send({
+      error: {
+        type: e.validation ? 'validation' : 'bad_request',
+        message: e.message,
+        requestId: request.id,
+      },
+    });
   });
 
   registerHttpEdge(app, config);

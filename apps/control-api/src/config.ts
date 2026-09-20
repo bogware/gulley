@@ -257,6 +257,18 @@ const EnvShape = z.object({
   OIDC_ROLE_MAP: z.string().default('[]'),
   OIDC_POST_LOGIN_REDIRECT: z.string().default('/'),
   OIDC_COOKIE_SECURE: envBool(false),
+  // Which id_token claim becomes the admin subject (the identity SCIM, RBAC grants and
+  // session revocation key on). Default `sub` (Entra: the immutable oid). Set it to
+  // `preferred_username` or `email` when the IdP's SCIM userName is the UPN/email, so
+  // an SSO session and its SCIM row are the SAME subject and a deprovision revokes it.
+  OIDC_SUBJECT_CLAIM: z.string().default('sub'),
+  // Deadline for the OIDC discovery/JWKS fetches and the authorization-code exchange
+  // (ms). Without it an unreachable IdP holds the callback for undici's ~300 s.
+  OIDC_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  // Production requires an https issuer (and https endpoints in its discovery
+  // document): the client secret is POSTed to token_endpoint. Opt-in for a local
+  // plaintext IdP (dev only).
+  OIDC_ALLOW_INSECURE_HTTP: envBool(false),
 
   // Entra (Azure AD) Graph adapter for the OAuth broker's revoke-on-deprovision.
   // When TENANT_ID + GRAPH_CLIENT_ID + GRAPH_CLIENT_SECRET are set, the broker checks
@@ -270,6 +282,8 @@ const EnvShape = z.object({
   ENTRA_GRAPH_BASE: z.string().url().default('https://graph.microsoft.com'),
   ENTRA_LOGIN_BASE: z.string().url().default('https://login.microsoftonline.com'),
   ENTRA_ACTIVE_CACHE_MS: z.coerce.number().int().positive().default(600_000),
+  // Deadline for each Graph / login call (ms). Default 5 s.
+  ENTRA_GRAPH_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
 
   // SCIM Groups → role mapping. JSON { "<group displayName>": { role, orgId } }.
   // When an IdP provisions a group via /scim/v2/Groups, each member is granted the
@@ -289,7 +303,20 @@ const EnvShape = z.object({
 /** Every environment variable the control-api reads, for documentation/CI checks. */
 export const ENV_KEYS: readonly string[] = Object.keys(EnvShape.shape);
 
-const Env = EnvShape;
+const Env = EnvShape.superRefine((c, ctx) => {
+  if (
+    c.NODE_ENV === 'production' &&
+    c.OIDC_ISSUER &&
+    !/^https:\/\//i.test(c.OIDC_ISSUER) &&
+    !c.OIDC_ALLOW_INSECURE_HTTP
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['OIDC_ISSUER'],
+      message: 'OIDC_ISSUER must be https in production (or set OIDC_ALLOW_INSECURE_HTTP=true)',
+    });
+  }
+});
 
 export type Config = z.infer<typeof Env>;
 

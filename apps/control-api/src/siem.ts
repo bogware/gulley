@@ -157,6 +157,9 @@ export interface SiemExporterDeps {
    *  (`seq > sinceSeq`) so the ever-growing chain isn't pulled whole every tick; omit for
    *  the full chain (readAuditRows(db, sinceSeq?)). */
   readRows: (sinceSeq?: number) => Promise<AuditRow[]>;
+  /** The current chain head (max seq) — lets `seedFromHead` skip the backlog with one
+   *  aggregate instead of reading the whole chain at boot. Falls back to readRows(). */
+  headSeq?: () => Promise<number>;
   /** Max events per SIEM POST. Default 200. */
   batchMax?: number;
   log?: (msg: string) => void;
@@ -187,6 +190,10 @@ export class SiemExporter {
 
   /** Skip the existing backlog: forward only events appended after this point. */
   async seedFromHead(): Promise<void> {
+    if (this.deps.headSeq) {
+      this.cursor = await this.deps.headSeq();
+      return;
+    }
     const rows = await this.deps.readRows();
     this.cursor = rows.reduce((max, r) => (r.seq > max ? r.seq : max), 0);
   }

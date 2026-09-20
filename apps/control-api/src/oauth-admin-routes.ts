@@ -1,7 +1,22 @@
 import type { FastifyInstance } from 'fastify';
 
-import { adminRoute, body, forbidden, notFound, str } from './admin';
+import { adminRoute, body, forbidden, notFound, str, strMax } from './admin';
 import type { ControlContext } from './context';
+
+/** The grant types the broker implements (see /.well-known/oauth-authorization-server). */
+const GRANT_TYPES = new Set(['device_code', 'authorization_code', 'refresh_token']);
+
+/** A redirect allowlist entry: an absolute http(s) URL, or a loopback path template. */
+function validRedirectEntry(v: unknown): v is string {
+  if (typeof v !== 'string' || v.length === 0 || v.length > 2_048) return false;
+  if (v.startsWith('/')) return true; // loopback path (the CLI's dynamic-port redirect)
+  try {
+    const u = new URL(v);
+    return u.protocol === 'https:' || u.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
 
 /**
  * OAuth / Enterprise identity MANAGEMENT surface for the console (distinct from the
@@ -64,8 +79,8 @@ export function registerOAuthAdminRoutes(app: FastifyInstance, ctx: ControlConte
       if (!(await ctx.access.can(admin, 'key:create', {}))) return forbidden(reply);
       if (!ctx.oauthAdmin) return reply.code(501).send(noDb);
       const b = body(request);
-      const clientId = str(b['clientId']);
-      const name = str(b['name']);
+      const clientId = strMax(b['clientId'], 128);
+      const name = strMax(b['name'], 256);
       const orgId = str(b['orgId']);
       const workspaceId = str(b['workspaceId']);
       if (!clientId || !name || !orgId || !workspaceId) {
@@ -73,10 +88,37 @@ export function registerOAuthAdminRoutes(app: FastifyInstance, ctx: ControlConte
           error: { type: 'validation', message: 'clientId, name, orgId, workspaceId required' },
         });
       }
-      const grantTypes = Array.isArray(b['grantTypes']) ? (b['grantTypes'] as string[]) : [];
-      const redirectAllowlist = Array.isArray(b['redirectAllowlist'])
-        ? (b['redirectAllowlist'] as string[])
-        : [];
+      if (!/^[A-Za-z0-9._:-]+$/.test(clientId))
+        return reply.code(422).send({
+          error: { type: 'validation', message: 'clientId may contain [A-Za-z0-9._:-] only' },
+        });
+      // Tenancy must resolve (the durable row has FKs; a dangling org used to 500) and
+      // the workspace must belong to the org (the pair is what a grant is scoped to).
+      const ws = ctx.workspaces.get(workspaceId);
+      if (!ctx.orgs.get(orgId)) return notFound(reply, 'org');
+      if (!ws) return notFound(reply, 'workspace');
+      if (ws.orgId !== orgId)
+        return reply
+          .code(422)
+          .send({ error: { type: 'validation', message: 'workspace is not in orgId' } });
+      const rawGrants = Array.isArray(b['grantTypes']) ? b['grantTypes'] : [];
+      const grantTypes = rawGrants.filter((g): g is string => typeof g === 'string');
+      if (grantTypes.length !== rawGrants.length || grantTypes.some((g) => !GRANT_TYPES.has(g)))
+        return reply.code(422).send({
+          error: {
+            type: 'validation',
+            message: `grantTypes must be a subset of ${[...GRANT_TYPES].join(', ')}`,
+          },
+        });
+      const rawRedirects = Array.isArray(b['redirectAllowlist']) ? b['redirectAllowlist'] : [];
+      if (rawRedirects.length > 64 || !rawRedirects.every(validRedirectEntry))
+        return reply.code(422).send({
+          error: {
+            type: 'validation',
+            message: 'redirectAllowlist entries must be absolute http(s) URLs or loopback paths',
+          },
+        });
+      const redirectAllowlist = rawRedirects;
       await ctx.oauthAdmin.clients.upsert({
         clientId,
         name,
@@ -132,7 +174,7 @@ export function registerOAuthAdminRoutes(app: FastifyInstance, ctx: ControlConte
       if (!(await ctx.access.can(admin, 'key:create', {}))) return forbidden(reply);
       if (!ctx.oauthAdmin) return reply.code(501).send(noDb);
       const handle = (request.params as { handle: string }).handle;
-      await ctx.oauthAdmin.grants.revoke(handle);
+      if (!(await ctx.oauthAdmin.grants.revoke(handle))) return notFound(reply, 'grant');
       await ctx.audit.append({
         orgId: null,
         actor: admin.subject,
@@ -171,17 +213,14 @@ export function registerOAuthAdminRoutes(app: FastifyInstance, ctx: ControlConte
       if (!(await ctx.access.can(admin, 'audit:verify', {}))) return forbidden(reply);
       const q = request.query as Record<string, string | undefined>;
       const limit = Math.min(Math.max(Number(q['limit']) || 50, 1), 200);
-      const rows = (await ctx.auditRows?.()) ?? [];
-      const alerts = rows
-        .filter((r) => r.action === 'oauth.refresh_reuse')
-        .sort((a, b) => b.seq - a.seq)
-        .slice(0, limit)
-        .map((r) => ({
-          seq: r.seq,
-          handle: r.target,
-          payload: r.payload,
-          createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
-        }));
+      // One bounded, action-filtered read (was: the whole audit chain, filtered in JS).
+      const rows = await ctx.auditByAction('oauth.refresh_reuse', limit);
+      const alerts = rows.map((r) => ({
+        seq: r.seq,
+        handle: r.target,
+        payload: r.payload,
+        createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
+      }));
       return reply.send({ alerts });
     }),
   );

@@ -6,6 +6,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Delegated admin sessions cannot impersonate.** `POST /admin/sessions` always
+  mints the token for the calling admin (a caller-chosen `subject` is now only a
+  label), requires at least one membership so the anti-amplification check always
+  runs, and the durable membership loader is skipped for delegated (`exchange`)
+  tokens — a delegated token's grants are its whole authority.
+- **OIDC hardening.** Discovery, JWKS and the advertised `token_endpoint` pass the
+  outbound egress guard; the discovery `issuer` must match the configured issuer;
+  production requires https end to end; all IdP calls are bounded; `/auth/logout`
+  revokes the session `jti`.
+- **OAuth broker.** The refresh secret is verified before the identity provider is
+  consulted (a handle alone can no longer drive a Graph lookup); Graph calls carry a
+  deadline; OAuth client saves validate tenancy, grant types and redirect entries and
+  re-scope the durable row on upsert.
+- **Uniform error bodies.** The control API no longer echoes internal error text
+  (driver messages, hosts) in 5xx responses; a lost audit row is a structured
+  `audit_lost` log event and an `audit_unavailable` response.
+
+### Changed
+
+- SCIM deprovision revokes every live session for the user (set-based, by subject
+  and email) in one transaction; SCIM list endpoints honour `startIndex`/`count`;
+  malformed uuid path ids are 404s (SCIM member values: 400 `invalidValue`).
+- `OIDC_SUBJECT_CLAIM`, `OIDC_FETCH_TIMEOUT_MS`, `OIDC_ALLOW_INSECURE_HTTP` and
+  `ENTRA_GRAPH_TIMEOUT_MS` knobs; platform-wide grants (`orgId: "*"`) persist in DB
+  mode; collection update audit rows record what changed (name/config hashes); audit
+  reads are paged from the backend and chain verification streams in batches.
+
 ## [0.3.0] — 2026-09-14
 
 First public release. Gulley is a self-hostable, enterprise LLM gateway: one

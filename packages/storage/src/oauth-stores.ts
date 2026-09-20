@@ -73,11 +73,12 @@ export class PostgresGrantStore implements GrantStore {
     };
   }
 
-  async revoke(handle: string): Promise<void> {
-    await this.db
+  async revoke(handle: string): Promise<boolean> {
+    const res = await this.db
       .update(oauthGrant)
       .set({ status: 'revoked' })
       .where(eq(oauthGrant.handle, handle));
+    return affectedRows(res) > 0;
   }
 
   async setAccess(handle: string, hash: string, expiresAt: number): Promise<void> {
@@ -277,8 +278,12 @@ export class PostgresOAuthClientStore implements OAuthClientStore {
       })
       .onConflictDoUpdate({
         target: oauthClient.clientId,
+        // Tenancy is part of the upsert: re-saving a client with a new org/workspace
+        // previously kept the OLD scope while the audit row recorded the requested one.
         set: {
           name: c.name,
+          orgId: c.orgId,
+          workspaceId: c.workspaceId,
           grantTypes: [...c.grantTypes],
           redirectAllowlist: [...c.redirectAllowlist],
           enabled: c.enabled,

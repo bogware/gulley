@@ -53,6 +53,24 @@ callback Gulley verifies the id_token (JWKS, asymmetric-only), maps App Roles/gr
 to memberships, and **upserts the user into the durable admin directory** so SSO,
 RBAC, SCIM, and the console are one identity.
 
+**One subject across SSO and SCIM.** The admin subject is the id_token claim named by
+`OIDC_SUBJECT_CLAIM` (default `sub`, Entra's immutable `oid`). Entra's SCIM
+provisioning sends the UPN as `userName`, so a SCIM deprovision keyed on the UPN would
+not find sessions keyed on the oid. Either set `OIDC_SUBJECT_CLAIM=preferred_username`
+(the UPN) so both paths share one subject, or leave the default: deprovision also
+revokes sessions keyed on the SCIM row's primary **email**, which covers the common
+UPN-equals-email tenant.
+
+**Egress and transport.** Discovery, JWKS, and the advertised `token_endpoint` all go
+through the control plane's outbound guard (`OUTBOUND_HOST_ALLOWLIST` / air-gap), the
+discovery document's `issuer` must equal `OIDC_ISSUER`, and in production the issuer
+and every advertised endpoint must be `https` (`OIDC_ALLOW_INSECURE_HTTP=true` opts a
+dev IdP out). Calls are bounded by `OIDC_FETCH_TIMEOUT_MS`.
+
+**Sign-out revokes.** `POST /auth/logout` revokes the session's `jti` (audited as
+`admin.session.logout`) as well as clearing the cookie, so a copied cookie is dead
+after sign-out rather than valid until `exp`.
+
 ## 4. Data-plane gateway auth (optional)
 
 Let clients call the gateway with an Entra JWT (`Authorization: Bearer <jwt>`)
@@ -97,7 +115,10 @@ SCIM_GROUP_ROLE_MAP={"gulley-editors":{"role":"editor","orgId":"*"}}
 ```
 
 Each member of a provisioned group is granted the mapped role; removing the member —
-or deleting the group — revokes exactly that grant.
+or deleting the group — revokes exactly that grant. A user deprovision (DELETE or
+`active=false`) deletes the admin user, cascades its grants, and revokes **every**
+live admin session for that subject (and its email) in the same transaction.
+`/scim/v2/Users` and `/Groups` honour `startIndex` / `count` paging.
 
 ## Roles
 

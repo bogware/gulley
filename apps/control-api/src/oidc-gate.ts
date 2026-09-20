@@ -107,6 +107,7 @@ export async function exchangeCode(
     verifier: string;
   },
   fetchImpl: typeof fetch = fetch,
+  opts: { timeoutMs?: number; assertAllowed?: (url: string) => void } = {},
 ): Promise<{ id_token?: string; access_token?: string }> {
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -116,10 +117,16 @@ export async function exchangeCode(
     code_verifier: p.verifier,
   });
   if (p.clientSecret) body.set('client_secret', p.clientSecret);
+  // The advertised token_endpoint is guarded like any outbound (it receives the client
+  // secret), the call is bounded, and a redirect is refused (it would re-target the
+  // secret-bearing POST).
+  opts.assertAllowed?.(md.token_endpoint);
   const res = await fetchImpl(md.token_endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
     body,
+    redirect: 'error',
+    signal: AbortSignal.timeout(opts.timeoutMs ?? 10_000),
   });
   if (!res.ok) throw new Error(`OIDC token exchange failed: ${res.status}`);
   return (await res.json()) as { id_token?: string; access_token?: string };

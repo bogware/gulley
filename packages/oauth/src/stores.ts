@@ -30,7 +30,9 @@ export interface RotateFields {
 export interface GrantStore {
   create(g: Grant): Promise<void>;
   get(handle: string): Promise<Grant | null>;
-  revoke(handle: string): Promise<void>;
+  /** Mark a family revoked. Returns false when no such grant exists (so an admin
+   *  revoke of a bogus handle is a 404, not an audited no-op). */
+  revoke(handle: string): Promise<boolean>;
   setAccess(handle: string, hash: string, expiresAt: number): Promise<void>;
   /** Atomic compare-and-rotate: applies `next` only if the current generation is
    *  still `expectedGen` (optimistic concurrency). Returns false on a lost race. */
@@ -47,9 +49,11 @@ export class InMemoryGrantStore implements GrantStore {
     const g = this.byHandle.get(handle);
     return g ? { ...g } : null;
   }
-  async revoke(handle: string): Promise<void> {
+  async revoke(handle: string): Promise<boolean> {
     const g = this.byHandle.get(handle);
-    if (g) g.status = 'revoked';
+    if (!g) return false;
+    g.status = 'revoked';
+    return true;
   }
   async setAccess(handle: string, hash: string, expiresAt: number): Promise<void> {
     const g = this.byHandle.get(handle);

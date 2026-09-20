@@ -586,7 +586,11 @@ export async function readAuditRows(db: Database, sinceSeq?: number): Promise<Au
           .where(gt(auditLog.seq, sinceSeq))
           .orderBy(asc(auditLog.seq))
       : await db.select().from(auditLog).orderBy(asc(auditLog.seq));
-  return rows.map((r) => ({
+  return rows.map(mapAuditRow);
+}
+
+function mapAuditRow(r: typeof auditLog.$inferSelect): AuditRow {
+  return {
     seq: r.seq,
     orgId: r.orgId,
     actor: r.actor ?? '',
@@ -596,7 +600,64 @@ export async function readAuditRows(db: Database, sinceSeq?: number): Promise<Au
     prevHash: r.prevHash,
     rowHash: r.rowHash,
     createdAt: r.createdAt,
-  }));
+  };
+}
+
+/** One page of the audit chain, NEWEST first, keyset-paged by seq (`before` is an
+ *  exclusive upper bound). The console's audit browser reads this instead of the
+ *  whole table. */
+export async function readAuditPage(
+  db: Database,
+  opts: { before?: number; limit: number },
+): Promise<AuditRow[]> {
+  const limit = Math.max(1, Math.min(opts.limit, 1_000));
+  const base = db.select().from(auditLog);
+  const rows =
+    opts.before !== undefined
+      ? await base.where(lt(auditLog.seq, opts.before)).orderBy(desc(auditLog.seq)).limit(limit)
+      : await base.orderBy(desc(auditLog.seq)).limit(limit);
+  return rows.map(mapAuditRow);
+}
+
+/** The newest rows of ONE action (e.g. the refresh-reuse theft feed), bounded. */
+export async function readAuditRowsByAction(
+  db: Database,
+  action: string,
+  limit: number,
+): Promise<AuditRow[]> {
+  const rows = await db
+    .select()
+    .from(auditLog)
+    .where(eq(auditLog.action, action))
+    .orderBy(desc(auditLog.seq))
+    .limit(Math.max(1, Math.min(limit, 1_000)));
+  return rows.map(mapAuditRow);
+}
+
+/** The chain head (max seq), 0 when empty — one aggregate, not a full scan. */
+export async function auditHeadSeq(db: Database): Promise<number> {
+  const [r] = await db.select({ max: sql<number | null>`max(${auditLog.seq})` }).from(auditLog);
+  return Number(r?.max ?? 0);
+}
+
+/** Walk the whole chain seq-ascending in bounded batches (keyset), so a verifier can
+ *  re-hash a multi-million-row chain without materialising it. */
+export async function* iterateAuditRows(
+  db: Database,
+  batchSize = 5_000,
+): AsyncGenerator<AuditRow, void, undefined> {
+  let after = 0;
+  for (;;) {
+    const rows = await db
+      .select()
+      .from(auditLog)
+      .where(gt(auditLog.seq, after))
+      .orderBy(asc(auditLog.seq))
+      .limit(batchSize);
+    if (rows.length === 0) return;
+    for (const r of rows) yield mapAuditRow(r);
+    after = rows[rows.length - 1]!.seq;
+  }
 }
 
 /** One rate-limit rule as stored in the `rate_limit.config` JSONB column. */
