@@ -4292,7 +4292,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     expect(res.status).toBe(200);
     expect(ct).not.toContain('jane@example.com'); // raw value never reaches the client
-    const tokens = [...ct.matchAll(/<<GULLEY_EMAIL_\d+>>/g)].map((m) => m[0]);
+    const tokens = [...ct.matchAll(/<<GULLEY_EMAIL_[0-9A-F]{8}_\d+>>/g)].map((m) => m[0]);
     expect(tokens.length).toBe(2); // both occurrences tokenized
     expect(tokens[0]).toBe(tokens[1]); // stable token (coreference preserved)
     expect(ledger.entries).toHaveLength(1);

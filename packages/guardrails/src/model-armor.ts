@@ -22,6 +22,8 @@ export interface ModelArmorGuardrailOptions {
   failClosed?: boolean;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** An undici Dispatcher that pins DNS at connect time (@gulley/egress pinnedEgressAgent). */
+  dispatcher?: unknown;
   /** Override the API base (for testing); defaults to the regional endpoint. */
   baseUrl?: string;
 }
@@ -80,6 +82,8 @@ export class ModelArmorPlugin implements GuardrailPlugin {
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
         body: JSON.stringify(payload),
         signal: ac.signal,
+        redirect: 'error',
+        ...(this.opts.dispatcher ? ({ dispatcher: this.opts.dispatcher } as object) : {}),
       });
       if (!res.ok) return this.onFailure();
       return this.interpret((await res.json()) as SanitizeResponse, text);
@@ -134,8 +138,12 @@ export class ModelArmorPlugin implements GuardrailPlugin {
 
   private onFailure(): GuardrailPluginResult {
     return this.failClosed
-      ? { action: 'blocked', findings: findingsFor(['model-armor:error'], '', this.name) }
-      : { action: 'none', findings: [] };
+      ? {
+          action: 'blocked',
+          findings: findingsFor(['model-armor:error'], '', this.name),
+          degraded: true,
+        }
+      : { action: 'none', findings: [], degraded: true };
   }
 }
 

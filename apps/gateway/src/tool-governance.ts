@@ -1,4 +1,4 @@
-import { type AuthzRuleConfig, CelAuthorizer } from '@gulley/cel';
+import { type AuthzRuleConfig, CelAuthorizer, type CelAuthorizerHooks } from '@gulley/cel';
 import { SSEParser } from '@gulley/providers';
 
 /**
@@ -341,7 +341,10 @@ export function governToolCalls(
  *  as the request AUTHZ rules). Returns undefined when unset/empty. Invalid JSON or
  *  a bad rule THROWS (a malformed governance policy must fail boot, never silently
  *  disable governance). */
-export function parseToolPolicy(raw: string | undefined): CelAuthorizer | undefined {
+export function parseToolPolicy(
+  raw: string | undefined,
+  hooks?: CelAuthorizerHooks,
+): CelAuthorizer | undefined {
   if (!raw || raw.trim() === '') return undefined;
   let parsed: unknown;
   try {
@@ -369,5 +372,13 @@ export function parseToolPolicy(raw: string | undefined): CelAuthorizer | undefi
     });
   }
   // Compiling here surfaces a bad CEL expression at boot (fail-closed).
-  return new CelAuthorizer(rules);
+  // STRICT compile against the activation's real roots (tool / model / provider /
+  // principal): a typo'd root (`tools.name`) used to compile, throw on every
+  // evaluation, and — since an erroring rule is a non-match — let every tool call
+  // through silently. Now it fails boot like the request authz rules do.
+  return new CelAuthorizer(
+    rules,
+    { declaredVars: ['tool', 'model', 'provider', 'principal'] },
+    hooks,
+  );
 }

@@ -100,8 +100,43 @@ function requireBool(v: unknown, what: string): boolean {
   return v;
 }
 
+/** Code-point length without materialising an array (a 32 MiB body field spread
+ *  into `[...v]` allocated tens of millions of elements per evaluation). */
+function codePointLength(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) i++;
+    n++;
+  }
+  return n;
+}
+
+/** Bounded cache of compiled `matches()` patterns. Patterns come from POLICY text
+ *  (operator-authored), but were re-compiled on every evaluation; they are capped
+ *  in length so a pathological pattern cannot cost unbounded compile time. */
+const MAX_PATTERN_LENGTH = 512;
+const REGEX_CACHE_MAX = 256;
+const regexCache = new Map<string, RegExp>();
+function cachedRegex(pattern: string): RegExp {
+  if (pattern.length > MAX_PATTERN_LENGTH) {
+    throw new CelEvalError(`matches() pattern longer than ${MAX_PATTERN_LENGTH} chars`);
+  }
+  let re = regexCache.get(pattern);
+  if (!re) {
+    re = new RegExp(pattern);
+    if (regexCache.size >= REGEX_CACHE_MAX) {
+      const oldest = regexCache.keys().next().value;
+      if (oldest !== undefined) regexCache.delete(oldest);
+    }
+    regexCache.set(pattern, re);
+  }
+  re.lastIndex = 0;
+  return re;
+}
+
 function sizeOf(v: unknown): number {
-  if (typeof v === 'string') return [...v].length;
+  if (typeof v === 'string') return codePointLength(v);
   if (Array.isArray(v)) return v.length;
   if (v instanceof Uint8Array) return v.length;
   if (isPlainObject(v)) return Object.keys(v).length;
@@ -305,7 +340,7 @@ export class Evaluator {
       case 'dyn':
         return a0;
       case 'matches':
-        return typeof a0 === 'string' && new RegExp(String(args[1])).test(a0);
+        return typeof a0 === 'string' && cachedRegex(String(args[1])).test(a0);
       case 'ip':
         if (typeof a0 !== 'string' || ipv4ToInt(a0) === null) {
           throw new CelEvalError(`ip() invalid address: ${String(a0)}`);
@@ -362,9 +397,9 @@ export class Evaluator {
       case 'contains':
         return s.includes(String(a0));
       case 'matches':
-        return new RegExp(String(a0)).test(s);
+        return cachedRegex(String(a0)).test(s);
       case 'size':
-        return [...s].length;
+        return codePointLength(s);
       case 'lowerAscii':
         return s.toLowerCase();
       case 'upperAscii':
@@ -426,7 +461,9 @@ export class Evaluator {
 export function jsonField(value: unknown, path: string): unknown {
   let cur = value;
   for (const seg of path.split('.')) {
-    if (isPlainObject(cur)) cur = cur[seg];
+    // Own properties only: `__proto__.toString` must not walk the prototype chain
+    // (the transformer would otherwise stringify a Function into a header).
+    if (isPlainObject(cur)) cur = Object.hasOwn(cur, seg) ? cur[seg] : undefined;
     else if (Array.isArray(cur) && /^\d+$/.test(seg)) cur = cur[Number(seg)];
     else return undefined;
   }

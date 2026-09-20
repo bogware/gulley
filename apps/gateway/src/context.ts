@@ -34,7 +34,7 @@ import {
   CelTransformer,
   ExternalAuthorizer,
 } from '@gulley/cel';
-import { assertEgressAllowed } from '@gulley/egress';
+import { assertEgressAllowed, pinnedEgressAgent } from '@gulley/egress';
 import {
   type HeaderModifierConfig,
   RequestMirror,
@@ -60,6 +60,7 @@ import {
   composePlugins,
   type Detector,
   GuardrailEngine,
+  type GuardrailEngineHooks,
   type GuardrailPlugin,
   InjectionDetector,
   ModelArmorPlugin,
@@ -127,19 +128,29 @@ import type { Config } from './config';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 
 /** Native guardrail engine (audit-only default). Per-route policy overrides live
- *  on the route; this is the global default applied to every proxied request. */
-export function buildGuardrails(config: Config): GuardrailEngine | undefined {
+ *  on the route; this is the global default applied to every proxied request.
+ *  External plugins connect through the DNS-pinned egress agent (no redirects, no
+ *  rebinding onto an internal address), carry one deadline, and report a degraded
+ *  (failure-policy) verdict through `hooks` so an outage is logged and metered. */
+export function buildGuardrails(
+  config: Config,
+  hooks: GuardrailEngineHooks = {},
+): GuardrailEngine | undefined {
   if (!config.GUARDRAILS_ENABLED) return undefined;
 
   // Compose the configured external plugins (webhook DLP + managed services)
   // behind the single plugin seam, layered after the native detectors.
   const plugins: GuardrailPlugin[] = [];
+  const dispatcher = pinnedEgressAgent();
+  const timeoutMs = config.GUARDRAILS_PLUGIN_TIMEOUT_MS;
   if (config.GUARDRAILS_WEBHOOK_URL) {
     plugins.push(
       new WebhookGuardrailPlugin({
         url: config.GUARDRAILS_WEBHOOK_URL,
         failMode: config.GUARDRAILS_WEBHOOK_FAIL_CLOSED ? 'closed' : 'open',
         allowInternal: config.GUARDRAILS_WEBHOOK_ALLOW_INTERNAL,
+        timeoutMs,
+        dispatcher,
       }),
     );
   }
@@ -150,6 +161,8 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
         baseUrl: config.GUARDRAILS_MODERATION_BASE_URL,
         model: config.GUARDRAILS_MODERATION_MODEL,
         failClosed: config.GUARDRAILS_MODERATION_FAIL_CLOSED, // enforcement: fail closed by default
+        timeoutMs,
+        dispatcher,
       }),
     );
   }
@@ -159,6 +172,9 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
         endpoint: config.GUARDRAILS_AZURE_CS_ENDPOINT,
         apiKey: config.GUARDRAILS_AZURE_CS_KEY,
         severityThreshold: config.GUARDRAILS_AZURE_CS_SEVERITY,
+        failClosed: config.GUARDRAILS_AZURE_CS_FAIL_CLOSED,
+        timeoutMs,
+        dispatcher,
       }),
     );
   }
@@ -168,6 +184,8 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
         guardrailId: config.GUARDRAILS_BEDROCK_GUARDRAIL_ID,
         apiKey: config.GUARDRAILS_BEDROCK_API_KEY,
         region: config.GUARDRAILS_BEDROCK_REGION,
+        failClosed: config.GUARDRAILS_BEDROCK_FAIL_CLOSED,
+        timeoutMs,
       }),
     );
   }
@@ -184,6 +202,8 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
         template: config.GUARDRAILS_MODEL_ARMOR_TEMPLATE,
         accessToken: config.GUARDRAILS_MODEL_ARMOR_ACCESS_TOKEN,
         failClosed: config.GUARDRAILS_MODEL_ARMOR_FAIL_CLOSED, // enforcement: fail closed by default
+        timeoutMs,
+        dispatcher,
       }),
     );
   }
@@ -204,6 +224,7 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
       },
     },
     composePlugins(plugins),
+    hooks,
   );
 }
 
@@ -677,7 +698,6 @@ export function createProductionContext(
     : undefined;
   const mirror = buildMirror(config);
   const secretResolver = config.CONFIG_SOURCE === 'db' ? buildSecretResolver(config) : undefined;
-  const guardrails = buildGuardrails(config);
 
   // Prometheus registry + the maintenance runner it feeds are created up front so every
   // background job below (sweeps, heal, retention) is metered from its first tick.
@@ -694,6 +714,14 @@ export function createProductionContext(
     lastWarn.set(key, now);
     log.warn(obj, msg);
   };
+  // A plugin that answered with its FAILURE policy (timeout / non-2xx) did not see the
+  // text: say so (throttled) and count it — "DLP unreachable" used to look like "clean".
+  const guardrails = buildGuardrails(config, {
+    onPluginDegraded: (plugin, direction) => {
+      warnThrottled(`guardrail-${plugin}`, { plugin, direction }, 'guardrail plugin degraded');
+      metrics?.recordStoreError('guardrail_plugin', direction);
+    },
+  });
 
   let routes = buildRoutes(config);
   const custom = buildCustomProviders(config);
@@ -752,12 +780,26 @@ export function createProductionContext(
     } catch {
       throw new Error('CEL_AUTHZ must be a JSON array of { expr, effect, name? }');
     }
-    authorizer = new CelAuthorizer(rules, { declaredVars: ['request', 'principal'] });
+    authorizer = new CelAuthorizer(
+      rules,
+      { declaredVars: ['request', 'principal'] },
+      {
+        onError: (err, rule) => {
+          warnThrottled(`cel-authz-${rule}`, { err, rule }, 'CEL authz rule threw (non-match)');
+          metrics?.recordStoreError('cel_authz', 'rule_error');
+        },
+      },
+    );
   }
 
   // LLM-leg tool-call governance policy (parsed + compiled here so a bad rule fails
   // boot, never silently disables governance).
-  const toolPolicy = parseToolPolicy(config.TOOL_POLICY);
+  const toolPolicy = parseToolPolicy(config.TOOL_POLICY, {
+    onError: (err, rule) => {
+      warnThrottled(`tool-policy-${rule}`, { err, rule }, 'tool policy rule threw (non-match)');
+      metrics?.recordStoreError('tool_policy', 'rule_error');
+    },
+  });
 
   let transformer: CelTransformer | undefined;
   if (config.CEL_TRANSFORM) {
@@ -1052,6 +1094,8 @@ export function createProductionContext(
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ type: 'budget.threshold', ...e }),
               signal: ctrl.signal,
+              redirect: 'error',
+              ...({ dispatcher: pinnedEgressAgent() } as object),
             })
               .catch(() => {})
               .finally(() => clearTimeout(t));

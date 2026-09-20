@@ -239,6 +239,13 @@ export class StreamingRedactor {
   get failClosed(): boolean {
     return this._failClosed;
   }
+  /** Terminal: nothing more may be emitted (blocked or failed closed). The SSE
+   *  rewriters consult this after every push so they stop emitting structural
+   *  frames — a `[DONE]` / `message_stop` after the safe prefix made a block look
+   *  like a complete answer to the client's SDK. */
+  terminal(): boolean {
+    return this._blocked || this._failClosed;
+  }
   /** For a `mask` policy: the reversible token↔original map accumulated over the
    *  stream (so an authorized consumer can detokenize). Undefined for other actions. */
   get vault(): TokenVault | undefined {

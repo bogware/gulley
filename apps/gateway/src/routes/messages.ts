@@ -2718,6 +2718,7 @@ async function handleProxy(
         ? {
             push: (t) => redactor.push(detok.push(t)),
             flush: () => redactor.push(detok.flush()) + redactor.flush(),
+            terminal: () => redactor.terminal(),
           }
         : redactor;
   const enforcer =

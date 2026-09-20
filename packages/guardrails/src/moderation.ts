@@ -13,6 +13,8 @@ export interface ModerationGuardrailOptions {
   failClosed?: boolean;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** An undici Dispatcher that pins DNS at connect time (@gulley/egress pinnedEgressAgent). */
+  dispatcher?: unknown;
 }
 
 interface ModerationResponse {
@@ -47,6 +49,8 @@ export class OpenAIModerationPlugin implements GuardrailPlugin {
         },
         body: JSON.stringify({ model: this.model, input: text }),
         signal: ac.signal,
+        redirect: 'error',
+        ...(this.opts.dispatcher ? ({ dispatcher: this.opts.dispatcher } as object) : {}),
       });
       if (!res.ok) return this.onFailure();
       const body = (await res.json()) as ModerationResponse;
@@ -68,8 +72,12 @@ export class OpenAIModerationPlugin implements GuardrailPlugin {
 
   private onFailure(): GuardrailPluginResult {
     return this.failClosed
-      ? { action: 'blocked', findings: findingsFor(['moderation_error'], '', this.name) }
-      : { action: 'none', findings: [] };
+      ? {
+          action: 'blocked',
+          findings: findingsFor(['moderation_error'], '', this.name),
+          degraded: true,
+        }
+      : { action: 'none', findings: [], degraded: true };
   }
 }
 

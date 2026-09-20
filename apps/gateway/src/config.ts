@@ -358,6 +358,14 @@ const EnvShape = z.object({
   // false to trade that safety for availability.
   GUARDRAILS_MODERATION_FAIL_CLOSED: envBool(true),
   GUARDRAILS_MODEL_ARMOR_FAIL_CLOSED: envBool(true),
+  // Azure Content Safety and Bedrock Guardrails previously had NO fail-mode knob and
+  // silently failed OPEN (an outage disabled moderation); they now follow the same
+  // fail-closed default as the other enforcement plugins.
+  GUARDRAILS_AZURE_CS_FAIL_CLOSED: envBool(true),
+  GUARDRAILS_BEDROCK_FAIL_CLOSED: envBool(true),
+  // Per-call deadline for every external guardrail plugin (webhook, moderation,
+  // Azure, Bedrock, Model Armor). Default 3 s.
+  GUARDRAILS_PLUGIN_TIMEOUT_MS: z.coerce.number().int().positive().default(3_000),
   GUARDRAILS_MODERATION_API_KEY: z.string().optional(),
   GUARDRAILS_MODERATION_BASE_URL: z.string().url().optional(),
   GUARDRAILS_MODERATION_MODEL: z.string().optional(),

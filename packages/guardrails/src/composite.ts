@@ -15,19 +15,21 @@ export class CompositeGuardrailPlugin implements GuardrailPlugin {
   async inspect(text: string, direction: GuardrailDirection): Promise<GuardrailPluginResult> {
     let current = text;
     let masked = false;
+    let degraded = false;
     const findings: Finding[] = [];
     for (const plugin of this.plugins) {
       const r = await plugin.inspect(current, direction);
       findings.push(...r.findings);
-      if (r.action === 'blocked') return { action: 'blocked', findings };
+      if (r.degraded) degraded = true;
+      if (r.action === 'blocked') return { action: 'blocked', findings, degraded };
       if (r.action === 'masked' && r.maskedText !== undefined) {
         current = r.maskedText;
         masked = true;
       }
     }
     return masked
-      ? { action: 'masked', findings, maskedText: current }
-      : { action: 'none', findings };
+      ? { action: 'masked', findings, maskedText: current, degraded }
+      : { action: 'none', findings, degraded };
   }
 }
 

@@ -73,13 +73,22 @@ const PATTERNS: InjectionPattern[] = [
   },
 ];
 
-// Zero-width / invisible characters used to smuggle instructions past filters.
-const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/g;
+// Zero-width / invisible characters used to smuggle instructions past filters. A
+// RUN is one finding: flagging each character produced a finding per code point
+// (a megabyte of U+200B = a million findings) and overwhelmed overlap resolution.
+const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]+/g;
+
+/** Scan bound (UTF-16 code units), matching the native detector's default. */
+const DEFAULT_MAX_SCAN = 4 * 1024 * 1024;
+const MAX_INJECTION_FINDINGS = 2_000;
 
 export class InjectionDetector implements Detector {
   readonly name = 'injection';
 
-  detect(text: string): Finding[] {
+  constructor(private readonly maxScanChars = DEFAULT_MAX_SCAN) {}
+
+  detect(full: string): Finding[] {
+    const text = full.length > this.maxScanChars ? full.slice(0, this.maxScanChars) : full;
     const findings: Finding[] = [];
     for (const p of PATTERNS) {
       p.re.lastIndex = 0;
@@ -97,7 +106,7 @@ export class InjectionDetector implements Detector {
         });
       }
     }
-    // Zero-width obfuscation: flag each invisible character span.
+    // Zero-width obfuscation: flag each invisible run.
     ZERO_WIDTH.lastIndex = 0;
     for (let m = ZERO_WIDTH.exec(text); m !== null; m = ZERO_WIDTH.exec(text)) {
       findings.push({
@@ -107,6 +116,7 @@ export class InjectionDetector implements Detector {
         source: 'pattern',
         confidence: 0.6,
       });
+      if (findings.length >= MAX_INJECTION_FINDINGS) break;
     }
     return findings;
   }

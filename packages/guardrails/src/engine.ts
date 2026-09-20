@@ -85,12 +85,30 @@ export interface OutputInspection {
  * and response text, applying the direction's policy. Audit-only never mutates;
  * block/mask/redact do. The default policies are audit in both directions.
  */
+export interface GuardrailEngineHooks {
+  /** Called when the external plugin returned its FAILURE policy (it did not see the
+   *  text): the host logs/meters "DLP enforcement degraded" — otherwise a fail-open
+   *  `none` is indistinguishable from a clean scan. */
+  onPluginDegraded?: (plugin: string, direction: 'input' | 'output') => void;
+}
+
 export class GuardrailEngine {
   constructor(
     private readonly detectors: Detector[],
     private readonly policies: GuardrailPolicies,
     private readonly plugin?: GuardrailPlugin,
+    private readonly hooks: GuardrailEngineHooks = {},
   ) {}
+
+  private notePlugin(result: GuardrailPluginResult, direction: 'input' | 'output'): void {
+    if (result.degraded && this.plugin) {
+      try {
+        this.hooks.onPluginDegraded?.(this.plugin.name, direction);
+      } catch {
+        /* observability must never affect enforcement */
+      }
+    }
+  }
 
   get outputPolicy(): GuardrailPolicy {
     return this.policies.output;
@@ -123,7 +141,7 @@ export class GuardrailEngine {
     };
     const plugins = [base.plugin, this.plugin].filter((p): p is GuardrailPlugin => p !== undefined);
     const plugin = plugins.length > 1 ? composePlugins(plugins) : plugins[0];
-    return new GuardrailEngine(detectors, policies, plugin);
+    return new GuardrailEngine(detectors, policies, plugin, { ...base.hooks, ...this.hooks });
   }
 
   /** A single Detector that fans out to all configured detectors and resolves
@@ -148,15 +166,30 @@ export class GuardrailEngine {
 
   async inspectInput(text: string): Promise<InputInspection> {
     const policy = this.policies.input;
-    let findings = filterByPolicy(this.detectAll(text), policy);
+    // Native findings are the ONLY spans a native transform (mask/redact) applies to.
+    // A plugin's findings are whole-text markers (start 0, end length, confidence 1)
+    // for audit/summary; merging them into the transform set let the marker beat every
+    // native span in overlap resolution and tokenize the WHOLE body into one token —
+    // a guaranteed 422 (unforwardable) on every plugin+mask request.
+    let nativeFindings = filterByPolicy(this.detectAll(text), policy);
+    let findings = nativeFindings;
+    let base = text; // the text a native transform applies to (plugin-masked when so)
 
     let plugin: InputInspection['plugin'];
     if (this.plugin) {
       const result = await this.plugin.inspect(text, 'input');
+      this.notePlugin(result, 'input');
       plugin = { name: this.plugin.name, result };
-      if (result.findings.length > 0) {
-        findings = resolveOverlaps([...findings, ...result.findings]);
+      if (result.action === 'masked' && result.maskedText !== undefined) {
+        // Chain: the native transform runs over the plugin-masked text, re-detected
+        // there so offsets are valid for it.
+        base = result.maskedText;
+        nativeFindings = filterByPolicy(this.detectAll(base), policy);
       }
+      findings =
+        result.findings.length > 0
+          ? resolveOverlaps([...nativeFindings, ...result.findings])
+          : nativeFindings;
     }
 
     const summary = summarize(findings);
@@ -180,23 +213,23 @@ export class GuardrailEngine {
         plugin,
       };
     }
-    if (policy.action === 'mask' && findings.length > 0) {
+    if (policy.action === 'mask' && nativeFindings.length > 0) {
       const vault = new TokenVault();
       return {
         findings,
         summary,
         blocked: false,
-        transformedText: vault.tokenize(text, findings),
+        transformedText: vault.tokenize(base, nativeFindings),
         vault,
         plugin,
       };
     }
-    if (policy.action === 'redact' && findings.length > 0) {
+    if (policy.action === 'redact' && nativeFindings.length > 0) {
       return {
         findings,
         summary,
         blocked: false,
-        transformedText: redactText(text, findings),
+        transformedText: redactText(base, nativeFindings),
         plugin,
       };
     }
@@ -253,6 +286,7 @@ export class GuardrailEngine {
     if (!this.plugin) return native;
 
     const result = await this.plugin.inspect(text, 'output');
+    this.notePlugin(result, 'output');
     const findings =
       result.findings.length > 0
         ? resolveOverlaps([...native.findings, ...result.findings])
@@ -263,7 +297,19 @@ export class GuardrailEngine {
       return { findings, summary, blocked: true };
     }
     if (result.action === 'masked' && result.maskedText !== undefined) {
-      return { findings, summary, blocked: false, transformedText: result.maskedText };
+      // The plugin de-identified what IT knows; the native policy still applies to
+      // what remains (a GitHub token or phone number the plugin's SDP config does
+      // not cover used to be forwarded unmasked because the native transform was
+      // discarded here). Re-run the natives over the plugin-masked text.
+      const chained = this.inspectOutputText(result.maskedText);
+      if (chained.blocked) return { findings, summary, blocked: true };
+      return {
+        findings,
+        summary,
+        blocked: false,
+        transformedText: chained.transformedText ?? result.maskedText,
+        vault: chained.vault,
+      };
     }
     // No plugin enforcement — fall back to the native policy's transform (if any).
     return {

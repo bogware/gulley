@@ -468,6 +468,10 @@ importers:
         version: 3.2.7(@types/node@22.20.1)(jsdom@25.0.1)
 
   packages/egress:
+    dependencies:
+      undici:
+        specifier: ^6.21.0
+        version: 6.28.0
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import type { Finding } from './types';
 
 /** Token format is JSON-safe (no quotes, backslashes, or control characters) so
@@ -17,11 +18,17 @@ export class TokenVault {
   private readonly byOriginal = new Map<string, string>();
   private readonly byToken = new Map<string, string>();
   private counter = 0;
+  /** Per-vault random namespace. Without it every request minted the same
+   *  `<<GULLEY_EMAIL_1>>`: in a multi-turn agent loop turn 1's masked reply came
+   *  back as history in turn 2, whose own vault reused the token for a DIFFERENT
+   *  value — the model saw two entities behind one placeholder and the detokenizer
+   *  rewrote turn 1's token to turn 2's original (wrong PII substituted). */
+  private readonly nonce = randomBytes(4).toString('hex').toUpperCase();
 
   private tokenFor(category: string, original: string): string {
     const existing = this.byOriginal.get(original);
     if (existing) return existing;
-    const token = `<<GULLEY_${tokenCategory(category)}_${++this.counter}>>`;
+    const token = `<<GULLEY_${tokenCategory(category)}_${this.nonce}_${++this.counter}>>`;
     this.byOriginal.set(original, token);
     this.byToken.set(token, original);
     return token;

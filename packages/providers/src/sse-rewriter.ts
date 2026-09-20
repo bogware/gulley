@@ -6,6 +6,11 @@ import { type SSEEvent, SSEParser } from './sse';
 export interface TextTransform {
   push(text: string): string;
   flush(): string;
+  /** Optional: true once the transform has blocked / failed closed. A rewriter then
+   *  emits the safe prefix it was just handed and NOTHING after it — no structural
+   *  terminal (`content_block_stop`/`message_stop`/`[DONE]`/`response.completed`),
+   *  so the caller's terminal error frame is the last thing the client sees. */
+  terminal?(): boolean;
 }
 
 function frameTextDelta(index: number, text: string): string {
@@ -102,6 +107,10 @@ export class AnthropicSseRewriter {
       this.lastTextIndex = index;
       const text = (parsed['delta'] as Record<string, unknown>)['text'] as string;
       const emitted = this.transform.push(text);
+      if (this.transform.terminal?.()) {
+        this._failClosed = true; // emit the safe prefix, then nothing more
+        return emitted ? frameTextDelta(index, emitted) : '';
+      }
       return emitted ? frameTextDelta(index, emitted) : '';
     }
 
@@ -109,7 +118,12 @@ export class AnthropicSseRewriter {
     // then pass the structural frame. flushTransform is empty once drained, so
     // calling it on every block-end is safe (incl. multi-block streams).
     if (type === 'content_block_stop' || type === 'message_delta' || type === 'message_stop') {
-      return this.flushTransform() + reframe(ev);
+      const tail = this.flushTransform();
+      if (this.transform.terminal?.()) {
+        this._failClosed = true; // the flush hit a block: no structural frame after it
+        return tail;
+      }
+      return tail + reframe(ev);
     }
 
     return reframe(ev);
@@ -187,7 +201,12 @@ export class OpenAiSseRewriter {
       parsed = JSON.parse(ev.data) as Record<string, unknown>;
     } catch {
       // `[DONE]` and any non-JSON: flush the held tail first, then pass through.
-      return this.synthFromTail() + reframe(ev);
+      const tail = this.synthFromTail();
+      if (this.transform.terminal?.()) {
+        this._failClosed = true; // never relay [DONE] after a block
+        return tail;
+      }
+      return tail + reframe(ev);
     }
     const choices = parsed['choices'];
     if (!parsed || typeof parsed !== 'object' || !Array.isArray(choices)) {
@@ -225,6 +244,12 @@ export class OpenAiSseRewriter {
         d['content'] = emitted;
         if (emitted) anyEmitted = true;
         contentDelta = d;
+        if (this.transform.terminal?.()) {
+          // Blocked mid-chunk: emit only the safe prefix as a bare content chunk,
+          // never this chunk's finish_reason/usage or anything after it.
+          this._failClosed = true;
+          return emitted ? this.synthFrame(emitted) : '';
+        }
       }
     }
     const hasTerminal = hasFinish || parsed['usage'] != null;
@@ -234,6 +259,10 @@ export class OpenAiSseRewriter {
       // chunk's own content when it carries some, else emit it as a synthetic
       // content chunk ahead of this terminal frame.
       const tail = this.transform.flush();
+      if (this.transform.terminal?.()) {
+        this._failClosed = true; // the flush hit a block: safe tail only, no finish/[DONE]
+        return tail ? this.synthFrame(tail) : '';
+      }
       if (tail) {
         if (hadContent && contentDelta) {
           contentDelta['content'] = String(contentDelta['content'] ?? '') + tail;
@@ -360,6 +389,12 @@ export class ResponsesSseRewriter {
       const emitted = this.transform.push(delta);
       this.acc += emitted;
       delete parsed['logprobs']; // per-token logprobs echo the RAW text — strip them
+      if (this.transform.terminal?.()) {
+        this._failClosed = true; // safe prefix only; no echoes / completion after a block
+        if (!emitted) return '';
+        parsed['delta'] = emitted;
+        return reframe({ event: ev.event, data: JSON.stringify(parsed) });
+      }
       if (!emitted) return ''; // held back this window — drop the frame
       parsed['delta'] = emitted;
       return reframe({ event: ev.event, data: JSON.stringify(parsed) });
@@ -374,6 +409,7 @@ export class ResponsesSseRewriter {
       if (this.firstPart === undefined && String(parsed['text'] ?? '') !== '')
         return this.failClose();
       const pre = this.drainTail();
+      if (this._failClosed) return pre;
       parsed['text'] = this.acc;
       delete parsed['logprobs'];
       return pre + reframe({ event: ev.event, data: JSON.stringify(parsed) });
@@ -395,6 +431,7 @@ export class ResponsesSseRewriter {
     // response.output from it), so it must be scrubbed like the other echoes.
     if (type === 'response.output_item.done') {
       const pre = this.drainTail();
+      if (this._failClosed) return pre;
       const item = parsed['item'] as Record<string, unknown> | undefined;
       if (!this.substituteContent(item?.['content'])) return this.failClose();
       return pre + reframe({ event: ev.event, data: JSON.stringify(parsed) });
@@ -406,6 +443,7 @@ export class ResponsesSseRewriter {
       type === 'response.failed'
     ) {
       const pre = this.drainTail(); // in case there was no output_text.done
+      if (this._failClosed) return pre;
       if (!this.substituteCompleted(parsed)) return this.failClose();
       return pre + reframe({ event: ev.event, data: JSON.stringify(parsed) });
     }
@@ -422,6 +460,7 @@ export class ResponsesSseRewriter {
    *  as a synthetic delta (idempotent — empty once drained). */
   private drainTail(): string {
     const tail = this.transform.flush();
+    if (this.transform.terminal?.()) this._failClosed = true; // caller emits no echo after this
     if (!tail) return '';
     this.acc += tail;
     return this.synthDelta(tail);

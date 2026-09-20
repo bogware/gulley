@@ -79,6 +79,11 @@ export interface GuardrailPluginResult {
   action: 'none' | 'blocked' | 'masked';
   findings: Finding[];
   maskedText?: string;
+  /** True when the verdict is the plugin's FAILURE policy (transport error,
+   *  timeout, non-2xx), not a real inspection — i.e. the DLP service did not see
+   *  the text. Lets the host log/meter "enforcement degraded" instead of treating
+   *  a fail-open `none` as a clean scan. */
+  degraded?: boolean;
 }
 
 /** An async, out-of-process guardrail (e.g. Bedrock Guardrails, Azure Content

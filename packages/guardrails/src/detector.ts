@@ -113,22 +113,60 @@ export class NativeDetector implements Detector {
     }
 
     if (this.contextBoost) applyContextBoost(text, raw);
-    return resolveOverlaps(raw);
+    return resolveOverlaps(capFindings(raw, text.length));
   }
+}
+
+/** Upper bound on raw findings one detector pass may return. A body engineered
+ *  to match hundreds of thousands of times (a megabyte of "a@b.co ") used to drive
+ *  overlap resolution for minutes of synchronous event-loop time on every replica
+ *  that scanned it — with the audit-only default on. Past the cap the list is
+ *  truncated and ONE synthetic, high-confidence `detector_overflow` finding spanning
+ *  the whole text is added, so enforcement and the cache-sensitivity gate fail
+ *  CLOSED rather than silently missing what was cut. */
+export const MAX_RAW_FINDINGS = 10_000;
+
+export function capFindings(raw: Finding[], textLength: number): Finding[] {
+  if (raw.length <= MAX_RAW_FINDINGS) return raw;
+  const kept = raw.slice(0, MAX_RAW_FINDINGS);
+  kept.push({
+    category: 'detector_overflow',
+    start: 0,
+    end: textLength,
+    source: 'pattern',
+    confidence: 0.99,
+  });
+  return kept;
 }
 
 /**
  * Greedily keep the highest-confidence finding for any overlapping span, so a
  * keyed secret wins over the entropy catch-all and no character is masked twice.
- * Returned findings are sorted by start offset.
+ * Returned findings are sorted by start offset. O(n log n): the kept set is held
+ * as a start-sorted list of DISJOINT intervals, so a candidate only has to be
+ * checked against its two neighbours (the previous quadratic scan took minutes
+ * on a body with tens of thousands of matches).
  */
 export function resolveOverlaps(findings: Finding[]): Finding[] {
+  if (findings.length <= 1) return [...findings];
   const byConfidence = [...findings].sort(
     (a, b) => b.confidence - a.confidence || b.end - b.start - (a.end - a.start),
   );
   const kept: Finding[] = [];
   for (const f of byConfidence) {
-    if (!kept.some((k) => f.start < k.end && k.start < f.end)) kept.push(f);
+    // First kept interval whose start is >= f.start.
+    let lo = 0;
+    let hi = kept.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((kept[mid] as Finding).start < f.start) lo = mid + 1;
+      else hi = mid;
+    }
+    const prev = kept[lo - 1];
+    const next = kept[lo];
+    if (prev && f.start < prev.end && prev.start < f.end) continue;
+    if (next && f.start < next.end && next.start < f.end) continue;
+    kept.splice(lo, 0, f);
   }
-  return kept.sort((a, b) => a.start - b.start);
+  return kept;
 }

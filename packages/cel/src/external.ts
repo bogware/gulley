@@ -24,6 +24,8 @@ function stableStringify(value: unknown): string {
  * recovered service is retried on the next request.
  */
 export interface ExternalAuthzConfig {
+  /** An undici Dispatcher that pins DNS at connect time (@gulley/egress pinnedEgressAgent). */
+  dispatcher?: unknown;
   url: string;
   /** CEL expression → a string cache key over the activation. Default keys by
    *  principal id + model + provider. */
@@ -106,6 +108,10 @@ export class ExternalAuthorizer {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(root),
         signal: ac.signal,
+        // The egress guard vetted THIS URL; a redirect would re-POST the request
+        // attributes elsewhere.
+        redirect: 'error',
+        ...(this.cfg.dispatcher ? ({ dispatcher: this.cfg.dispatcher } as object) : {}),
       });
       if (!res.ok) return this.onFailure();
       const body = (await res.json()) as ServiceResponse;

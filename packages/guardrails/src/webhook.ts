@@ -30,6 +30,9 @@ export interface WebhookGuardrailOptions {
   /** Display name (for findings / audit). Default 'webhook'. */
   name?: string;
   fetchImpl?: typeof fetch;
+  /** An undici Dispatcher that pins DNS at connect time (see @gulley/egress
+   *  pinnedEgressAgent); ignored for an `allowInternal` webhook. */
+  dispatcher?: unknown;
 }
 
 interface WebhookVerdict {
@@ -46,6 +49,7 @@ export class WebhookGuardrailPlugin implements GuardrailPlugin {
   private readonly timeoutMs: number;
   private readonly failMode: 'open' | 'closed';
   private readonly fetchImpl: typeof fetch;
+  private readonly dispatcher: unknown;
 
   constructor(opts: WebhookGuardrailOptions) {
     const parsed = new URL(opts.url); // throws on an invalid URL — a config error
@@ -69,6 +73,7 @@ export class WebhookGuardrailPlugin implements GuardrailPlugin {
     this.timeoutMs = opts.timeoutMs ?? 3000;
     this.failMode = opts.failMode ?? 'open';
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.dispatcher = opts.allowInternal ? undefined : opts.dispatcher;
   }
 
   async inspect(text: string, direction: GuardrailDirection): Promise<GuardrailPluginResult> {
@@ -80,6 +85,10 @@ export class WebhookGuardrailPlugin implements GuardrailPlugin {
         headers: { 'content-type': 'application/json', ...this.headers },
         body: JSON.stringify({ text, direction }),
         signal: ac.signal,
+        // Never follow a redirect: the egress guard vetted THIS URL, and a 307 would
+        // re-POST the prompt text to wherever the (compromised) host points.
+        redirect: 'error',
+        ...(this.dispatcher ? ({ dispatcher: this.dispatcher } as object) : {}),
       });
       if (!res.ok) return this.onFailure();
       const verdict = (await res.json()) as WebhookVerdict;
@@ -107,8 +116,9 @@ export class WebhookGuardrailPlugin implements GuardrailPlugin {
           findings: [
             { category: 'webhook_error', start: 0, end: 0, source: 'plugin', confidence: 1 },
           ],
+          degraded: true,
         }
-      : { action: 'none', findings: [] };
+      : { action: 'none', findings: [], degraded: true };
   }
 
   private findings(verdict: WebhookVerdict, text: string): Finding[] {

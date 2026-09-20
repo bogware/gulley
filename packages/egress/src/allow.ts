@@ -88,7 +88,23 @@ export function isBlockedIp(host: string): boolean {
   const h = host.toLowerCase().replace(/^\[|\]$/g, '');
   if (h.includes(':')) {
     if (h === '::1' || h === '::') return true;
-    if (h.startsWith('fe80') || h.startsWith('fc') || h.startsWith('fd')) return true;
+    // Link-local is fe80::/10 (fe80–febf), not only the fe80 prefix; ULA fc00::/7.
+    if (/^fe[89ab]/.test(h) || h.startsWith('fc') || h.startsWith('fd')) return true;
+    // IPv4-compatible (::a.b.c.d, deprecated but parsed) and NAT64 (64:ff9b::/96)
+    // embed an IPv4 address that must be checked as such.
+    const compat = /^::(\d+\.\d+\.\d+\.\d+)$/.exec(h);
+    if (compat?.[1]) return isBlockedIp(compat[1]);
+    // The WHATWG parser normalises ::169.254.169.254 to ::a9fe:a9fe (hex).
+    const compatHex = /^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+    if (compatHex?.[1] && compatHex[2] && compatHex[1] !== 'ffff') {
+      const n = ((parseInt(compatHex[1], 16) << 16) | parseInt(compatHex[2], 16)) >>> 0;
+      return isBlockedIp([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.'));
+    }
+    const nat64 = /^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+    if (nat64?.[1] && nat64[2]) {
+      const n = ((parseInt(nat64[1], 16) << 16) | parseInt(nat64[2], 16)) >>> 0;
+      return isBlockedIp([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.'));
+    }
     // IPv4-mapped IPv6, dotted form (::ffff:169.254.169.254).
     const mapped = /::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(h);
     if (mapped?.[1]) return isBlockedIp(mapped[1]);
@@ -111,6 +127,19 @@ export function isBlockedIp(host: string): boolean {
     inCidr(ip, '169.254.0.0', 16) || // link-local incl. IMDS + ECS metadata
     inCidr(ip, '0.0.0.0', 8) ||
     inCidr(ip, '100.64.0.0', 10) // CGNAT
+  );
+}
+
+/** Names that always resolve to a local or metadata endpoint, whatever DNS says. */
+export function isBlockedHostname(host: string): boolean {
+  const h = host.toLowerCase().replace(/\.$/, '');
+  return (
+    h === 'localhost' ||
+    h.endsWith('.localhost') ||
+    h === 'metadata.google.internal' ||
+    h === 'metadata' ||
+    h === 'instance-data' ||
+    h === 'instance-data.ec2.internal'
   );
 }
 
@@ -158,7 +187,7 @@ export function assertEgressAllowed(rawUrl: string, opts: EgressOptions = {}): U
     throw new EgressError('userinfo', 'credentials embedded in URL are not allowed');
   }
   const host = url.hostname.toLowerCase();
-  if (isBlockedIp(host)) {
+  if (isBlockedIp(host) || isBlockedHostname(host)) {
     throw new EgressError('blocked-ip', `egress to internal/link-local address blocked: ${host}`);
   }
   const allow = toSet(opts.allowlist);

@@ -15,6 +15,8 @@ export interface AzureContentSafetyOptions {
   failClosed?: boolean;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** An undici Dispatcher that pins DNS at connect time (@gulley/egress pinnedEgressAgent). */
+  dispatcher?: unknown;
 }
 
 interface AnalyzeResponse {
@@ -50,6 +52,8 @@ export class AzureContentSafetyPlugin implements GuardrailPlugin {
         },
         body: JSON.stringify({ text }),
         signal: ac.signal,
+        redirect: 'error',
+        ...(this.opts.dispatcher ? ({ dispatcher: this.opts.dispatcher } as object) : {}),
       });
       if (!res.ok) return this.onFailure();
       const body = (await res.json()) as AnalyzeResponse;
@@ -68,7 +72,11 @@ export class AzureContentSafetyPlugin implements GuardrailPlugin {
 
   private onFailure(): GuardrailPluginResult {
     return this.failClosed
-      ? { action: 'blocked', findings: findingsFor(['content_safety_error'], '', this.name) }
-      : { action: 'none', findings: [] };
+      ? {
+          action: 'blocked',
+          findings: findingsFor(['content_safety_error'], '', this.name),
+          degraded: true,
+        }
+      : { action: 'none', findings: [], degraded: true };
   }
 }

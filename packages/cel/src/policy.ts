@@ -31,11 +31,22 @@ interface CompiledRule {
  * non-match, so a malformed request can't crash authorization — an allow-list
  * with only erroring rules therefore fails closed (denied).
  */
+export interface CelAuthorizerHooks {
+  /** A rule threw at evaluation (it is treated as a non-match). Without a hook the
+   *  failure was invisible: a typo'd root variable in a DENY rule made every
+   *  evaluation throw and every call pass, silently. */
+  onError?: (err: unknown, rule: string) => void;
+}
+
 export class CelAuthorizer {
   private readonly allow: CompiledRule[] = [];
   private readonly deny: CompiledRule[] = [];
 
-  constructor(rules: AuthzRuleConfig[], compileOpts?: CompileOptions) {
+  constructor(
+    rules: AuthzRuleConfig[],
+    compileOpts?: CompileOptions,
+    private readonly hooks: CelAuthorizerHooks = {},
+  ) {
     rules.forEach((r, i) => {
       const compiled: CompiledRule = {
         program: compile(r.expr, compileOpts),
@@ -71,7 +82,12 @@ export class CelAuthorizer {
   private match(rule: CompiledRule, root: Record<string, unknown>): boolean {
     try {
       return rule.program.evalBool(root);
-    } catch {
+    } catch (err) {
+      try {
+        this.hooks.onError?.(err, rule.name);
+      } catch {
+        /* observability must never affect authorization */
+      }
       return false; // an erroring rule is a non-match (see class doc)
     }
   }

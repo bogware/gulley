@@ -244,7 +244,7 @@ describe('StreamingRedactor', () => {
     out += r.flush();
     expect(out).not.toContain('jane@example.com');
     expect(out).not.toContain('bob@work.io');
-    expect(out).toMatch(/<<GULLEY_EMAIL_\d+>>/); // reversible token, not <<REDACTED_…>>
+    expect(out).toMatch(/<<GULLEY_EMAIL_[0-9A-F]{8}_\d+>>/); // reversible token, not <<REDACTED_…>>
     expect(out).not.toContain('<<REDACTED_');
     expect(r.vault?.detokenize(out)).toBe(text); // fully reversible round-trip
   });
@@ -255,7 +255,7 @@ describe('StreamingRedactor', () => {
     let out = '';
     for (let i = 0; i < text.length; i += 5) out += r.push(text.slice(i, i + 5));
     out += r.flush();
-    const tokens = [...out.matchAll(/<<GULLEY_EMAIL_\d+>>/g)].map((m) => m[0]);
+    const tokens = [...out.matchAll(/<<GULLEY_EMAIL_[0-9A-F]{8}_\d+>>/g)].map((m) => m[0]);
     expect(tokens).toHaveLength(3); // three occurrences tokenized
     expect(tokens[0]).toBe(tokens[1]); // the repeated jane@… shares one token
     expect(tokens[0]).not.toBe(tokens[2]); // bob@… is a distinct token
@@ -435,7 +435,7 @@ describe('GuardrailEngine', () => {
     });
     const r = engine.inspectOutputText(text);
     expect(r.transformedText).not.toContain('jane@example.com');
-    expect(r.transformedText).toMatch(/<<GULLEY_EMAIL_\d+>>/); // reversible token
+    expect(r.transformedText).toMatch(/<<GULLEY_EMAIL_[0-9A-F]{8}_\d+>>/); // reversible token
     expect(r.vault?.detokenize(r.transformedText ?? '')).toBe(text); // fully restorable
   });
 
