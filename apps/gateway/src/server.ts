@@ -48,6 +48,11 @@ export function buildServer(
     // Keep idle keep-alive connections open LONGER than the load balancer does: if the
     // target closes first, the LB may reuse the half-closed socket and answer 502.
     keepAliveTimeout: config.HTTP_KEEPALIVE_TIMEOUT_MS,
+    // Fastify's per-request "incoming request"/"request completed" pair is replaced by
+    // ONE completion record per request (see the onResponse hook below and the
+    // pipeline's access record): the pair logged two lines per liveness probe and,
+    // for a hijacked proxied stream, an "incoming" with never a completion.
+    disableRequestLogging: true,
     // Fastify's default request id is a per-process counter (`req-1`, ...) that
     // resets on restart and repeats across tasks — NOT unique across a multi-task
     // fleet over one Postgres. requestId keys the ledger, request log, audit rows,
@@ -75,6 +80,30 @@ export function buildServer(
   app.addHook('onSend', (request, reply, payload, done) => {
     if (!reply.hasHeader('x-gulley-request-id')) reply.header('x-gulley-request-id', request.id);
     done(null, payload);
+  });
+
+  // One completion record for every NON-hijacked reply (a denial, a 404, a 5xx, a
+  // health probe): proxied streams and cache hits are hijacked and emit their own
+  // richer record from the pipeline. Probes are logged at debug so they stay out of
+  // an info-level stream. Also shipped to the OTLP access-log sink when configured.
+  app.addHook('onResponse', (request, reply, done) => {
+    const path = (request.url.split('?')[0] ?? request.url) || '/';
+    const probe = request.method === 'GET' && (path === '/health' || path === '/ready');
+    const record = {
+      event: 'http.complete',
+      requestId: request.id,
+      method: request.method,
+      route: path,
+      statusCode: reply.statusCode,
+      status: reply.statusCode < 400 ? 'ok' : 'error',
+      latencyMs: Math.round(reply.elapsedTime),
+    };
+    if (probe) request.log.debug(record, 'probe');
+    else {
+      request.log.info(record, 'access');
+      context?.accessLogSink?.emit(record);
+    }
+    done();
   });
 
   // The proxy forwards raw bytes upstream, so capture the body verbatim rather

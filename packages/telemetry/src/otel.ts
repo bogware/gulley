@@ -59,6 +59,14 @@ export interface RequestSpanData {
   /** Per-stage timings (epoch ms), materialized as child spans under the request
    *  span — recorded off the hot path (cheap marks), never per-chunk. */
   stages?: Array<{ name: string; startMs: number; endMs: number }>;
+  /** Why an in-flight request ended early: client | watchdog | deadline | transform |
+   *  socket | guardrail. Distinguishes a provider stall from a user's Ctrl-C. */
+  abortReason?: string;
+  /** False when the budget store was unavailable and the request was admitted
+   *  unmetered under the fail-open policy (an alertable blind spot). */
+  budgetEnforced?: boolean;
+  /** False when the rate limiter's store was unavailable (fail-open admission). */
+  rateLimitEnforced?: boolean;
 }
 
 export interface Telemetry {
@@ -106,6 +114,9 @@ export function spanAttributes(data: RequestSpanData): Attributes {
       : {}),
     ...(data.guardrailAction ? { 'gulley.guardrail.action': data.guardrailAction } : {}),
     ...(data.traceId ? { 'gulley.trace_id': data.traceId } : {}),
+    ...(data.abortReason ? { 'gulley.abort.reason': data.abortReason } : {}),
+    ...(data.budgetEnforced === false ? { 'gulley.budget.enforced': false } : {}),
+    ...(data.rateLimitEnforced === false ? { 'gulley.ratelimit.enforced': false } : {}),
   };
 }
 

@@ -26,6 +26,10 @@ export interface CircuitBreakerOptions {
    *  CLOSED → OPEN (ejected) — the key resiliency event to alert on. Never throws into
    *  the caller (invoked in a try/catch); does not affect breaker behavior. */
   onOpen?: (key: string) => void;
+  /** Called once when an ejected target recovers (a half-open probe succeeded). */
+  onClose?: (key: string) => void;
+  /** Called when a half-open probe token is granted (the first caller after cooldown). */
+  onHalfOpen?: (key: string) => void;
 }
 
 interface CircuitState {
@@ -79,6 +83,8 @@ export class CircuitBreaker {
   private readonly sync: BreakerSync;
   private readonly now: () => number;
   private readonly onOpen?: (key: string) => void;
+  private readonly onClose?: (key: string) => void;
+  private readonly onHalfOpen?: (key: string) => void;
 
   constructor(opts: CircuitBreakerOptions = {}) {
     this.threshold = opts.failureThreshold ?? 5;
@@ -91,6 +97,26 @@ export class CircuitBreaker {
     this.sync = opts.sync ?? new NoopBreakerSync();
     this.now = opts.now ?? ((): number => Date.now());
     this.onOpen = opts.onOpen;
+    this.onClose = opts.onClose;
+    this.onHalfOpen = opts.onHalfOpen;
+  }
+
+  private notify(hook: ((key: string) => void) | undefined, key: string): void {
+    if (!hook) return;
+    try {
+      hook(key);
+    } catch {
+      /* observability hook must never affect breaker behavior */
+    }
+  }
+
+  /** Release a half-open probe token WITHOUT recording an outcome — for a probe whose
+   *  dispatch never resolved to a verdict (a hedge loser aborted mid-flight, a client
+   *  abort before the response). Otherwise the token strands until probeTimeoutMs and
+   *  every other caller is shed with 503 for that window. */
+  releaseProbe(key: string): void {
+    const s = this.state.get(key);
+    if (s) s.probeUntil = 0;
   }
 
   isOpen(key: string): boolean {
@@ -135,6 +161,7 @@ export class CircuitBreaker {
     // Half-open: admit exactly one probe until it resolves or the token self-heals.
     if (s.probeUntil > now) return false;
     s.probeUntil = now + this.probeTimeoutMs;
+    this.notify(this.onHalfOpen, key);
     return true;
   }
 
@@ -167,7 +194,11 @@ export class CircuitBreaker {
     s.probeUntil = 0; // probe resolved → release the half-open token
     // Recovered on a half-open probe → clear the backoff so the next fault
     // starts from the base cooldown again.
-    if (s.openUntil <= this.now()) s.ejections = 0;
+    if (s.openUntil <= this.now() && s.ejections > 0) {
+      s.ejections = 0;
+      s.openUntil = 0;
+      this.notify(this.onClose, key);
+    }
   }
 
   /** Record a failure. `retryAfterMs` (parsed from an upstream Retry-After / rate
@@ -185,17 +216,14 @@ export class CircuitBreaker {
       const wasOpen = s.openUntil > this.now(); // distinguish a fresh ejection from a re-trip
       s.ejections += 1;
       const backoff = Math.min(this.cooldownMs * 2 ** (s.ejections - 1), this.maxCooldownMs);
-      s.openUntil = this.now() + Math.max(backoff, retryAfterMs ?? 0);
+      // The upstream's Retry-After raises the floor but never past maxCooldownMs: an
+      // hours-long (or epoch-shaped) header would otherwise eject the target for that
+      // long on EVERY replica via publishOpen.
+      s.openUntil = this.now() + Math.min(Math.max(backoff, retryAfterMs ?? 0), this.maxCooldownMs);
       // Broadcast so peer replicas eject this target too (fire-and-forget).
       this.sync.publishOpen(key, s.openUntil);
       // Notify only on a CLOSED → OPEN transition (not every extend), best-effort.
-      if (!wasOpen && this.onOpen) {
-        try {
-          this.onOpen(key);
-        } catch {
-          /* observability hook must never affect breaker behavior */
-        }
-      }
+      if (!wasOpen) this.notify(this.onOpen, key);
     }
   }
 }

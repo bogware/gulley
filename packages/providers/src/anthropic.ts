@@ -77,7 +77,7 @@ export class PassthroughAdapter implements ProviderAdapter {
       body: req.body,
       signal: req.signal,
       bodyTimeout: 0,
-      headersTimeout: 60_000,
+      headersTimeout: req.headersTimeoutMs ?? 60_000,
     });
 
     return {

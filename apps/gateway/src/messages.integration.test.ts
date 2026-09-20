@@ -25,6 +25,7 @@ import {
 } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { AdaptiveLimiter, CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
+import { GatewayMetrics } from '@gulley/metrics';
 import { initTelemetry } from '@gulley/telemetry';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from './config';
@@ -5542,6 +5543,366 @@ describe('same-model arbitrage', () => {
     await app.close();
     await new Promise<void>((r) => bedrockSrv.close(() => r()));
     await new Promise<void>((r) => anthropicSrv.close(() => r()));
+  });
+});
+
+describe('hot-path hardening (refine cycle 2026-09)', () => {
+  const MSG_START =
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":1}}}\n\n';
+
+  async function serve(
+    handler: (req: http.IncomingMessage, res: http.ServerResponse) => void,
+  ): Promise<{ url: string; close: () => Promise<void>; hits: () => number }> {
+    let hits = 0;
+    const srv = http.createServer((req, res) => {
+      hits += 1;
+      handler(req, res);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+      hits: () => hits,
+    };
+  }
+
+  const streamBody = (model = 'claude-sonnet-4-6') =>
+    JSON.stringify({
+      model,
+      stream: true,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+  it('a watchdog stall is recorded as an ERROR (not a client abort), ends the stream with a terminal error frame, and faults the breaker', async () => {
+    const hung = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START); // then hang forever
+    });
+    const { store, token } = seededStore();
+    const { ctx, requestLog, breaker } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', hung.url) },
+      },
+    ];
+    ctx.streamInactivityMs = 150;
+    ctx.metrics = new GatewayMetrics();
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamBody(),
+    });
+    const text = await res.text();
+    await vi.waitFor(() => expect(requestLog.entries.length).toBe(1));
+
+    expect(text).toContain('event: error'); // no more silent truncation
+    expect(text).toContain('stalled');
+    const row = requestLog.entries[0]!;
+    expect(row.status).toBe('error');
+    expect(row.attributes?.['abortReason']).toBe('watchdog');
+    expect(breaker.errorRate('anthropic')).toBeGreaterThan(0); // the stall is an upstream fault
+    expect(ctx.metrics.render()).toContain('gulley_request_aborts_total{reason="watchdog"} 1');
+
+    await app.close();
+    await hung.close();
+  });
+
+  it('a client disconnect mid-stream is recorded as ABORTED with reason client and frees the limiter slot without a drop', async () => {
+    const slow = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START);
+      const t = setInterval(() => {
+        if (res.destroyed) clearInterval(t);
+        else
+          res.write(
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}\n\n',
+          );
+      }, 20);
+    });
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', slow.url) },
+      },
+    ];
+    const limiter = new AdaptiveLimiter({ initialLimit: 20 });
+    ctx.limiter = limiter;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const port = Number(new URL(base).port);
+
+    await new Promise<void>((resolve) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1',
+          port,
+          path: '/v1/messages',
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': token },
+        },
+        (res) => {
+          res.once('data', () => {
+            req.destroy(); // client goes away after the first bytes
+            resolve();
+          });
+        },
+      );
+      req.end(streamBody());
+    });
+    await vi.waitFor(() => expect(requestLog.entries.length).toBe(1));
+    const row = requestLog.entries[0]!;
+    expect(row.status).toBe('aborted');
+    expect(row.attributes?.['abortReason']).toBe('client');
+    expect(limiter.inFlight('anthropic')).toBe(0);
+    expect(limiter.currentLimit('anthropic')).toBe(20); // released, not penalised as a drop
+
+    await app.close();
+    await slow.close();
+  });
+
+  it('a cascade tier-0 leg that stalls fails CLOSED (502), charges the leg, and never crashes the process', async () => {
+    // Previously readFully() removed its own 'error' listener before destroying the
+    // undici body; undici's injected RequestAbortedError then had no listener →
+    // uncaughtException → the whole replica drained and exited.
+    const up = await serve((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        const model = String((JSON.parse(b) as { model?: string }).model ?? '');
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        if (model.includes('haiku'))
+          res.write(MSG_START.replace('claude-sonnet-4-6', model)); // tier-0 hangs
+        else res.end(MSG_START);
+      });
+    });
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', up.url) },
+      },
+    ];
+    ctx.cascade = [
+      { model: 'claude-haiku-*', escalateTo: 'claude-sonnet-4-6', stopReasons: ['refusal'] },
+    ];
+    ctx.streamInactivityMs = 150;
+    const uncaught = vi.fn();
+    process.on('uncaughtException', uncaught);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    try {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: streamBody('claude-haiku-4-5'),
+      });
+      expect(res.status).toBe(502);
+      await vi.waitFor(() =>
+        expect(ledger.entries.some((e) => e.requestId.endsWith('#cascade-tier0'))).toBe(true),
+      );
+      await new Promise((r) => setTimeout(r, 50)); // let any stray 'error' surface
+      expect(uncaught).not.toHaveBeenCalled();
+    } finally {
+      process.off('uncaughtException', uncaught);
+      await app.close();
+      await up.close();
+    }
+  });
+
+  it('an in-band `event: error` frame under a 200 is recorded as an error and faults the breaker', async () => {
+    const flaky = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        MSG_START +
+          'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n',
+      );
+    });
+    const { store, token } = seededStore();
+    const { ctx, requestLog, breaker } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', flaky.url) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamBody(),
+    });
+    await res.text();
+    await vi.waitFor(() => expect(requestLog.entries.length).toBe(1));
+    expect(requestLog.entries[0]!.status).toBe('error');
+    expect(requestLog.entries[0]!.attributes?.['upstreamErrorFrame']).toBe(true);
+    expect(breaker.errorRate('anthropic')).toBeGreaterThan(0);
+    await app.close();
+    await flaky.close();
+  });
+
+  it('a key-store outage answers 503 + Retry-After with a generic body and is metered — never a driver-message 500', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.keyStore = {
+      findByPrefix: async () => {
+        throw new Error('connect ECONNREFUSED 10.0.1.5:5432');
+      },
+      touchLastUsed: async () => {},
+    } as unknown as GatewayContext['keyStore'];
+    ctx.metrics = new GatewayMetrics();
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    for (const [method, path, body] of [
+      ['POST', '/v1/messages', streamBody()],
+      ['GET', '/v1/models', undefined],
+    ] as const) {
+      const res = await fetch(`${base}${path}`, {
+        method,
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        ...(body ? { body } : {}),
+      });
+      expect(res.status).toBe(503);
+      expect(res.headers.get('retry-after')).toBe('2');
+      expect(res.headers.get('x-gulley-request-id')).toMatch(/^req_/);
+      const text = await res.text();
+      expect(text).not.toContain('ECONNREFUSED');
+      expect(text).toContain('auth store unavailable');
+    }
+    expect(ctx.metrics.render()).toContain(
+      'gulley_store_errors_total{policy="error",store="auth"} 1',
+    );
+    await app.close();
+  });
+
+  it('hold-then-flush enforces on the LOGICAL text: a secret split across two deltas is withheld', async () => {
+    const leaky = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(
+        MSG_START +
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"key AKIAIOSFO"}}\n\n' +
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"DNN7EXAMPLE ok"}}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      );
+    });
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('leaky', leaky.url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action: 'block' },
+        }),
+        holdStreamedOutput: true,
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamBody(),
+    });
+    const text = await res.text();
+    expect(res.headers.get('x-gulley-guardrail')).toBe('output-blocked');
+    expect(text).not.toContain('AKIA');
+    expect(text).toContain('event: error');
+    await app.close();
+    await leaky.close();
+  });
+
+  it('a pipeline exception before dispatch answers an Anthropic-shaped 500 with the request id and is metered', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', upstreamUrl) },
+        guardrails: {
+          inspectInput: async () => {
+            throw new Error('plugin exploded: sk-ant-should-not-leak');
+          },
+        } as unknown as GuardrailEngine,
+      },
+    ];
+    ctx.metrics = new GatewayMetrics();
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamBody(),
+    });
+    const json = (await res.json()) as {
+      type: string;
+      error: { type: string };
+      request_id?: string;
+    };
+    expect(res.status).toBe(500);
+    expect(json.type).toBe('error');
+    expect(json.error.type).toBe('api_error');
+    expect(json.request_id).toMatch(/^req_/);
+    expect(res.headers.get('x-gulley-request-id')).toBe(json.request_id);
+    expect(JSON.stringify(json)).not.toContain('sk-ant');
+    expect(ctx.metrics.render()).toContain('gulley_unhandled_errors_total{stage="pipeline"} 1');
+    await app.close();
+  });
+
+  it('an upstream that accepts the request but never answers is NOT replayed: one attempt, 504, worst-case metered', async () => {
+    const stalled = await serve((_req, res) => {
+      setTimeout(() => {
+        if (!res.destroyed) {
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(MSG_START);
+        }
+      }, 1_500);
+    });
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', stalled.url) },
+      },
+    ];
+    ctx.upstreamHeadersTimeoutMs = 200;
+    ctx.retryMaxAttempts = 3;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4000,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(res.status).toBe(504);
+    await vi.waitFor(() => expect(ledger.entries.length).toBe(1));
+    expect(stalled.hits()).toBe(1); // no same-target replay of a billed generation
+    expect(ledger.entries[0]!.costMicroUsd).toBeGreaterThan(0); // worst-case, not a $0 refund
+    expect(ledger.entries[0]!.status).toBe('error');
+    await app.close();
+    await stalled.close();
   });
 });
 

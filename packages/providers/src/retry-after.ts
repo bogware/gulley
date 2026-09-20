@@ -56,17 +56,38 @@ const looksAbsolute = (s: string): boolean => /\d{4}-\d\d-\d\d|gmt|utc/i.test(s)
  * none present. Authoritative `Retry-After` / `retry-after-ms` win; otherwise the
  * soonest rate-limit-reset bucket is used. `nowMs` is injectable for testing.
  */
+/** Ceiling on any parsed backoff. An upstream (or a fronting proxy) can express a
+ *  reset as an epoch timestamp or hours away; unbounded, one such header pinned a
+ *  retry sleep (and, via the breaker's cooldown floor, ejected the target fleet-wide)
+ *  for that long. Anything above this is clamped; the value still ranks candidates. */
+export const MAX_RETRY_AFTER_MS = 300_000;
+
+/** A bare number that is far too large to be a delta is an epoch: seconds if it is
+ *  around 1e9 (2001–2286), milliseconds if around 1e12. */
+function bareNumberToMs(n: number, nowMs: number): number {
+  if (n >= 1e11) return Math.max(0, n - nowMs); // epoch milliseconds
+  if (n >= 1e8) return Math.max(0, n * 1000 - nowMs); // epoch seconds
+  return n * 1000; // delta-seconds
+}
+
+const clamp = (ms: number | undefined): number | undefined =>
+  ms === undefined ? undefined : Math.min(Math.max(0, ms), MAX_RETRY_AFTER_MS);
+
 export function parseRetryAfterMs(
   headers: HeaderBag,
   nowMs: number = Date.now(),
 ): number | undefined {
+  return clamp(parseRetryAfterMsUnclamped(headers, nowMs));
+}
+
+function parseRetryAfterMsUnclamped(headers: HeaderBag, nowMs: number): number | undefined {
   const ms = headerValue(headers, 'retry-after-ms');
   if (ms && /^\d+$/.test(ms.trim())) return Number(ms.trim());
 
   const ra = headerValue(headers, 'retry-after');
   if (ra) {
     const t = ra.trim();
-    if (/^\d+$/.test(t)) return Number(t) * 1000; // delta-seconds
+    if (/^\d+$/.test(t)) return bareNumberToMs(Number(t), nowMs); // delta-seconds (or epoch)
     const abs = msUntil(t, nowMs); // HTTP-date form
     if (abs !== undefined) return abs;
   }
@@ -80,7 +101,12 @@ export function parseRetryAfterMs(
   ]) {
     const v = headerValue(headers, name);
     if (!v) continue;
-    const d = looksAbsolute(v) ? msUntil(v, nowMs) : parseDurationMs(v);
+    // A bare integer here is the GitHub convention: an epoch-seconds reset.
+    const d = looksAbsolute(v)
+      ? msUntil(v, nowMs)
+      : /^\d+$/.test(v.trim())
+        ? bareNumberToMs(Number(v.trim()), nowMs)
+        : parseDurationMs(v);
     if (d !== undefined) candidates.push(d);
   }
   // Anthropic RFC3339 reset timestamps.

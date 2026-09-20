@@ -37,7 +37,15 @@ export async function resolveVirtualKey(
   const parsed = parseVirtualKey(candidate);
   if (!parsed) return err({ reason: 'malformed_credential' });
 
-  const stored = await deps.keyStore.findByPrefix(parsed.keyPrefix);
+  let stored: Awaited<ReturnType<KeyStore['findByPrefix']>>;
+  try {
+    stored = await deps.keyStore.findByPrefix(parsed.keyPrefix);
+  } catch (cause) {
+    // A Postgres outage/timeout is NOT an invalid credential: surface it as a
+    // distinct failure so the gateway answers 503 + Retry-After (and meters it)
+    // instead of letting the driver error escape as a Fastify 500.
+    return err({ reason: 'store_unavailable', cause });
+  }
   if (!stored) return err({ reason: 'unknown_key' });
   if (!verifySecret(deps.pepper, parsed.secret, stored.keyHash)) {
     return err({ reason: 'bad_secret' });

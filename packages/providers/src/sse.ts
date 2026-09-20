@@ -93,10 +93,15 @@ export class SSEParser {
   private enforceLimit(): void {
     if (this.buffer.length + this.dataBytes <= this.maxBufferBytes) return;
     if (this.onOverflow === 'throw') throw new SSEOverflowError(this.maxBufferBytes);
-    this.buffer = '';
+    // Drop the oversized PENDING event only. The unscanned remainder of the chunk
+    // still in `buffer` may hold the very next, well-formed events (the usage-bearing
+    // message_delta after a giant content delta) — clearing it lost them and the
+    // request metered from message_start's output_tokens. The buffer itself is only
+    // discarded when it alone exceeds the cap (one unterminated runaway line).
     this.currentEvent = undefined;
     this.dataLines = [];
     this.dataBytes = 0;
     this.dropping = true;
+    if (this.buffer.length > this.maxBufferBytes) this.buffer = '';
   }
 }

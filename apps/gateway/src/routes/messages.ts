@@ -35,6 +35,7 @@ import {
 import type { CelAuthorizer, CelTransformer, ExternalAuthorizer, HeaderChanges } from '@gulley/cel';
 import {
   extractToolCalls,
+  extractTextFromSse,
   extractToolCallsFromSse,
   governToolCalls,
   type ToolCall,
@@ -285,6 +286,11 @@ export interface GatewayContext {
   cacheLookupTimeoutMs?: number;
   /** Stop every background maintenance timer this context started (SIGTERM drain). */
   stopMaintenance?: () => void;
+  /** Teardowns still writing their ledger/audit/budget rows; the SIGTERM drain awaits
+   *  them (bounded) so a deploy never exits mid-write. */
+  inflightTeardowns?: Set<Promise<void>>;
+  /** Upstream time-to-headers budget (config.UPSTREAM_HEADERS_TIMEOUT_MS). */
+  upstreamHeadersTimeoutMs?: number;
   /** Request header names whose values are captured as cost-attribution tags on the
    *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
   attributionHeaders?: string[];
@@ -340,6 +346,16 @@ const MASK_VAULT_PERSIST_TIMEOUT_MS = 5_000;
 const DEFAULT_STREAM_INACTIVITY_MS = 120_000;
 /** Responses over this size are streamed through but never cached. */
 const CACHE_BODY_CAP = 2 * 1024 * 1024;
+/** Ceiling on a same-target retry sleep, whatever Retry-After said. */
+const RETRY_SLEEP_CAP_MS = 30_000;
+
+/** undici's headers timeout: the request was fully sent, the upstream just never
+ *  answered in time — distinct from a connect/socket fault that never reached it. */
+function isHeadersTimeout(err: unknown): boolean {
+  const code = (err as { code?: unknown } | undefined)?.code;
+  const name = (err as { name?: unknown } | undefined)?.name;
+  return code === 'UND_ERR_HEADERS_TIMEOUT' || name === 'HeadersTimeoutError';
+}
 /** Hard deadline for the whole cache lookup (exact read + embed + vector query). The
  *  cache is best-effort, so a hung store must degrade to a plain proxy, not stall the
  *  request forever before budget/dispatch. Production threads the Zod-validated
@@ -418,7 +434,36 @@ export function registerRoutes(app: FastifyInstance, holder: RouteHolder): void 
         error: { type: 'not_found', message: 'no route for path' },
       }) as unknown as void;
     }
-    return handleProxy(holder.ctx, route, req, reply);
+    const startedAtMs = Date.now();
+    return handleProxy(holder.ctx, route, req, reply).catch((err: unknown) => {
+      // The pipeline threw before it took over the socket (a dependency fault in a
+      // pre-dispatch stage). Fastify's default handler would answer 500 with the
+      // driver's message in the body and record NOTHING — no metric, no span, no
+      // request id. Log it as an event, count it, meter it, and answer in the
+      // Anthropic error shape with the request id.
+      const ctx = holder.ctx;
+      req.log.error({ err, event: 'proxy.unhandled_error' }, 'pipeline threw before dispatch');
+      ctx.metrics?.recordUnhandled('pipeline');
+      safeRecord(ctx, req.log, {
+        provider: 'unknown',
+        requestModel: 'unknown',
+        responseModel: 'unknown',
+        route: path,
+        statusCode: 500,
+        status: 'error',
+        inputTokens: 0,
+        outputTokens: 0,
+        costMicroUsd: 0,
+        streamed: false,
+        startedAtMs,
+      });
+      if (reply.sent || reply.raw.headersSent) return;
+      return reply.code(500).send({
+        type: 'error',
+        error: { type: 'api_error', message: 'internal error' },
+        request_id: req.id,
+      }) as unknown as void;
+    });
   });
   // Model discovery (OpenAI-shaped list), filtered to the caller's allowed models.
   const modelsHandler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
@@ -479,24 +524,67 @@ function handleDebugTrace(ctx: GatewayContext, request: FastifyRequest, reply: F
   request.raw.on('close', cleanup);
 }
 
+/**
+ * Resolve a data-plane principal by the SAME credential-channel ladder the proxy uses
+ * (Basic → inbound JWT → brokered `gko_at_` → virtual key), with no reply side effects.
+ * Used by the read-only endpoints (model discovery) so a harness authenticating with
+ * a broker token or a JWT is not 401'd on discovery while its POSTs succeed.
+ */
+async function resolveAnyPrincipal(
+  ctx: GatewayContext,
+  request: FastifyRequest,
+): Promise<{ kind: 'ok'; principal: Principal } | { kind: 'unauthorized' | 'unavailable' }> {
+  const authHeader = headerValue(request, 'authorization');
+  const bearer = bearerToken(request);
+  const brokeredToken = brokeredAccessToken(bearer, headerValue(request, 'x-api-key'));
+  if (ctx.basicAuth && authHeader && /^basic\s/i.test(authHeader)) {
+    const basic = resolveBasicPrincipal(authHeader, ctx.basicAuth);
+    return isErr(basic) ? { kind: 'unauthorized' } : { kind: 'ok', principal: basic.value };
+  }
+  if (ctx.jwtAuth && bearer && looksLikeJwt(bearer)) {
+    const p = await resolveJwtPrincipal(bearer, ctx.jwtAuth);
+    return p ? { kind: 'ok', principal: p } : { kind: 'unauthorized' };
+  }
+  if (ctx.brokerResolver && brokeredToken) {
+    try {
+      const r = await ctx.brokerResolver(brokeredToken);
+      return isErr(r) ? { kind: 'unauthorized' } : { kind: 'ok', principal: r.value };
+    } catch {
+      return { kind: 'unavailable' };
+    }
+  }
+  const auth = await resolveVirtualKey(
+    { apiKey: headerValue(request, 'x-api-key'), bearer },
+    { keyStore: ctx.keyStore, pepper: ctx.pepper },
+  );
+  if (isErr(auth)) {
+    return { kind: auth.error.reason === 'store_unavailable' ? 'unavailable' : 'unauthorized' };
+  }
+  return { kind: 'ok', principal: auth.value };
+}
+
 /** GET /v1/models — the models this principal may use, as an OpenAI model list. */
 async function handleModels(
   ctx: GatewayContext,
   request: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> {
-  const auth = await resolveVirtualKey(
-    { apiKey: headerValue(request, 'x-api-key'), bearer: bearerToken(request) },
-    { keyStore: ctx.keyStore, pepper: ctx.pepper },
-  );
-  if (isErr(auth)) {
+  const resolved = await resolveAnyPrincipal(ctx, request);
+  if (resolved.kind !== 'ok') {
+    if (resolved.kind === 'unavailable') {
+      await reply
+        .code(503)
+        .header('retry-after', '2')
+        .send({ type: 'error', error: { type: 'api_error', message: 'auth store unavailable' } });
+      return;
+    }
     await reply.code(401).send({
       type: 'error',
       error: { type: 'authentication_error', message: 'invalid credentials' },
     });
     return;
   }
-  const principal = auth.value;
+  const principal = resolved.principal;
   const ids = new Set<string>([...(ctx.models ?? []), ...(ctx.modelRouter?.knownModels() ?? [])]);
   const data = [...ids]
     // Advertise an id only if a request for it would actually be permitted. Both the
@@ -540,7 +628,12 @@ async function readFully(
     };
     const fail = (err: Error): void => {
       cleanup();
-      body.destroy();
+      // Keep a permanent no-op 'error' listener: undici injects RequestAbortedError
+      // into a body destroyed without a cause, and with our listener already removed
+      // that 'error' would be UNHANDLED → uncaughtException → the whole replica drains
+      // and exits on a single stalled cascade leg / client abort.
+      body.on('error', () => {});
+      body.destroy(err);
       reject(err);
     };
     // Inactivity guard: a half-open upstream (2xx headers, then no bytes, no end/error)
@@ -626,6 +719,44 @@ async function handleProxy(
   };
   const started = Date.now();
   const requestId = request.id;
+
+  // --- client-abort wiring, FIRST ---
+  // Registered before the first await: a client that disconnects during a slow
+  // guardrail plugin / cache lookup / budget reserve used to go unnoticed (the handler
+  // was attached only right before dispatch), so the request was still forwarded,
+  // generated and BILLED into a dead socket. `abortWith` is the single abort entry
+  // point: it records WHY (a provider stall is not a user's Ctrl-C), aborts the
+  // upstream signal, and destroys whatever body is live — a cascade replay body or a
+  // paused decompressor is NOT reached by the abort signal, and one paused for
+  // backpressure when the client vanished would otherwise stay paused forever, its
+  // single teardown() never running (budget, ledger, audit and limiter slot all leak).
+  type AbortReason = 'client' | 'watchdog' | 'deadline' | 'transform' | 'socket' | 'guardrail';
+  let abortReason: AbortReason | undefined;
+  const live: { body?: Readable } = {}; // the body currently piped (set once dispatched)
+  const controller = new AbortController();
+  const abortWith = (reason: AbortReason, err?: Error): void => {
+    if (!abortReason) abortReason = reason;
+    if (!controller.signal.aborted) controller.abort();
+    if (live.body && !live.body.destroyed)
+      live.body.destroy(err ?? new Error(`aborted: ${reason}`));
+  };
+  let reserveRefresh: ReturnType<typeof setInterval> | undefined;
+  const stopReserveRefresh = (): void => {
+    if (reserveRefresh) {
+      clearInterval(reserveRefresh);
+      reserveRefresh = undefined;
+    }
+  };
+  // CRITICAL: this 'close' handler is also the reliable cleanup when teardown() is
+  // bypassed (a throw between the reservation-refresh interval being armed and the
+  // stream handlers being wired): the socket still closes → this fires → the
+  // interval is cleared. Without it an unref'd interval would refresh the reservation
+  // FOREVER, so the orphan-sweep could never reclaim it (a permanent budget leak).
+  reply.raw.on('close', () => {
+    stopReserveRefresh();
+    if (!reply.raw.writableEnded) abortWith('client');
+  });
+
   // Cost-attribution tags from configured request headers (repo/branch/PR/session/
   // developer/…), captured once and threaded onto the ledger, request-log, and audit
   // so spend rolls up by any SDLC dimension for chargeback.
@@ -725,7 +856,20 @@ async function handleProxy(
     // fall-through to the virtual-key path. Read-only verify (lookup + secret + expiry).
     // Accepted on either header a harness uses: `Authorization: Bearer` (Claude Code's
     // ANTHROPIC_AUTH_TOKEN / apiKeyHelper, Codex) or `x-api-key` (ANTHROPIC_API_KEY).
-    const brokered = await ctx.brokerResolver(brokeredToken);
+    let brokered: Awaited<ReturnType<NonNullable<GatewayContext['brokerResolver']>>>;
+    try {
+      brokered = await ctx.brokerResolver(brokeredToken);
+    } catch (err) {
+      // The grant store (Postgres) is down: a dependency outage, not a bad token.
+      request.log.error({ err }, 'auth store unavailable (broker grants)');
+      ctx.metrics?.recordStoreError('auth', 'error');
+      recordDenied(503);
+      await reply
+        .code(503)
+        .header('retry-after', '2')
+        .send({ type: 'error', error: { type: 'api_error', message: 'auth store unavailable' } });
+      return;
+    }
     if (isErr(brokered)) {
       request.log.info({ reason: brokered.error.reason }, 'broker token rejected');
       recordDenied(401);
@@ -741,6 +885,19 @@ async function handleProxy(
       { apiKey: headerValue(request, 'x-api-key'), bearer },
       { keyStore: ctx.keyStore, pepper: ctx.pepper },
     );
+    if (isErr(auth) && auth.error.reason === 'store_unavailable') {
+      // The key store (Postgres) is down. Previously the driver error escaped as an
+      // opaque Fastify 500 (its message in the body) with no metric — ALB alarms read
+      // it as an application bug. Shed with 503 + Retry-After and count it.
+      request.log.error({ err: auth.error.cause }, 'auth store unavailable (key store)');
+      ctx.metrics?.recordStoreError('auth', 'error');
+      recordDenied(503);
+      await reply
+        .code(503)
+        .header('retry-after', '2')
+        .send({ type: 'error', error: { type: 'api_error', message: 'auth store unavailable' } });
+      return;
+    }
     if (isErr(auth)) {
       request.log.info({ reason: auth.error.reason }, 'auth rejected');
       recordDenied(401);
@@ -1131,10 +1288,28 @@ async function handleProxy(
   // standard x-ratelimit-* + retry-after headers.
   let rlRules: RateLimit[] = [];
   let rlHeaders: Record<string, string> = {};
+  let rateLimitDegraded = false;
   if (ctx.rateLimiter) {
     const { outcome, rules } = await ctx.rateLimiter.check(principal.scope.workspaceId, requestId);
     rlRules = rules;
     rlHeaders = rateLimitHeaders(outcome);
+    if (outcome.degraded) {
+      // The limiter's store/rules were unavailable and the policy admitted (or
+      // rejected) blind. This used to be invisible end to end: no log, no audit row,
+      // no metric — an outage silently switched RPM/TPM enforcement off fleet-wide.
+      rateLimitDegraded = true;
+      request.log.warn(
+        { allowed: outcome.allowed, workspaceId: principal.scope.workspaceId },
+        'rate-limit store unavailable — policy applied blind',
+      );
+      await auditSafe({
+        orgId: principal.scope.orgId,
+        actor: principal.id,
+        action: 'ratelimit.store_unavailable',
+        target: provider0,
+        payload: { model: requestedModel, allowed: outcome.allowed },
+      });
+    }
     if (!outcome.allowed) {
       await auditSafe({
         orgId: principal.scope.orgId,
@@ -1216,7 +1391,11 @@ async function handleProxy(
   let vault: TokenVault | undefined;
   let inputMasked = false;
   if (engine) {
-    const gr = await engine.inspectInput(body.toString('utf8'));
+    // Scan the canonical (decoded) JSON when the body parsed: the raw bytes may spell
+    // `@` as `\u0040` (or a newline as `\n`), which every detector missed while the
+    // provider decoded it back into the real value — a one-escape DLP bypass. The
+    // masked output stays a JSON object, so the re-parse below still applies.
+    const gr = await engine.inspectInput(parseOk ? JSON.stringify(parsed) : body.toString('utf8'));
     inputFindings = gr.summary.total;
     if (gr.blocked) {
       await auditSafe({
@@ -1319,6 +1498,7 @@ async function handleProxy(
     !cacheControlHas(request, 'no-cache');
   let cacheReq: CacheableRequest | undefined;
   let cacheLookup: CacheLookup | undefined;
+  let cacheErrored = false; // lookup failed/timed out (distinct from "not configured")
   if (cacheOn && ctx.cache) {
     cacheReq = {
       // Default partition = workspace (shared within the one trust domain). A route may
@@ -1349,6 +1529,8 @@ async function handleProxy(
       // The cache is best-effort: an embeddings/vector outage (or a lookup timeout) must
       // degrade to a plain proxy, never fail or stall the request.
       request.log.warn({ err }, 'cache lookup failed/timed out — bypassing');
+      ctx.metrics?.recordStoreError('cache', 'bypass');
+      cacheErrored = true;
       cacheLookup = undefined;
     }
     if (cacheLookup?.response) {
@@ -1372,14 +1554,20 @@ async function handleProxy(
   }
 
   // --- budget: reserve worst-case at admission (hard cap, TOCTOU-safe) ---
-  const maxOutput =
-    numField(parsed['max_tokens']) ??
-    numField(parsed['max_output_tokens']) ??
-    // OpenAI reasoning / o-series / gpt-5-class models take `max_completion_tokens`
-    // (and reject `max_tokens`); without this a request that sets only that field
-    // reserves against the 8k default and can breach the hard cap at scale.
-    numField(parsed['max_completion_tokens']) ??
-    DEFAULT_MAX_OUTPUT_TOKENS;
+  // Clamped to a positive integer: a negative/zero/NaN value made the worst-case
+  // estimate <= 0, which skipped the reservation (and the commit) entirely.
+  const maxOutput = Math.max(
+    1,
+    Math.floor(
+      numField(parsed['max_tokens']) ??
+        numField(parsed['max_output_tokens']) ??
+        // OpenAI reasoning / o-series / gpt-5-class models take `max_completion_tokens`
+        // (and reject `max_tokens`); without this a request that sets only that field
+        // reserves against the 8k default and can breach the hard cap at scale.
+        numField(parsed['max_completion_tokens']) ??
+        DEFAULT_MAX_OUTPUT_TOKENS,
+    ),
+  );
   let worstCase = estimateWorstCaseMicroUsd(
     provider0,
     requestedModel,
@@ -1418,8 +1606,10 @@ async function handleProxy(
     for (const s of reservedScopes) {
       try {
         await ctx.budgets.commit(s, requestId, 0); // release the reservation (spend 0)
-      } catch {
-        /* best-effort rollback */
+      } catch (err) {
+        // A failed rollback leaks the reservation until the orphan sweep — say so.
+        request.log.warn({ err, scope: s }, 'budget rollback failed');
+        ctx.metrics?.recordStoreError('budget', 'rollback');
       }
     }
     reservedScopes.length = 0;
@@ -1477,6 +1667,13 @@ async function handleProxy(
       if (!budgetStoreDown) {
         budgetStoreDown = true;
         request.log.error({ err, scope }, 'budget store unavailable');
+        // Fail-open admissions were previously indistinguishable from enforced ones on
+        // /metrics and in traces; this counter + the span/request-log flag make the
+        // "budget enforcement is off" window alertable.
+        ctx.metrics?.recordStoreError(
+          'budget',
+          ctx.budgetFailOpen !== false ? 'fail_open' : 'fail_closed',
+        );
         await auditSafe({
           orgId: principal.scope.orgId,
           actor: principal.id,
@@ -1494,11 +1691,13 @@ async function handleProxy(
     for (const s of reservedScopes) {
       try {
         await ctx.budgets.commit(s, requestId, 0);
-      } catch {
-        /* best-effort rollback */
+      } catch (err) {
+        request.log.warn({ err, scope: s }, 'budget rollback failed');
+        ctx.metrics?.recordStoreError('budget', 'rollback');
       }
     }
     reservedScopes.length = 0;
+    ctx.metrics?.recordShed('budget_store');
     safeRecord(ctx, request.log, {
       provider: provider0,
       requestModel: requestedModel,
@@ -1552,6 +1751,7 @@ async function handleProxy(
   // (must be servable by this route's candidates). Done BEFORE the per-model reserve
   // so the model budget is charged for the model actually used.
   const downshift = ctx.budgetDownshift;
+  let downshiftedFrom: string | undefined;
   if (
     downshift &&
     admittedUtilization >= downshift.threshold &&
@@ -1566,6 +1766,7 @@ async function handleProxy(
       { from: requestedModel, to: downshift.model, utilization: admittedUtilization },
       'budget-aware model downshift',
     );
+    downshiftedFrom = requestedModel;
     requestedModel = downshift.model;
     parsed['model'] = downshift.model;
     body = Buffer.from(JSON.stringify(parsed), 'utf8');
@@ -1652,33 +1853,26 @@ async function handleProxy(
   // stream is still in flight: refresh its expiry on a throttled interval (well under
   // the reservation lifetime), fire-and-forget, never per-chunk. A fast request's
   // interval never fires (it's > the request duration).
-  let reserveRefresh: ReturnType<typeof setInterval> | undefined;
-  const stopReserveRefresh = (): void => {
-    if (reserveRefresh) {
-      clearInterval(reserveRefresh);
-      reserveRefresh = undefined;
-    }
-  };
   if (ctx.budgets.refresh && ctx.budgetReserveRefreshMs && reservedScopes.length > 0) {
     const refreshFn = ctx.budgets.refresh.bind(ctx.budgets);
+    let refreshWarned = false;
     reserveRefresh = setInterval(() => {
-      for (const scope of reservedScopes) void refreshFn(scope, requestId).catch(() => {});
+      for (const scope of reservedScopes)
+        void refreshFn(scope, requestId).catch((err: unknown) => {
+          // A persistently failing refresh lets the orphan sweep reap a LIVE stream's
+          // reservation; warn once per request and count it.
+          if (!refreshWarned) {
+            refreshWarned = true;
+            request.log.warn({ err, scope }, 'budget reservation refresh failed');
+            ctx.metrics?.recordStoreError('budget', 'refresh');
+          }
+        });
     }, ctx.budgetReserveRefreshMs);
     reserveRefresh.unref();
   }
-
-  const controller = new AbortController();
-  // CRITICAL: this 'close' handler is registered BEFORE the throwing stream setup
-  // (rewriter/detector construction, reply.hijack, writeHead), so it is the reliable
-  // cleanup even when teardown() is bypassed. If handleProxy throws after the refresh
-  // interval is armed but before the stream 'end'/'error' handlers (which drive
-  // teardown) are wired, the socket still closes → this fires → the interval is cleared.
-  // Without it, an unref'd interval would refresh the reservation FOREVER, so the
-  // orphan-sweep could never reclaim it (a permanent reservation leak → budget DoS).
-  reply.raw.on('close', () => {
-    stopReserveRefresh();
-    if (!reply.raw.writableEnded && !controller.signal.aborted) controller.abort();
-  });
+  // The client may already be gone (a disconnect during a slow pre-dispatch stage);
+  // never forward — and bill — a request nobody is waiting for.
+  if (reply.raw.destroyed) abortWith('client');
 
   // Shadow traffic: fire-and-forget a sampled copy of the EFFECTIVE (masked/
   // shaped/transformed) request to the mirror target. Fully detached — never
@@ -1697,6 +1891,8 @@ async function handleProxy(
   let limiterHeld = false; // the served target's adaptive-concurrency slot
   let anySaturation = false; // a candidate was skipped because it was at capacity
   let anyRealAttempt = false; // we actually forwarded to at least one upstream
+  let credentialUnavailable = false; // a tenant credential could not be resolved
+  let headersTimedOut = false; // the upstream accepted the request but never answered
   let dispatchMs: number | undefined; // when we dispatched to the serving target
   let firstByteMs: number | undefined; // when its response headers arrived
 
@@ -1714,7 +1910,7 @@ async function handleProxy(
     deadlineTimer = setTimeout(() => {
       if (firstByteMs === undefined && !controller.signal.aborted) {
         deadlineExceeded = true;
-        controller.abort();
+        abortWith('deadline');
       }
     }, remaining);
     deadlineTimer.unref?.();
@@ -1813,6 +2009,20 @@ async function handleProxy(
       anySaturation = true;
       return { kind: 'saturated', target };
     }
+    // Resolve the tenant credential OUTSIDE the attempt: a Postgres/Secrets Manager
+    // fault here is a gateway-side outage, not an upstream fault — it must not open the
+    // provider's circuit (fleet-wide via breaker sync) nor shrink its concurrency.
+    let credential: typeof target.credential;
+    try {
+      credential = await credentialFor(target);
+    } catch (err) {
+      request.log.error({ target: target.name, err }, 'upstream credential unavailable');
+      ctx.metrics?.recordStoreError('credentials', 'error');
+      credentialUnavailable = true;
+      if (limiterAcquired) ctx.limiter?.release(target.name);
+      ctx.breaker.releaseProbe(target.name);
+      return { kind: 'failed', target };
+    }
     anyRealAttempt = true;
     const forwardStart = Date.now();
     try {
@@ -1820,8 +2030,9 @@ async function handleProxy(
         path: target.upstreamPath,
         body: bodyForTarget(target, body, requestedModel),
         headers: forwardHeaders,
-        credential: await credentialFor(target),
+        credential,
         signal,
+        headersTimeoutMs: ctx.upstreamHeadersTimeoutMs,
       });
       if (resp.statusCode >= 400 && isFailoverStatus(strategy, resp.statusCode)) {
         ctx.breaker.recordFailure(target.name, parseRetryAfterMs(resp.headers));
@@ -1833,8 +2044,11 @@ async function handleProxy(
     } catch (err) {
       if (signal.aborted) {
         // We (or the client) cancelled this branch — not a fault: free the slot
-        // without adapting the limit, and don't blame the breaker.
+        // without adapting the limit, don't blame the breaker, and hand back a
+        // half-open probe token this branch may have claimed (else the target is
+        // shed for probeTimeoutMs after every hedge race it loses).
         if (limiterAcquired) ctx.limiter?.release(target.name);
+        ctx.breaker.releaseProbe(target.name);
         return { kind: 'aborted', target };
       }
       request.log.warn({ target: target.name, err }, 'hedge branch error');
@@ -1858,6 +2072,8 @@ async function handleProxy(
     if (r.kind === 'usable') {
       r.resp.body.resume();
       if (r.limiterAcquired) ctx.limiter?.release(r.target.name);
+      // A usable loser proved the upstream reachable — resolve any probe it claimed.
+      ctx.breaker.recordSuccess(r.target.name);
     }
   };
 
@@ -1969,6 +2185,7 @@ async function handleProxy(
       if (ctx.limiter) {
         if (!ctx.limiter.tryAcquire(target.name)) {
           anySaturation = true;
+          ctx.metrics?.recordShed('adaptive_limit');
           request.log.warn({ target: target.name }, 'target at capacity — skipping');
           continue;
         }
@@ -1985,7 +2202,23 @@ async function handleProxy(
       if (!ctx.breaker.tryProbe(target.name)) {
         if (limiterAcquired) ctx.limiter?.release(target.name);
         anySaturation = true;
+        ctx.metrics?.recordShed('half_open_probe');
         request.log.warn({ target: target.name }, 'half-open probe in flight — shedding');
+        continue;
+      }
+      // Multi-tenant isolation: forward with THIS tenant's own provider key when it
+      // has one, else the gateway's default (route/env) credential. Resolved OUTSIDE
+      // the attempt so a Postgres/Secrets Manager fault is a gateway-side outage, not
+      // an upstream fault (no breaker trip, no concurrency penalty, no retry storm).
+      let credential: typeof target.credential;
+      try {
+        credential = await credentialFor(target);
+      } catch (err) {
+        request.log.error({ target: target.name, err }, 'upstream credential unavailable');
+        ctx.metrics?.recordStoreError('credentials', 'error');
+        credentialUnavailable = true;
+        if (limiterAcquired) ctx.limiter?.release(target.name);
+        ctx.breaker.releaseProbe(target.name);
         continue;
       }
       anyRealAttempt = true;
@@ -1994,13 +2227,15 @@ async function handleProxy(
         if (controller.signal.aborted) break;
         if (attempt > 0) {
           const backoff = Math.min(retryBackoffMs * 2 ** (attempt - 1), 2000);
-          await abortableSleep(Math.max(backoff, retryAfterMs ?? 0), controller.signal);
+          // Honour the upstream's Retry-After, capped: a long value must not pin the
+          // client socket, the reservation and the limiter slot for minutes.
+          await abortableSleep(
+            Math.min(Math.max(backoff, retryAfterMs ?? 0), RETRY_SLEEP_CAP_MS),
+            controller.signal,
+          );
           if (controller.signal.aborted) break;
         }
         try {
-          // Multi-tenant isolation: forward with THIS tenant's own provider key
-          // when it has one, else the gateway's default (route/env) credential.
-          const credential = await credentialFor(target);
           forwardStart = Date.now();
           const r = await target.adapter.forward({
             path: target.upstreamPath,
@@ -2008,6 +2243,7 @@ async function handleProxy(
             headers: forwardHeaders,
             credential,
             signal: controller.signal,
+            headersTimeoutMs: ctx.upstreamHeadersTimeoutMs,
           });
           retryAfterMs = parseRetryAfterMs(r.headers);
           // A transient status with attempts left → discard and retry the SAME target.
@@ -2026,6 +2262,19 @@ async function handleProxy(
         } catch (err) {
           request.log.warn({ target: target.name, err, attempt }, 'target attempt error');
           if (controller.signal.aborted) break;
+          if (isHeadersTimeout(err)) {
+            // The request was SENT and the provider is (most likely) generating a long
+            // non-streamed answer it will bill. Replaying it on the same target, or
+            // failing over, would buy the same generation twice — stop here: one
+            // breaker fault, a 504 to the client, worst-case metered in teardown.
+            headersTimedOut = true;
+            deadlineExceeded = true;
+            ctx.breaker.recordFailure(target.name);
+            if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
+            limiterAcquired = false;
+            abortWith('deadline');
+            break;
+          }
           if (attempt < maxAttempts - 1) {
             ctx.breaker.recordFailure(target.name); // connection error → retry same target
             continue;
@@ -2042,6 +2291,8 @@ async function handleProxy(
         // (connection error, no abort) records a fault + a concurrency drop.
         if (controller.signal.aborted) {
           if (limiterAcquired) ctx.limiter?.release(target.name);
+          // No verdict for a probe this dispatch may have claimed — hand it back.
+          if (!headersTimedOut) ctx.breaker.releaseProbe(target.name);
           break;
         }
         ctx.breaker.recordFailure(target.name);
@@ -2191,7 +2442,20 @@ async function handleProxy(
         }
         let resp1: typeof upstream | undefined;
         const t1ForwardStart = Date.now();
+        let t1Credential: typeof t1.credential | undefined;
         if (t1Admitted) {
+          try {
+            t1Credential = await credentialFor(t1);
+          } catch (err) {
+            // Gateway-side credential fault: not an upstream fault, no escalation.
+            request.log.error({ target: t1.name, err }, 'upstream credential unavailable');
+            ctx.metrics?.recordStoreError('credentials', 'error');
+            if (t1LimiterAcquired) ctx.limiter?.release(t1.name);
+            ctx.breaker.releaseProbe(t1.name);
+            t1Admitted = false;
+          }
+        }
+        if (t1Admitted && t1Credential !== undefined) {
           try {
             resp1 = await t1.adapter.forward({
               path: t1.upstreamPath,
@@ -2202,8 +2466,9 @@ async function handleProxy(
               // arbitrage map (keyed by that model) still rewrites it to the upstream id.
               body: bodyForTarget(t1, withModel(body, cascade.model), cascade.model),
               headers: forwardHeaders,
-              credential: await credentialFor(t1),
+              credential: t1Credential,
               signal: controller.signal,
+              headersTimeoutMs: ctx.upstreamHeadersTimeoutMs,
             });
           } catch {
             resp1 = undefined;
@@ -2327,11 +2592,16 @@ async function handleProxy(
   // A pre-first-byte deadline breach (no upstream served, we aborted) is a 504
   // Gateway Timeout, distinct from a generic 502 no-usable-upstream.
   let statusCode = upstream?.statusCode ?? (deadlineExceeded ? 504 : 502);
-  let status: RequestStatus = controller.signal.aborted
-    ? 'aborted'
-    : statusCode < 400
-      ? 'ok'
-      : 'error';
+  let status: RequestStatus =
+    abortReason === 'client'
+      ? 'aborted'
+      : controller.signal.aborted
+        ? 'error'
+        : statusCode < 400
+          ? 'ok'
+          : 'error';
+  // An in-band error frame (`event: error` / {"error":…}) inside a 200 stream.
+  let sawUpstreamError = false;
   let settled = false;
   // Set when the M17 windowed enforcer terminates a stream in-band (block / withhold /
   // fail-closed). The abort it triggers would otherwise be indistinguishable from a
@@ -2351,6 +2621,10 @@ async function handleProxy(
   // responses only; streamed output guardrails are audit.
   const outScanner = engine ? new StreamingScanner(engine.combinedDetector()) : undefined;
   const detok = vault ? new StreamingReplacer(vault.entries()) : undefined;
+  // A second, independent replacer feeds the AUDIT scanner detokenized text, so an
+  // echoed masked value is counted as an output finding exactly as the enforcing path
+  // would count it (the scanner previously saw the placeholder tokens instead).
+  const auditDetok = vault && outScanner ? new StreamingReplacer(vault.entries()) : undefined;
   const decoder = outScanner || detok ? new StringDecoder('utf8') : undefined;
   const outputEnforcing = engine !== undefined && engine.outputPolicy.action !== 'audit';
   // Opt-in hold-then-flush: buffer a streamed response so the output policy can
@@ -2456,16 +2730,36 @@ async function handleProxy(
     }
     if (limiterHeld && served) {
       limiterHeld = false;
-      // RTT for concurrency = full request duration; drop = fault (5xx) or abort.
-      // An M17 guardrail block aborts the stream but is a POLICY decision, not an
-      // upstream fault — don't penalize the target's concurrency/latency score for it.
-      const dropped = (status === 'aborted' || statusCode >= 500) && !streamGuardrailAction;
-      ctx.limiter?.record(served.name, Date.now() - (dispatchMs ?? started), dropped);
+      if (abortReason === 'client') {
+        // A client disconnect says nothing about the target: free the slot without
+        // feeding a truncated RTT or a spurious "drop" into the adaptive limit.
+        ctx.limiter?.release(served.name);
+      } else {
+        // The concurrency signal is time to FIRST BYTE (the upstream's queueing
+        // latency), not the whole stream: a normal-length generation is not
+        // congestion (the all-time-min baseline + full duration used to ratchet the
+        // limit down to its floor on healthy targets). Drop = upstream fault (5xx,
+        // stall, deadline, in-band error); an M17 guardrail block is POLICY, not a fault.
+        const dropped =
+          (statusCode >= 500 ||
+            abortReason === 'watchdog' ||
+            abortReason === 'deadline' ||
+            sawUpstreamError) &&
+          !streamGuardrailAction;
+        ctx.limiter?.record(
+          served.name,
+          (firstByteMs ?? Date.now()) - (dispatchMs ?? started),
+          dropped,
+        );
+      }
     }
+    if (abortReason) ctx.metrics?.recordAbort(abortReason);
 
     const n = usage.normalized();
     const meteredModel = n.model ?? requestedModel;
     const cost = computeCost(provider, meteredModel, n, ctx.rateResolver);
+    // 'error' (lookup failed/timed out) is distinct from 'bypass' (not configured).
+    const cacheStatus = cacheLookup?.status ?? (cacheErrored ? 'error' : 'bypass');
     // A buffered-enforcement body that overflowed the cap can't be metered (the
     // usage was never parsed), but the provider still generated and billed it.
     // Charge the worst-case reservation rather than $0, so a withheld over-cap
@@ -2495,7 +2789,10 @@ async function handleProxy(
         'served a model with no catalog price — metering $0 unless fail-closed',
       );
     }
-    const chargedWorstCase = meteringFailed || usageMissing || chargeUnpriced;
+    // A request the upstream accepted but never answered (headers timeout) was in all
+    // likelihood generated and billed by the provider: charge its worst-case rather
+    // than refunding the reservation on a 504.
+    const chargedWorstCase = meteringFailed || usageMissing || chargeUnpriced || headersTimedOut;
     // Fail-closed charge is the SERVED leg's worst-case (not the combined cascade
     // reservation) — a cascade's other-leg spend is billed separately via
     // cascadeExtraMicroUsd, so charging the combined figure here would double-count it.
@@ -2568,6 +2865,7 @@ async function handleProxy(
         await ctx.budgets.commit(scope, requestId, amount);
       } catch (err) {
         request.log.error({ err, scope }, 'budget commit failed');
+        ctx.metrics?.recordSinkError('budget_commit');
       }
     }
 
@@ -2622,6 +2920,7 @@ async function handleProxy(
       }
     } catch (err) {
       request.log.error({ err, sink: 'ledger' }, 'durable sink write failed');
+      ctx.metrics?.recordSinkError('ledger');
     }
     // Each durable sink is isolated below: a failure in one (a DB blip, hash-chain
     // contention) must not skip the others. SOC 2 audit-completeness requires the
@@ -2649,52 +2948,64 @@ async function handleProxy(
           // win a key collision — a tag value is client-supplied and must never
           // shadow the real routing target / cache status.
           ...(attribution ?? {}),
-          cache: cacheLookup?.status ?? 'bypass',
+          cache: cacheStatus,
           target: served?.name ?? provider,
           ...(reportedGuardrailAction ? { guardrailAction: reportedGuardrailAction } : {}),
           ...(outFindings.length > 0 ? { guardrailOutputFindings: outFindings.length } : {}),
           ...(unpriced ? { unpriced: true } : {}),
+          ...(abortReason ? { abortReason } : {}),
+          ...(sawUpstreamError ? { upstreamErrorFrame: true } : {}),
+          ...(headersTimedOut ? { headersTimedOut: true } : {}),
+          ...(budgetStoreDown ? { budgetUnenforced: true } : {}),
+          ...(rateLimitDegraded ? { rateLimitUnenforced: true } : {}),
+          ...(downshiftedFrom ? { downshiftedFrom } : {}),
+          ...(cascadeEscalatedFrom ? { cascadeEscalatedFrom } : {}),
         },
       });
     } catch (err) {
       request.log.error({ err, sink: 'request-log' }, 'durable sink write failed');
+      ctx.metrics?.recordSinkError('request_log');
     }
     try {
-      // Operator-configurable access log (credential-free record → CEL field
-      // engine → structured log line). Fail-open; never carries headers/content.
-      if (ctx.accessLog) {
-        const record = ctx.accessLog.build({
-          requestId,
-          principal: {
-            id: principal.id,
-            orgId: principal.scope.orgId,
-            workspaceId: principal.scope.workspaceId,
-          },
-          provider,
-          target: served?.name ?? provider,
-          requestModel: requestedModel,
-          responseModel: meteredModel,
-          route: served?.upstreamPath ?? route.clientPaths[0] ?? '',
-          statusCode,
-          status,
-          streamed,
-          inputTokens: cost.totalInputTokens,
-          outputTokens: cost.outputTokens,
-          costMicroUsd,
-          latencyMs: Date.now() - started,
-          cache: cacheLookup?.status ?? 'bypass',
-          guardrailAction: reportedGuardrailAction ?? null,
-          guardrailInputFindings: inputFindings,
-          guardrailOutputFindings: outFindings.length,
-          ...(trace ? { traceId: trace.traceId } : {}),
-        });
-        if (record) {
-          request.log.info({ access: record }, 'access');
-          ctx.accessLogSink?.emit(record); // also ship to the OTLP logs backend
-        }
+      // Per-request completion record — ALWAYS emitted (a proxied request's response is
+      // hijacked, so Fastify's own "request completed" line never fires for it). The
+      // operator CEL field engine (ACCESS_LOG_FIELDS) shapes it when configured; the
+      // credential-free default record is logged as-is otherwise. Never headers/content.
+      const accessRecord = {
+        event: 'proxy.complete',
+        requestId,
+        principal: {
+          id: principal.id,
+          orgId: principal.scope.orgId,
+          workspaceId: principal.scope.workspaceId,
+        },
+        provider,
+        target: served?.name ?? provider,
+        requestModel: requestedModel,
+        responseModel: meteredModel,
+        route: served?.upstreamPath ?? route.clientPaths[0] ?? '',
+        statusCode,
+        status,
+        streamed,
+        inputTokens: cost.totalInputTokens,
+        outputTokens: cost.outputTokens,
+        costMicroUsd,
+        latencyMs: Date.now() - started,
+        cache: cacheStatus,
+        guardrailAction: reportedGuardrailAction ?? null,
+        guardrailInputFindings: inputFindings,
+        guardrailOutputFindings: outFindings.length,
+        abortReason: abortReason ?? null,
+        ...(trace ? { traceId: trace.traceId } : {}),
+      };
+      const record = ctx.accessLog ? ctx.accessLog.build(accessRecord) : accessRecord;
+      if (record) {
+        request.log.info({ access: record }, 'access');
+        ctx.accessLogSink?.emit(record); // also ship to the OTLP logs backend
       }
     } catch (err) {
       request.log.error({ err, sink: 'access-log' }, 'durable sink write failed');
+      ctx.metrics?.recordSinkError('access_log');
     }
     // The audit append keeps its own isolation so a chain-contention/DB failure
     // here does not skip the cache store + mask-vault persist that follow it.
@@ -2715,17 +3026,21 @@ async function handleProxy(
           costMicroUsd,
           guardrailInputFindings: inputFindings,
           guardrailOutputFindings: outFindings.length,
-          cache: cacheLookup?.status ?? 'bypass',
+          cache: cacheStatus,
           ...(served?.region ? { servedRegion: served.region } : {}),
           ...(cascadeEscalatedFrom ? { cascadeEscalatedFrom } : {}),
           ...(unpriced ? { unpriced: true } : {}),
+          ...(abortReason ? { abortReason } : {}),
+          ...(budgetStoreDown ? { budgetUnenforced: true } : {}),
           ...(attribution ? { attribution } : {}),
         },
       });
     } catch (err) {
       request.log.error({ err, sink: 'audit' }, 'audit append failed');
+      ctx.metrics?.recordSinkError('audit');
     }
-    // Cache store + mask-vault persist run after the audit row is secured.
+    // Cache store runs after the audit row is secured; the mask-vault persist below is
+    // isolated from it so a cache-store fault never skips the reversal record.
     try {
       // Persist to cache — only clean, non-sensitive, non-truncated 2xx bodies.
       if (
@@ -2754,6 +3069,10 @@ async function handleProxy(
         // the tier-0 partition would serve higher-model content to a key scoped only for
         // the tier-0 model on a later hit (a cross-authz-scope leak).
         cascadeEscalatedFrom === undefined &&
+        // Same for a budget DOWNSHIFT: cacheReq was keyed on the original (expensive)
+        // model before the reserve; the body is the cheaper model's answer, and a later
+        // full-budget request for the original model would replay it for CACHE_TTL.
+        downshiftedFrom === undefined &&
         !captureOverflow &&
         !outputSensitive &&
         !cacheControlHas(request, 'no-store') &&
@@ -2777,7 +3096,11 @@ async function handleProxy(
           );
         }
       }
-
+    } catch (err) {
+      request.log.error({ err, sink: 'cache_store' }, 'durable sink write failed');
+      ctx.metrics?.recordSinkError('cache_store');
+    }
+    try {
       // Durable mask-reversal store (M22 D): persist each non-empty mask vault's
       // token↔original map, envelope-encrypted (AAD-bound to request+workspace+
       // direction), so an authorized admin can de-tokenize a masked response later.
@@ -2826,7 +3149,8 @@ async function handleProxy(
         );
       }
     } catch (err) {
-      request.log.error({ err, sink: 'cache/mask-vault' }, 'durable sink write failed');
+      request.log.error({ err, sink: 'mask_vault' }, 'durable sink write failed');
+      ctx.metrics?.recordSinkError('mask_vault');
     }
 
     // Telemetry emit is isolated (safeRecord) so a metrics fault can't reject this
@@ -2850,10 +3174,13 @@ async function handleProxy(
       streamed,
       stopReason: n.stopReason,
       startedAtMs: started,
-      cacheStatus: cacheLookup?.status ?? 'bypass',
+      cacheStatus,
       guardrailInputFindings: engine ? inputFindings : undefined,
       guardrailOutputFindings: engine ? outFindings.length : undefined,
       guardrailAction: reportedGuardrailAction,
+      abortReason,
+      budgetEnforced: budgetStoreDown ? false : undefined,
+      rateLimitEnforced: rateLimitDegraded ? false : undefined,
       traceId: trace?.traceId,
       traceParentId: trace?.spanId,
       sampled: trace?.sampled,
@@ -2885,14 +3212,28 @@ async function handleProxy(
     });
   };
 
+  /** Run the single teardown and register it with the drain, so a SIGTERM waits
+   *  (bounded) for its budget-commit/ledger/audit writes instead of exiting mid-write. */
+  const runTeardown = (): Promise<void> => {
+    const p = teardown();
+    const set = ctx.inflightTeardowns;
+    if (set) {
+      set.add(p);
+      void p.finally(() => set.delete(p));
+    }
+    return p;
+  };
+
   // No response served. If EVERY candidate was skipped purely for saturation (no
   // real upstream attempt failed), this is backpressure — shed with 503 +
   // Retry-After so the caller backs off, rather than a misleading 502.
   if (!upstream || !served) {
     const shed = anySaturation && !anyRealAttempt;
-    status = controller.signal.aborted ? 'aborted' : 'error';
-    statusCode = shed ? 503 : deadlineExceeded ? 504 : 502;
-    await teardown();
+    const credentialOutage = credentialUnavailable && !anyRealAttempt && !shed;
+    status = abortReason === 'client' ? 'aborted' : 'error';
+    statusCode = shed || credentialOutage ? 503 : deadlineExceeded ? 504 : 502;
+    if (shed) ctx.metrics?.recordShed('capacity');
+    await runTeardown();
     if (!reply.sent) {
       if (shed) {
         await reply
@@ -2901,6 +3242,14 @@ async function handleProxy(
           .send({
             type: 'error',
             error: { type: 'overloaded_error', message: 'all upstreams at capacity' },
+          });
+      } else if (credentialOutage) {
+        await reply
+          .code(503)
+          .header('retry-after', '2')
+          .send({
+            type: 'error',
+            error: { type: 'api_error', message: 'upstream credential unavailable' },
           });
       } else if (deadlineExceeded) {
         await reply.code(504).send({
@@ -2958,6 +3307,7 @@ async function handleProxy(
     reply.raw.writeHead(statusCode, finalizeResp(responseHeaders));
   }
 
+  live.body = upstreamBody;
   const servedTarget = served;
   const upstreamHeaders = upstream.headers;
 
@@ -2968,8 +3318,8 @@ async function handleProxy(
   const resetWatchdog = (): void => {
     if (watchdog) clearTimeout(watchdog);
     watchdog = setTimeout(() => {
-      request.log.warn('upstream stream idle — aborting');
-      controller.abort();
+      request.log.warn({ target: servedTarget.name }, 'upstream stream idle — aborting');
+      abortWith('watchdog');
     }, ctx.streamInactivityMs ?? DEFAULT_STREAM_INACTIVITY_MS);
     watchdog.unref();
   };
@@ -2981,6 +3331,11 @@ async function handleProxy(
 
   upstreamBody.on('data', (chunk: Buffer) => {
     resetWatchdog();
+    if (reply.raw.destroyed) {
+      // The client socket is gone: stop pulling (and paying for) bytes nobody reads.
+      abortWith('client');
+      return;
+    }
     if (captureFull && !captureOverflow) {
       if (fullBytes + chunk.length <= bufferLimit) {
         fullChunks.push(chunk);
@@ -3000,7 +3355,7 @@ async function handleProxy(
       // otherwise-valid response (unlike the enforce/detok transforms below).
       if (outScanner && text && !redactor) {
         try {
-          outScanner.push(text);
+          outScanner.push(auditDetok ? auditDetok.push(text) : text);
         } catch (err) {
           // Keep streaming (don't sever a live response for a choking audit detector),
           // but mark the scan incomplete so the cache gate fails SAFE (see teardown).
@@ -3012,7 +3367,9 @@ async function handleProxy(
 
     if (streamed) {
       try {
-        usage.ingestSse(parserSse.push(text ?? chunk.toString('utf8')));
+        const events = parserSse.push(text ?? chunk.toString('utf8'));
+        if (!sawUpstreamError && events.some(isUpstreamErrorEvent)) sawUpstreamError = true;
+        usage.ingestSse(events);
       } catch {
         /* metering is best-effort */
       }
@@ -3035,7 +3392,7 @@ async function handleProxy(
       }
     } catch (err) {
       request.log.error({ err }, 'stream output transform failed — withholding');
-      controller.abort();
+      abortWith('transform', err as Error);
       return;
     }
     try {
@@ -3066,11 +3423,11 @@ async function handleProxy(
           );
           reply.raw.end();
           clearWatchdog();
-          controller.abort();
+          abortWith('guardrail');
         }
       }
-    } catch {
-      controller.abort();
+    } catch (err) {
+      abortWith('socket', err as Error);
     }
   });
 
@@ -3120,7 +3477,7 @@ async function handleProxy(
           reply.raw.end();
         }
       } finally {
-        await teardown();
+        await runTeardown();
       }
     })();
   });
@@ -3128,11 +3485,12 @@ async function handleProxy(
   async function onUpstreamEnd(): Promise<void> {
     clearWatchdog();
     const tail = decoder ? decoder.end() : '';
-    if (tail && outScanner) {
+    const auditTail = auditDetok && !redactor ? auditDetok.push(tail) + auditDetok.flush() : tail;
+    if (auditTail && outScanner && !redactor) {
       // Audit-only scan of the final decoded tail — swallow a throw (best-effort);
       // it must not fail-close an otherwise-complete response.
       try {
-        outScanner.push(tail);
+        outScanner.push(auditTail);
       } catch (err) {
         outputScanFailed = true; // fail safe on the cache gate (see teardown)
         request.log.warn({ err }, 'output audit scan (tail) failed — continuing, will not cache');
@@ -3145,10 +3503,20 @@ async function handleProxy(
     let toolCalls: ToolCall[] | undefined;
     if (streamed) {
       try {
-        if (tail) usage.ingestSse(parserSse.push(tail));
-        usage.ingestSse(parserSse.push('\n\n'));
+        const events = [...(tail ? parserSse.push(tail) : []), ...parserSse.push('\n\n')];
+        if (!sawUpstreamError && events.some(isUpstreamErrorEvent)) sawUpstreamError = true;
+        usage.ingestSse(events);
       } catch {
         /* best-effort */
+      }
+      if (sawUpstreamError) {
+        // A mid-stream `event: error` / {"error":…} frame under a 200 (overloaded,
+        // throttled, a translated backend fault) means the request FAILED. It used to
+        // be recorded as a success with message_start's token count, and the breaker
+        // never heard about it.
+        status = 'error';
+        ctx.breaker.recordFailure(servedTarget.name);
+        request.log.warn({ target: servedTarget.name }, 'upstream emitted an in-band error frame');
       }
       if (toolGovern && !captureOverflow && fullBytes > 0) {
         toolCalls = extractToolCallsFromSse(
@@ -3289,7 +3657,17 @@ async function handleProxy(
       // WITHHOLDS the response (a terminal error frame); an audit-only policy records
       // findings and flushes the buffered SSE, detokenized.
       const text = Buffer.concat(fullChunks).toString('utf8');
-      const out = await engine.inspectOutput(text);
+      // Inspect the LOGICAL text (deltas joined per client dialect), never the SSE
+      // framing: a value split across two content_block_delta events, or JSON-escaped
+      // inside a frame, was invisible to the detectors here while the same body
+      // non-streamed was blocked. Detokenize first so the enforcer sees real values
+      // (same order as the streaming-enforce transform).
+      // Fail safe on an unrecognised framing: nothing extractable → scan the raw text.
+      const logical = extractTextFromSse(text, clientDialect) || text;
+      const inspectDetok = vault ? new StreamingReplacer(vault.entries()) : undefined;
+      const out = await engine.inspectOutput(
+        inspectDetok ? inspectDetok.push(logical) + inspectDetok.flush() : logical,
+      );
       outputEnforced = out;
       const withhold = out.blocked || out.transformedText !== undefined;
       const bodyOut = withhold
@@ -3391,10 +3769,17 @@ async function handleProxy(
 
   upstreamBody.on('error', (err: Error) => {
     clearWatchdog();
-    // An M17 in-stream guardrail block also aborts the controller, but it is a policy
-    // outcome, not a client disconnect — record it as 'error', not 'aborted'.
-    status = controller.signal.aborted && !streamGuardrailAction ? 'aborted' : 'error';
-    request.log.error({ err }, 'upstream stream error');
+    // Only a CLIENT disconnect is 'aborted'. A watchdog stall, a transform/socket
+    // fault, an in-stream guardrail block or a deadline are 'error' — and say why —
+    // so a provider stalling mid-stream never looks like users pressing Ctrl-C on
+    // the ledger, in metrics or in traces.
+    status = abortReason === 'client' ? 'aborted' : 'error';
+    if (abortReason === 'watchdog') ctx.breaker.recordFailure(servedTarget.name);
+    if (abortReason === 'client') {
+      request.log.info({ target: servedTarget.name }, 'client disconnected mid-stream');
+    } else {
+      request.log.error({ err, reason: abortReason ?? 'upstream' }, 'upstream stream error');
+    }
     if (!reply.raw.writableEnded) {
       if (!reply.raw.headersSent) {
         // Buffered mode (headers were NOT flushed eagerly, and onUpstreamEnd never
@@ -3426,20 +3811,45 @@ async function handleProxy(
         } catch {
           /* client already gone */
         }
-      } else if (streamed && !controller.signal.aborted) {
+      } else if (
+        streamed &&
+        abortReason !== 'client' &&
+        abortReason !== 'guardrail' &&
+        !reply.raw.destroyed
+      ) {
         // Non-buffered stream: headers (200) already flushed and bytes may have been
         // sent, so we can only append a clean terminal error frame before closing —
-        // never a fresh body (that would corrupt the partial response).
+        // never a fresh body (that would corrupt the partial response). A gateway-
+        // initiated abort (stall watchdog, transform fault) gets one too: a silent
+        // clean end looked like a complete answer to the client's SDK.
         try {
-          reply.raw.write(providerErrorFrame(clientDialect, 'upstream stream error'));
+          reply.raw.write(
+            providerErrorFrame(
+              clientDialect,
+              abortReason === 'watchdog'
+                ? 'upstream stream stalled'
+                : abortReason === 'transform'
+                  ? 'response withheld by guardrail'
+                  : 'upstream stream error',
+            ),
+          );
         } catch {
           /* client already gone */
         }
       }
       reply.raw.end();
     }
-    void teardown();
+    void runTeardown();
   });
+}
+
+/** True for an in-band error frame in any served dialect: Anthropic `event: error`
+ *  (or `{"type":"error"…}`), OpenAI/Azure `data: {"error":…}`, Responses
+ *  `event: error`. Matched on the frame head only — never a content scan. */
+function isUpstreamErrorEvent(ev: { event?: string; data: string }): boolean {
+  if (ev.event === 'error') return true;
+  const head = ev.data.slice(0, 64);
+  return /^\s*\{\s*"(type)"\s*:\s*"error"/.test(head) || /^\s*\{\s*"error"\s*:/.test(head);
 }
 
 /** A terminal SSE error event in the served provider's streaming dialect, so a
@@ -3587,6 +3997,14 @@ async function serveFromCache(
         ...(savedMicroUsd ? { cacheSavedMicroUsd: savedMicroUsd } : {}),
       },
     });
+  } catch (err) {
+    request.log.error({ err, sink: 'request-log' }, 'cache-hit request-log write failed');
+    ctx.metrics?.recordSinkError('request_log');
+  }
+  // The audit row is isolated from the request-log write (a failed request-log write
+  // used to skip the proxy.cache_hit audit row — the completeness gap the miss-path
+  // teardown already guards against).
+  try {
     await ctx.audit.append({
       orgId: principal.scope.orgId,
       actor: principal.id,
@@ -3603,7 +4021,45 @@ async function serveFromCache(
       },
     });
   } catch (err) {
-    request.log.error({ err }, 'cache-hit teardown failed');
+    request.log.error({ err, sink: 'audit' }, 'cache-hit audit append failed');
+    ctx.metrics?.recordSinkError('audit');
+  }
+  try {
+    // Completion record for the hit (the miss path emits its own in teardown).
+    const accessRecord = {
+      event: 'proxy.complete',
+      requestId,
+      principal: {
+        id: principal.id,
+        orgId: principal.scope.orgId,
+        workspaceId: principal.scope.workspaceId,
+      },
+      provider,
+      target: `cache:${lookup.status}`,
+      requestModel,
+      responseModel: cached.model,
+      route: route.clientPaths[0] ?? '',
+      statusCode: cached.statusCode,
+      status: 'ok',
+      streamed: cached.streamed,
+      inputTokens: cached.inputTokens,
+      outputTokens: cached.outputTokens,
+      costMicroUsd: 0,
+      latencyMs: Date.now() - started,
+      cache: lookup.status,
+      guardrailAction: null,
+      guardrailInputFindings: 0,
+      guardrailOutputFindings: 0,
+      abortReason: null,
+    };
+    const record = ctx.accessLog ? ctx.accessLog.build(accessRecord) : accessRecord;
+    if (record) {
+      request.log.info({ access: record }, 'access');
+      ctx.accessLogSink?.emit(record);
+    }
+  } catch (err) {
+    request.log.error({ err, sink: 'access-log' }, 'durable sink write failed');
+    ctx.metrics?.recordSinkError('access_log');
   }
 
   safeRecord(ctx, request.log, {

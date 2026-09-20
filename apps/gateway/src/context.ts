@@ -1143,8 +1143,15 @@ export function createProductionContext(
     breaker: new CircuitBreaker({
       ...(breakerSync ? { sync: breakerSync } : {}),
       probeTimeoutMs: config.BREAKER_HALF_OPEN_PROBE_TIMEOUT_MS,
-      // Surface a target ejection (CLOSED → OPEN) as a metric — the key resiliency event.
-      ...(metrics ? { onOpen: (target) => metrics.recordBreakerState(target, 'open') } : {}),
+      // Surface every breaker transition (open / half_open / closed) as a metric — the
+      // key resiliency events. Previously only CLOSED → OPEN was emitted.
+      ...(metrics
+        ? {
+            onOpen: (target: string) => metrics.recordBreakerState(target, 'open'),
+            onHalfOpen: (target: string) => metrics.recordBreakerState(target, 'half_open'),
+            onClose: (target: string) => metrics.recordBreakerState(target, 'closed'),
+          }
+        : {}),
     }),
     breakerSync,
     limiter: config.ADAPTIVE_CONCURRENCY_ENABLED
@@ -1201,6 +1208,8 @@ export function createProductionContext(
     rateResolver,
     streamInactivityMs: config.STREAM_INACTIVITY_MS,
     cacheLookupTimeoutMs: config.CACHE_LOOKUP_TIMEOUT_MS,
+    upstreamHeadersTimeoutMs: config.UPSTREAM_HEADERS_TIMEOUT_MS,
+    inflightTeardowns: new Set<Promise<void>>(),
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,

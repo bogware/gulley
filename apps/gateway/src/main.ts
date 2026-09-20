@@ -138,6 +138,18 @@ async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 
   // completes in-flight streams, and their single teardown writes the request/
   // access-log/audit rows — so flushing first would drop those late teardowns.
   await settle('upstream-pool', () => closeUpstreamPool());
+  // Teardowns whose durable writes (budget commit, ledger, audit) are still pending —
+  // the client socket ends BEFORE those writes, so pool close alone does not cover
+  // them. Bounded by the flush reserve so a wedged sink cannot outlive the deadline.
+  await settle('inflight-teardowns', () => {
+    const pending = context?.inflightTeardowns;
+    if (!pending || pending.size === 0) return;
+    app.log.info({ pending: pending.size }, 'waiting for in-flight teardowns');
+    return Promise.race([
+      Promise.allSettled([...pending]),
+      new Promise<void>((r) => setTimeout(r, flushReserveMs).unref()),
+    ]);
+  });
   await settle('request-log', () => context?.flushLogs?.()); // buffered request logs
   await settle('access-log', () => context?.accessLogSink?.shutdown()); // OTLP access-log batch
   await settle('telemetry', () => context?.telemetry?.shutdown()); // OTel span pipeline

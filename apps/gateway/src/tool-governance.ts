@@ -136,6 +136,57 @@ interface ParsedEvent {
   data: Record<string, unknown> | undefined;
 }
 
+/**
+ * The LOGICAL text of a streamed response (every text/thinking/tool-argument delta
+ * joined, per client dialect) — what an output guardrail must inspect. Scanning the
+ * raw SSE framing instead lets a value split across two delta events (or JSON-escaped
+ * inside a frame) through undetected.
+ */
+export function extractTextFromSse(sse: string, dialect: ToolStreamDialect): string {
+  const parser = new SSEParser({ onOverflow: 'reset' });
+  const events = [...parser.push(sse), ...parser.push('\n\n')];
+  const parts: string[] = [];
+  const push = (v: unknown): void => {
+    if (typeof v === 'string' && v.length > 0) parts.push(v);
+  };
+  for (const e of events) {
+    let data: Record<string, unknown> | undefined;
+    try {
+      data = asRecord(JSON.parse(e.data));
+    } catch {
+      continue;
+    }
+    if (!data) continue;
+    if (dialect === 'anthropic') {
+      // The event type may ride on the `event:` line only (some upstreams omit it
+      // from the JSON), so accept either.
+      const type = typeof data['type'] === 'string' ? data['type'] : e.event;
+      if (type !== 'content_block_delta') continue;
+      const delta = asRecord(data['delta']);
+      push(delta?.['text']);
+      push(delta?.['partial_json']);
+      push(delta?.['thinking']);
+    } else if (dialect === 'responses') {
+      const type = typeof data['type'] === 'string' ? (data['type'] as string) : e.event;
+      if (
+        type === 'response.output_text.delta' ||
+        type === 'response.function_call_arguments.delta' ||
+        type === 'response.reasoning_summary_text.delta'
+      )
+        push(data['delta']);
+    } else {
+      const choices = data['choices'];
+      const delta = Array.isArray(choices) ? asRecord(asRecord(choices[0])?.['delta']) : undefined;
+      push(delta?.['content']);
+      push(delta?.['reasoning_content']);
+      const tcs = delta?.['tool_calls'];
+      if (Array.isArray(tcs))
+        for (const raw of tcs) push(asRecord(asRecord(raw)?.['function'])?.['arguments']);
+    }
+  }
+  return parts.join('');
+}
+
 function num(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
 }

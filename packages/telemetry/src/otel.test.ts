@@ -35,6 +35,9 @@ const fullData: RequestSpanData = {
   cacheReadTokens: 20,
   cacheWriteTokens: 10,
   traceId: 'abcdef01234567890abcdef012345678',
+  abortReason: 'watchdog',
+  budgetEnforced: false,
+  rateLimitEnforced: false,
 };
 
 const ALLOWED_PREFIX = /^(gen_ai|gulley|http)\./;
@@ -67,11 +70,14 @@ describe('spanAttributes — no-credential-logging invariant', () => {
         'gen_ai.usage.cache_read.input_tokens',
         'gen_ai.usage.input_tokens',
         'gen_ai.usage.output_tokens',
+        'gulley.abort.reason',
+        'gulley.budget.enforced',
         'gulley.cache.status',
         'gulley.cost.micro_usd',
         'gulley.guardrail.action',
         'gulley.guardrail.input.findings',
         'gulley.guardrail.output.findings',
+        'gulley.ratelimit.enforced',
         'gulley.route',
         'gulley.served.region',
         'gulley.streamed',

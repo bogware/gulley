@@ -19,6 +19,11 @@ export interface ForwardRequest {
   headers: Record<string, string | string[] | undefined>;
   credential: UpstreamCredential;
   signal: AbortSignal;
+  /** Time-to-response-headers budget for this forward (ms). Streaming responses
+   *  answer in seconds, but a NON-streamed long generation can legitimately take
+   *  minutes before its first byte; the gateway threads UPSTREAM_HEADERS_TIMEOUT_MS
+   *  here. Adapters default to 60 s when absent. */
+  headersTimeoutMs?: number;
 }
 
 export interface ForwardResponse {

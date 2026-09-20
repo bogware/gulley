@@ -57,7 +57,7 @@ export class BedrockAdapter implements ProviderAdapter {
       body: JSON.stringify(rest),
       signal: req.signal,
       bodyTimeout: 0,
-      headersTimeout: 60_000,
+      headersTimeout: req.headersTimeoutMs ?? 60_000,
     });
 
     // Error responses are plain JSON, not an eventstream — pass them through.

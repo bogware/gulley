@@ -11,8 +11,12 @@ export type AuthFailureReason =
   | 'disabled'
   | 'expired'
   | 'mode_not_allowed'
-  | 'no_scope';
+  | 'no_scope'
+  /** The key store (Postgres) could not be reached — a 503, never a 401. */
+  | 'store_unavailable';
 
 export interface AuthFailure {
   reason: AuthFailureReason;
+  /** The underlying dependency error for `store_unavailable` (logged, never sent). */
+  cause?: unknown;
 }

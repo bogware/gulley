@@ -9,14 +9,22 @@ export interface AdaptiveLimiterOptions {
   backoffRatio?: number;
   /** EWMA smoothing for limit updates (0..1); higher = more reactive. */
   smoothing?: number;
+  /** How long a no-load baseline sample stays authoritative before it is replaced by
+   *  the following window's minimum (ms). An all-time minimum never forgot one
+   *  freak-fast sample, so every later normal-length generation looked congested and
+   *  the limit ratcheted down to minLimit on a healthy target. Default 60 s. */
+  baselineWindowMs?: number;
   now?: () => number;
 }
 
 interface TargetState {
   limit: number;
   inflight: number;
-  /** Rolling minimum observed RTT — the uncongested baseline (ms). */
-  rttNoLoad: number;
+  /** Minimum RTT seen in the PREVIOUS baseline window (the current baseline). */
+  baseline: number;
+  /** Minimum RTT seen in the current window (becomes the baseline at rollover). */
+  windowMin: number;
+  windowStartMs: number;
 }
 
 /**
@@ -40,8 +48,12 @@ export class AdaptiveLimiter {
   private readonly initialLimit: number;
   private readonly backoffRatio: number;
   private readonly smoothing: number;
+  private readonly baselineWindowMs: number;
+  private readonly now: () => number;
 
   constructor(opts: AdaptiveLimiterOptions = {}) {
+    this.baselineWindowMs = Math.max(1_000, opts.baselineWindowMs ?? 60_000);
+    this.now = opts.now ?? ((): number => Date.now());
     this.minLimit = Math.max(1, opts.minLimit ?? 4);
     this.maxLimit = Math.max(this.minLimit, opts.maxLimit ?? 200);
     this.initialLimit = Math.min(this.maxLimit, Math.max(this.minLimit, opts.initialLimit ?? 20));
@@ -52,7 +64,13 @@ export class AdaptiveLimiter {
   private get(name: string): TargetState {
     let s = this.state.get(name);
     if (!s) {
-      s = { limit: this.initialLimit, inflight: 0, rttNoLoad: Number.POSITIVE_INFINITY };
+      s = {
+        limit: this.initialLimit,
+        inflight: 0,
+        baseline: Number.POSITIVE_INFINITY,
+        windowMin: Number.POSITIVE_INFINITY,
+        windowStartMs: this.now(),
+      };
       this.state.set(name, s);
     }
     return s;
@@ -80,14 +98,23 @@ export class AdaptiveLimiter {
     }
 
     const rtt = Math.max(1, rttMs);
-    // Track the no-load baseline (the fastest we've seen this target answer).
-    if (rtt < s.rttNoLoad) s.rttNoLoad = rtt;
+    // Track the no-load baseline as a WINDOWED minimum: the fastest sample of the
+    // previous window (with the current window's minimum as a floor) — so a single
+    // unusually fast answer ages out instead of defining "uncongested" forever.
+    const now = this.now();
+    if (now - s.windowStartMs >= this.baselineWindowMs) {
+      s.baseline = s.windowMin;
+      s.windowMin = Number.POSITIVE_INFINITY;
+      s.windowStartMs = now;
+    }
+    if (rtt < s.windowMin) s.windowMin = rtt;
+    const rttNoLoad = Math.min(s.baseline, s.windowMin);
 
     // Only grow while near saturation — otherwise idle traffic (in-flight far
     // below the limit) would inflate the ceiling unboundedly on fast samples.
     if (s.inflight + 1 < s.limit / 2) return;
 
-    const gradient = Math.max(0.5, Math.min(1, s.rttNoLoad / rtt));
+    const gradient = Math.max(0.5, Math.min(1, rttNoLoad / rtt));
     const queue = Math.sqrt(s.limit);
     const newLimit = s.limit * gradient + queue;
     s.limit = Math.min(
