@@ -58,16 +58,46 @@ const NAV_GROUPS: Array<{ group: string; items: NavItem[] }> = [
   },
 ];
 
+/** Three honest states: checking, verified (with the row count), or unverified /
+ *  unavailable (a 403 for a scoped viewer is "unavailable", not "tampered"). */
 function AuditStatus() {
   const q = useAdminQuery((api) => api.verifyAudit(), []);
   const verified = q.data?.verified;
+  const label = q.loading
+    ? '…'
+    : q.error
+      ? q.status === 403
+        ? 'not permitted'
+        : 'unavailable'
+      : verified
+        ? `verified (${q.data?.count ?? 0})`
+        : 'UNVERIFIED';
   return (
-    <div className="flex items-center gap-1.5">
-      <Dot tone={q.loading ? 'amber' : verified ? 'green' : 'red'} />
+    <div className="flex items-center gap-1.5" title={q.error ?? undefined}>
+      <Dot tone={q.loading ? 'amber' : q.error ? 'amber' : verified ? 'green' : 'red'} />
+      <span className="font-mono text-2xs text-secondary">audit chain · {label}</span>
+    </div>
+  );
+}
+
+/** Control-API reachability + build version from its unauthenticated /health. */
+function ControlStatus() {
+  const q = useAdminQuery((api) => api.health(), []);
+  return (
+    <div className="flex items-center gap-1.5" title={q.error ?? undefined}>
+      <Dot tone={q.loading ? 'amber' : q.error ? 'red' : 'green'} />
       <span className="font-mono text-2xs text-secondary">
-        audit chain ·{' '}
-        {q.loading ? '…' : verified ? `verified (${q.data?.count ?? 0})` : 'unverified'}
+        control API · {q.loading ? '…' : q.error ? 'unreachable' : 'connected'}
       </span>
+    </div>
+  );
+}
+
+function Version() {
+  const q = useAdminQuery((api) => api.health(), []);
+  return (
+    <div className="mt-0.5 font-mono text-[10px] text-secondary">
+      {q.data?.version ? `v${q.data.version}` : '—'} · self-hosted
     </div>
   );
 }
@@ -91,7 +121,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         {/* wordmark */}
         <div className="border-b border-[#C9C2B3] px-3.5 py-3">
           <div className="text-[15px] font-semibold tracking-[-0.01em] text-ink">Gulley</div>
-          <div className="mt-0.5 font-mono text-[10px] text-secondary">v1.14.2 · self-hosted</div>
+          <Version />
         </div>
 
         {/* nav groups */}
@@ -128,10 +158,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
         {/* footer status */}
         <div className="mt-auto border-t border-[#C9C2B3] px-3.5 py-3">
-          <div className="flex items-center gap-1.5">
-            <Dot tone="green" />
-            <span className="font-mono text-2xs text-secondary">control API · connected</span>
-          </div>
+          <ControlStatus />
           <div className="mt-1">
             <AuditStatus />
           </div>

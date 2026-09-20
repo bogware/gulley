@@ -45,6 +45,8 @@ export function CollectionPage({
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | undefined>(undefined);
 
+  const list = items.data?.entities ?? [];
+
   const reset = (): void => {
     setEditing(null);
     setName('');
@@ -76,7 +78,8 @@ export function CollectionPage({
   }
 
   async function remove(id: string): Promise<void> {
-    if (!api) return;
+    const name = list.find((e) => e.id === id)?.name ?? id;
+    if (!api || !window.confirm(`Delete ${title.toLowerCase()} "${name}"?`)) return;
     try {
       await api.deleteCollectionItem(kind, id);
       if (editing === id) reset();
@@ -94,7 +97,6 @@ export function CollectionPage({
 
   const wsName = (id: string): string =>
     workspaces.data?.workspaces.find((w) => w.id === id)?.name ?? id;
-  const list = items.data?.entities ?? [];
 
   return (
     <div>
@@ -106,6 +108,10 @@ export function CollectionPage({
           <PanelHeader title={title} meta={`${list.length}`} />
           {items.loading ? (
             <Spinner />
+          ) : items.error ? (
+            <div className="p-3">
+              <ErrorNote error={items.error} onRetry={items.refetch} />
+            </div>
           ) : list.length === 0 ? (
             <EmptyState message="None configured." />
           ) : (
@@ -148,6 +154,10 @@ export function CollectionPage({
               <Field label="Workspace">
                 {workspaces.loading ? (
                   <Spinner />
+                ) : workspaces.error ? (
+                  <div className="p-3">
+                    <ErrorNote error={workspaces.error} onRetry={workspaces.refetch} />
+                  </div>
                 ) : (
                   <Select value={ws} onChange={(e) => setWs(e.target.value)} className="w-full">
                     <option value="">workspace…</option>

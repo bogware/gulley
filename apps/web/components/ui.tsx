@@ -313,10 +313,22 @@ export function EmptyState({ message }: { message: string }) {
   return <div className="py-10 text-center text-[11.5px] text-micro">{message}</div>;
 }
 
-export function ErrorNote({ error }: { error: string }) {
+export function ErrorNote({ error, onRetry }: { error: string; onRetry?: () => void }) {
   return (
-    <div className="rounded-control border border-err-border bg-err-bg px-3 py-2 text-[11.5px] text-err-text">
-      {error}
+    <div
+      role="alert"
+      className="flex items-start justify-between gap-3 rounded-control border border-err-border bg-err-bg px-3 py-2 text-[11.5px] text-err-text"
+    >
+      <span className="min-w-0 break-words">{error}</span>
+      {onRetry ? (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="shrink-0 rounded-control border border-err-border px-2 py-[2px] text-[10.5px] font-medium hover:bg-white/40"
+        >
+          Retry
+        </button>
+      ) : null}
     </div>
   );
 }

@@ -19,6 +19,32 @@ export interface StoredProfile {
   refreshToken: string;
   /** Epoch ms of the last successful login/refresh. */
   updatedAt: number;
+  /** The broker's discovered endpoints, cached so `gulley token` (called by the agent
+   *  on every session) does not re-run RFC 8414 discovery each time. */
+  endpoints?: CachedEndpoints;
+}
+
+export interface CachedEndpoints {
+  issuer: string;
+  deviceAuthorizationEndpoint: string;
+  tokenEndpoint: string;
+  revocationEndpoint: string;
+  introspectionEndpoint: string;
+  /** Epoch ms when discovered; re-discovered after {@link ENDPOINTS_TTL_MS}. */
+  at: number;
+}
+
+/** How long cached broker endpoints are trusted before re-discovery. */
+export const ENDPOINTS_TTL_MS = 6 * 3_600_000;
+
+/** Thrown for a credentials file that exists but cannot be parsed. */
+export class CorruptCredentialsError extends Error {
+  constructor(readonly path: string) {
+    super(
+      `the credentials file at ${path} is corrupt — run \`gulley login\` again (or delete the file)`,
+    );
+    this.name = 'CorruptCredentialsError';
+  }
 }
 
 export interface CredentialsFile {
@@ -35,13 +61,29 @@ export function credentialsPath(homeDir: string, env: Record<string, string | un
   return `${homeDir.replace(/[\\/]+$/, '')}${sep}.gulley${sep}credentials.json`;
 }
 
-export function parseCredentials(text: string | undefined): CredentialsFile {
+export function parseCredentials(text: string | undefined, path = ''): CredentialsFile {
   if (!text || !text.trim()) return { version: 1, profiles: {} };
-  const parsed = JSON.parse(text) as Partial<CredentialsFile>;
+  let parsed: Partial<CredentialsFile>;
+  try {
+    parsed = JSON.parse(text) as Partial<CredentialsFile>;
+  } catch {
+    throw new CorruptCredentialsError(path);
+  }
   if (parsed.version !== 1 || !parsed.profiles || typeof parsed.profiles !== 'object') {
-    throw new Error('unrecognized credentials file format');
+    throw new CorruptCredentialsError(path);
   }
   return { version: 1, profiles: parsed.profiles };
+}
+
+/** Expand a leading `~` / `~/` to the home directory (the onboarding pack paths use
+ *  it, e.g. `~/.codex/config.toml`; writing it literally created a `./~` folder). */
+export function expandHome(path: string, homeDir: string): string {
+  if (path === '~') return homeDir;
+  if (path.startsWith('~/') || path.startsWith('~\\')) {
+    const sep = homeDir.includes('\\') && !homeDir.includes('/') ? '\\' : '/';
+    return `${homeDir.replace(/[\\/]+$/, '')}${sep}${path.slice(2)}`;
+  }
+  return path;
 }
 
 export function serializeCredentials(file: CredentialsFile): string {

@@ -84,6 +84,10 @@ function PeopleTab() {
         />
         {users.loading ? (
           <Spinner />
+        ) : users.error ? (
+          <div className="p-3">
+            <ErrorNote error={users.error} onRetry={users.refetch} />
+          </div>
         ) : (users.data?.users.length ?? 0) === 0 ? (
           <EmptyState message="No provisioned admin users (SCIM/OIDC populate this in DB mode)." />
         ) : (
@@ -120,6 +124,10 @@ function PeopleTab() {
         />
         {sessions.loading ? (
           <Spinner />
+        ) : sessions.error ? (
+          <div className="p-3">
+            <ErrorNote error={sessions.error} onRetry={sessions.refetch} />
+          </div>
         ) : (sessions.data?.sessions.length ?? 0) === 0 ? (
           <EmptyState message="No recorded sessions." />
         ) : (
@@ -152,7 +160,11 @@ function PeopleTab() {
                     <Button
                       variant="ghost"
                       onClick={async () => {
-                        if (!api) return;
+                        if (
+                          !api ||
+                          !window.confirm(`Revoke session ${s.jti.slice(0, 8)}… for ${s.subject}?`)
+                        )
+                          return;
                         try {
                           await api.revokeSession(s.jti);
                           sessions.refetch();
@@ -254,6 +266,10 @@ function AccessTab() {
           <Spinner />
         ) : memberships.error && isNotConfigured(memberships.error) ? (
           <EmptyState message="Durable memberships require a database." />
+        ) : memberships.error ? (
+          <div className="p-3">
+            <ErrorNote error={memberships.error} onRetry={memberships.refetch} />
+          </div>
         ) : list.length === 0 ? (
           <EmptyState message="No grants." />
         ) : (
@@ -281,7 +297,7 @@ function AccessTab() {
                     <Button
                       variant="ghost"
                       onClick={async () => {
-                        if (!api) return;
+                        if (!api || !window.confirm(`Revoke this ${m.role} grant?`)) return;
                         try {
                           await api.deleteMembership(m.id!);
                           memberships.refetch();
@@ -481,6 +497,10 @@ function OAuthTab() {
           <PanelHeader title="OAuth clients" meta={`${clients.data?.clients.length ?? 0}`} />
           {clients.loading ? (
             <Spinner />
+          ) : clients.error ? (
+            <div className="p-3">
+              <ErrorNote error={clients.error} onRetry={clients.refetch} />
+            </div>
           ) : (clients.data?.clients.length ?? 0) === 0 ? (
             <EmptyState message="No registered clients." />
           ) : (
@@ -534,6 +554,10 @@ function OAuthTab() {
           />
           {grants.loading ? (
             <Spinner />
+          ) : grants.error ? (
+            <div className="p-3">
+              <ErrorNote error={grants.error} onRetry={grants.refetch} />
+            </div>
           ) : (grants.data?.grants.length ?? 0) === 0 ? (
             <EmptyState message="No issued grants." />
           ) : (
@@ -562,7 +586,13 @@ function OAuthTab() {
                       <Button
                         variant="ghost"
                         onClick={async () => {
-                          if (!api) return;
+                          if (
+                            !api ||
+                            !window.confirm(
+                              `Revoke the token family for ${g.principalId}? The agent will have to log in again.`,
+                            )
+                          )
+                            return;
                           try {
                             await api.revokeOAuthGrant(g.handle);
                             grants.refetch();

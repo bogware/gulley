@@ -83,6 +83,10 @@ export default function OrgsPage() {
           />
           {orgs.loading ? (
             <Spinner />
+          ) : orgs.error ? (
+            <div className="p-3">
+              <ErrorNote error={orgs.error} onRetry={orgs.refetch} />
+            </div>
           ) : orgList.length === 0 ? (
             <EmptyState message="No orgs yet." />
           ) : (
@@ -101,12 +105,21 @@ export default function OrgsPage() {
                   <div className="flex justify-end">
                     <Button
                       variant="ghost"
-                      onClick={() =>
+                      onClick={() => {
+                        if (
+                          !window.confirm(
+                            `Delete org "${o.name}"? Its workspaces, keys and config go with it.`,
+                          )
+                        )
+                          return;
                         void run(
                           () => api!.deleteOrg(o.id),
-                          () => orgs.refetch(),
-                        )
-                      }
+                          () => {
+                            orgs.refetch();
+                            workspaces.refetch();
+                          },
+                        );
+                      }}
                     >
                       Delete
                     </Button>
@@ -156,6 +169,10 @@ export default function OrgsPage() {
           </div>
           {workspaces.loading ? (
             <Spinner />
+          ) : workspaces.error ? (
+            <div className="p-3">
+              <ErrorNote error={workspaces.error} onRetry={workspaces.refetch} />
+            </div>
           ) : wsList.length === 0 ? (
             <EmptyState message="No workspaces yet." />
           ) : (
@@ -172,12 +189,14 @@ export default function OrgsPage() {
                   <div className="flex justify-end">
                     <Button
                       variant="ghost"
-                      onClick={() =>
+                      onClick={() => {
+                        if (!window.confirm(`Delete workspace "${w.name}" and everything in it?`))
+                          return;
                         void run(
                           () => api!.deleteWorkspace(w.id),
                           () => workspaces.refetch(),
-                        )
-                      }
+                        );
+                      }}
                     >
                       Delete
                     </Button>

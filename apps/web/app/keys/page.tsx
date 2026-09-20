@@ -49,7 +49,7 @@ export default function KeysPage() {
     }
   }
   async function disable(id: string): Promise<void> {
-    if (!api) return;
+    if (!api || !window.confirm('Disable this key? Requests using it fail immediately.')) return;
     try {
       await api.disableKey(id);
       keys.refetch();
@@ -58,7 +58,13 @@ export default function KeysPage() {
     }
   }
   async function rotate(id: string): Promise<void> {
-    if (!api) return;
+    if (
+      !api ||
+      !window.confirm(
+        'Rotate this key? The current token stops working; the new one is shown once.',
+      )
+    )
+      return;
     try {
       setMinted(await api.rotateKey(id));
       keys.refetch();
@@ -97,6 +103,10 @@ export default function KeysPage() {
             <EmptyState message="Select a workspace to list its keys." />
           ) : keys.loading ? (
             <Spinner />
+          ) : keys.error ? (
+            <div className="p-3">
+              <ErrorNote error={keys.error} onRetry={keys.refetch} />
+            </div>
           ) : list.length === 0 ? (
             <EmptyState message="No keys in this workspace yet." />
           ) : (

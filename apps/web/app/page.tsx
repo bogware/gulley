@@ -127,9 +127,31 @@ export default function Dashboard() {
     return m;
   }, [buckets]);
 
+  // Export = the usage buckets behind this view, as CSV (what the tiles are computed from).
+  function exportCsv(): void {
+    const header = 'bucketStart,group,requests,inputTokens,outputTokens,costMicroUsd';
+    const rows = buckets.map((b) =>
+      [b.bucketStart, b.group ?? '', b.requests, b.inputTokens, b.outputTokens, b.costMicroUsd]
+        .map((v) => `"${String(v).replace(/"/g, '""')}"`)
+        .join(','),
+    );
+    const blob = new Blob([`${[header, ...rows].join('\n')}\n`], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `gulley-usage-${range}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div>
-      <PageHeaderStrip range={range} onRange={setRange} />
+      <PageHeaderStrip
+        range={range}
+        onRange={setRange}
+        onExport={exportCsv}
+        exportable={buckets.length > 0}
+      />
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_300px]">
         {/* ---- left column ---- */}
@@ -171,6 +193,10 @@ export default function Dashboard() {
             <div className="p-3">
               {usage.loading ? (
                 <Spinner />
+              ) : usage.error ? (
+                <div className="p-3">
+                  <ErrorNote error={usage.error} onRetry={usage.refetch} />
+                </div>
               ) : byTime.length === 0 ? (
                 <EmptyState message="No usage in range." />
               ) : (
@@ -205,7 +231,7 @@ export default function Dashboard() {
               right={
                 <div className="flex items-center gap-2">
                   <span className="flex items-center gap-1 font-mono text-[10px] text-secondary">
-                    <Dot tone="green" /> live
+                    <Dot tone={logs.error ? 'red' : 'green'} /> {logs.error ? 'stale' : 'latest 7'}
                   </span>
                   <a href="/logs" className="text-[11px] text-accent hover:underline">
                     Open log browser →
@@ -253,6 +279,10 @@ export default function Dashboard() {
             <div className="flex flex-col">
               {providers.loading ? (
                 <Spinner />
+              ) : providers.error ? (
+                <div className="p-3">
+                  <ErrorNote error={providers.error} onRetry={providers.refetch} />
+                </div>
               ) : (providers.data?.providers.length ?? 0) === 0 ? (
                 <EmptyState message="No providers configured." />
               ) : (
@@ -345,7 +375,17 @@ function withGood(
   return { ...d, good: d.dir === 'up' ? upIsGood : !upIsGood };
 }
 
-function PageHeaderStrip({ range, onRange }: { range: Range; onRange: (r: Range) => void }) {
+function PageHeaderStrip({
+  range,
+  onRange,
+  onExport,
+  exportable,
+}: {
+  range: Range;
+  onRange: (r: Range) => void;
+  onExport: () => void;
+  exportable: boolean;
+}) {
   return (
     <div className="-mx-5 -mt-4 mb-4 flex flex-wrap items-center justify-between gap-3 border-b border-line bg-header px-5 py-3.5">
       <div>
@@ -365,7 +405,14 @@ function PageHeaderStrip({ range, onRange }: { range: Range; onRange: (r: Range)
             { value: '30d', label: '30d' },
           ]}
         />
-        <Button variant="primary">Export</Button>
+        <Button
+          variant="primary"
+          onClick={onExport}
+          disabled={!exportable}
+          title="Download the usage buckets in range as CSV"
+        >
+          Export CSV
+        </Button>
       </div>
     </div>
   );

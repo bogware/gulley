@@ -3,8 +3,8 @@
 # pnpm can resolve the workspace:
 #   docker buildx build --platform linux/arm64 -f apps/web/Dockerfile .
 # The browser talks only to this origin: NEXT_PUBLIC_CONTROL_API_URL defaults to
-# the same-origin `/control`, and next.config.mjs rewrites /control/* to the
-# control-api given by the runtime CONTROL_API_URL env. Node is PID 1.
+# the same-origin `/control`, and app/control/[...path]/route.ts proxies /control/*
+# to the control-api given by the RUNTIME CONTROL_API_URL env. Node is PID 1.
 FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS base
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
 # Pull Debian security fixes into the base layer, then enable pnpm.
@@ -17,10 +17,9 @@ FROM base AS build
 COPY . .
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile --filter @gulley/web...
-# Next.js evaluates next.config.mjs rewrites() at BUILD time and bakes the
-# destination into the routes manifest, so the control-api the console proxies
-# /control/* to must be a BUILD ARG (a runtime env is ignored). Defaults to the
-# same-origin dev value. Pass --build-arg CONTROL_API_URL=https://api.<domain>.
+# CONTROL_API_URL is read per request by the /control proxy route, so it is a
+# RUNTIME env (set it on the container). The build arg is kept for compatibility
+# with older deploy scripts; it is not required.
 ARG CONTROL_API_URL=""
 ENV CONTROL_API_URL=$CONTROL_API_URL
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1

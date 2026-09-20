@@ -141,6 +141,10 @@ function Chargeback() {
         />
         {q.loading ? (
           <Spinner />
+        ) : q.error ? (
+          <div className="p-3">
+            <ErrorNote error={q.error} onRetry={q.refetch} />
+          </div>
         ) : rows.length === 0 ? (
           <EmptyState message="No spend in range." />
         ) : (

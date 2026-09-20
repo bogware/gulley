@@ -37,13 +37,99 @@ import type {
   Workspace,
 } from './types';
 
-/** True when an API error is a 501 "not configured" (a disabled optional subsystem),
- *  which pages render as a graceful "not enabled" state rather than a hard failure. */
-export function isNotConfigured(error: string | undefined): boolean {
-  return (
-    !!error && (/→ 501/.test(error) || /not_configured|not_supported|not enabled/i.test(error))
-  );
+/**
+ * A failed control-api call, classified. `status` 0 = the request never got an HTTP
+ * answer (network down, proxy 502 is a real status; a client-side timeout is 0 with
+ * `timeout: true`). `type`/`requestId` come from the API's error envelope when present.
+ */
+export class ApiError extends Error {
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    readonly status: number,
+    readonly type: string | undefined,
+    readonly detail: string,
+    readonly requestId?: string,
+    readonly timeout = false,
+  ) {
+    super(
+      status === 0
+        ? `${method} ${path} → ${timeout ? 'timed out' : 'network error'}${detail ? `: ${detail}` : ''}`
+        : `${method} ${path} → ${status}${detail ? `: ${detail}` : ''}${requestId ? ` (${requestId})` : ''}`,
+    );
+    this.name = 'ApiError';
+  }
+  get unauthorized(): boolean {
+    return this.status === 401;
+  }
+  get forbidden(): boolean {
+    return this.status === 403;
+  }
+  get notFound(): boolean {
+    return this.status === 404;
+  }
+  get notConfigured(): boolean {
+    return this.status === 501 || /not_configured|not_supported/i.test(this.type ?? '');
+  }
 }
+
+const MAX_DETAIL = 300;
+
+/** Parse an error body: the API envelope `{ error: { type, message, requestId } }`, an
+ *  OAuth `{ error, error_description }`, or raw text — truncated so a stray HTML page
+ *  or a stack never floods the UI. */
+export function parseErrorBody(text: string): {
+  type?: string;
+  message: string;
+  requestId?: string;
+} {
+  const raw = text.trim();
+  if (!raw) return { message: '' };
+  try {
+    const j = JSON.parse(raw) as Record<string, unknown>;
+    const env = j['error'];
+    if (env && typeof env === 'object') {
+      const e = env as Record<string, unknown>;
+      return {
+        type: typeof e['type'] === 'string' ? e['type'] : undefined,
+        message: typeof e['message'] === 'string' ? e['message'].slice(0, MAX_DETAIL) : '',
+        requestId: typeof e['requestId'] === 'string' ? e['requestId'] : undefined,
+      };
+    }
+    if (typeof env === 'string') {
+      const d = j['error_description'];
+      return { type: env, message: (typeof d === 'string' ? d : env).slice(0, MAX_DETAIL) };
+    }
+    if (typeof j['message'] === 'string') return { message: j['message'].slice(0, MAX_DETAIL) };
+  } catch {
+    /* not JSON */
+  }
+  return { message: raw.replace(/\s+/g, ' ').slice(0, MAX_DETAIL) };
+}
+
+/** Human-readable message for any thrown value (ApiError keeps its own). */
+export function describeError(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** True when an API error is a 501 "not configured" (a disabled optional subsystem),
+ *  which pages render as a graceful "not enabled" state rather than a hard failure.
+ *  Accepts the thrown error or the string a query hook surfaced. */
+export function isNotConfigured(error: unknown): boolean {
+  if (error instanceof ApiError) return error.notConfigured;
+  const text = typeof error === 'string' ? error : error instanceof Error ? error.message : '';
+  return !!text && (/→ 501/.test(text) || /not_configured|not_supported|not enabled/i.test(text));
+}
+
+export interface ApiOptions {
+  /** Per-call deadline (ms). Default 15 s — a hung control API must not hang the console. */
+  timeoutMs?: number;
+  /** Fired on any 401: the session is gone (expired, revoked, logged out elsewhere). */
+  onUnauthorized?: () => void;
+}
+
+/** Default per-call deadline. */
+export const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
  * Typed client for the Gulley control-api admin surface. Every call carries the
@@ -54,25 +140,67 @@ export class GulleyAdminApi {
   constructor(
     private readonly baseUrl: string,
     private readonly token?: string,
+    private readonly opts: ApiOptions = {},
   ) {}
 
-  private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
-        ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      // Include the OIDC session cookie (http-only) so pasted-token auth is optional.
-      credentials: 'include',
-      cache: 'no-store',
-    });
+  private async raw(method: string, path: string, body?: unknown): Promise<Response> {
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers: {
+          ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
+          ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        // Include the OIDC session cookie (http-only) so pasted-token auth is optional.
+        credentials: 'include',
+        cache: 'no-store',
+        signal: AbortSignal.timeout(this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      });
+    } catch (e) {
+      const timeout = (e as { name?: string }).name === 'TimeoutError';
+      throw new ApiError(
+        method,
+        path,
+        0,
+        undefined,
+        timeout ? '' : describeError(e),
+        undefined,
+        timeout,
+      );
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`${method} ${path} → ${res.status}${text ? `: ${text}` : ''}`);
+      const parsed = parseErrorBody(text);
+      const err = new ApiError(
+        method,
+        path,
+        res.status,
+        parsed.type,
+        parsed.message,
+        parsed.requestId,
+      );
+      if (err.unauthorized) this.opts.onUnauthorized?.();
+      throw err;
     }
-    return (await res.json()) as T;
+    return res;
+  }
+
+  private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await this.raw(method, path, body);
+    const text = await res.text();
+    if (!text) return undefined as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new ApiError(method, path, res.status, 'bad_response', 'response was not JSON');
+    }
+  }
+
+  /** Unauthenticated liveness + build version of the control API (for the shell). */
+  health(): Promise<{ status: string; service: string; version: string }> {
+    return this.req('GET', '/health');
   }
 
   // --- auth (OIDC session gate) ---
@@ -174,13 +302,7 @@ export class GulleyAdminApi {
   }
 
   private async reqText(path: string): Promise<string> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      headers: { ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
-      credentials: 'include',
-      cache: 'no-store',
-    });
-    if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
-    return res.text();
+    return (await this.raw('GET', path)).text();
   }
 
   // --- lifecycle / CRUD (deletes + updates the console previously lacked) ---

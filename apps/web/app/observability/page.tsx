@@ -1,12 +1,13 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Cell,
   Dot,
   EmptyState,
   ErrorNote,
   GridRow,
+  InlineResult,
   Meter,
   PageHeader,
   Panel,
@@ -26,16 +27,39 @@ export default function ObservabilityPage() {
   const status = useAdminQuery((a) => a.observabilityStatus(), []);
   const metrics = useAdminQuery((a) => a.observabilityMetrics(), []);
 
-  // Poll every 5s — the gateway counters are cumulative-since-boot per replica.
-  useEffect(() => {
-    const t = window.setInterval(() => metrics.refetch(), 5000);
-    return () => window.clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const notConfigured =
     (status.data && status.data.configured === false) || isNotConfigured(metrics.error);
   const m: GatewayMetricsSummary | undefined = metrics.data?.metrics;
+
+  // Poll every 5s (the gateway counters are cumulative-since-boot per replica) — but
+  // back off to 60s while the fetch is failing, never poll an unconfigured listener,
+  // and remember when the data on screen was last fresh.
+  const [lastOk, setLastOk] = useState<number | null>(null);
+  const failures = useRef(0);
+  useEffect(() => {
+    if (metrics.data) {
+      setLastOk(Date.now());
+      failures.current = 0;
+    }
+  }, [metrics.data]);
+  useEffect(() => {
+    if (metrics.error) failures.current += 1;
+  }, [metrics.error]);
+  useEffect(() => {
+    if (notConfigured) return;
+    let timer: number | undefined;
+    const schedule = (): void => {
+      const delay = Math.min(60_000, 5_000 * 2 ** Math.min(failures.current, 4));
+      timer = window.setTimeout(() => {
+        metrics.refetch();
+        schedule();
+      }, delay);
+    };
+    schedule();
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notConfigured]);
+  const stale = Boolean(m && metrics.error);
 
   return (
     <div>
@@ -72,6 +96,13 @@ export default function ObservabilityPage() {
         <ErrorNote error={metrics.error} />
       ) : m ? (
         <div className="flex flex-col gap-4">
+          {stale ? (
+            <InlineResult tone="err">
+              Showing the last successful snapshot
+              {lastOk ? ` from ${new Date(lastOk).toLocaleTimeString()}` : ''} — the gateway metrics
+              listener is not responding ({metrics.error}). Retrying with backoff.
+            </InlineResult>
+          ) : null}
           <div className="grid grid-cols-2 gap-2.5 md:grid-cols-5">
             <StatTile
               label="Requests"
@@ -114,7 +145,8 @@ export default function ObservabilityPage() {
 
           <div className="text-[10px] text-micro">
             Snapshot at {new Date(m.scrapedAt).toLocaleTimeString()} · counters are cumulative since
-            the replica&apos;s boot (this reflects one replica). Auto-refreshing every 5s.
+            the replica&apos;s boot (this reflects one replica). Auto-refreshing every 5s (backs off
+            while unreachable).
           </div>
         </div>
       ) : (

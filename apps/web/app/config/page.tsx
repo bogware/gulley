@@ -146,6 +146,10 @@ export default function ConfigPage() {
           <PanelHeader title="Version history" meta="newest first" />
           {history.loading ? (
             <Spinner />
+          ) : history.error ? (
+            <div className="p-3">
+              <ErrorNote error={history.error} onRetry={history.refetch} />
+            </div>
           ) : (history.data?.versions.length ?? 0) === 0 ? (
             <EmptyState message="No applied versions yet." />
           ) : (

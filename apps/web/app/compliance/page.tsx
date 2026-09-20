@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   Button,
   Cell,
@@ -81,13 +81,39 @@ function NotConfigured({ what }: { what: string }) {
 
 function AuditTab() {
   const { api } = useAdmin();
-  const events = useAdminQuery((a) => a.auditEvents({ limit: 100 }), []);
   const attest = useAdminQuery((a) => a.auditAttestation(), []);
   const [downloading, setDownloading] = useState(false);
+  const [bundleError, setBundleError] = useState<string | undefined>(undefined);
+
+  // Keyset-paged audit trail: first page on mount, "Load more" walks `before`.
+  const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [cursor, setCursor] = useState<number | undefined>(undefined);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | undefined>(undefined);
+  const load = useCallback(
+    async (before?: number) => {
+      setLoading(true);
+      setError(undefined);
+      try {
+        const page = await api.auditEvents({ limit: 100, before });
+        setEvents((prev) => (before === undefined ? page.events : [...prev, ...page.events]));
+        setCursor(page.nextCursor);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [api],
+  );
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   async function downloadBundle(): Promise<void> {
     if (!api) return;
     setDownloading(true);
+    setBundleError(undefined);
     try {
       const bundle = await api.evidenceBundle();
       const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
@@ -97,6 +123,14 @@ function AuditTab() {
       a.download = `gulley-evidence-bundle-${Date.now()}.json`;
       a.click();
       URL.revokeObjectURL(url);
+    } catch (e) {
+      setBundleError(
+        isNotConfigured(e)
+          ? 'Evidence bundle needs an attestation signer (AUDIT_ATTESTATION_KEY or a KMS signer).'
+          : e instanceof Error
+            ? e.message
+            : String(e),
+      );
     } finally {
       setDownloading(false);
     }
@@ -106,12 +140,15 @@ function AuditTab() {
     <div className="flex flex-col gap-4">
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
         <Panel className="overflow-hidden">
-          <PanelHeader title="Audit trail" meta="hash-chained, newest first" />
-          {events.loading ? (
+          <PanelHeader
+            title="Audit trail"
+            meta={`hash-chained, newest first · ${events.length} loaded`}
+          />
+          {loading && events.length === 0 ? (
             <Spinner />
-          ) : events.error ? (
+          ) : error && events.length === 0 ? (
             <div className="p-3">
-              <ErrorNote error={events.error} />
+              <ErrorNote error={error} onRetry={() => void load()} />
             </div>
           ) : (
             <div className="max-h-[520px] overflow-y-auto">
@@ -121,7 +158,7 @@ function AuditTab() {
                 <Cell>Actor · target</Cell>
                 <Cell align="right">When</Cell>
               </GridRow>
-              {(events.data?.events ?? []).map((e: AuditEvent) => (
+              {events.map((e: AuditEvent) => (
                 <GridRow key={e.seq} cols="52px 120px minmax(0,1fr) 96px">
                   <Cell mono tone="secondary">
                     {e.seq}
@@ -137,6 +174,20 @@ function AuditTab() {
                   </Cell>
                 </GridRow>
               ))}
+              {error && events.length > 0 ? (
+                <div className="p-3">
+                  <ErrorNote error={error} onRetry={() => void load(cursor)} />
+                </div>
+              ) : null}
+              {cursor !== undefined ? (
+                <div className="flex justify-center border-t border-line px-3 py-2.5">
+                  <Button onClick={() => void load(cursor)} disabled={loading}>
+                    {loading ? 'Loading…' : 'Load more'}
+                  </Button>
+                </div>
+              ) : events.length > 0 ? (
+                <div className="py-2 text-center text-[10px] text-micro">end of chain</div>
+              ) : null}
             </div>
           )}
         </Panel>
@@ -172,6 +223,7 @@ function AuditTab() {
               >
                 {downloading ? 'Preparing…' : 'Download evidence bundle'}
               </Button>
+              {bundleError ? <ErrorNote error={bundleError} /> : null}
             </div>
           </Panel>
         </div>

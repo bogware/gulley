@@ -45,6 +45,16 @@ export interface FlowDeps {
   now: () => number;
 }
 
+/** Per-request deadline for every broker call. The agent's token helper runs on the
+ *  hot path of a coding session; a stalled broker must fail fast, not hang it. */
+export const BROKER_REQUEST_TIMEOUT_MS = 10_000;
+
+function timeoutSignal(): AbortSignal | undefined {
+  return typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+    ? AbortSignal.timeout(BROKER_REQUEST_TIMEOUT_MS)
+    : undefined;
+}
+
 function trimUrl(u: string): string {
   return u.replace(/\/+$/, '');
 }
@@ -66,6 +76,7 @@ export async function discoverBroker(
   try {
     const res = await fetchImpl(`${base}/.well-known/oauth-authorization-server`, {
       headers: { accept: 'application/json' },
+      signal: timeoutSignal(),
     });
     if (!res.ok) return fallback;
     const meta = (await res.json()) as Record<string, unknown>;
@@ -98,6 +109,7 @@ async function postForm(
       accept: 'application/json',
     },
     body: new URLSearchParams(fields).toString(),
+    signal: timeoutSignal(),
   });
   const text = await res.text();
   let body: Record<string, unknown> = {};
@@ -184,16 +196,33 @@ export async function pollDeviceToken(
 ): Promise<TokenSet> {
   let intervalMs = Math.max(1, auth.interval) * 1000;
   const deadline = deps.now() + auth.expiresIn * 1000;
+  let networkErrors = 0;
   for (;;) {
     await deps.sleep(intervalMs);
     if (deps.now() > deadline) {
       throw new OAuthFlowError('expired_token', 'the device code expired before approval');
     }
-    const { status, body } = await postForm(deps.fetch, endpoints.tokenEndpoint, {
-      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-      device_code: auth.deviceCode,
-      client_id: clientId,
-    });
+    let polled: { status: number; body: Record<string, unknown> };
+    try {
+      polled = await postForm(deps.fetch, endpoints.tokenEndpoint, {
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        device_code: auth.deviceCode,
+        client_id: clientId,
+      });
+      networkErrors = 0;
+    } catch (err) {
+      // A transient network blip while the user is at the consent page must not
+      // abort the login: keep polling inside the code's lifetime (bounded).
+      networkErrors += 1;
+      if (networkErrors >= 6) {
+        throw new OAuthFlowError(
+          'network_error',
+          `the broker is unreachable (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+      continue;
+    }
+    const { status, body } = polled;
     if (status === 200) return toTokenSet(body);
     const code = typeof body['error'] === 'string' ? (body['error'] as string) : 'server_error';
     switch (code) {
@@ -233,17 +262,19 @@ export async function refreshAccessToken(
   );
 }
 
-/** Best-effort revocation (the broker always answers 200; failures are swallowed
- *  because the local credential is deleted regardless). */
+/** Best-effort revocation. Returns whether the broker acknowledged it (a 2xx): the
+ *  local credential is deleted regardless, but the caller can say honestly whether
+ *  the family is dead server-side or will only expire on its own. */
 export async function revokeToken(
   endpoints: BrokerEndpoints,
   token: string,
   fetchImpl: typeof fetch,
-): Promise<void> {
+): Promise<boolean> {
   try {
-    await postForm(fetchImpl, endpoints.revocationEndpoint, { token });
+    const { status } = await postForm(fetchImpl, endpoints.revocationEndpoint, { token });
+    return status >= 200 && status < 300;
   } catch {
-    /* best-effort */
+    return false;
   }
 }
 

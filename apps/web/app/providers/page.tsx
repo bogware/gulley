@@ -79,6 +79,10 @@ export default function ProvidersPage() {
           <Panel className="overflow-hidden">
             {providers.loading ? (
               <Spinner />
+            ) : providers.error ? (
+              <div className="p-3">
+                <ErrorNote error={providers.error} onRetry={providers.refetch} />
+              </div>
             ) : list.length === 0 ? (
               <EmptyState message="No providers configured." />
             ) : (

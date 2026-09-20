@@ -170,6 +170,10 @@ export default function AnalyticsPage() {
           <div className="p-4">
             {q.loading ? (
               <Spinner />
+            ) : q.error ? (
+              <div className="p-3">
+                <ErrorNote error={q.error} onRetry={q.refetch} />
+              </div>
             ) : times.length === 0 ? (
               <EmptyState message="No usage in range." />
             ) : (
@@ -202,6 +206,10 @@ export default function AnalyticsPage() {
           <PanelHeader title={`By ${groupBy}`} meta={`${groups.length} groups`} />
           {q.loading ? (
             <Spinner />
+          ) : q.error ? (
+            <div className="p-3">
+              <ErrorNote error={q.error} onRetry={q.refetch} />
+            </div>
           ) : groups.length === 0 ? (
             <EmptyState message="No usage in range." />
           ) : (

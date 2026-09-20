@@ -1,11 +1,18 @@
 import { render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Queue of query results the page consumes in call order (status, then metrics).
+// Query results the page consumes in hook order on EVERY render (status, then metrics) —
+// the page re-renders after its own effects, so the mock must be stable across renders.
 const results: Array<Record<string, unknown>> = [];
+let call = 0;
 vi.mock('../../lib/hooks', () => ({
   useAdminQuery: () =>
-    results.shift() ?? { data: undefined, loading: true, error: undefined, refetch: vi.fn() },
+    results[call++ % Math.max(results.length, 1)] ?? {
+      data: undefined,
+      loading: true,
+      error: undefined,
+      refetch: vi.fn(),
+    },
 }));
 vi.mock('../../lib/admin-context', () => ({
   useAdmin: () => ({ api: {}, authed: true, ready: true }),
@@ -17,6 +24,7 @@ const q = (data?: unknown, error?: string) => ({ data, loading: false, error, re
 
 beforeEach(() => {
   results.length = 0;
+  call = 0;
 });
 
 describe('ObservabilityPage', () => {

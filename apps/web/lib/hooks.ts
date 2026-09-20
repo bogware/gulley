@@ -2,11 +2,13 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useAdmin } from './admin-context';
-import type { GulleyAdminApi } from './api';
+import { ApiError, describeError, type GulleyAdminApi } from './api';
 
 export interface QueryResult<T> {
   data?: T;
   error?: string;
+  /** HTTP status of the last failure (0 = network/timeout), undefined when none. */
+  status?: number;
   loading: boolean;
   refetch: () => void;
 }
@@ -22,6 +24,7 @@ export function useAdminQuery<T>(
   const { api } = useAdmin();
   const [data, setData] = useState<T | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [status, setStatus] = useState<number | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [nonce, setNonce] = useState(0);
   const factoryRef = useRef(factory);
@@ -36,6 +39,7 @@ export function useAdminQuery<T>(
     let cancelled = false;
     setLoading(true);
     setError(undefined);
+    setStatus(undefined);
     factoryRef
       .current(api)
       .then((result) => {
@@ -46,7 +50,8 @@ export function useAdminQuery<T>(
       })
       .catch((err: unknown) => {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err));
+          setError(describeError(err));
+          setStatus(err instanceof ApiError ? err.status : undefined);
           setLoading(false);
         }
       });
@@ -56,5 +61,5 @@ export function useAdminQuery<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, nonce, ...deps]);
 
-  return { data, error, loading, refetch: () => setNonce((n) => n + 1) };
+  return { data, error, status, loading, refetch: () => setNonce((n) => n + 1) };
 }

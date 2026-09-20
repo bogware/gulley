@@ -5,8 +5,15 @@ import { useAdmin } from '../lib/admin-context';
 import { controlApiUrl, GulleyAdminApi } from '../lib/api';
 import { Button, Card, ErrorNote, Input } from './ui';
 
+/** The page to return to after SSO: a same-origin path only (never an absolute URL). */
+export function returnToPath(): string {
+  if (typeof window === 'undefined') return '/';
+  const p = `${window.location.pathname}${window.location.search}`;
+  return p.startsWith('/') && !p.startsWith('//') ? p : '/';
+}
+
 export function TokenGate() {
-  const { setToken, refreshAuth } = useAdmin();
+  const { setToken, refreshAuth, authNotice } = useAdmin();
   const [oidc, setOidc] = useState<{ enabled: boolean } | null>(null);
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | undefined>(undefined);
@@ -47,13 +54,16 @@ export function TokenGate() {
         </p>
       </div>
 
+      {authNotice ? <ErrorNote error={authNotice} /> : null}
+
       {oidc?.enabled ? (
         <Card className="p-3.5">
           <Button
             variant="primary"
             className="w-full justify-center"
             onClick={() => {
-              window.location.href = `${controlApiUrl()}/auth/login`;
+              // Deep links (e.g. /oauth/device?user_code=…) survive the SSO round trip.
+              window.location.href = `${controlApiUrl()}/auth/login?return_to=${encodeURIComponent(returnToPath())}`;
             }}
           >
             Sign in with SSO

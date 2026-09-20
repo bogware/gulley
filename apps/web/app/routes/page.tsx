@@ -12,14 +12,11 @@ import {
   Spinner,
   StatusChip,
 } from '../../components/ui';
+import { useAdmin } from '../../lib/admin-context';
 import { useAdminQuery } from '../../lib/hooks';
+import { applyRouteEdits, type Target } from '../../lib/route-edit';
 import type { CollectionEntity } from '../../lib/types';
 
-interface Target {
-  name: string;
-  provider?: string;
-  weight: number;
-}
 interface ParsedRoute {
   id: string;
   alias: string;
@@ -117,17 +114,42 @@ export default function RoutesPage() {
               ))}
             </div>
           ) : null}
-          {active ? <RouteBuilder route={active} /> : null}
+          {active ? <RouteBuilder route={active} onApplied={() => routes.refetch()} /> : null}
         </div>
       )}
     </div>
   );
 }
 
-function RouteBuilder({ route }: { route: ParsedRoute }) {
+function RouteBuilder({ route, onApplied }: { route: ParsedRoute; onApplied: () => void }) {
+  const { api } = useAdmin();
   const [mode, setMode] = useState(route.mode);
   const [targets, setTargets] = useState<Target[]>(route.targets);
   const [dryRun, setDryRun] = useState<string[] | null>(null);
+  const [applying, setApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | undefined>(undefined);
+
+  // Hot-reload = save the edited config through the audited console write path (in DB
+  // mode that is one config commit the gateway reconciles from; the gateway's watcher
+  // picks the new version up live).
+  async function hotReload(): Promise<void> {
+    if (!api || !window.confirm(`Apply the new strategy/weights to alias/${route.alias}?`)) return;
+    setApplying(true);
+    setApplyError(undefined);
+    try {
+      await api.updateCollectionItem('routes', route.id, {
+        config: applyRouteEdits(route.raw, mode, targets),
+      });
+      setDryRun([
+        `applied — alias/${route.alias} now ${mode}, weights ${targets.map((t) => t.weight).join('/')}`,
+      ]);
+      onApplied();
+    } catch (e) {
+      setApplyError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setApplying(false);
+    }
+  }
 
   useEffect(() => {
     setMode(route.mode);
@@ -177,12 +199,18 @@ function RouteBuilder({ route }: { route: ParsedRoute }) {
         </Button>
         <Button
           variant="primary"
-          disabled={!dirty || !balanced}
-          title="Apply via GitOps /config/apply"
+          disabled={!dirty || !balanced || applying}
+          onClick={() => void hotReload()}
+          title="Save the edited strategy + weights (audited; gateways reconcile live in DB mode)"
         >
-          Hot-reload
+          {applying ? 'Applying…' : 'Hot-reload'}
         </Button>
       </div>
+      {applyError ? (
+        <div className="mb-4">
+          <ErrorNote error={applyError} />
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_330px]">
         <div className="flex flex-col gap-4">
@@ -280,8 +308,8 @@ function RouteBuilder({ route }: { route: ParsedRoute }) {
       </div>
 
       <p className="mt-3 text-[10px] text-micro">
-        Weight editing is local; applying a change goes through the audited config hot-reload path
-        (M13). Wiring the in-console apply + the smart-routing classifier gate is a follow-up.
+        Weight editing is local until Hot-reload, which saves the route through the audited console
+        write path; in DB mode that is a config commit gateways reconcile from live (M13).
       </p>
     </div>
   );

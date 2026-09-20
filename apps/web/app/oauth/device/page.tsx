@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Button, Card, ErrorNote, InlineResult, Input, Spinner } from '../../../components/ui';
 import { useAdmin } from '../../../lib/admin-context';
+import { ApiError } from '../../../lib/api';
 import type { DeviceCodePreview } from '../../../lib/types';
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -61,10 +62,14 @@ function DeviceConsent() {
         .catch((e: unknown) => {
           if (!cancelled) {
             setPreview(null);
+            const status = e instanceof ApiError ? e.status : /→ (4\d\d)/.exec(msg(e))?.[1];
+            const code = Number(status);
             setLookupError(
-              /→ 4\d\d/.test(msg(e))
-                ? 'Unknown, expired, or already-used code.'
-                : `Could not look up the code: ${msg(e)}`,
+              code === 401 || code === 403
+                ? 'Your session has expired — sign in again to approve this device.'
+                : code === 400 || code === 404 || code === 410
+                  ? 'Unknown, expired, or already-used code.'
+                  : `Could not look up the code: ${msg(e)}`,
             );
           }
         });

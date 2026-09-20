@@ -34,9 +34,23 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
     reply.send({ enabled: Boolean(ctx.oidc), loginUrl: '/auth/login' }),
   );
 
+  /** A post-login destination is honoured only as a same-origin path (`/x?y`), never
+   *  an absolute or scheme-relative URL — the console passes its current page so a deep
+   *  link (e.g. the device-consent page with its code) survives the SSO round trip. */
+  const safeReturnTo = (raw: unknown, fallback: string): string => {
+    if (typeof raw !== 'string' || raw.length === 0 || raw.length > 2_048) return fallback;
+    if (!raw.startsWith('/') || raw.startsWith('//') || raw.startsWith('/\\')) return fallback;
+    if (/[\r\n]/.test(raw)) return fallback;
+    return raw;
+  };
+
   app.get('/auth/login', async (_req: FastifyRequest, reply: FastifyReply) => {
     const oidc = ctx.oidc;
     if (!oidc) return oidcError(reply, 404, 'OIDC is not configured');
+    const returnTo = safeReturnTo(
+      (_req.query as Record<string, unknown> | undefined)?.['return_to'],
+      oidc.postLoginRedirect,
+    );
     const secret = ctx.resolverDeps.sessionSecrets[0];
     if (!secret) return oidcError(reply, 500, 'no session secret configured');
 
@@ -62,7 +76,7 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
       state,
       verifier,
       nonce,
-      returnTo: oidc.postLoginRedirect,
+      returnTo,
       exp: now() + 600_000,
     });
     reply.header(
@@ -188,7 +202,8 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
       serializeCookie(SESSION_COOKIE, token, { secure: oidc.cookieSecure, maxAge: ttlSec }),
       clearCookie(FLOW_COOKIE, { secure: oidc.cookieSecure }),
     ]);
-    return reply.redirect(flow.returnTo);
+    // Re-validated on the way out too (the cookie is signed, but defence in depth).
+    return reply.redirect(safeReturnTo(flow.returnTo, oidc.postLoginRedirect));
   });
 
   app.get('/auth/me', async (request: FastifyRequest, reply: FastifyReply) => {

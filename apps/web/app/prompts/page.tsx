@@ -54,6 +54,10 @@ export default function PromptsPage() {
             <PanelHeader title="Templates" meta={`${list.length}`} />
             {prompts.loading ? (
               <Spinner />
+            ) : prompts.error ? (
+              <div className="p-3">
+                <ErrorNote error={prompts.error} onRetry={prompts.refetch} />
+              </div>
             ) : list.length === 0 ? (
               <EmptyState message="No prompts yet." />
             ) : (

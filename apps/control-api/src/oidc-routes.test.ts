@@ -157,6 +157,30 @@ describe('OIDC session gate', () => {
     expect((orgs.json().orgs as Array<{ id: string }>).some((o) => o.id === orgId)).toBe(true);
   });
 
+  it('honours a same-origin return_to and refuses an off-origin one', async () => {
+    for (const [given, expected] of [
+      ['/oauth/device?user_code=ABCD-EFGH', '/oauth/device?user_code=ABCD-EFGH'],
+      ['https://evil.test/phish', '/'],
+      ['//evil.test/phish', '/'],
+    ] as const) {
+      const login = await app.inject({
+        method: 'GET',
+        url: `/auth/login?return_to=${encodeURIComponent(given)}`,
+      });
+      const authorize = new URL(login.headers['location'] as string);
+      currentNonce = authorize.searchParams.get('nonce') as string;
+      const state = authorize.searchParams.get('state') as string;
+      const flowCookie = cookieVal(login.headers as Record<string, unknown>, 'gulley_oidc_flow');
+      const cb = await app.inject({
+        method: 'GET',
+        url: `/auth/callback?code=abc&state=${state}`,
+        headers: { cookie: `gulley_oidc_flow=${encodeURIComponent(flowCookie)}` },
+      });
+      expect(cb.statusCode).toBe(302);
+      expect(cb.headers['location']).toBe(expected);
+    }
+  });
+
   it('rejects a callback with a mismatched state', async () => {
     const login = await app.inject({ method: 'GET', url: '/auth/login' });
     const flowCookie = cookieVal(login.headers as Record<string, unknown>, 'gulley_oidc_flow');

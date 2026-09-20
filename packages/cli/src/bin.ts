@@ -5,23 +5,48 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname } from 'node:path';
 import { runCli, type CliIo } from './cli';
+import { BROKER_REQUEST_TIMEOUT_MS } from './device-login';
 
-/** A cross-process lock via an exclusive-create lock file next to the credentials.
- *  A lock older than 30s is considered abandoned (a crashed helper) and reclaimed. */
+const LOCK_STALE_MS = 30_000;
+/** Longer than the stale threshold: a live holder is waited out, never evicted. */
+const LOCK_WAIT_MS = 45_000;
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM = exists but not ours (still alive); ESRCH = gone.
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * A cross-process lock via an exclusive-create lock file next to the credentials.
+ * The holder's pid is written into it, so an abandoned lock (a crashed helper) is
+ * reclaimed only when its pid is gone — a live-but-slow holder is never evicted
+ * (evicting it let two helpers rotate the same refresh token, which the broker
+ * treats as theft and revokes the whole family). Reclaim is rename-then-unlink so
+ * two waiters cannot both "reclaim" and both proceed.
+ */
 async function acquireLock(path: string): Promise<() => void> {
   const lockPath = `${path}.lock`;
-  const deadline = Date.now() + 15_000;
+  const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
     try {
       mkdirSync(dirname(lockPath), { recursive: true });
-      closeSync(openSync(lockPath, 'wx'));
+      const fd = openSync(lockPath, 'wx');
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
       return () => {
         try {
           unlinkSync(lockPath);
@@ -31,11 +56,21 @@ async function acquireLock(path: string): Promise<() => void> {
       };
     } catch {
       try {
-        if (Date.now() - statSync(lockPath).mtimeMs > 30_000) unlinkSync(lockPath);
+        const st = statSync(lockPath);
+        const holder = Number(readFileSync(lockPath, 'utf8').trim());
+        const abandoned =
+          Date.now() - st.mtimeMs > LOCK_STALE_MS &&
+          (!Number.isFinite(holder) || !pidAlive(holder));
+        if (abandoned) {
+          const claim = `${lockPath}.reclaim-${process.pid}`;
+          renameSync(lockPath, claim); // exactly one waiter wins the rename
+          unlinkSync(claim);
+        }
       } catch {
-        /* raced */
+        /* raced or already reclaimed */
       }
-      if (Date.now() > deadline) throw new Error(`could not lock ${lockPath} (stale lock?)`);
+      if (Date.now() > deadline)
+        throw new Error(`could not lock ${lockPath} — another gulley process is holding it`);
       await new Promise((r) => setTimeout(r, 100));
     }
   }
@@ -45,8 +80,11 @@ const io: CliIo = {
   readText: (p) => (existsSync(p) ? readFileSync(p, 'utf8') : undefined),
   writeText: (p, c, opts) => {
     if (opts?.secret) {
+      // Atomic: a crash mid-write must never leave a truncated credentials file.
       mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
-      writeFileSync(p, c, { mode: 0o600 });
+      const tmp = `${p}.tmp-${process.pid}`;
+      writeFileSync(tmp, c, { mode: 0o600 });
+      renameSync(tmp, p);
     } else {
       mkdirSync(dirname(p), { recursive: true });
       writeFileSync(p, c);
@@ -61,7 +99,12 @@ const io: CliIo = {
   },
   log: (l) => process.stdout.write(`${l}\n`),
   error: (l) => process.stderr.write(`${l}\n`),
-  fetch: (input, init) => fetch(input, init),
+  // Every broker call is bounded (the agent's token helper is on a session's hot path).
+  fetch: (input, init) =>
+    fetch(input, {
+      ...init,
+      signal: init?.signal ?? AbortSignal.timeout(BROKER_REQUEST_TIMEOUT_MS),
+    }),
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   now: () => Date.now(),
   homeDir: homedir(),

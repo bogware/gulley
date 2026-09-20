@@ -27,15 +27,19 @@ export default function SettingsPage() {
   const level = useAdminQuery((a) => a.logLevel(), []);
   const dump = useAdminQuery((a) => a.configDump(), []);
   const [busy, setBusy] = useState(false);
+  const [levelError, setLevelError] = useState<string | undefined>(undefined);
 
   const subsystems = status.data?.subsystems ?? {};
 
   async function setLevel(l: string): Promise<void> {
     if (!api) return;
     setBusy(true);
+    setLevelError(undefined);
     try {
       await api.setLogLevel(l);
       level.refetch();
+    } catch (e) {
+      setLevelError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -124,6 +128,7 @@ export default function SettingsPage() {
                   ))}
                 </Select>
                 {busy ? <span className="text-[10px] text-secondary">updating…</span> : null}
+                {levelError ? <ErrorNote error={levelError} /> : null}
                 <Button variant="ghost" onClick={() => level.refetch()}>
                   Refresh
                 </Button>

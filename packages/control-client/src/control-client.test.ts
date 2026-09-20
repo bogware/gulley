@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { ControlApiError, ControlClient } from './client';
+import { ControlApiError, ControlClient, ControlNetworkError } from './client';
 import { controlApiOpenApi } from './openapi';
 
 /** A fetch stub that records the last call and returns a canned JSON response. */
@@ -126,5 +126,74 @@ describe('controlApiOpenApi document', () => {
   it('marks /health public and everything else bearer-secured', () => {
     expect(controlApiOpenApi.paths['/health']?.get?.security).toEqual([]);
     expect(controlApiOpenApi.paths['/orgs']?.post?.security).toEqual([{ bearerAuth: [] }]);
+  });
+});
+
+describe('ControlClient — deadlines and non-JSON answers (refine cycle 2026-09)', () => {
+  it('a non-JSON error page keeps the status and carries the raw text (no SyntaxError)', async () => {
+    const f = vi.fn(
+      async () =>
+        new Response('<html>502 Bad Gateway</html>', {
+          status: 502,
+          headers: { 'content-type': 'text/html' },
+        }),
+    ) as unknown as typeof fetch;
+    const c = new ControlClient({ baseUrl: 'http://api.test', token: 't', fetch: f });
+    await expect(c.listOrgs()).rejects.toMatchObject({
+      name: 'ControlApiError',
+      status: 502,
+      body: { raw: '<html>502 Bad Gateway</html>' },
+    });
+  });
+
+  it('lifts type / message / requestId from the API error envelope', async () => {
+    const f = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: { type: 'audit_unavailable', message: 'm', requestId: 'req_1' },
+          }),
+          { status: 500 },
+        ),
+    ) as unknown as typeof fetch;
+    const c = new ControlClient({ baseUrl: 'http://api.test', token: 't', fetch: f });
+    let err: unknown;
+    try {
+      await c.listOrgs();
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ControlApiError);
+    expect((err as ControlApiError).type).toBe('audit_unavailable');
+    expect((err as ControlApiError).requestId).toBe('req_1');
+    expect((err as Error).message).toBe('control API 500: m');
+  });
+
+  it('a hung control API surfaces as a ControlNetworkError timeout; network errors are wrapped', async () => {
+    const hang = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            const e = new Error('aborted');
+            e.name = 'TimeoutError';
+            reject(e);
+          });
+        }),
+    ) as unknown as typeof fetch;
+    const c = new ControlClient({
+      baseUrl: 'http://api.test',
+      token: 't',
+      fetch: hang,
+      timeoutMs: 20,
+    });
+    await expect(c.listOrgs()).rejects.toMatchObject({
+      name: 'ControlNetworkError',
+      timeout: true,
+    });
+    const down = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+    const c2 = new ControlClient({ baseUrl: 'http://api.test', token: 't', fetch: down });
+    await expect(c2.listOrgs()).rejects.toBeInstanceOf(ControlNetworkError);
   });
 });

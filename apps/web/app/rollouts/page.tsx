@@ -92,6 +92,10 @@ export default function RolloutsPage() {
             <PanelHeader title="Rollouts" meta={`${rolloutList.length}`} />
             {rollouts.loading ? (
               <Spinner />
+            ) : rollouts.error ? (
+              <div className="p-3">
+                <ErrorNote error={rollouts.error} onRetry={rollouts.refetch} />
+              </div>
             ) : rolloutList.length === 0 ? (
               <EmptyState message="No rollouts yet." />
             ) : (
@@ -239,6 +243,10 @@ export default function RolloutsPage() {
             <PanelHeader title="Eval suites" meta={`${suiteList.length}`} />
             {suites.loading ? (
               <Spinner />
+            ) : suites.error ? (
+              <div className="p-3">
+                <ErrorNote error={suites.error} onRetry={suites.refetch} />
+              </div>
             ) : suiteList.length === 0 ? (
               <EmptyState message="No suites yet." />
             ) : (
@@ -259,12 +267,13 @@ export default function RolloutsPage() {
                     <div className="flex justify-end">
                       <Button
                         variant="ghost"
-                        onClick={() =>
+                        onClick={() => {
+                          if (!window.confirm(`Delete eval suite "${s.name}"?`)) return;
                           void run(
                             () => api!.deleteEvalSuite(s.id),
                             () => suites.refetch(),
-                          )
-                        }
+                          );
+                        }}
                       >
                         Delete
                       </Button>

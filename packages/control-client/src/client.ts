@@ -13,17 +13,45 @@ export interface ControlClientOptions {
   token: string;
   /** Injected fetch (tests / non-global runtimes); defaults to global fetch. */
   fetch?: typeof fetch;
+  /** Per-call deadline (ms). Default 15 s; 0 disables. */
+  timeoutMs?: number;
 }
 
+/** A non-2xx answer. `body` is the parsed JSON, or `{ raw }` when it was not JSON
+ *  (a proxy's HTML error page, an empty 502), and `type`/`requestId` are lifted from
+ *  the API's `{ error: { type, message, requestId } }` envelope when present. */
 export class ControlApiError extends Error {
+  readonly type: string | undefined;
+  readonly requestId: string | undefined;
   constructor(
     public readonly status: number,
     public readonly body: unknown,
   ) {
-    super(`control API ${status}`);
+    const env =
+      body && typeof body === 'object' && (body as { error?: unknown }).error
+        ? ((body as { error?: unknown }).error as Record<string, unknown>)
+        : undefined;
+    const message = env && typeof env['message'] === 'string' ? env['message'] : undefined;
+    super(`control API ${status}${message ? `: ${message}` : ''}`);
     this.name = 'ControlApiError';
+    this.type = env && typeof env['type'] === 'string' ? env['type'] : undefined;
+    this.requestId = env && typeof env['requestId'] === 'string' ? env['requestId'] : undefined;
   }
 }
+
+/** The request never got an HTTP answer: DNS/connect failure, or the deadline. */
+export class ControlNetworkError extends Error {
+  constructor(
+    message: string,
+    readonly timeout: boolean,
+    override readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'ControlNetworkError';
+  }
+}
+
+const DEFAULT_TIMEOUT_MS = 15_000;
 
 export interface Org {
   id: string;
@@ -81,6 +109,7 @@ export class ControlClient {
   private readonly baseUrl: string;
   private readonly token: string;
   private readonly f: typeof fetch;
+  private readonly timeoutMs: number;
 
   constructor(opts: ControlClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, '');
@@ -88,20 +117,43 @@ export class ControlClient {
     const injected = opts.fetch ?? globalThis.fetch;
     if (!injected) throw new Error('no fetch available; pass options.fetch');
     this.f = injected;
+    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
   private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = { authorization: `Bearer ${this.token}` };
     const hasBody = body !== undefined;
     if (hasBody) headers['content-type'] = 'application/json';
-    const res = await this.f(`${this.baseUrl}${path}`, {
-      method,
-      headers,
-      ...(hasBody ? { body: JSON.stringify(body) } : {}),
-    });
+    let res: Response;
+    try {
+      res = await this.f(`${this.baseUrl}${path}`, {
+        method,
+        headers,
+        ...(hasBody ? { body: JSON.stringify(body) } : {}),
+        ...(this.timeoutMs > 0 ? { signal: AbortSignal.timeout(this.timeoutMs) } : {}),
+      });
+    } catch (err) {
+      const timeout = (err as { name?: string }).name === 'TimeoutError';
+      throw new ControlNetworkError(
+        timeout
+          ? `control API ${method} ${path} timed out after ${this.timeoutMs} ms`
+          : `control API ${method} ${path} unreachable: ${err instanceof Error ? err.message : String(err)}`,
+        timeout,
+        err,
+      );
+    }
     const text = await res.text();
-    const json = text ? (JSON.parse(text) as unknown) : undefined;
+    let json: unknown;
+    let parsed = true;
+    try {
+      json = text ? (JSON.parse(text) as unknown) : undefined;
+    } catch {
+      parsed = false;
+      json = { raw: text.slice(0, 2_000) };
+    }
+    // A non-JSON body is never surfaced as a SyntaxError: the status is the signal.
     if (!res.ok) throw new ControlApiError(res.status, json);
+    if (!parsed) throw new ControlApiError(res.status, json);
     return json as T;
   }
 

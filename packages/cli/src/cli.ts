@@ -22,14 +22,18 @@
 import { mergeClaudeSettings, mergeCodexConfig } from './client-config';
 import {
   accessTokenIsFresh,
+  CorruptCredentialsError,
   credentialsPath,
   DEFAULT_PROFILE,
+  ENDPOINTS_TTL_MS,
+  expandHome,
   parseCredentials,
   serializeCredentials,
   type CredentialsFile,
   type StoredProfile,
 } from './credentials';
 import {
+  type BrokerEndpoints,
   discoverBroker,
   introspectAccessToken,
   OAuthFlowError,
@@ -82,7 +86,25 @@ const USAGE = [
 
 function loadFile(io: CliIo): { path: string; file: CredentialsFile } {
   const path = credentialsPath(io.homeDir, io.env);
-  return { path, file: parseCredentials(io.readText(path)) };
+  return { path, file: parseCredentials(io.readText(path), path) };
+}
+
+/** Broker endpoints for a profile: the cached set while fresh, else re-discovered
+ *  (and the cache refreshed on the next save). */
+async function endpointsFor(
+  io: CliIo,
+  p: StoredProfile,
+): Promise<{ endpoints: BrokerEndpoints; fresh: boolean }> {
+  const c = p.endpoints;
+  if (c && io.now() - c.at < ENDPOINTS_TTL_MS) {
+    const { at: _at, ...endpoints } = c;
+    return { endpoints, fresh: true };
+  }
+  return { endpoints: await discoverBroker(p.brokerUrl, io.fetch), fresh: false };
+}
+
+function cacheEndpoints(endpoints: BrokerEndpoints, now: number): StoredProfile['endpoints'] {
+  return { ...endpoints, at: now };
 }
 
 function saveFile(io: CliIo, path: string, file: CredentialsFile): void {
@@ -97,21 +119,30 @@ function describe(err: unknown): string {
 /** Returns a process exit code (0 = success). Never throws for expected errors. */
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [cmd] = argv;
-  switch (cmd) {
-    case 'login':
-      return login(argv.slice(1), io);
-    case 'token':
-      return token(argv.slice(1), io);
-    case 'logout':
-      return logout(argv.slice(1), io);
-    case 'status':
-      return status(argv.slice(1), io);
-    case 'verify':
-    case 'init':
-      return onboarding(argv, io);
-    default:
-      for (const l of USAGE) io.error(l);
-      return 2;
+  try {
+    switch (cmd) {
+      case 'login':
+        return await login(argv.slice(1), io);
+      case 'token':
+        return await token(argv.slice(1), io);
+      case 'logout':
+        return await logout(argv.slice(1), io);
+      case 'status':
+        return await status(argv.slice(1), io);
+      case 'verify':
+      case 'init':
+        return await onboarding(argv, io);
+      default:
+        for (const l of USAGE) io.error(l);
+        return 2;
+    }
+  } catch (err) {
+    // A corrupt credentials file used to surface as an opaque JSON.parse stack.
+    if (err instanceof CorruptCredentialsError) {
+      io.error(`error: ${err.message}`);
+      return 1;
+    }
+    throw err;
   }
 }
 
@@ -142,6 +173,13 @@ async function login(args: string[], io: CliIo): Promise<number> {
     });
     const { path, file } = loadFile(io);
     const now = io.now();
+    // Re-login over an existing profile: revoke the old family (best-effort) so it
+    // does not linger, unrevocable from this machine, until its absolute TTL.
+    const previous = file.profiles[profile];
+    if (previous && previous.refreshToken !== tokens.refreshToken) {
+      const { endpoints: prevEndpoints } = await endpointsFor(io, previous);
+      await revokeToken(prevEndpoints, previous.refreshToken, io.fetch);
+    }
     file.profiles[profile] = {
       brokerUrl: endpoints.issuer,
       clientId,
@@ -149,6 +187,7 @@ async function login(args: string[], io: CliIo): Promise<number> {
       accessExpiresAt: now + tokens.expiresIn * 1000,
       refreshToken: tokens.refreshToken,
       updatedAt: now,
+      endpoints: cacheEndpoints(endpoints, now),
     };
     saveFile(io, path, file);
     io.error(`✓ signed in — profile "${profile}" saved to ${path}`);
@@ -175,7 +214,7 @@ async function token(args: string[], io: CliIo): Promise<number> {
   // here — as "run gulley login" — instead of as opaque 401s from the gateway until
   // the cached token expires. A broker that cannot answer keeps the cached token.
   if (!force && accessTokenIsFresh(p, io.now())) {
-    const endpoints = await discoverBroker(p.brokerUrl, io.fetch);
+    const { endpoints } = await endpointsFor(io, p);
     const active = await introspectAccessToken(endpoints, p.accessToken, io.fetch);
     if (active !== false) {
       io.log(p.accessToken);
@@ -187,9 +226,9 @@ async function token(args: string[], io: CliIo): Promise<number> {
   // (now superseded) refresh token.
   const release = await io.lock(path);
   try {
-    const latest = parseCredentials(io.readText(path)).profiles[profile];
+    const latest = parseCredentials(io.readText(path), path).profiles[profile];
     const current = latest ?? p;
-    const endpoints = await discoverBroker(current.brokerUrl, io.fetch);
+    const { endpoints, fresh: cachedEndpoints } = await endpointsFor(io, current);
     if (
       latest &&
       !force &&
@@ -214,8 +253,9 @@ async function token(args: string[], io: CliIo): Promise<number> {
       accessExpiresAt: now + rotated.expiresIn * 1000,
       refreshToken: rotated.refreshToken,
       updatedAt: now,
+      ...(cachedEndpoints ? {} : { endpoints: cacheEndpoints(endpoints, now) }),
     };
-    const fresh = parseCredentials(io.readText(path));
+    const fresh = parseCredentials(io.readText(path), path);
     fresh.profiles[profile] = next;
     saveFile(io, path, fresh);
     io.log(next.accessToken);
@@ -236,13 +276,17 @@ async function logout(args: string[], io: CliIo): Promise<number> {
     io.error(`nothing to do: no credentials for profile "${profile}"`);
     return 0;
   }
-  const endpoints = await discoverBroker(p.brokerUrl, io.fetch);
+  const { endpoints } = await endpointsFor(io, p);
   // Revoking the refresh token kills the whole family (the access token with it).
-  await revokeToken(endpoints, p.refreshToken, io.fetch);
+  const revoked = await revokeToken(endpoints, p.refreshToken, io.fetch);
   delete file.profiles[profile];
   if (Object.keys(file.profiles).length === 0) io.deleteFile(path);
   else saveFile(io, path, file);
-  io.error(`✓ signed out — profile "${profile}" revoked and removed`);
+  if (revoked) io.error(`✓ signed out — profile "${profile}" revoked at the broker and removed`);
+  else
+    io.error(
+      `✓ signed out locally — profile "${profile}" removed, but the broker could not be reached to revoke it (the tokens expire on their own; an admin can revoke the grant in the console)`,
+    );
   return 0;
 }
 
@@ -309,7 +353,8 @@ async function onboarding(argv: string[], io: CliIo): Promise<number> {
   // init: write the verified client config, merging into an existing file so the
   // developer's other settings survive.
   const cfg = pack.manifest.config;
-  const out = flag(argv, 'out') ?? cfg.path;
+  // Pack paths are home-relative (`~/.codex/config.toml`): expand, never write `./~`.
+  const out = expandHome(flag(argv, 'out') ?? cfg.path, io.homeDir);
   const existing = io.readText(out);
   let content: string;
   try {

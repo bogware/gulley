@@ -102,7 +102,7 @@ aws ecr get-login-password --region "$AWS_REGION" \
 # The console proxies /control/* to the control-api at BUILD time (Next.js bakes the
 # rewrite destination), so the api host MUST be passed as a build arg:
 ( cd ../.. && docker buildx build --platform linux/arm64 \
-    --build-arg CONTROL_API_URL="https://$API_DOMAIN" \
+    --build-arg CONTROL_API_URL="https://$API_DOMAIN" \  # optional: the task env sets it at runtime
     -f apps/web/Dockerfile     -t "$ECR_WEB:latest" --push . )
 ```
 

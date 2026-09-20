@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Button,
   Cell,
@@ -51,37 +51,48 @@ export default function LogsPage() {
     [provider, model, status, errorsOnly],
   );
 
+  // Sequence guard: a slow earlier response must never overwrite a newer page.
+  const seq = useRef(0);
+
   const applyFilters = useCallback(async () => {
     if (!api) return;
+    const my = ++seq.current;
     setLoading(true);
     setError(undefined);
-    setSelected(null);
     try {
       const page = await api.logs(buildFilter(undefined));
+      if (my !== seq.current) return;
       setEntries(page.entries);
       setCursor(page.nextCursor);
+      // Keep the open drawer if its entry is still in the result set.
+      setSelected((cur) => (cur && page.entries.some((e) => e.id === cur.id) ? cur : null));
     } catch (e) {
-      setError(msg(e));
+      if (my === seq.current) setError(msg(e));
     } finally {
-      setLoading(false);
+      if (my === seq.current) setLoading(false);
     }
   }, [api, buildFilter]);
 
+  // Discrete controls (status, errors-only) apply immediately; the free-text fields
+  // apply on Enter / the Apply button — not a request per keystroke.
   useEffect(() => {
     void applyFilters();
-  }, [applyFilters]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, status, errorsOnly]);
 
   async function loadMore(): Promise<void> {
     if (!api || !cursor) return;
+    const my = ++seq.current;
     setLoading(true);
     try {
       const page = await api.logs(buildFilter(cursor));
+      if (my !== seq.current) return;
       setEntries((prev) => [...prev, ...page.entries]);
       setCursor(page.nextCursor);
     } catch (e) {
-      setError(msg(e));
+      if (my === seq.current) setError(msg(e));
     } finally {
-      setLoading(false);
+      if (my === seq.current) setLoading(false);
     }
   }
 
@@ -131,7 +142,7 @@ export default function LogsPage() {
         </div>
       </div>
 
-      {error ? <ErrorNote error={error} /> : null}
+      {error ? <ErrorNote error={error} onRetry={() => void applyFilters()} /> : null}
 
       <div className="flex gap-4">
         {/* table */}

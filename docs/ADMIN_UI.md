@@ -7,7 +7,9 @@ exist.
 > (`next build`). Auth supports both a **bootstrap/paste-token** flow (dev /
 > break-glass) and **Entra SSO** ("Sign in with SSO" — see
 > [ENTRA_SETUP.md](ENTRA_SETUP.md)). `pnpm --filter @gulley/web dev` serves it;
-> `/control/*` proxies to the control-api (`CONTROL_API_URL`, default :8081).
+> `/control/*` proxies to the control-api (`CONTROL_API_URL`, default :8081) — read at
+> **request time** by `app/control/[...path]/route.ts`, so one console image serves any
+> environment (the value is a runtime env, not a build arg).
 
 ## Stack
 
@@ -22,8 +24,10 @@ exist.
 The console authenticates against the control-api with an **admin session bearer
 token**. In production that token is minted by the **Entra OIDC login → admin
 session** gate (auth-code + PKCE; see [ENTRA_SETUP.md](ENTRA_SETUP.md)). For dev or
-break-glass, a **bootstrap admin token** is pasted into the console (stored in
-`localStorage`, sent as `Authorization: Bearer`).
+break-glass, a **bootstrap admin token** is pasted into the console (kept in
+`sessionStorage` for the tab's lifetime — never `localStorage` — and sent as
+`Authorization: Bearer`). Any `401` from the control-api signs the console out again
+and shows why; every call carries a 15 s deadline.
 
 ## Routes / pages
 

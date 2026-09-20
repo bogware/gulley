@@ -44,6 +44,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the migrations the build ships and report `/ready` 503 while the database is
   behind (or was never migrated) — `DB_SCHEMA_CHECK`.
 
+### Fixed (console, CLI, client)
+
+- **Console.** A `401` from any call signs the console out (with a reason) instead of
+  leaving a dead token in place; every call has a 15 s deadline and a typed
+  `ApiError`; every list panel shows the real error with a Retry instead of an empty
+  state; destructive actions (rotate/disable key, delete org/workspace/entity/suite,
+  revoke session/grant/membership) confirm first; the log browser no longer fetches per
+  keystroke and guards against out-of-order responses; the observability page backs
+  off while the gateway listener is down and labels a stale snapshot; the audit trail
+  pages with "Load more"; the shell shows the control API's real version and
+  reachability; the evidence-bundle download and log-level change report failures;
+  a route-segment error boundary replaces a blank page; security headers (CSP,
+  nosniff, frame-ancestors) are set; Export (CSV) and Hot-reload (save through the
+  audited route write) are wired; SSO keeps a deep link via a same-origin `return_to`.
+- **Console proxy.** `/control/*` is proxied at request time from `CONTROL_API_URL`
+  (a runtime env; one image per environment) instead of a build-time rewrite.
+- **CLI.** `gulley init` expands `~` in pack paths (it used to create `./~`); the
+  credential lock records its holder's pid and never evicts a live holder; broker
+  calls carry a 10 s deadline; discovery is cached in the profile; the credentials
+  file is written atomically and a corrupt one gives clear guidance; `logout` says
+  whether the broker actually revoked; re-login revokes the previous family; device
+  polling survives transient network errors.
+- **control-client.** Per-call deadline (`timeoutMs`), typed `ControlNetworkError`,
+  and a non-JSON error page keeps its status instead of surfacing as a `SyntaxError`.
+
 ### Changed
 
 - SCIM deprovision revokes every live session for the user (set-based, by subject
