@@ -154,7 +154,9 @@ notes first — the runtime image and the migration procedure changed.
   both apps (and the migrate / doctor / audit-verify entries) into `dist/`, stamps
   the version + git sha (`/health`, `gulley_build_info`, OTel `service.version`,
   log lines), and copies the migrations; the image is
-  `gcr.io/distroless/nodejs22-debian12:nonroot` with production-only, per-app dependency trees
+  `gcr.io/distroless/nodejs22-debian12:nonroot` (with Debian's current security build of
+  its `libssl3` overlaid, so a lagging base rebuild cannot fail the release scan) with
+  production-only, per-app dependency trees
   (`pnpm deploy`) — no tsx,
   esbuild, vitest, drizzle-kit, shell or package manager at runtime. The console
   image runs Next's standalone server on the same base. Trivy scans run **before**

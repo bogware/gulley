@@ -37,6 +37,16 @@ The console image (`ghcr.io/bogware/gulley-web`, `apps/web/Dockerfile`) is Next'
 standalone server on the same distroless base, published through the same
 scan-then-sign gate.
 
+**OS packages.** The distroless base is rebuilt on its own cadence, so between
+rebuilds one of its few OS packages (in practice `libssl3`) can lag a Debian security
+release — which fails the release scan, as intended. Both Dockerfiles therefore carry
+an `os-patch` stage that installs the current Debian bookworm build of that package
+and overlays it (shared objects plus the dpkg metadata in `/var/lib/dpkg/status.d`
+the scanner reads) on the runtime stage. Node links OpenSSL statically, so the system
+`libssl3` is not on its load path; the overlay keeps the image's OS surface current
+rather than carrying an exception. No `.trivyignore` exists: a finding the scan
+reports must be fixed in the image.
+
 ## The public images (GHCR)
 
 The public release images are multi-arch (`linux/amd64` + `linux/arm64`) and live at
