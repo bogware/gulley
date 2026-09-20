@@ -7,7 +7,7 @@ import {
   type Tracer,
 } from '@opentelemetry/api';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
-import { Resource } from '@opentelemetry/resources';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 
@@ -109,6 +109,9 @@ export function spanAttributes(data: RequestSpanData): Attributes {
   };
 }
 
+/** Upper bound on one OTLP export attempt (and the batch processor's export budget). */
+export const EXPORT_TIMEOUT_MS = 5_000;
+
 const NOOP: Telemetry = {
   recordRequest: () => {},
   forceFlush: async () => {},
@@ -130,20 +133,25 @@ export interface TelemetryOptions {
 export function initTelemetry(opts: TelemetryOptions): Telemetry {
   if (!opts.endpoint) return NOOP;
 
+  // Bounded export: the OTLP transport retries transient failures with backoff, and
+  // shutdown()/forceFlush() await the final export — cap both so a dead collector
+  // can never hold the SIGTERM drain hostage.
   const exporter = new OTLPTraceExporter({
     url: `${opts.endpoint.replace(/\/$/, '')}/v1/traces`,
-  });
-  const provider = new NodeTracerProvider({
-    resource: new Resource({ 'service.name': opts.serviceName ?? 'gulley-gateway' }),
+    timeoutMillis: EXPORT_TIMEOUT_MS,
   });
   // Bounded, non-blocking export; drops rather than back-pressuring the hot path.
-  provider.addSpanProcessor(
-    new BatchSpanProcessor(exporter, {
-      maxQueueSize: 2048,
-      maxExportBatchSize: 512,
-      scheduledDelayMillis: 1000,
-    }),
-  );
+  const provider = new NodeTracerProvider({
+    resource: resourceFromAttributes({ 'service.name': opts.serviceName ?? 'gulley-gateway' }),
+    spanProcessors: [
+      new BatchSpanProcessor(exporter, {
+        maxQueueSize: 2048,
+        maxExportBatchSize: 512,
+        scheduledDelayMillis: 1000,
+        exportTimeoutMillis: EXPORT_TIMEOUT_MS,
+      }),
+    ],
+  });
   provider.register();
   const tracer: Tracer = trace.getTracer('gulley-gateway');
 
