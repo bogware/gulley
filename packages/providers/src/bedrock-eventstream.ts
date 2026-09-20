@@ -123,8 +123,28 @@ function parseHeaders(buf: Buffer): Record<string, string> {
 export function bedrockToSse(upstream: Readable): Readable {
   const out = new PassThrough();
   const parser = new EventstreamParser();
+  // Set once an exception/error frame ended `out` cleanly: the upstream is then
+  // destroyed early, and an undici body reports that as its own 'error' — which must
+  // not destroy `out` and discard the shaped error frame still queued for the client.
+  let ended = false;
+
+  // Bedrock's exception/error frames arrive as the upstream's LAST message: shape them
+  // into the Anthropic `event: error` envelope the pipeline and every client SDK
+  // understand, then END the stream cleanly behind the frame — exactly how Anthropic's
+  // own API signals an in-band failure (the gateway books an `event: error` under a 200
+  // as an upstream fault: status error, breaker fault, request-log upstreamErrorFrame).
+  // Destroying `out` instead raced the frame: under client backpressure the PassThrough
+  // dropped it unread, and the gateway's error path appended a second, generic frame.
+  const failWithFrame = (type: string, message: string): void => {
+    ended = true;
+    out.end(
+      `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type, message } })}\n\n`,
+    );
+    upstream.destroy();
+  };
 
   upstream.on('data', (chunk: Buffer) => {
+    if (ended) return;
     let frames: EventstreamFrame[];
     try {
       frames = parser.push(chunk);
@@ -162,11 +182,7 @@ export function bedrockToSse(upstream: Readable): Readable {
           /* keep the generic message */
         }
         const type = f.headers[':exception-type'] ?? eventType ?? 'api_error';
-        out.write(
-          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type, message } })}\n\n`,
-        );
-        out.destroy(new EventstreamError(`bedrock ${type}: ${message}`));
-        upstream.destroy();
+        failWithFrame(type, message);
         return;
       } else if (messageType === 'error') {
         // The third eventstream message type: a transport-level error with the
@@ -174,11 +190,7 @@ export function bedrockToSse(upstream: Readable): Readable {
         // client saw a clean end with no message_stop and the request logged as ok.
         const code = f.headers[':error-code'] ?? 'unknown';
         const message = f.headers[':error-message'] ?? 'eventstream error';
-        out.write(
-          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: code, message } })}\n\n`,
-        );
-        out.destroy(new EventstreamError(`bedrock eventstream error ${code}: ${message}`));
-        upstream.destroy();
+        failWithFrame(code, message);
         return;
       }
     }
@@ -192,8 +204,12 @@ export function bedrockToSse(upstream: Readable): Readable {
       });
     }
   });
-  upstream.on('end', () => out.end());
-  upstream.on('error', (err: Error) => out.destroy(err));
+  upstream.on('end', () => {
+    if (!ended) out.end();
+  });
+  upstream.on('error', (err: Error) => {
+    if (!ended) out.destroy(err);
+  });
 
   return out;
 }

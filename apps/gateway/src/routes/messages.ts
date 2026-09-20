@@ -1922,6 +1922,52 @@ async function handleProxy(
 
   type UpstreamResp = Awaited<ReturnType<RouteTarget['adapter']['forward']>>;
 
+  // Billed legs OTHER than the served one — a cascade's discarded tier, a hedge leg the
+  // provider accepted but never answered (headers timeout). Each is metered (at its
+  // real usage when we have it, else worst-case — never $0/refund) and committed to the
+  // reserved scopes, and gets its own ledger row under a derived request id so
+  // per-leg spend stays attributable.
+  let cascadeExtraMicroUsd = 0; // spend on billed legs other than the served one
+  const cascadeLedgerRows: Array<{
+    suffix: string;
+    /** Which mechanism produced the leg — the ledger attribute key it is filed under. */
+    attr: 'cascade' | 'hedge';
+    provider: string;
+    model: string;
+    /** The model this leg was budget-RESERVED under (its `model:` cap scope), which can
+     *  differ from the response's reported model. */
+    capModel: string;
+    cost: ReturnType<typeof computeCost>;
+    micro: number;
+    status: RequestStatus;
+  }> = [];
+  // Charge a billed-but-discarded leg at worst-case (never $0/refund) — the provider
+  // generated + billed it, and (unlike the served leg) its bytes are NOT replayed to
+  // the client, so nothing else meters it. Charged even on a client abort: dropping it
+  // would refund real provider spend (violating "always meter on abort"). Always called
+  // with the model the leg was RESERVED under (`capModel`).
+  const chargeDiscarded = (
+    suffix: string,
+    attr: 'cascade' | 'hedge',
+    provider: string,
+    model: string,
+    bodyLen: number,
+    status: RequestStatus = 'ok',
+  ): void => {
+    const micro = estimateWorstCaseMicroUsd(provider, model, bodyLen, maxOutput, ctx.rateResolver);
+    cascadeExtraMicroUsd += micro;
+    cascadeLedgerRows.push({
+      suffix,
+      attr,
+      provider,
+      model,
+      capModel: model,
+      cost: computeCost(provider, model, emptyUsage(), ctx.rateResolver),
+      micro,
+      status,
+    });
+  };
+
   // Commit a chosen (pre-first-byte) upstream response as the one we serve: record
   // its TTFB to the outlier detector, hold the scoreboard + limiter slots, and
   // update the breaker. Shared by the sequential failover loop and the hedge race
@@ -1995,7 +2041,12 @@ async function handleProxy(
       }
     | { kind: 'failed'; target: RouteTarget }
     | { kind: 'saturated'; target: RouteTarget }
-    | { kind: 'aborted'; target: RouteTarget };
+    | { kind: 'aborted'; target: RouteTarget }
+    | { kind: 'timeout'; target: RouteTarget };
+  // Hedge legs the provider ACCEPTED but never answered (headers timeout): sent, most
+  // likely generating + billing, never cancelled pre-first-byte like a normal hedge
+  // loser — so each one is metered (settleHedgeTimeouts) and none is ever replayed.
+  const timedOutLegs: RouteTarget[] = [];
 
   const hedgeBranch = async (target: RouteTarget, signal: AbortSignal): Promise<BranchResult> => {
     let limiterAcquired = false;
@@ -2061,11 +2112,44 @@ async function handleProxy(
         ctx.breaker.releaseProbe(target.name);
         return { kind: 'failed', target };
       }
+      if (isHeadersTimeout(err)) {
+        // The request was SENT and the provider is (most likely) generating a long
+        // non-streamed answer it will bill — the sequential loop's never-replay rule
+        // applies to a hedge leg too. One breaker fault + a limiter drop, and the leg
+        // is remembered so runHedge meters it and refuses to fail over past the race.
+        request.log.warn({ target: target.name }, 'hedge leg headers timeout — never replayed');
+        ctx.breaker.recordFailure(target.name);
+        if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
+        timedOutLegs.push(target);
+        return { kind: 'timeout', target };
+      }
       request.log.warn({ target: target.name, err }, 'hedge branch error');
       ctx.breaker.recordFailure(target.name);
       if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
       return { kind: 'failed', target };
     }
+  };
+
+  // Settle the race's accepted-but-unanswered legs. With a winner, each is an extra
+  // worst-case ledger row (the served leg meters normally). Without one, the FIRST is
+  // metered as THE request — 504 + worst-case in teardown, exactly like the sequential
+  // loop's headers timeout — and any other as an extra row; the abort ends the request
+  // so no later candidate replays (and re-buys) the generation. Returns the index the
+  // sequential loop should resume from.
+  const settleHedgeTimeouts = (winner: Winner | undefined, nextIndex: number): number => {
+    if (timedOutLegs.length === 0) return nextIndex;
+    let extra = timedOutLegs;
+    if (!winner) {
+      headersTimedOut = true;
+      deadlineExceeded = true;
+      abortWith('deadline');
+      extra = extra.slice(1);
+      nextIndex = candidates.length;
+    }
+    for (const t of extra)
+      chargeDiscarded('hedge-timeout', 'hedge', t.provider, requestedModel, body.length, 'error');
+    timedOutLegs.length = 0;
+    return nextIndex;
   };
 
   const linkChild = (): AbortController => {
@@ -2138,6 +2222,8 @@ async function handleProxy(
         return { winner: raced.r, nextIndex: 2 };
       }
       if (raced.r.kind === 'aborted') return { nextIndex: candidates.length }; // client gone
+      // A headers timeout shorter than the hedge delay: never replayed (504 below).
+      if (raced.r.kind === 'timeout') return { nextIndex: settleHedgeTimeouts(undefined, 1) };
       return { nextIndex: 1 }; // A failed/saturated fast → failover to B normally
     }
     if (controller.signal.aborted) {
@@ -2152,7 +2238,7 @@ async function handleProxy(
       { p: pB, ctrl: ctrlB },
     ]);
     ctx.metrics?.recordHedge(winner?.target.name === b.name ? 'hedge_won' : 'primary_won');
-    return { winner, nextIndex: 2 };
+    return { winner, nextIndex: settleHedgeTimeouts(winner, 2) };
   };
 
   let startIndex = 0;
@@ -2343,20 +2429,10 @@ async function handleProxy(
   // byte only" holds. The chosen leg's bytes are buffered and REPLAYED as the served
   // body, so the derivations + capture + teardown below run unchanged on the final tier.
   // Every billed leg is metered (discarded/over-cap legs at worst-case, never $0, and
-  // committed to the reserved scopes). Degrades to serving tier-0 (a valid, weaker
-  // answer) on a tier-1 failure/over-cap; a tier-0 stall/error/over-cap fails CLOSED
-  // (its bytes can't be replayed byte-exact) but still charges its worst-case.
-  let cascadeExtraMicroUsd = 0; // spend on billed cascade legs other than the served one
-  const cascadeLedgerRows: Array<{
-    suffix: string;
-    provider: string;
-    model: string;
-    /** The model this leg was budget-RESERVED under (its `model:` cap scope), which can
-     *  differ from the response's reported model. */
-    capModel: string;
-    cost: ReturnType<typeof computeCost>;
-    micro: number;
-  }> = [];
+  // committed to the reserved scopes — see chargeDiscarded above). Degrades to serving
+  // tier-0 (a valid, weaker answer) on a tier-1 failure/over-cap; a tier-0 stall/error/
+  // over-cap fails CLOSED (its bytes can't be replayed byte-exact) but still charges its
+  // worst-case.
   let cascadeEscalatedFrom: string | undefined;
   if (cascade && upstream && served && upstream.statusCode < 400) {
     const capLimit = ctx.responseBufferLimit ?? JSON_PARSE_CAP;
@@ -2364,33 +2440,6 @@ async function handleProxy(
       served.alwaysStream === true ||
       served.adapter.alwaysStream === true ||
       parsed['stream'] === true;
-    // Charge a billed-but-discarded cascade leg at worst-case (never $0/refund) — the
-    // provider generated + billed it, and (unlike the served leg) its bytes are NOT
-    // replayed to the client, so nothing else meters it. Charged even on a client abort:
-    // dropping it would refund real provider spend (violating "always meter on abort").
-    const chargeDiscarded = (
-      suffix: string,
-      provider: string,
-      model: string,
-      bodyLen: number,
-    ): void => {
-      const micro = estimateWorstCaseMicroUsd(
-        provider,
-        model,
-        bodyLen,
-        maxOutput,
-        ctx.rateResolver,
-      );
-      cascadeExtraMicroUsd += micro;
-      cascadeLedgerRows.push({
-        suffix,
-        provider,
-        model,
-        capModel: model, // chargeDiscarded is always called with the reserved model
-        cost: computeCost(provider, model, emptyUsage(), ctx.rateResolver),
-        micro,
-      });
-    };
     let t0raw: Awaited<ReturnType<typeof readFully>> | undefined;
     try {
       t0raw = await readFully(
@@ -2406,7 +2455,7 @@ async function handleProxy(
       // Tier-0 could not be buffered (stall/error) or exceeded the cap → fail CLOSED (a
       // mid-body error must not surface as an implicit empty 200). It was billed, so
       // charge its worst-case rather than refunding the reservation.
-      chargeDiscarded('cascade-tier0', served.provider, requestedModel, body.length);
+      chargeDiscarded('cascade-tier0', 'cascade', served.provider, requestedModel, body.length);
       upstream = {
         statusCode: 502,
         headers: { 'content-type': 'application/json' },
@@ -2496,13 +2545,34 @@ async function handleProxy(
             });
           } catch (err) {
             resp1 = undefined;
-            // A genuine connection fault (not an abort, not a client-input refusal) is a
-            // breaker fault — mirror the main failover loop, else tier-1's circuit never
-            // opens on a hard-down target.
-            if (!controller.signal.aborted && !(err instanceof ProviderRequestError))
+            if (controller.signal.aborted || err instanceof ProviderRequestError) {
+              // An abort (client gone / deadline) or a client-input refusal is NOT an
+              // upstream fault: free the slot without adapting the limit, and hand back
+              // the half-open probe token this dispatch may have claimed — there is no
+              // verdict for it, and a stranded token sheds t1 for probeTimeoutMs.
+              if (t1LimiterAcquired) ctx.limiter?.release(t1.name);
+              ctx.breaker.releaseProbe(t1.name);
+            } else {
+              // A genuine connection fault is a breaker fault — mirror the main failover
+              // loop, else tier-1's circuit never opens on a hard-down target. Free the
+              // admission slot (fault → adapt the limit down), never leak it.
               ctx.breaker.recordFailure(t1.name);
-            // Free the admission slot (fault → adapt the limit down), never leak it.
-            if (t1LimiterAcquired) ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, true);
+              if (t1LimiterAcquired)
+                ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, true);
+              // A headers timeout means the escalation request was SENT and the
+              // provider is (most likely) generating + billing it: meter the leg at
+              // worst-case (never a $0 refund of its reservation) — the tier-0 answer
+              // is served, so nothing else would account for it.
+              if (isHeadersTimeout(err))
+                chargeDiscarded(
+                  'cascade-tier1',
+                  'cascade',
+                  cascade.provider,
+                  cascade.model,
+                  body.length,
+                  'error',
+                );
+            }
           }
         }
         if (resp1 && resp1.statusCode < 400) {
@@ -2538,6 +2608,7 @@ async function handleProxy(
             cascadeExtraMicroUsd += c0micro;
             cascadeLedgerRows.push({
               suffix: 'cascade-tier0',
+              attr: 'cascade',
               provider: served.provider,
               model: t0n.model ?? requestedModel,
               // requestedModel is still the tier-0 reserved model here (reassigned to
@@ -2545,6 +2616,7 @@ async function handleProxy(
               capModel: requestedModel,
               cost: c0,
               micro: c0micro,
+              status: 'ok',
             });
             cascadeEscalatedFrom = t0n.model ?? requestedModel;
             if (scoreboardHeld) {
@@ -2578,7 +2650,13 @@ async function handleProxy(
             // charge it at worst-case and fall back to serving tier-0. The upstream itself
             // was healthy (the cap is ours), so release the slot without a fault penalty.
             if (t1LimiterAcquired) ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, false);
-            chargeDiscarded('cascade-tier1', cascade.provider, cascade.model, body.length);
+            chargeDiscarded(
+              'cascade-tier1',
+              'cascade',
+              cascade.provider,
+              cascade.model,
+              body.length,
+            );
           }
         } else if (resp1) {
           // Classify the status against TIER-1's own strategy (it selected this target).
@@ -2931,8 +3009,9 @@ async function handleProxy(
           createdAt,
         });
       }
-      // Discarded / over-cap cascade legs: each its own ledger row under a derived id so
-      // per-tier spend stays attributable (the budget was already committed above).
+      // Discarded / over-cap cascade legs and accepted-but-unanswered hedge legs: each
+      // its own ledger row under a derived id so per-leg spend stays attributable (the
+      // budget was already committed above).
       for (const r of cascadeLedgerRows) {
         await ctx.ledger.record({
           requestId: `${requestId}#${r.suffix}`,
@@ -2943,8 +3022,8 @@ async function handleProxy(
           model: r.model,
           cost: r.cost,
           costMicroUsd: r.micro,
-          status: 'ok',
-          attributes: { ...attribution, cascade: r.suffix },
+          status: r.status,
+          attributes: { ...attribution, [r.attr]: r.suffix },
           createdAt,
         });
       }
@@ -3350,9 +3429,19 @@ async function handleProxy(
   // neither 'end' nor 'error', so without this teardown never runs and the
   // reservation leaks. Aborting drives the 'error' path → teardown → release.
   let watchdog: ReturnType<typeof setTimeout> | undefined;
+  // True while WE hold the upstream paused for client backpressure. The same idle
+  // budget then bounds the CLIENT's drain instead: a reader that never drains is a
+  // stalled client (torn down as a client abort — partial spend still metered, no
+  // breaker fault, no limiter drop), never a stalled upstream.
+  let pausedForClient = false;
   const resetWatchdog = (): void => {
     if (watchdog) clearTimeout(watchdog);
     watchdog = setTimeout(() => {
+      if (pausedForClient) {
+        request.log.warn({ target: servedTarget.name }, 'client socket never drained — aborting');
+        abortWith('client');
+        return;
+      }
       request.log.warn({ target: servedTarget.name }, 'upstream stream idle — aborting');
       abortWith('watchdog');
     }, ctx.streamInactivityMs ?? DEFAULT_STREAM_INACTIVITY_MS);
@@ -3438,8 +3527,18 @@ async function handleProxy(
         if (outBuf.length > 0) {
           const flushed = reply.raw.write(outBuf);
           if (!flushed) {
+            // The upstream is healthy and sending — it is the CLIENT that is behind.
+            // Re-arm the watchdog in client mode for the pause (the upstream cannot
+            // reset it while paused, so an idle fire here would otherwise be booked
+            // as an upstream stall: breaker fault + limiter drop on a good target).
+            pausedForClient = true;
+            resetWatchdog();
             upstreamBody.pause();
-            reply.raw.once('drain', () => upstreamBody.resume());
+            reply.raw.once('drain', () => {
+              pausedForClient = false;
+              resetWatchdog();
+              upstreamBody.resume();
+            });
           }
         }
         // M17: a block or fail-closed verdict terminates the stream AFTER the safe
@@ -3850,13 +3949,16 @@ async function handleProxy(
         streamed &&
         abortReason !== 'client' &&
         abortReason !== 'guardrail' &&
+        !sawUpstreamError &&
         !reply.raw.destroyed
       ) {
         // Non-buffered stream: headers (200) already flushed and bytes may have been
         // sent, so we can only append a clean terminal error frame before closing —
         // never a fresh body (that would corrupt the partial response). A gateway-
         // initiated abort (stall watchdog, transform fault) gets one too: a silent
-        // clean end looked like a complete answer to the client's SDK.
+        // clean end looked like a complete answer to the client's SDK. Not when the
+        // upstream's OWN terminal error frame was already relayed (sawUpstreamError):
+        // a second, generic frame after it would be a corrupt double error.
         try {
           reply.raw.write(
             providerErrorFrame(

@@ -216,7 +216,7 @@ describe('Bedrock', () => {
     await new Promise<void>((r) => srv.close(() => r()));
   });
 
-  it('eventstream: an exception frame is shaped as an Anthropic error and fails the stream; an error frame too', async () => {
+  it('eventstream: an exception frame is shaped as an Anthropic error frame and ENDS the stream cleanly behind it; an error frame too', async () => {
     for (const frame of [
       encodeFrame(
         { ':message-type': 'exception', ':exception-type': 'throttlingException' },
@@ -236,8 +236,41 @@ describe('Bedrock', () => {
       expect(r.text).toMatch(
         /"type":"error","error":\{"type":"(throttlingException|InternalError)"/,
       );
-      expect(r.error).toBeDefined();
+      // The frame IS the failure signal (like Anthropic's own `event: error`): no
+      // stream error behind it, so the gateway never appends a second generic frame.
+      expect(r.error).toBeUndefined();
+      expect(r.text.endsWith('\n\n')).toBe(true);
+      expect(up.destroyed).toBe(true); // the upstream socket is released early
     }
+  });
+
+  it('eventstream: the shaped error frame survives client backpressure and an undici-style abort error on the destroyed upstream', async () => {
+    // An undici body reports a plain destroy() as its own 'error' (RequestAbortedError).
+    // That must not destroy the SSE stream and discard the frame still queued for a
+    // slow client: the client reads the frame, then a clean end.
+    class UndiciLikeBody extends Readable {
+      override _read(): void {}
+      override _destroy(err: Error | null, cb: (e?: Error | null) => void): void {
+        cb(err ?? new Error('Request aborted'));
+      }
+    }
+    const up = new UndiciLikeBody();
+    const out = bedrockToSse(up);
+    let error: Error | undefined;
+    out.on('error', (e: Error) => (error = e));
+    up.push(
+      encodeFrame(
+        { ':message-type': 'exception', ':exception-type': 'modelStreamErrorException' },
+        Buffer.from('{"message":"stream broke"}'),
+      ),
+    );
+    await new Promise((r) => setTimeout(r, 20)); // nobody is reading `out` yet (backpressure)
+    expect(up.destroyed).toBe(true);
+    const r = await collect(out); // the slow client finally drains
+    expect(r.text).toContain('"type":"modelStreamErrorException"');
+    expect(r.text).toContain('"message":"stream broke"');
+    expect(r.error).toBeUndefined();
+    expect(error).toBeUndefined();
   });
 });
 

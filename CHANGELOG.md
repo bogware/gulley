@@ -44,6 +44,55 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the migrations the build ships and report `/ready` 503 while the database is
   behind (or was never migrated) — `DB_SCHEMA_CHECK`.
 
+### Fixed (gateway hot path)
+
+- **Abort attribution and the single teardown.** Every abort goes through one path
+  and destroys the live body, so a client disconnect during a slow pre-dispatch stage
+  is no longer forwarded and billed into a dead socket, and a replayed (cascade) or
+  paused (backpressure, decompressor) body can no longer strand its teardown. Only a
+  client disconnect is `aborted`; a watchdog stall, deadline, transform or socket
+  fault is an `error` with `abortReason` on the ledger, request log, audit row and
+  span, faults the breaker, and ends the stream with a terminal error frame instead
+  of a silent clean end.
+- **Never replay an accepted request.** A headers timeout (request sent, never
+  answered) is not retried on the same target, failed over, or replayed past a hedge
+  race: one breaker fault, a 504, the leg metered at worst case. A hedge leg or a
+  cascade tier-1 escalation the provider accepted but never answered is metered at
+  worst case beside the served leg (`#hedge-timeout` / `#cascade-tier1` ledger rows)
+  instead of refunded. `UPSTREAM_HEADERS_TIMEOUT_MS` (default 10 min) replaces the
+  hard-coded 60 s.
+- **Healthy upstreams are not blamed.** Client backpressure no longer trips the
+  inactivity watchdog against the paused upstream: the idle budget bounds the
+  client's drain, and a reader that never drains is torn down as a client abort with
+  its partial spend metered. Tenant-credential faults, adapter refusals
+  (`ProviderRequestError` → 400) and aborts release half-open probe tokens and
+  limiter slots without a fault — on the cascade escalation path too; the adaptive
+  limiter is fed time-to-first-byte against a windowed baseline; `Retry-After` is
+  clamped (5 min) and the breaker's ejection floor is capped at `maxCooldownMs`.
+- **In-band errors are failures.** An `event: error` / `{"error":…}` frame under a
+  200 (native, OpenAI-chat and Gemini translations, Bedrock `exception` and `error`
+  eventstream frames) is recorded as an error and faults the breaker. The Bedrock
+  frame is delivered ahead of a clean end even under client backpressure, and the
+  gateway never appends a second, generic frame behind an upstream's own.
+- **Metering.** Cached prompt tokens on translated routes are billed (they were
+  $0); a `stream:false` client on a translating adapter is metered from the SSE;
+  `max_tokens` is clamped so a negative value cannot skip the reservation; a
+  budget-downshifted answer is never cached under the original model's key; the
+  in-memory budget store no longer prunes an idle scope that still holds committed
+  spend (lifetime and long-window caps were silently reset to $0 once a day).
+- **Store outages degrade loudly.** Budget, rate-limit and cache-lookup fail-open
+  are logged, audited, metered (`gulley_store_errors_total`) and flagged on the
+  request log and span; key-store / grant-store outages answer 503 + `Retry-After`
+  with a generic body; every sink failure counts (`gulley_sink_errors_total`); a
+  completion record is emitted for every request, including denials and 5xx.
+- **Guardrails.** Hold-then-flush enforcement inspects the logical text of a
+  buffered stream (a secret split across two deltas passed as audit-only); the input
+  scan runs over the decoded JSON (a `@` escape evaded every detector); overlap
+  resolution is O(n log n) with a fail-closed 10k-finding cap; vault tokens carry a
+  per-vault nonce; a windowed-enforcer block is terminal for the SSE rewriters;
+  plugin verdicts compose with the native transform; plugin degradation is metered,
+  and the Azure / Bedrock plugins gain fail-closed knobs.
+
 ### Fixed (console, CLI, client)
 
 - **Console.** A `401` from any call signs the console out (with a reason) instead of

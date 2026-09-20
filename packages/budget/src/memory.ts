@@ -10,7 +10,8 @@ interface Counters {
 }
 
 /** Idle scopes are dropped after this long with no reservation activity, bounding the
- *  map on the counter-less path (attr:<key>:<value> scopes are client-controlled). */
+ *  map on the counter-less path (attr:<key>:<value> scopes are client-controlled) — but
+ *  only once they hold no live committed spend (see prune). */
 const IDLE_PRUNE_MS = 24 * 60 * 60 * 1000;
 const PRUNE_EVERY_N_RESERVES = 1_000;
 
@@ -72,7 +73,19 @@ export class InMemoryBudgetStore implements BudgetStore {
   private prune(nowMs: number): void {
     if (++this.reserves % PRUNE_EVERY_N_RESERVES !== 0) return;
     for (const [k, c] of this.counters) {
-      if (c.reserved.size === 0 && nowMs - c.lastTouchedMs > IDLE_PRUNE_MS) this.counters.delete(k);
+      if (c.reserved.size > 0 || nowMs - c.lastTouchedMs <= IDLE_PRUNE_MS) continue;
+      const budget = this.capFor(k);
+      if (!budget) {
+        this.counters.delete(k); // no cap any more → nothing to enforce against
+        continue;
+      }
+      // An idle scope still holding LIVE committed spend — a lifetime cap, or a window
+      // longer than the idle horizon — must survive: dropping it silently reset the cap
+      // to $0 spent (a lifetime cap could be breached again and again, once per day).
+      // Only a scope whose window has lapsed (or that never spent) is released; the
+      // forced 24 h window on attribution caps keeps client-controlled scopes bounded.
+      this.rollWindow(c, budget, nowMs);
+      if (c.committed === 0) this.counters.delete(k);
     }
   }
 

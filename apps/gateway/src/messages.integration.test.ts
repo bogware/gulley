@@ -22,6 +22,7 @@ import {
   AnthropicToOpenAIAdapter,
   AnthropicUsageExtractor,
   OpenAIUsageExtractor,
+  ProviderRequestError,
   SSEParser,
 } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
@@ -5994,6 +5995,388 @@ describe('translated routes (refine cycle 2026-09)', () => {
     expect(breaker.errorRate('openai-compat')).toBe(0);
     await app.close();
     await new Promise<void>((r) => up.close(() => r()));
+  });
+});
+
+describe('hot-path review fixes (refine cycle 2026-09, wave 9)', () => {
+  const MSG_START =
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":1}}}\n\n';
+
+  async function serve(
+    handler: (req: http.IncomingMessage, res: http.ServerResponse) => void,
+  ): Promise<{ url: string; close: () => Promise<void>; hits: () => number }> {
+    let hits = 0;
+    const srv = http.createServer((req, res) => {
+      hits += 1;
+      req.resume();
+      handler(req, res);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      close: () =>
+        new Promise<void>((r) => {
+          srv.closeAllConnections();
+          srv.close(() => r());
+        }),
+      hits: () => hits,
+    };
+  }
+
+  /** An upstream that answers only after `afterMs` (past a short headers timeout). */
+  const stallThenAnswer = (afterMs: number) =>
+    serve((_req, res) => {
+      const t = setTimeout(() => {
+        if (res.destroyed) return;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(GOLDEN_SSE);
+      }, afterMs);
+      res.on('close', () => clearTimeout(t));
+    });
+
+  it('hedge: a headers timeout on BOTH legs is never replayed — 504, one fault each, every accepted leg metered at worst case', async () => {
+    const a = await stallThenAnswer(3_000);
+    const b = await stallThenAnswer(3_000);
+    const c = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(GOLDEN_SSE);
+    });
+    const { store, token } = seededStore();
+    const { ctx, ledger, requestLog, breaker } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        hedgeDelayMs: 30,
+        strategy: {
+          mode: 'fallback',
+          targets: [
+            anthropicTarget('a', a.url),
+            anthropicTarget('b', b.url),
+            anthropicTarget('c', c.url),
+          ],
+        },
+      },
+    ];
+    ctx.upstreamHeadersTimeoutMs = 200;
+    ctx.retryMaxAttempts = 3;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4000,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(res.status).toBe(504);
+    await vi.waitFor(() => expect(ledger.entries.length).toBe(2));
+    // Neither accepted leg was replayed, and the third candidate was never dialed:
+    // failing over would buy the same generation a third time.
+    expect(a.hits()).toBe(1);
+    expect(b.hits()).toBe(1);
+    expect(c.hits()).toBe(0);
+    // The request row (leg A: 504, worst case) + leg B as its own worst-case row.
+    const main = ledger.entries.find((e) => !e.requestId.includes('#'))!;
+    const extra = ledger.entries.find((e) => e.requestId.endsWith('#hedge-timeout'))!;
+    expect(main.status).toBe('error');
+    expect(main.costMicroUsd).toBeGreaterThan(0);
+    expect(extra.status).toBe('error');
+    expect(extra.costMicroUsd).toBe(main.costMicroUsd);
+    expect(extra.attributes?.['hedge']).toBe('hedge-timeout');
+    expect(requestLog.entries[0]?.attributes?.['headersTimedOut']).toBe(true);
+    expect(breaker.errorRate('a')).toBeGreaterThan(0);
+    expect(breaker.errorRate('b')).toBeGreaterThan(0);
+    expect(breaker.errorRate('c')).toBe(0);
+    await app.close();
+    await Promise.all([a.close(), b.close(), c.close()]);
+  });
+
+  it('hedge: a primary that times out at headers while the hedge wins is metered at worst case beside the served leg', async () => {
+    // The primary's adapter reports undici's headers timeout (synthetic — undici's own
+    // timer coalesces to ~1 s, which would race the hedge delay) 100 ms in; the hedge is
+    // dispatched at 30 ms and answers at 300 ms. Order: hedge fired → primary accepted-
+    // but-unanswered → hedge wins. The primary must be metered, never replayed.
+    let slowCalls = 0;
+    let slowAbortedAfterTimeout = false;
+    const slow: RouteTarget = {
+      name: 'slow',
+      provider: 'anthropic',
+      adapter: {
+        name: 'slow',
+        forward: (req) =>
+          new Promise((_resolve, reject) => {
+            slowCalls += 1;
+            const onAbort = (): void => {
+              clearTimeout(t);
+              slowAbortedAfterTimeout = true; // cancelled BEFORE it timed out (a normal loser)
+              reject(new Error('aborted'));
+            };
+            const t = setTimeout(() => {
+              req.signal?.removeEventListener('abort', onAbort);
+              reject(
+                Object.assign(new Error('headers timeout'), {
+                  code: 'UND_ERR_HEADERS_TIMEOUT',
+                  name: 'HeadersTimeoutError',
+                }),
+              );
+            }, 100);
+            req.signal?.addEventListener('abort', onAbort, { once: true });
+          }),
+      },
+      credential: { scheme: 'x-api-key', value: UPSTREAM_KEY },
+      upstreamPath: '/v1/messages',
+    };
+    const fast = await serve((_req, res) => {
+      setTimeout(() => {
+        if (res.destroyed) return;
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(GOLDEN_SSE);
+      }, 300);
+    });
+    const { store, token } = seededStore();
+    const { ctx, ledger, breaker } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        hedgeDelayMs: 30,
+        strategy: { mode: 'fallback', targets: [slow, anthropicTarget('fast', fast.url)] },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-target')).toBe('fast');
+    expect(text).toContain('message_stop');
+    await vi.waitFor(() => expect(ledger.entries.length).toBe(2));
+    const served = ledger.entries.find((e) => !e.requestId.includes('#'))!;
+    const lost = ledger.entries.find((e) => e.requestId.endsWith('#hedge-timeout'))!;
+    expect(served.status).toBe('ok');
+    expect(served.cost.outputTokens).toBe(42); // the winner: real usage
+    expect(lost.status).toBe('error');
+    expect(lost.costMicroUsd).toBeGreaterThan(0); // the accepted primary: worst case, not $0
+    expect(lost.attributes?.['hedge']).toBe('hedge-timeout');
+    expect(slowCalls).toBe(1); // never replayed
+    expect(slowAbortedAfterTimeout).toBe(false); // it had already timed out when the hedge won
+    expect(breaker.errorRate('slow')).toBeGreaterThan(0); // one fault for the accepted-unanswered leg
+    expect(breaker.errorRate('fast')).toBe(0);
+    await app.close();
+    await fast.close();
+  });
+
+  const REFUSAL_SSE = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"id":"m","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1}}}',
+    '',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CHEAP-REFUSAL"}}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":2}}',
+    '',
+    'event: message_stop',
+    'data: {"type":"message_stop"}',
+    '',
+    '',
+  ].join('\n');
+
+  it('cascade: a tier-1 headers timeout serves tier-0 and meters the accepted escalation leg at worst case (no $0 refund)', async () => {
+    const tier1Hits: string[] = [];
+    const up = await serve((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        const model = String((JSON.parse(b) as { model?: string }).model ?? '');
+        if (model.includes('haiku')) {
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(REFUSAL_SSE);
+          return;
+        }
+        tier1Hits.push(model);
+        const t = setTimeout(() => {
+          if (res.destroyed) return;
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(GOLDEN_SSE);
+        }, 3_000); // past the headers timeout (undici fires a 200 ms one at ~1 s)
+        res.on('close', () => clearTimeout(t));
+      });
+    });
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', up.url) },
+      },
+    ];
+    ctx.cascade = [
+      { model: 'claude-haiku-*', escalateTo: 'claude-sonnet-4-6', stopReasons: ['refusal'] },
+    ];
+    ctx.upstreamHeadersTimeoutMs = 200;
+    ctx.retryMaxAttempts = 3;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'q' }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).toContain('CHEAP-REFUSAL'); // graceful fallback to the tier-0 answer
+    expect(tier1Hits).toEqual(['claude-sonnet-4-6']); // dispatched once, never replayed
+    await vi.waitFor(() => expect(ledger.entries.length).toBe(2));
+    const t1 = ledger.entries.find((e) => e.requestId.endsWith('#cascade-tier1'))!;
+    expect(t1.model).toBe('claude-sonnet-4-6');
+    expect(t1.status).toBe('error');
+    expect(t1.costMicroUsd).toBeGreaterThan(0); // worst case for the billed escalation
+    await app.close();
+    await up.close();
+  });
+
+  it('cascade: a tier-1 dispatch refused by its adapter hands the half-open probe token back (t1 is not shed for probeTimeoutMs)', async () => {
+    const up = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(REFUSAL_SSE);
+    });
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    // t1's breaker is HALF-OPEN: one ejection, cooldown elapsed. The cascade dispatch
+    // claims its single probe token; a dispatch with no verdict must release it.
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      cooldownMs: 1,
+      probeTimeoutMs: 60_000,
+    });
+    ctx.breaker = breaker;
+    breaker.recordFailure('strong');
+    await new Promise((r) => setTimeout(r, 5));
+    const refusing: RouteTarget = {
+      name: 'strong',
+      provider: 'anthropic',
+      adapter: {
+        name: 'refusing',
+        forward: async () => {
+          throw new ProviderRequestError('untranslatable request');
+        },
+      },
+      credential: { scheme: 'x-api-key', value: UPSTREAM_KEY },
+      upstreamPath: '/v1/messages',
+    };
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('cheap', up.url) },
+      },
+    ];
+    ctx.modelRouter = new ModelRouter([
+      {
+        pattern: 'claude-sonnet-4-6',
+        target: 'claude-sonnet-4-6',
+        strategy: { mode: 'single', target: refusing },
+      },
+    ]);
+    ctx.cascade = [
+      { model: 'claude-haiku-*', escalateTo: 'claude-sonnet-4-6', stopReasons: ['refusal'] },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'q' }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).toContain('CHEAP-REFUSAL');
+    // The probe token was handed back: the next caller may probe 'strong' again
+    // (a stranded token would return false here for the whole probeTimeoutMs).
+    expect(breaker.tryProbe('strong')).toBe(true);
+    await app.close();
+    await up.close();
+  });
+
+  it('streaming: a client that stops reading is torn down as a CLIENT abort — the paused, healthy upstream is never faulted', async () => {
+    // A big SSE body the client refuses to read: the gateway pauses the upstream for
+    // client backpressure. The idle watchdog then bounds the CLIENT's drain, not the
+    // upstream — status 'aborted', no breaker fault, partial spend still metered.
+    const bigDelta =
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"' +
+      'x'.repeat(4_000) +
+      '"}}\n\n';
+    let upstreamClosed = false;
+    const up = await serve((req, res) => {
+      req.on('close', () => {
+        upstreamClosed = true;
+      });
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START);
+      for (let i = 0; i < 8_000; i++) res.write(bigDelta); // ~32 MB, far past any socket buffer
+      // never ends: only the client's stall (or the gateway) ends this stream
+    });
+    const CAP = 10_000_000;
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: CAP }]]));
+    const { ctx, requestLog, breaker } = buildContext(store, budgets);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', up.url) },
+      },
+    ];
+    ctx.streamInactivityMs = 150;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    // Do NOT read the body: the gateway's client-bound socket fills and it pauses
+    // the upstream. The stall is torn down after the idle budget.
+    await vi.waitFor(() => expect(requestLog.entries.length).toBe(1), { timeout: 5_000 });
+    await vi.waitFor(() => expect(upstreamClosed).toBe(true));
+    const row = requestLog.entries[0]!;
+    expect(row.status).toBe('aborted');
+    expect(row.attributes?.['abortReason']).toBe('client');
+    expect(breaker.errorRate('anthropic')).toBe(0); // the upstream was healthy: no fault
+    expect(budgets.committed('ws_1')).toBeGreaterThan(0); // partial spend metered
+    await res.body?.cancel().catch(() => undefined);
+    await app.close();
+    await up.close();
   });
 });
 
