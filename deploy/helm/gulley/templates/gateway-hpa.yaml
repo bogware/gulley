@@ -18,9 +18,10 @@ spec:
   maxReplicas: {{ .Values.gateway.autoscaling.maxReplicas }}
   metrics:
     # CPU is a coarse fallback: a streaming proxy's real saturation is connection /
-    # event-loop bound, so add customMetrics (in-flight requests, event-loop lag) via a
-    # metrics adapter for accurate scale-out. CPU stays so clusters without an adapter
-    # still autoscale.
+    # event-loop bound, so add customMetrics derived from the gateway's own Prometheus
+    # metrics (e.g. a per-pod request rate from gulley_requests_total) via a metrics
+    # adapter for accurate scale-out. CPU stays so clusters without an adapter still
+    # autoscale.
     - type: Resource
       resource:
         name: cpu

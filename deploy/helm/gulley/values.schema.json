@@ -7,15 +7,25 @@
     "resources": {
       "type": "object",
       "properties": {
-        "requests": { "type": "object" },
-        "limits": { "type": "object" }
+        "requests": {
+          "type": "object"
+        },
+        "limits": {
+          "type": "object"
+        }
       }
     },
     "service": {
       "type": "object",
       "properties": {
-        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
-        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        "type": {
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer"]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
       }
     }
   },
@@ -24,81 +34,196 @@
       "type": "object",
       "required": ["repository"],
       "properties": {
-        "repository": { "type": "string", "minLength": 1 },
-        "tag": { "type": "string" },
-        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string"
+        },
+        "pullPolicy": {
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
       }
     },
-    "imagePullSecrets": { "type": "array" },
-    "nameOverride": { "type": "string" },
-    "fullnameOverride": { "type": "string" },
-    "existingSecret": { "type": "string" },
-    "allowCredentialsInConfig": { "type": "boolean" },
-    "config": { "type": "object" },
+    "imagePullSecrets": {
+      "type": "array"
+    },
+    "nameOverride": {
+      "type": "string"
+    },
+    "fullnameOverride": {
+      "type": "string"
+    },
+    "existingSecret": {
+      "type": "string"
+    },
+    "allowCredentialsInConfig": {
+      "type": "boolean"
+    },
+    "config": {
+      "type": "object"
+    },
     "serviceAccount": {
       "type": "object",
       "properties": {
-        "create": { "type": "boolean" },
-        "name": { "type": "string" },
-        "annotations": { "type": "object" }
+        "create": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object"
+        }
       }
     },
-    "podAnnotations": { "type": "object" },
-    "podSecurityContext": { "type": "object" },
-    "securityContext": { "type": "object" },
-    "nodeSelector": { "type": "object" },
-    "tolerations": { "type": "array" },
-    "affinity": { "type": "object" },
-    "defaultAntiAffinityTopologyKey": { "type": "string", "minLength": 1 },
+    "podAnnotations": {
+      "type": "object"
+    },
+    "podSecurityContext": {
+      "type": "object"
+    },
+    "securityContext": {
+      "type": "object"
+    },
+    "nodeSelector": {
+      "type": "object"
+    },
+    "tolerations": {
+      "type": "array"
+    },
+    "affinity": {
+      "type": "object"
+    },
+    "defaultAntiAffinityTopologyKey": {
+      "type": "string",
+      "minLength": 1
+    },
     "networkPolicy": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
-        "ingressNamespaceSelector": { "type": "object" },
-        "metricsNamespaceSelector": { "type": "object" },
-        "egressCIDRs": { "type": "array", "items": { "type": "string" } },
-        "egressPorts": { "type": "array", "items": { "type": "integer" } }
+        "enabled": {
+          "type": "boolean"
+        },
+        "ingressNamespaceSelector": {
+          "type": "object"
+        },
+        "metricsNamespaceSelector": {
+          "type": "object"
+        },
+        "egressCIDRs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "egressPorts": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        }
       }
     },
     "ingress": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
-        "className": { "type": "string" },
-        "annotations": { "type": "object" },
-        "hosts": { "type": "array" },
-        "tls": { "type": "array" }
+        "enabled": {
+          "type": "boolean"
+        },
+        "className": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object"
+        },
+        "hosts": {
+          "type": "array"
+        },
+        "tls": {
+          "type": "array"
+        }
       }
     },
     "gateway": {
       "type": "object",
       "required": ["enabled", "port"],
       "properties": {
-        "enabled": { "type": "boolean" },
-        "replicaCount": { "type": "integer", "minimum": 1 },
-        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "metricsPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "command": { "type": "array", "items": { "type": "string" } },
-        "service": { "$ref": "#/$defs/service" },
-        "resources": { "$ref": "#/$defs/resources" },
-        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
-        "drainBufferSeconds": { "type": "integer", "minimum": 1 },
-        "preStopSleepSeconds": { "type": "integer", "minimum": 0 },
+        "enabled": {
+          "type": "boolean"
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "metricsPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "service": {
+          "$ref": "#/$defs/service"
+        },
+        "resources": {
+          "$ref": "#/$defs/resources"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "drainBufferSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "preStopSleepSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
         "podDisruptionBudget": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
-            "maxUnavailable": { "type": ["integer", "string"] }
+            "enabled": {
+              "type": "boolean"
+            },
+            "maxUnavailable": {
+              "type": ["integer", "string"]
+            }
           }
         },
         "autoscaling": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
-            "minReplicas": { "type": "integer", "minimum": 1 },
-            "maxReplicas": { "type": "integer", "minimum": 1 },
-            "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 },
-            "customMetrics": { "type": "array" }
+            "enabled": {
+              "type": "boolean"
+            },
+            "minReplicas": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxReplicas": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "targetCPUUtilizationPercentage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "customMetrics": {
+              "type": "array"
+            }
           }
         }
       }
@@ -107,15 +232,68 @@
       "type": "object",
       "required": ["enabled", "port"],
       "properties": {
-        "enabled": { "type": "boolean" },
-        "replicaCount": { "type": "integer", "minimum": 1 },
-        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "command": { "type": "array", "items": { "type": "string" } },
-        "service": { "$ref": "#/$defs/service" },
-        "resources": { "$ref": "#/$defs/resources" },
-        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
-        "drainBufferSeconds": { "type": "integer", "minimum": 1 },
-        "preStopSleepSeconds": { "type": "integer", "minimum": 0 }
+        "enabled": {
+          "type": "boolean"
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "service": {
+          "$ref": "#/$defs/service"
+        },
+        "resources": {
+          "$ref": "#/$defs/resources"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "drainBufferSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "preStopSleepSeconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "migrate": {
+      "type": "object",
+      "description": "Schema-migration Job run as a Helm pre-install/pre-upgrade hook from the same image.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "backoffLimit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "activeDeadlineSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resources": {
+          "$ref": "#/$defs/resources"
+        }
       }
     }
   }

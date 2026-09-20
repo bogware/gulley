@@ -19,7 +19,7 @@ the admin console are delivered. Note scope caveats documented in ARCHITECTURE.m
 
 ## Commands
 
-Node ≥ 22 via corepack; pnpm 9. Turborepo drives the workspace.
+Node ≥ 22.9 via corepack; pnpm 9. Turborepo drives the workspace.
 
 ```bash
 pnpm install                     # corepack enable first if pnpm is missing

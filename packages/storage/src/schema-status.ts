@@ -69,13 +69,18 @@ export async function schemaStatus(
         ok: false,
         applied: null,
         expected,
-        reason: 'migrations never applied (run db:migrate)',
+        reason: 'migrations never applied (run the migrate entry)',
       };
     }
     throw err;
   }
   if (applied === null) {
-    return { ok: false, applied, expected, reason: 'migrations never applied (run db:migrate)' };
+    return {
+      ok: false,
+      applied,
+      expected,
+      reason: 'migrations never applied (run the migrate entry)',
+    };
   }
   if (expected === null) {
     return { ok: true, applied, expected, reason: 'bundled migration journal unavailable' };
@@ -85,7 +90,7 @@ export async function schemaStatus(
       ok: false,
       applied,
       expected,
-      reason: 'database schema is behind this build (run db:migrate)',
+      reason: 'database schema is behind this build (run the migrate entry)',
     };
   }
   if (applied > expected) {

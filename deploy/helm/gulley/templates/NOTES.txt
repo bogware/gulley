@@ -9,6 +9,13 @@ Planes:
 {{- end }}
 
 Image: {{ include "gulley.image" . }}
+{{- if .Values.migrate.enabled }}
+Schema: migrated by the pre-install/pre-upgrade hook Job {{ include "gulley.fullname" . }}-migrate
+        (both planes report /ready 503 until the schema matches this image)
+{{- else }}
+Schema: migrate.enabled=false — apply the bundled migrations yourself before the
+        planes can report /ready (see deploy/README.md)
+{{- end }}
 
 1. Watch the rollout:
      kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "gulley.fullname" . }}-gateway

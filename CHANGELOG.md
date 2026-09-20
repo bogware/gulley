@@ -6,6 +6,36 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-20
+
+The production-readiness release: a full review/refine pass over the data plane,
+the control plane, the console and CLI, and the runtime image. Read the upgrade
+notes first — the runtime image and the migration procedure changed.
+
+### Upgrade notes
+
+- **The runtime image is distroless and pre-bundled.** The entrypoints are
+  `node dist/gateway/main.mjs` and `node dist/control-api/main.mjs` (plus
+  `dist/gateway/doctor.mjs`, `dist/control-api/migrate.mjs`,
+  `dist/control-api/audit-verify.mjs`); there is no shell, `pnpm` or `tsx` in the
+  image. Any custom deployment that ran the apps through `pnpm`/`tsx` must switch to
+  the bundled entries. Helm chart 0.2.0 targets these entries and requires a v0.4.0+
+  image.
+- **Migrations run from the image.** Apply them with `node dist/control-api/migrate.mjs`
+  before starting the planes (compose runs the `migrate` service first; the ECS module
+  ships a one-off migrate task; on Kubernetes run it once per release). Migrations
+  `0021` (indexes, idempotent ledger writes, truncate guards) and `0022` (durable prompt
+  registry) ship in this release. Both planes now report `/ready` 503 until the schema
+  matches the build (`DB_SCHEMA_CHECK`, default on).
+- **Compose requires `GULLEY_KEY_PEPPER`** and forces `NODE_ENV=production`; the
+  console's control-API rewrite is now a runtime proxy, so set `CONTROL_API_URL` on the
+  console container instead of a build argument.
+- **Delegated admin sessions** (`POST /admin/sessions`) are always minted for the
+  calling admin; a caller-chosen `subject` is a label only, and at least one membership
+  is required.
+- **Image scans are strict** (`.trivyignore` removed): the release workflow fails on any
+  unfixed HIGH/CRITICAL finding in the runtime image.
+
 ### Security
 
 - **Delegated admin sessions cannot impersonate.** `POST /admin/sessions` always
@@ -124,7 +154,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   both apps (and the migrate / doctor / audit-verify entries) into `dist/`, stamps
   the version + git sha (`/health`, `gulley_build_info`, OTel `service.version`,
   log lines), and copies the migrations; the image is
-  `gcr.io/distroless/nodejs22` with production-only, per-app dependency trees
+  `gcr.io/distroless/nodejs22-debian12:nonroot` with production-only, per-app dependency trees
   (`pnpm deploy`) — no tsx,
   esbuild, vitest, drizzle-kit, shell or package manager at runtime. The console
   image runs Next's standalone server on the same base. Trivy scans run **before**
@@ -247,5 +277,6 @@ _Resolved during pre-release hardening (these never shipped in a public release)
   token on `x-api-key` as well as the bearer; IPv6 loopback (`[::1]`) PKCE redirects
   are accepted; and `gulley init` merges into an existing settings file.
 
-[Unreleased]: https://github.com/bogware/gulley/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bogware/gulley/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/bogware/gulley/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bogware/gulley/releases/tag/v0.3.0

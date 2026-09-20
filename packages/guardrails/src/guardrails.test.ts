@@ -29,25 +29,57 @@ describe('NativeDetector', () => {
     expect(cats(pem)).toContain('private_key');
   });
 
-  it('scans the private_key pattern in sub-quadratic time on hostile input (ReDoS guard)', () => {
-    // Many BEGIN anchors with NO matching END: an unbounded lazy gap rescans to EOS at
-    // each anchor — O(n²), seconds-to-minutes of event-loop block. The length-bounded
-    // gap keeps each anchor's scan bounded, so the whole pass is linear. Timing is
-    // machine-dependent, so assert the SCALING, not an absolute bound: doubling the
-    // input ~doubles a linear scan but ~quadruples a quadratic one.
+  it('scans the private_key pattern in linear time on hostile input (ReDoS guard)', () => {
+    // Many BEGIN anchors with NO matching END: a lazy-gap regex rescans its window at
+    // each anchor — O(anchors × window), seconds of event-loop block per request even
+    // with a 16 KiB bound (a CI runner timed out at 5 s). The purpose-built scanner
+    // collects the END anchors once and walks both lists with a cursor, so the pass is
+    // O(n). Timing is machine-dependent: assert a generous absolute bound plus, when
+    // the runs are long enough to be measurable, the scaling (2× input ≈ 2× time).
     const marker = '-----BEGIN PRIVATE KEY-----\n';
-    const measure = (repeats: number): number => {
-      const body = marker.repeat(repeats);
+    const measure = (body: string): number => {
       const t0 = performance.now();
       det.detect(body);
       return performance.now() - t0;
     };
-    measure(2_000); // warm up the JIT so the two timed runs are comparable
-    const small = measure(10_000); // ~280 KB
-    const large = measure(20_000); // ~560 KB — twice the input
-    expect(large).toBeLessThan(small * 3); // linear ≈ 2×; the pre-fix quadratic was ≈ 4×
-    // A hostile all-BEGIN body (no END) yields no private_key finding either way.
+    measure(marker.repeat(2_000)); // warm up the JIT so the timed runs are comparable
+    const small = measure(marker.repeat(10_000)); // ~280 KB
+    const large = measure(marker.repeat(20_000)); // ~560 KB — twice the input
+    expect(large).toBeLessThan(1_000); // the pre-fix scan took > 5 s here
+    if (small > 20) expect(large).toBeLessThan(small * 3);
+    // The other hostile shape: many BEGINs and ONE END far away (every anchor used to
+    // scan its full window before giving up).
+    const oneEnd = measure(marker.repeat(20_000) + '-----END PRIVATE KEY-----');
+    expect(oneEnd).toBeLessThan(1_000);
+    // No END within 16 KiB of any BEGIN → no private_key finding (a contiguous run of
+    // BEGINs ending in an END does match from the first BEGIN in range, as the regex did).
     expect(det.detect(marker.repeat(5_000)).map((f) => f.category)).not.toContain('private_key');
+    expect(
+      det
+        .detect(marker.repeat(1_000) + 'A'.repeat(17_000) + '-----END PRIVATE KEY-----')
+        .filter((f) => f.category === 'private_key'),
+    ).toHaveLength(0);
+  });
+
+  it('matches PEM blocks exactly like the documented regex (first END in range, non-overlapping)', () => {
+    const key = (n: number) =>
+      `-----BEGIN EC PRIVATE KEY-----\n${'Q'.repeat(n)}\n-----END EC PRIVATE KEY-----`;
+    // Two keys in one body: both found, each spanning exactly its own block.
+    const two = `x ${key(40)} y ${key(60)} z`;
+    const found = det.detect(two).filter((f) => f.category === 'private_key');
+    expect(found).toHaveLength(2);
+    expect(two.slice(found[0]!.start, found[0]!.end)).toBe(key(40));
+    expect(two.slice(found[1]!.start, found[1]!.end)).toBe(key(60));
+    // A BEGIN whose END lies beyond the 16 KiB bound is not a key, but the next
+    // well-formed block after it still is.
+    const far = `-----BEGIN PRIVATE KEY-----\n${'A'.repeat(20_000)}\n${key(30)}`;
+    const farFound = det.detect(far).filter((f) => f.category === 'private_key');
+    expect(farFound).toHaveLength(1);
+    expect(far.slice(farFound[0]!.start, farFound[0]!.end)).toBe(key(30));
+    // Header variants pair BEGIN/END by position, as the regex did (no type matching).
+    expect(cats('-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----')).toContain(
+      'private_key',
+    );
   });
 
   it('detects a large private key (>8KB body) at cache-excluding confidence (regression guard)', () => {

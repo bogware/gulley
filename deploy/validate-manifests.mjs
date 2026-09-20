@@ -53,6 +53,15 @@ try {
     if (!Array.isArray(cmd) || cmd[0] !== entry)
       fail(`values.yaml ${plane}.command must start with ${entry} (bundled runtime entry)`);
   }
+  // The schema-migration hook Job runs the bundled migrate entry from the same image.
+  const mig = values.migrate?.command;
+  if (
+    values.migrate?.enabled !== false &&
+    (!Array.isArray(mig) || mig[0] !== 'dist/control-api/migrate.mjs')
+  )
+    fail(
+      'values.yaml migrate.command must start with dist/control-api/migrate.mjs (bundled migrate entry)',
+    );
   ok('values.yaml');
 } catch (e) {
   fail(`values.yaml parse: ${e.message}`);
@@ -83,6 +92,17 @@ for (const file of readdirSync(tplDir)) {
     if (!/\{\{-?\s*define\b/.test(text)) fail(`templates/${file}: helper has no define`);
   }
   ok(`templates/${file}`);
+}
+// The migrate Job must be a pre-install + pre-upgrade hook: both planes gate /ready
+// on the schema version, so it has to run BEFORE the Deployments roll.
+try {
+  const job = readFileSync(join(tplDir, 'migrate-job.yaml'), 'utf8');
+  if (!/kind:\s*Job/.test(job)) fail('templates/migrate-job.yaml must define a Job');
+  if (!/helm\.sh\/hook:\s*pre-install,pre-upgrade/.test(job))
+    fail('templates/migrate-job.yaml must be a pre-install,pre-upgrade hook');
+  ok('templates/migrate-job.yaml is a pre-install/pre-upgrade hook');
+} catch (e) {
+  fail(`templates/migrate-job.yaml: ${e.message}`);
 }
 
 // --- docker-compose.prod.yml (one-command deploy) ---

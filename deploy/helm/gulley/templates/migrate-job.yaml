@@ -1,0 +1,91 @@
+{{- if .Values.migrate.enabled -}}
+# One-off schema migration, run as a Helm hook BEFORE the planes are (re)deployed.
+# Both planes gate /ready on the database schema matching their build, so an upgrade
+# that ships a migration would otherwise roll pods that never become Ready. The Job
+# carries its own env (on a first install it runs before the release's ConfigMap
+# exists) and projects the same Secret as the planes; DATABASE_URL comes from there.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gulley.fullname" . }}-migrate
+  labels:
+    {{- include "gulley.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: '0'
+    # A previous run is removed before the next starts and a successful Job is
+    # cleaned up; a FAILED Job is kept so its pod log can be read (the install /
+    # upgrade itself fails, and nothing rolls).
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrate.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "gulley.selectorLabels" (dict "root" . "plane" "migrate") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "gulley.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "gulley.image" . }}
+          imagePullPolicy: {{ include "gulley.pullPolicy" . }}
+          command:
+            {{- toYaml .Values.migrate.command | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if and (not .Values.allowCredentialsInConfig) (contains "@" (default "" .Values.config.DATABASE_URL)) }}
+          {{- fail "config.DATABASE_URL carries credentials (contains '@'); put it in the Secret named by existingSecret, or set allowCredentialsInConfig=true" }}
+          {{- end }}
+          # The same non-secret config the ConfigMap carries, inlined. Empty values are
+          # skipped so a key set in the Secret (DATABASE_URL) is not shadowed: explicit
+          # `env` entries take precedence over `envFrom`.
+          env:
+            - name: NODE_ENV
+              value: production
+            {{- range $k, $v := .Values.config }}
+            {{- if and (ne $k "extra") (kindIs "string" $v) (ne $v "") }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- end }}
+            {{- range $k, $v := .Values.config.extra }}
+            {{- if ne (toString $v) "" }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- end }}
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

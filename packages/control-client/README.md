@@ -28,8 +28,9 @@ const chain = await gulley.verifyPromptChain(prompt.id); // { verified, count }
 ```
 
 Every method sends the admin bearer token; a non-2xx response throws
-`ControlApiError` carrying the status and parsed body. Pass `fetch` explicitly in
-runtimes without a global `fetch`.
+`ControlApiError` carrying the status and parsed body (a non-JSON error page keeps
+its status), and a network failure or a per-call deadline (`timeoutMs`) throws
+`ControlNetworkError`. Pass `fetch` explicitly in runtimes without a global `fetch`.
 
 ## OpenAPI
 

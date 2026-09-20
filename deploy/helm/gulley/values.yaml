@@ -3,8 +3,9 @@
 
 image:
   repository: ghcr.io/bogware/gulley
-  # Defaults to the chart's appVersion when empty. Pin a release tag (or a digest) in
-  # production; a mutable `latest` tag is pulled with pullPolicy Always automatically.
+  # Defaults to the chart's appVersion when empty. Pin a release tag in production
+  # (the chart renders `repository:tag`, so a digest cannot go here); a mutable
+  # `latest` tag is pulled with pullPolicy Always automatically.
   tag: ''
   pullPolicy: IfNotPresent
 
@@ -71,15 +72,17 @@ gateway:
     targetCPUUtilizationPercentage: 70
     # CPU alone under-scales a streaming proxy (its load is connection/event-loop
     # bound). Add Pods/External metrics driven by the gateway's own Prometheus
-    # metrics (active in-flight requests per pod, event-loop lag) via a metrics
-    # adapter (prometheus-adapter / KEDA) — CPU stays as a coarse fallback. Each
-    # entry is a full autoscaling/v2 metric spec, appended verbatim to the HPA.
-    # REQUIRES an in-cluster metrics adapter AND that the gateway export the named
-    # metric; leave empty on clusters without one (CPU-only). Example:
+    # metrics via a metrics adapter (prometheus-adapter / KEDA) — CPU stays as a
+    # coarse fallback. Each entry is a full autoscaling/v2 metric spec, appended
+    # verbatim to the HPA. REQUIRES an in-cluster metrics adapter AND a metric the
+    # gateway actually exports (@gulley/metrics: gulley_requests_total,
+    # gulley_request_duration_seconds, gulley_tokens_total, … — it has no in-flight
+    # or event-loop-lag gauge, so derive a per-pod rate in the adapter); leave empty
+    # on clusters without one (CPU-only). Example (adapter-derived rate):
     #   customMetrics:
     #     - type: Pods
     #       pods:
-    #         metric: { name: gulley_gateway_inflight_requests }
+    #         metric: { name: gulley_requests_per_second }
     #         target: { type: AverageValue, averageValue: '40' }
     customMetrics: []
   # SIGTERM → bounded graceful drain. MUST exceed SHUTDOWN_GRACE_MS (derived below)
@@ -138,12 +141,33 @@ controlApi:
       periodSeconds: 5
       failureThreshold: 24
 
+# --- Schema migration (Helm hook: pre-install + pre-upgrade) ---
+# Runs the bundled migrate entry from the SAME image before the planes are
+# (re)deployed, so no pod ever rolls against a schema it does not know (both planes
+# gate /ready on the schema version). A failed Job fails the install/upgrade and is
+# kept for `kubectl logs`. Set enabled: false when migrations are applied out of band
+# (a pipeline step, the ECS migrate task) and run them yourself before upgrading.
+migrate:
+  enabled: true
+  command: ['dist/control-api/migrate.mjs']
+  backoffLimit: 2
+  # Hard cap on one migration run (seconds); a long-running data migration needs more.
+  activeDeadlineSeconds: 600
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
 podAnnotations: {}
 podSecurityContext:
   runAsNonRoot: true
-  runAsUser: 1000
+  # The distroless base's `nonroot` user (the image's files are owned by it).
+  runAsUser: 65532
   # emptyDir /tmp is group-writable for the non-root user under readOnlyRootFilesystem.
-  fsGroup: 1000
+  fsGroup: 65532
   # RuntimeDefault seccomp so the pods meet the restricted Pod Security Standard and
   # run with kernel-syscall confinement.
   seccompProfile:

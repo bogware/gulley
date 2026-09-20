@@ -36,15 +36,22 @@ kubectl -n gulley create secret generic gulley-secrets \
   --from-literal=ANTHROPIC_UPSTREAM_API_KEY=... \
   --from-literal=DATABASE_URL="postgres://gulley:<pw>@$(terraform output -raw aurora_endpoint):5432/gulley"
 
-# Phase 2 — install the chart:
-terraform apply -var-file=test.tfvars -var install_chart=true -var existing_secret_name=gulley-secrets
+# Phase 2 — install the chart (pin the release; the 0.2.x chart needs a v0.4.0+ image):
+terraform apply -var-file=test.tfvars -var install_chart=true \
+  -var existing_secret_name=gulley-secrets -var image_tag=v0.4.0
 ```
+
+The chart's pre-install/pre-upgrade hook Job (`<release>-migrate`, `migrate.enabled`)
+applies the bundled migrations from the same image before the planes roll; both
+planes report `/ready` 503 until the schema is current. Day-2 operations (upgrades,
+values, air-gapped registries) are in [`deploy/README.md`](../../deploy/README.md).
 
 ## What IRSA grants
 
 The chart's ServiceAccount is annotated (by the `helm_release`) with the IAM role in
 `terraform output gateway_irsa_role_arn`, whose trust is scoped to exactly
-`gulley/<name>-gateway-sa`. It grants `bedrock:InvokeModel*` and read of
+`gulley/<name>-gateway-sa`. It grants `bedrock:InvokeModel`,
+`bedrock:InvokeModelWithResponseStream`, `bedrock:ApplyGuardrail` and read of
 `secretsmanager:...:secret:gulley/*` — the SigV4 / provider-key access the data plane
 needs, with **no static keys on the node**.
 

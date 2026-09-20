@@ -32,13 +32,14 @@ KMS/Secrets/IAM · `data.tf` Aurora/Redis/WORM · `observability.tf` logs/ECR ·
 ## Deploy
 
 **Follow [INSTALL.md](./INSTALL.md)** — the exact, ordered runbook (two-phase apply,
-image build/push, secret population, migration, verification, teardown). Quick shape:
+image mirror/build, secret population, migration, verification, upgrades, teardown).
+Quick shape:
 
 ```sh
 cp test.tfvars.example test.tfvars     # edit domain_name, hosted_zone_id, bootstrap hash
 terraform init
 terraform apply -var-file=test.tfvars -var enable_services=false   # infra, 0 tasks
-# ... build+push images, populate secrets, run the migrate task ...
+# ... mirror the release images into ECR, populate secrets, run the migrate task ...
 terraform apply -var-file=test.tfvars                              # start services
 # ... test ...
 terraform destroy -var-file=test.tfvars                           # clean teardown

@@ -37,17 +37,19 @@ provider's credential for the request's workspace (Postgres `provider` +
 `provider_credential`, ARN → value via the `SecretResolver`, cached with a TTL);
 the gateway forwards upstream with that tenant's key, falling back to the
 gateway's default (env/route) credential when a tenant has none — so single-tenant
-deployments are unchanged. Tests cover the mechanism with an in-memory
+deployments are unchanged. A credential-resolution fault is answered without
+blaming the upstream (no breaker fault). Tests cover the mechanism with an in-memory
 `MapTenantCredentialResolver`; the DB resolver is exercised live.
 
-## Per-tenant routing (M14 D)
+## Per-tenant routing
 
 Beyond credentials, a workspace may **reroute a client path to its own
 strategy/provider**: tenant A's `/v1/messages` can serve Anthropic while tenant
-B's serves a self-hosted model. A `TenantRouteResolver` (in-process
-`MapTenantRouteResolver`; back a DB-driven one with an in-memory snapshot like the
-config reconciler) is consulted after authn — so the workspace is known — and its
-override wins over the shared route and the model router. It is resolved against
+B's serves a self-hosted model. A `TenantRouteResolver`
+(`apps/gateway/src/tenant-routes.ts`; the shipped implementation is the in-process
+`MapTenantRouteResolver` — a DB-driven one would be backed by an in-memory snapshot
+like the config reconciler) is consulted after authn — so the workspace is known —
+and its override wins over the shared route and the model router. It is resolved against
 the matched route's **full client-path alias set** (a route is indexed under every
 one of its `clientPaths`), so an override keyed under one alias applies to all of
 them — a client can't hit a sibling alias to slip its tenant routing pin. When the override

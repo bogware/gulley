@@ -75,6 +75,21 @@ export class NativeDetector implements Detector {
     const raw: Finding[] = [];
 
     for (const def of NATIVE_PATTERNS) {
+      const push = (index: number, value: string): void => {
+        if (!def.validate || def.validate(value)) {
+          raw.push({
+            category: def.category,
+            start: index,
+            end: index + value.length,
+            source: def.source,
+            confidence: def.confidence,
+          });
+        }
+      };
+      if (def.find) {
+        for (const hit of def.find(text)) push(hit.index, hit.value);
+        continue;
+      }
       def.regex.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = def.regex.exec(text)) !== null) {
@@ -83,15 +98,7 @@ export class NativeDetector implements Detector {
           def.regex.lastIndex++;
           continue;
         }
-        if (!def.validate || def.validate(value)) {
-          raw.push({
-            category: def.category,
-            start: m.index,
-            end: m.index + value.length,
-            source: def.source,
-            confidence: def.confidence,
-          });
-        }
+        push(m.index, value);
       }
     }
 

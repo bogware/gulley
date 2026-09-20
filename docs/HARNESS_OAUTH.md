@@ -50,7 +50,8 @@ CONTROL_API_PUBLIC_URL=https://api.gulley.acme.internal
 CONSOLE_PUBLIC_URL=https://gulley.acme.internal
 ```
 
-(The Terraform module sets all of these from `enable_oauth_broker = true`.)
+(The Terraform module always sets the two public URLs from the stack's DNS names and
+turns on `OAUTH_BROKER_ENABLED` for both planes with `enable_oauth_broker = true`.)
 
 Register the client in the console — **Identity → OAuth broker → Register a client**
 — or with the API:
@@ -80,10 +81,16 @@ pnpm gulley login --broker https://api.gulley.acme.internal --client claude-code
 ```
 
 `gulley token --profile claude-code` then prints a valid access token, refreshing it
-through the broker ahead of expiry (a cross-process lock serializes concurrent helper
-invocations so two agent sessions never replay the same refresh token). `gulley
-status` shows the profiles (never the secrets); `gulley logout` revokes the family and
-deletes the local credential. `GULLEY_CREDENTIALS` overrides the file location.
+through the broker ahead of expiry (`--force-refresh` forces one). A cross-process,
+pid-aware lock file next to the credentials serializes concurrent helper invocations so
+two agent sessions never replay the same refresh token (a crashed holder is reclaimed,
+a live one never evicted); the credentials file is written atomically with mode 0600;
+the broker's discovered endpoints are cached in the profile (6 h) and every broker call
+carries a 10 s deadline. `gulley status` shows the profiles (never the secrets);
+`gulley logout` revokes the family at the broker (and says so if the broker could not
+be reached) and deletes the local credential; logging in again over an existing profile
+revokes the previous family first. `GULLEY_CREDENTIALS` overrides the file location
+(default `~/.gulley/credentials.json`).
 
 ## 3. Point the agent at the gateway
 

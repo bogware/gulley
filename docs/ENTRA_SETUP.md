@@ -122,5 +122,6 @@ live admin session for that subject (and its email) in the same transaction.
 
 ## Roles
 
-Gulley RBAC roles: `owner`, `admin`, `editor`, `viewer` (deny-by-default; see
-`packages/rbac`). Map the least privilege each App Role/group needs.
+Gulley RBAC roles: `owner`, `admin`, `editor`, `billing`, `viewer` (deny-by-default;
+see `packages/rbac`). Map the least privilege each App Role/group needs; a mapping
+whose role is not one of these is rejected.

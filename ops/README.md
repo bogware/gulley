@@ -3,7 +3,10 @@
 Operator-facing observability for the Gulley gateway. Everything here is driven by
 the Prometheus metrics the gateway exposes on its **separate management listener**
 (`/metrics` on `METRICS_PORT`, default 9090 — never the data port) and the OTLP
-traces/logs it exports when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+traces/logs it exports when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The compose file
+(`deploy/docker-compose.prod.yml`) publishes that listener on `127.0.0.1:9090` only;
+the Helm chart annotates the gateway pods for scraping (`gateway.metricsAnnotations`).
+`gulley_build_info` carries the running version + git sha.
 
 ## `prometheus/gulley-slo-alerts.yml`
 

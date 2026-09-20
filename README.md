@@ -11,7 +11,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-2F5D8C.svg"></a>
   <img alt="Self-hostable" src="https://img.shields.io/badge/self--hostable-yes-2F5D8C.svg">
-  <img alt="Node ≥ 22" src="https://img.shields.io/badge/node-%E2%89%A522-2F5D8C.svg">
+  <img alt="Node ≥ 22.9" src="https://img.shields.io/badge/node-%E2%89%A522.9-2F5D8C.svg">
   <a href="https://developercertificate.org/"><img alt="DCO" src="https://img.shields.io/badge/commits-DCO%20signed-2F5D8C.svg"></a>
 </p>
 
@@ -41,7 +41,7 @@ control, and audit over every request.
 - **Coding-agent aware** — governs and _attributes_ the traffic Claude Code and Codex actually generate; in-stream (not buffered) source-code / secret DLP; the prompt cache the big cacheable prefixes depend on is metered, so you can see the dollars it saves.
 - **Enterprise identity** — Microsoft **Entra (Azure AD) SSO** for the console, JWT auth for the data plane, App-Role / group → RBAC, SCIM provisioning, and Graph-backed revoke-on-deprovision. See [`docs/ENTRA_SETUP.md`](docs/ENTRA_SETUP.md).
 - **Observability without lock-in** — emits OpenTelemetry (GenAI semantic conventions) to _your_ backend; enforces cost/rate limits locally; a Prometheus endpoint and a batteries-included admin console.
-- **Runs where you run** — one container for AWS ECS Fargate (a single adaptable [Terraform module](infra/terraform)), Kubernetes ([Helm](deploy/helm)), or a [docker-compose](deploy/docker-compose.prod.yml) self-host.
+- **Runs where you run** — one distroless container for AWS ECS Fargate (a single adaptable [Terraform module](infra/terraform)), Kubernetes ([Helm](deploy/helm), with an [EKS Terraform module](infra/eks)), or a [docker-compose](deploy/docker-compose.prod.yml) self-host.
 
 ## The console
 
@@ -71,35 +71,48 @@ topology, and a concrete integration-spec appendix — lives in
 apps/gateway       data plane: the streaming proxy + request pipeline
 apps/control-api   control plane: orgs, keys, routes, policies, OAuth/OIDC, SCIM
 apps/web           admin console (Next.js)
-packages/*         core, providers, routing, auth, rbac, budget, cost, catalog, cache,
-                   guardrails, pipeline, config, storage, telemetry, oauth, oidc, cel,
-                   crypto, worm, redact, egress, control-client
-infra/terraform    one adaptable AWS module (test/prod tiers) — see INSTALL.md
+packages/*         core, providers, routing, auth, rbac, budget, ratelimit, cost, catalog,
+                   cache, guardrails, pipeline, config, storage, telemetry, metrics, oauth,
+                   oidc, cel, crypto, worm, redact, egress, http-edge, prompts,
+                   control-client, cli
+infra/terraform    one adaptable AWS ECS module (test/prod tiers) — see INSTALL.md
+infra/eks          the EKS sibling module (AWS substrate for the Helm chart)
 deploy/            Helm chart + docker-compose self-host
+scripts/bundle.mjs esbuild bundling of both apps for the distroless runtime image
 ```
 
 ## Quick start (development)
 
-Prerequisites: **Node ≥ 22** (via [corepack](https://nodejs.org/api/corepack.html)), **Docker**.
+Prerequisites: **Node ≥ 22.9** (via [corepack](https://nodejs.org/api/corepack.html)), **Docker**.
 
 ```bash
-corepack enable                 # activates pnpm from package.json's packageManager
+corepack enable                            # activates pnpm from package.json's packageManager
 pnpm install
-cp .env.example .env            # local defaults; no real secrets
-docker compose up -d            # postgres (pgvector) + redis (cache/counters/vector)
-pnpm --filter @gulley/storage db:migrate
-pnpm dev                        # gateway (:8080), control-api (:8081), web (:3000)
+cp .env.example .env                       # dev defaults, no real secrets — then add your
+                                           # ANTHROPIC_UPSTREAM_API_KEY (no provider key = no routes)
+docker compose up -d                       # postgres (pgvector) + the three role-split redis
+pnpm --filter @gulley/control-api migrate  # apply the SQL migrations
+pnpm dev                                   # gateway (:8080), control-api (:8081), web (:3000)
 ```
 
-Point any Anthropic-Messages client at the gateway and send a request with a virtual key:
+Every workspace script (`dev`, `migrate`, `seed`, the `*:check` smoke tests) loads the
+repo-root `.env` itself (`--env-file-if-exists`), so nothing has to be exported into
+the shell; Turborepo's strict env mode is not in the way. The gateway answers `/ready`
+with 503 until at least one provider route is configured and the database schema is
+current, so check `curl -s localhost:8080/ready` before the first request.
+
+Mint a virtual key and point any Anthropic-Messages client at the gateway:
 
 ```bash
-# mint a key (prints a gk_ token once)
-DATABASE_URL=postgres://gulley:gulley@localhost:5432/gulley GULLEY_KEY_PEPPER=dev-pepper-1234567890 \
-  pnpm --filter @gulley/control-api seed --name dev
+# mint a key (prints a gk_ token once; DATABASE_URL + GULLEY_KEY_PEPPER come from .env)
+pnpm --filter @gulley/control-api seed --name dev
 
 export ANTHROPIC_BASE_URL=http://localhost:8080
-export ANTHROPIC_API_KEY=gk_...        # the printed token
+export ANTHROPIC_API_KEY=gk_...            # the printed token
+curl -s "$ANTHROPIC_BASE_URL/v1/messages" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-haiku-4-5","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}'
 # now Claude Code, Codex, or curl all flow through Gulley
 ```
 
@@ -110,13 +123,17 @@ developers run `pnpm gulley login` — Claude Code and Codex then fetch tokens t
 
 ## Deploy
 
-The release image is published multi-arch (amd64 + arm64) at
-**`ghcr.io/bogware/gulley`**, cosign-signed with an SBOM + SLSA provenance
-(`docker pull ghcr.io/bogware/gulley` — [how to verify](docs/SUPPLY_CHAIN.md)).
+Two release images are published multi-arch (amd64 + arm64), distroless, cosign-signed
+with SBOM + SLSA provenance: **`ghcr.io/bogware/gulley`** (one image runs either the
+gateway or the control-api) and **`ghcr.io/bogware/gulley-web`** (the console) —
+[how to verify](docs/SUPPLY_CHAIN.md). The SQL migrations ship in the API image
+(`node dist/control-api/migrate.mjs`).
 
-- **AWS (Terraform)** — one adaptable module, `test` and `prod` tiers, with an exact
+- **AWS ECS (Terraform)** — one adaptable module, `test` and `prod` tiers, with an exact
   agent/operator runbook: [`infra/terraform/INSTALL.md`](infra/terraform/INSTALL.md).
-- **Kubernetes** — [`deploy/helm/gulley`](deploy/helm/gulley).
+- **AWS EKS (Terraform)** — the sibling module that stands up the cluster + data tier
+  for the Helm chart: [`infra/eks`](infra/eks).
+- **Kubernetes** — [`deploy/helm/gulley`](deploy/helm/gulley); see [`deploy/README.md`](deploy/README.md).
 - **Single host** — [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml)
   (`up` migrates the database first, then starts both planes).
 - **Identity** — wire Microsoft Entra SSO + SCIM: [`docs/ENTRA_SETUP.md`](docs/ENTRA_SETUP.md).
@@ -124,13 +141,16 @@ The release image is published multi-arch (amd64 + arm64) at
 
 ## Common tasks
 
-| Command                            | What it does                                       |
-| ---------------------------------- | -------------------------------------------------- |
-| `pnpm dev`                         | Run all apps in watch mode                         |
-| `bash ci/verify.sh`                | The full local gate (format/lint/types/test/build) |
-| `pnpm test`                        | Unit/integration tests (Vitest)                    |
-| `pnpm db:generate`                 | Generate SQL migrations from the schema            |
-| `pnpm --filter @gulley/<pkg> test` | Test one package                                   |
+| Command                                     | What it does                                                 |
+| ------------------------------------------- | ------------------------------------------------------------ |
+| `pnpm dev`                                  | Run all apps in watch mode (each loads the repo-root `.env`) |
+| `bash ci/verify.sh`                         | The full local gate (format/lint/types/test/build/bundle)    |
+| `pnpm test`                                 | Unit/integration tests (Vitest)                              |
+| `pnpm --filter @gulley/<pkg> test`          | Test one package                                             |
+| `pnpm --filter @gulley/control-api migrate` | Apply the SQL migrations (same entry the image runs)         |
+| `pnpm db:generate`                          | Generate a SQL migration from the Drizzle schema             |
+| `pnpm bundle`                               | esbuild-bundle both apps into `dist/` (what the image runs)  |
+| `pnpm --filter @gulley/gateway doctor`      | Static preflight over the gateway config                     |
 
 ## Contributing
 
@@ -138,7 +158,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) and our [Code of Conduct](CODE_OF_CONDU
 Contributions are accepted under the
 [Developer Certificate of Origin](https://developercertificate.org/) — sign your commits
 with `git commit -s`. Report vulnerabilities privately via
-[Security Advisories](../../security/advisories/new); see [`SECURITY.md`](SECURITY.md).
+[Security Advisories](https://github.com/bogware/gulley/security/advisories/new); see
+[`SECURITY.md`](SECURITY.md).
 
 ## License
 

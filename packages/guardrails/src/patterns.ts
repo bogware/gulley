@@ -14,6 +14,50 @@ export interface PatternDef {
   confidence: number;
   /** Optional post-match validation (e.g. Luhn for card numbers). */
   validate?: (match: string) => boolean;
+  /** Optional purpose-built scanner used INSTEAD of `regex` (which then documents the
+   *  shape). For a pattern whose regex cannot be made linear on hostile input. */
+  find?: (text: string) => Array<{ index: number; value: string }>;
+}
+
+const PEM_BEGIN = /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g;
+const PEM_END = /-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g;
+/** Longest PEM body a BEGIN/END pair may enclose. 16 KiB covers real PEM/PGP private
+ *  keys with margin (RSA-16384 body ≈ 12.8 KB; RSA-4096 ≈ 3.2 KB) and must stay
+ *  comfortably ABOVE real key sizes: the 0.99-confidence finding is what excludes a
+ *  secret-bearing RESPONSE from the cache (cache-sensitivity is confidence-gated at 0.8;
+ *  the entropy fallback only reaches 0.4). */
+const PEM_MAX_BODY = 16384;
+
+/**
+ * Linear PEM private-key scanner. The regex form (`BEGIN…[\s\S]{0,16384}?…END`) is
+ * O(anchors × 16 KiB) on hostile input — a body of many `-----BEGIN` markers with no
+ * `-----END` made each anchor rescan its whole window (seconds of event-loop block per
+ * request even with the bound). Here every END anchor is collected in one pass and each
+ * BEGIN takes the first END after it with a moving cursor (both ascending), so the
+ * whole scan is O(n) whatever the anchor count. Match semantics equal the regex:
+ * first END within the bound, non-overlapping, scanning resumes after the END.
+ */
+export function findPemPrivateKeys(text: string): Array<{ index: number; value: string }> {
+  const ends: Array<{ index: number; end: number }> = [];
+  PEM_END.lastIndex = 0;
+  for (let m = PEM_END.exec(text); m !== null; m = PEM_END.exec(text))
+    ends.push({ index: m.index, end: m.index + m[0].length });
+  if (ends.length === 0) return [];
+  const out: Array<{ index: number; value: string }> = [];
+  let j = 0;
+  PEM_BEGIN.lastIndex = 0;
+  for (let m = PEM_BEGIN.exec(text); m !== null; m = PEM_BEGIN.exec(text)) {
+    const bodyStart = m.index + m[0].length;
+    while (j < ends.length && (ends[j] as { index: number }).index < bodyStart) j++;
+    if (j >= ends.length) break;
+    const e = ends[j] as { index: number; end: number };
+    if (e.index - bodyStart <= PEM_MAX_BODY) {
+      out.push({ index: m.index, value: text.slice(m.index, e.end) });
+      PEM_BEGIN.lastIndex = e.end;
+      j++;
+    }
+  }
+  return out;
 }
 
 /** Luhn checksum over the digits, restricted to [minLen, maxLen] digit runs. */
@@ -62,18 +106,12 @@ export const SECRET_PATTERNS: PatternDef[] = [
   {
     category: 'private_key',
     source: 'secret',
-    // The body gap is LENGTH-BOUNDED ({0,16384}), not an unbounded lazy `[\s\S]*?`.
-    // An unbounded gap makes the pass quadratic on hostile input: many `-----BEGIN`
-    // anchors with no matching `-----END` force an O(n)-to-EOS rescan at each of the
-    // O(n) anchors. 16 KiB covers real PEM/PGP private keys with margin (RSA-16384
-    // body ≈ 12.8 KB; RSA-4096 ≈ 3.2 KB) — the bound must stay comfortably ABOVE real
-    // key sizes because this high-confidence (0.99) finding is what excludes a
-    // secret-bearing RESPONSE from the cache (cache-sensitivity is confidence-gated at
-    // 0.8, and the entropy fallback only reaches 0.4). The residual linear cost on a
-    // hostile body is bounded by NativeDetector's maxScanBytes cap. The complete fix
-    // for untrusted regexes is RE2 (a documented seam; see the file header).
+    // Documents the shape; the scan itself is `findPemPrivateKeys` (linear on hostile
+    // input — see it for why a length-bounded lazy gap is not enough). The complete
+    // fix for untrusted CUSTOM regexes is RE2 (a documented seam; see the file header).
     regex:
       /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]{0,16384}?-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g,
+    find: findPemPrivateKeys,
     confidence: 0.99,
   },
   {

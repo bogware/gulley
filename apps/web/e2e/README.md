@@ -16,9 +16,9 @@ pnpm --filter @gulley/web e2e --grep smoke
 
 ## Full flows (seeded backend)
 
-`e2e/flows/*.spec.ts` sign in with a real admin token and navigate every route, asserting
-each page mounts and renders its header. They are **skipped** unless `E2E_ADMIN_TOKEN` is
-set. Point the run at a seeded stack:
+`e2e/flows/*.spec.ts` (today `navigate.spec.ts`) sign in with a real admin token and
+visit every console route, asserting each page mounts and renders its header. They are
+**skipped** unless `E2E_ADMIN_TOKEN` is set. Point the run at a seeded stack:
 
 ```bash
 # with a running control-api (seed orgs/workspaces/providers/keys first) and the web app
@@ -28,5 +28,5 @@ export PLAYWRIGHT_BASE_URL=http://127.0.0.1:3000               # an already-runn
 pnpm --filter @gulley/web e2e
 ```
 
-The full flows are the CI target once a seeded control-api fixture is stood up; the smoke
-layer is safe to run in any build job.
+Neither layer runs in `ci/verify.sh` yet. The full flows are the CI target once a seeded
+control-api fixture is stood up; the smoke layer is safe to run in any build job.

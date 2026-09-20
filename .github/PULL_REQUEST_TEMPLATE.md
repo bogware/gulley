@@ -10,7 +10,7 @@
 
 ## Checklist
 
-- [ ] `bash ci/verify.sh` passes locally (format, lint, typecheck, test, build)
+- [ ] `bash ci/verify.sh` passes locally (format, lint, typecheck, test, build, bundle)
 - [ ] Tests added/updated for the change
 - [ ] Docs updated if behavior or config changed (`.env.example`, `docs/`)
 - [ ] Commits are signed off (`git commit -s`) — DCO is required
@@ -18,7 +18,11 @@
 
 ## Hot path
 
-- [ ] This change touches the data-plane hot path (`apps/gateway/src/routes/messages.ts`,
-      `context.ts`, `packages/{budget,cost,cache,routing}`, `providers/src/sse.ts`).
-      If checked, describe how the invariants in
-      [`docs/HOTPATH_REVIEW.md`](../docs/HOTPATH_REVIEW.md) are preserved.
+- [ ] This change touches the data-plane hot path (`bash ci/hotpath-guard.sh` lists the
+      files: `apps/gateway/src/routes/messages.ts`, `context.ts`, `reconcile.ts`,
+      `packages/{budget,cost,cache,routing}`, `providers/src/sse.ts`, the Bedrock
+      eventstream decoder, the streaming guardrail primitives).
+      If checked, run the adversarial review in
+      [`docs/HOTPATH_REVIEW.md`](../docs/HOTPATH_REVIEW.md), describe how its invariants
+      are preserved, and put a `Hotpath-Reviewed:` trailer on a commit — the `hotpath`
+      CI job fails without one.

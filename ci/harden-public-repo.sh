@@ -26,7 +26,7 @@ gh api -X PATCH "repos/${REPO}" \
 echo "-> branch protection on main (PR review + required checks; no force-push/delete; admins may bypass)"
 gh api -X PUT "repos/${REPO}/branches/main/protection" --input - >/dev/null <<'JSON'
 {
-  "required_status_checks": { "strict": true, "contexts": ["verify", "hotpath", "terraform"] },
+  "required_status_checks": { "strict": true, "contexts": ["verify", "hotpath", "terraform", "deploy-manifests"] },
   "enforce_admins": false,
   "required_pull_request_reviews": { "required_approving_review_count": 1, "dismiss_stale_reviews": true },
   "restrictions": null,

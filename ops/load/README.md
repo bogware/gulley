@@ -1,8 +1,8 @@
 # Load & conformance harness
 
-Two complementary checks, both asserting the SLOs the M13 dashboards visualize
-(`ops/prometheus/gulley-slo-alerts.yml`): **availability 99.5%** (error ratio
-< 0.005; only 5xx/transport count) and **p99 end-to-end latency < 10s**.
+Two complementary checks, both asserting the SLOs the Grafana dashboard and alert
+rules encode (`ops/prometheus/gulley-slo-alerts.yml`): **availability 99.5%** (error
+ratio < 0.005; only 5xx/transport count) and **p99 end-to-end latency < 10s**.
 
 ## In-process load smoke (no deploy, no provider cost)
 

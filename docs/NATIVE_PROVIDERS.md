@@ -38,8 +38,10 @@ protocol:
 
 Text, thinking, tool-calls, and base64 images survive; only genuinely
 untranslatable content (e.g. a URL-sourced image, which Gemini's `inlineData`
-can't carry) is refused (`canTranslateAnthropicToGemini`) so nothing is silently
-mistranslated.
+can't carry) is refused (`canTranslateAnthropicToGemini` → `ProviderRequestError`,
+which the gateway answers as a terminal 400: no retry, no failover, no breaker
+fault) so nothing is silently mistranslated. A Gemini `error` frame inside a 200
+stream is relayed as an Anthropic `event: error` and recorded as a failure.
 
 ### Vertex auth (SA-JWT → OAuth2)
 
