@@ -1,6 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import { PassThrough, type Readable } from 'node:stream';
 import { SSEParser } from './sse';
-import type { ForwardRequest, ForwardResponse, ProviderAdapter } from './types';
+import {
+  type ForwardRequest,
+  type ForwardResponse,
+  type ProviderAdapter,
+  ProviderRequestError,
+} from './types';
 
 // --- Request: canonical Anthropic Messages -> OpenAI Chat Completions ---
 
@@ -25,6 +31,12 @@ function contentToText(content: unknown): string {
  * lost). Returns false when the request carries any such block.
  */
 export function canTranslateAnthropicToOpenAI(body: Record<string, unknown>): boolean {
+  // Top-level surfaces this translation cannot carry: tools / tool_choice (the model
+  // would answer in prose and the agent loop would never see a tool_use), thinking,
+  // structured-output config. Refuse loudly rather than drop them silently.
+  for (const k of ['tools', 'tool_choice', 'thinking', 'output_config', 'response_format']) {
+    if (body[k] !== undefined && body[k] !== null) return false;
+  }
   const messages = Array.isArray(body['messages']) ? (body['messages'] as unknown[]) : [];
   for (const m of messages) {
     const content = (m as Record<string, unknown>)['content'];
@@ -69,6 +81,7 @@ export function anthropicMessagesToOpenAIChat(
   };
   if (typeof body['max_tokens'] === 'number') out['max_tokens'] = body['max_tokens'];
   if (typeof body['temperature'] === 'number') out['temperature'] = body['temperature'];
+  if (typeof body['top_p'] === 'number') out['top_p'] = body['top_p'];
   const stop = body['stop_sequences'];
   if (Array.isArray(stop) && stop.length > 0) out['stop'] = stop;
   return out;
@@ -100,11 +113,22 @@ export function openaiChatSseToAnthropic(upstream: Readable, model: string): Rea
   const out = new PassThrough();
   const parser = new SSEParser();
   let started = false;
+  let sawError = false;
   let finish: string | null = null;
   let promptTokens = 0;
   let completionTokens = 0;
   let cachedTokens = 0;
-  const msgId = `msg_gulley_${Math.random().toString(36).slice(2, 12)}`;
+  const msgId = `msg_gulley_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+
+  // An in-band upstream error frame (`data: {"error":{…}}`, the real mid-stream
+  // shape) must surface as an Anthropic `event: error` AND a failed stream — not be
+  // swallowed into a clean `end_turn` + `message_stop` recorded as a 200 success.
+  const fail = (message: string): void => {
+    if (sawError) return;
+    sawError = true;
+    emit('error', { type: 'error', error: { type: 'api_error', message } });
+    out.destroy(new Error(`upstream error frame: ${message}`));
+  };
 
   const emit = (event: string, data: object): void => {
     out.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -133,6 +157,7 @@ export function openaiChatSseToAnthropic(upstream: Readable, model: string): Rea
   };
 
   const handle = (chunk: string): void => {
+    if (sawError) return;
     for (const ev of parser.push(chunk)) {
       const data = ev.data.trim();
       if (data === '[DONE]') continue;
@@ -141,6 +166,11 @@ export function openaiChatSseToAnthropic(upstream: Readable, model: string): Rea
         p = JSON.parse(data) as Record<string, unknown>;
       } catch {
         continue;
+      }
+      const errObj = p['error'] as Record<string, unknown> | undefined;
+      if (errObj && typeof errObj === 'object') {
+        fail(typeof errObj['message'] === 'string' ? errObj['message'] : 'upstream error');
+        return;
       }
       const usage = p['usage'] as Record<string, unknown> | undefined;
       if (usage) {
@@ -189,6 +219,7 @@ export function openaiChatSseToAnthropic(upstream: Readable, model: string): Rea
     } catch {
       /* best-effort */
     }
+    if (sawError) return; // already terminated with an error frame
     ensureStart();
     emit('content_block_stop', { type: 'content_block_stop', index: 0 });
     emit('message_delta', {
@@ -223,6 +254,8 @@ export interface AnthropicToOpenAIOptions {
 
 export class AnthropicToOpenAIAdapter implements ProviderAdapter {
   readonly name = 'anthropic->openai';
+  /** The translated upstream call is always streamed (see ProviderAdapter). */
+  readonly alwaysStream = true;
 
   constructor(private readonly opts: AnthropicToOpenAIOptions) {}
 
@@ -234,7 +267,9 @@ export class AnthropicToOpenAIAdapter implements ProviderAdapter {
       /* leave {} */
     }
     if (!canTranslateAnthropicToOpenAI(body)) {
-      throw new Error('request has provider-affine content; refusing cross-family translation');
+      throw new ProviderRequestError(
+        'request carries provider-affine content (tools, thinking, non-text blocks) that cannot be translated to this provider',
+      );
     }
 
     const openaiBody = anthropicMessagesToOpenAIChat(body, this.opts.targetModel);
@@ -244,6 +279,7 @@ export class AnthropicToOpenAIAdapter implements ProviderAdapter {
       headers: {},
       credential: req.credential,
       signal: req.signal,
+      headersTimeoutMs: req.headersTimeoutMs,
     });
 
     if (resp.statusCode >= 400) return resp; // upstream error passes through

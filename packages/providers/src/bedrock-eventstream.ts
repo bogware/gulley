@@ -151,7 +151,35 @@ export function bedrockToSse(upstream: Readable): Readable {
           /* skip a malformed chunk */
         }
       } else if (messageType === 'exception' || (eventType && eventType.endsWith('Exception'))) {
-        out.write(`event: error\ndata: ${f.payload.toString('utf8')}\n\n`);
+        // Shape Bedrock's `{"message":…}` into the Anthropic error envelope the
+        // pipeline and every client SDK understand, then FAIL the stream (an
+        // exception frame mid-stream is an upstream fault, not a clean end).
+        let message = 'bedrock exception';
+        try {
+          const j = JSON.parse(f.payload.toString('utf8')) as { message?: unknown };
+          if (typeof j.message === 'string') message = j.message;
+        } catch {
+          /* keep the generic message */
+        }
+        const type = f.headers[':exception-type'] ?? eventType ?? 'api_error';
+        out.write(
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type, message } })}\n\n`,
+        );
+        out.destroy(new EventstreamError(`bedrock ${type}: ${message}`));
+        upstream.destroy();
+        return;
+      } else if (messageType === 'error') {
+        // The third eventstream message type: a transport-level error with the
+        // detail in headers and an empty payload. It was silently dropped, so the
+        // client saw a clean end with no message_stop and the request logged as ok.
+        const code = f.headers[':error-code'] ?? 'unknown';
+        const message = f.headers[':error-message'] ?? 'eventstream error';
+        out.write(
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: code, message } })}\n\n`,
+        );
+        out.destroy(new EventstreamError(`bedrock eventstream error ${code}: ${message}`));
+        upstream.destroy();
+        return;
       }
     }
     // Propagate backpressure: the upstream is consumed via 'data' (not .pipe), so a

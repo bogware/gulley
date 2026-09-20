@@ -19,9 +19,14 @@ export interface BedrockGuardrailOptions {
   /** Interpret an intervention as a hard reject (`block`) or use the guardrail's
    *  anonymized text (`mask`). Default `block`. */
   mode?: 'block' | 'mask';
-  /** On transport/HTTP error: allow (fail-open, default) or reject (fail-closed). */
+  /** On transport/HTTP error: allow (fail-open) or reject (fail-closed). Note the
+   *  gateway wires this from GUARDRAILS_BEDROCK_FAIL_CLOSED (default CLOSED, like the
+   *  other enforcement plugins). */
   failClosed?: boolean;
   signal?: AbortSignal;
+  /** Per-call deadline (headers AND body). Default 3 s, like the other plugins — a
+   *  stalled ApplyGuardrail body previously pinned the request for undici's 300 s. */
+  timeoutMs?: number;
 }
 
 interface ApplyGuardrailResponse {
@@ -65,6 +70,12 @@ export class BedrockGuardrailPlugin implements GuardrailPlugin {
   async inspect(text: string, direction: GuardrailDirection): Promise<GuardrailPluginResult> {
     const source = direction === 'input' ? 'INPUT' : 'OUTPUT';
     const url = `${this.baseUrl}/guardrail/${encodeURIComponent(this.opts.guardrailId)}/version/${encodeURIComponent(this.version)}/apply`;
+    const timeoutMs = this.opts.timeoutMs ?? 3_000;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    timer.unref?.();
+    const onOuterAbort = (): void => ac.abort();
+    this.opts.signal?.addEventListener('abort', onOuterAbort, { once: true });
     try {
       const res = await request(url, {
         method: 'POST',
@@ -74,8 +85,10 @@ export class BedrockGuardrailPlugin implements GuardrailPlugin {
           accept: 'application/json',
         },
         body: JSON.stringify({ source, content: [{ text: { text } }] }),
-        signal: this.opts.signal,
-        headersTimeout: 30_000,
+        signal: ac.signal,
+        headersTimeout: timeoutMs,
+        bodyTimeout: timeoutMs,
+        maxRedirections: 0,
       });
       const bodyText = await res.body.text();
       if (res.statusCode >= 400) {
@@ -96,6 +109,9 @@ export class BedrockGuardrailPlugin implements GuardrailPlugin {
       return this.opts.failClosed
         ? { action: 'blocked', findings: [pluginFinding(text)] }
         : { action: 'none', findings: [] };
+    } finally {
+      clearTimeout(timer);
+      this.opts.signal?.removeEventListener('abort', onOuterAbort);
     }
   }
 }

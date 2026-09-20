@@ -83,6 +83,12 @@ export class OpenAIUsageExtractor implements UsageExtractor {
     const u = (json['usage'] ?? response?.['usage']) as Record<string, unknown> | undefined;
     if (u) this.apply(u);
     if (typeof json['status'] === 'string') this.stopReason = json['status'];
+    // Non-streamed chat.completions: the stop reason lives on the first choice (the
+    // stream path already reads it) — without it cascade escalation on `length` and
+    // the request-log stopReason were blank for every non-streamed chat call.
+    const choices = json['choices'] as Array<Record<string, unknown>> | undefined;
+    const finish = choices?.[0]?.['finish_reason'];
+    if (typeof finish === 'string') this.stopReason = finish;
   }
 
   private apply(u: Record<string, unknown>): void {

@@ -1,6 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import { PassThrough, type Readable } from 'node:stream';
 import { SSEParser } from './sse';
-import type { ForwardRequest, ForwardResponse, ProviderAdapter } from './types';
+import {
+  type ForwardRequest,
+  type ForwardResponse,
+  type ProviderAdapter,
+  ProviderRequestError,
+} from './types';
 
 /**
  * Native Google Gemini / Vertex AI `generateContent` translation.
@@ -65,17 +71,19 @@ export function canTranslateAnthropicToGemini(body: Record<string, unknown>): bo
 
 /** Coerce an Anthropic tool_result `content` (string | block[]) into the JSON
  *  object Gemini's functionResponse.response requires. */
-function toolResultResponse(content: unknown): Record<string, unknown> {
-  if (typeof content === 'string') return { result: content };
+function toolResultResponse(content: unknown, isError = false): Record<string, unknown> {
+  const wrap = (r: Record<string, unknown>): Record<string, unknown> =>
+    isError ? { ...r, error: true } : r;
+  if (typeof content === 'string') return wrap({ result: content });
   if (Array.isArray(content)) {
     const text = content
       .map((b) => textOf(b as Record<string, unknown>))
       .filter(Boolean)
       .join('\n');
-    return { result: text };
+    return wrap({ result: text });
   }
-  if (content && typeof content === 'object') return content as Record<string, unknown>;
-  return { result: content ?? null };
+  if (content && typeof content === 'object') return wrap(content as Record<string, unknown>);
+  return wrap({ result: content ?? null });
 }
 
 function partsForContent(content: unknown, toolNameById: Map<string, string>): GeminiPart[] {
@@ -100,13 +108,23 @@ function partsForContent(content: unknown, toolNameById: Map<string, string>): G
         block['input'] && typeof block['input'] === 'object'
           ? (block['input'] as Record<string, unknown>)
           : {};
-      parts.push({ functionCall: { name, args } });
+      const part: GeminiPart = { functionCall: { name, args } };
+      // Echo the thought signature Gemini attached to this call (relayed to the
+      // client as a signature_delta on the tool_use block) — mandatory on newer
+      // Gemini models for the function-calling contract.
+      if (typeof block['signature'] === 'string') part.thoughtSignature = block['signature'];
+      parts.push(part);
     } else if (block['type'] === 'tool_result') {
       // Gemini keys functionResponse on the function NAME, but the Anthropic block
       // carries only tool_use_id — resolve it from the prior tool_use blocks.
       const id = typeof block['tool_use_id'] === 'string' ? block['tool_use_id'] : '';
       const name = toolNameById.get(id) ?? id;
-      parts.push({ functionResponse: { name, response: toolResultResponse(block['content']) } });
+      parts.push({
+        functionResponse: {
+          name,
+          response: toolResultResponse(block['content'], block['is_error'] === true),
+        },
+      });
     } else if (isBase64Image(block)) {
       const source = block['source'] as Record<string, unknown>;
       parts.push({
@@ -206,8 +224,19 @@ export function anthropicToGemini(body: Record<string, unknown>): Record<string,
   if (typeof body['max_tokens'] === 'number') gen['maxOutputTokens'] = body['max_tokens'];
   if (typeof body['temperature'] === 'number') gen['temperature'] = body['temperature'];
   if (typeof body['top_p'] === 'number') gen['topP'] = body['top_p'];
+  if (typeof body['top_k'] === 'number') gen['topK'] = body['top_k'];
   const stop = body['stop_sequences'];
   if (Array.isArray(stop) && stop.length > 0) gen['stopSequences'] = stop;
+  // Anthropic `thinking: {type:'enabled', budget_tokens}` → Gemini thinkingConfig, so
+  // a client that asked for reasoning actually gets thought parts back (previously
+  // the field vanished and no thinking block could ever arrive).
+  const thinking = body['thinking'] as Record<string, unknown> | undefined;
+  if (thinking && typeof thinking === 'object' && thinking['type'] === 'enabled') {
+    const cfg: Record<string, unknown> = { includeThoughts: true };
+    if (typeof thinking['budget_tokens'] === 'number')
+      cfg['thinkingBudget'] = thinking['budget_tokens'];
+    gen['thinkingConfig'] = cfg;
+  }
   if (Object.keys(gen).length > 0) out['generationConfig'] = gen;
 
   return out;
@@ -244,9 +273,12 @@ function num(v: unknown, fallback = 0): number {
 export function geminiSseToAnthropic(upstream: Readable, model: string): Readable {
   const out = new PassThrough();
   const parser = new SSEParser();
-  const msgId = `msg_gulley_${model.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8)}`;
+  // A fresh id per response — a deterministic per-model id gave every Gemini
+  // response the same message.id, defeating client-side correlation.
+  const msgId = `msg_gulley_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
   let messageStarted = false;
+  let sawError = false;
   let open: { type: 'thinking' | 'text'; index: number } | null = null;
   let nextIndex = 0;
   let toolCallSeq = 0;
@@ -301,7 +333,7 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
   // Gemini delivers a whole functionCall (full args) in one part — no cross-chunk
   // accumulation. Emit the canonical Anthropic tool_use triple atomically, closing
   // any open text/thinking block first, and never leaving the block "open".
-  const emitToolUse = (name: string, args: Record<string, unknown>): void => {
+  const emitToolUse = (name: string, args: Record<string, unknown>, sig?: string): void => {
     closeBlock();
     ensureStart();
     const index = nextIndex++;
@@ -317,7 +349,25 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
       index,
       delta: { type: 'input_json_delta', partial_json: JSON.stringify(args ?? {}) },
     });
+    // Relay the thought signature riding on the functionCall part so the client can
+    // echo it back on the next turn (partsForContent re-attaches it).
+    if (sig)
+      emit('content_block_delta', {
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'signature_delta', signature: sig },
+      });
     emit('content_block_stop', { type: 'content_block_stop', index });
+  };
+
+  // An in-band Gemini error (`{"error":…}`) or a prompt-level block
+  // (`promptFeedback.blockReason`) must surface as an Anthropic `event: error` AND a
+  // failed stream — not a clean `end_turn` recorded as a 200 success.
+  const fail = (message: string): void => {
+    if (sawError) return;
+    sawError = true;
+    emit('error', { type: 'error', error: { type: 'api_error', message } });
+    out.destroy(new Error(`upstream error frame: ${message}`));
   };
 
   // A model-generated image part -> a canonical Anthropic image content block.
@@ -335,10 +385,12 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
 
   const handlePart = (part: Record<string, unknown>): void => {
     const fc = part['functionCall'] as { name?: unknown; args?: unknown } | undefined;
+    const partSig =
+      typeof part['thoughtSignature'] === 'string' ? part['thoughtSignature'] : undefined;
     if (fc && typeof fc.name === 'string') {
       const args =
         fc.args && typeof fc.args === 'object' ? (fc.args as Record<string, unknown>) : {};
-      emitToolUse(fc.name, args);
+      emitToolUse(fc.name, args, partSig);
       return;
     }
     const inline = part['inlineData'] as { mimeType?: unknown; data?: unknown } | undefined;
@@ -371,10 +423,19 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
         index: open?.index ?? 0,
         delta: { type: 'text_delta', text },
       });
+      // A signature on a TEXT part (Gemini attaches it to the last part of a turn):
+      // relay it so the client can echo it back on that text block.
+      if (sig)
+        emit('content_block_delta', {
+          type: 'content_block_delta',
+          index: open?.index ?? 0,
+          delta: { type: 'signature_delta', signature: sig },
+        });
     }
   };
 
   const handle = (chunk: string): void => {
+    if (sawError) return;
     for (const ev of parser.push(chunk)) {
       const data = ev.data.trim();
       if (!data || data === '[DONE]') continue;
@@ -383,6 +444,16 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
         p = JSON.parse(data) as Record<string, unknown>;
       } catch {
         continue;
+      }
+      const errObj = p['error'] as Record<string, unknown> | undefined;
+      if (errObj && typeof errObj === 'object') {
+        fail(typeof errObj['message'] === 'string' ? errObj['message'] : 'upstream error');
+        return;
+      }
+      const feedback = p['promptFeedback'] as Record<string, unknown> | undefined;
+      if (feedback && typeof feedback['blockReason'] === 'string') {
+        fail(`prompt blocked: ${feedback['blockReason']}`);
+        return;
       }
       const usage = p['usageMetadata'] as Record<string, unknown> | undefined;
       if (usage) {
@@ -423,6 +494,7 @@ export function geminiSseToAnthropic(upstream: Readable, model: string): Readabl
     } catch {
       /* best-effort */
     }
+    if (sawError) return; // already terminated with an error frame
     ensureStart();
     closeBlock();
     emit('message_delta', {
@@ -472,6 +544,8 @@ const DEFAULT_GEMINI_PATH = '/v1beta/models/{model}:streamGenerateContent?alt=ss
 
 export class GeminiNativeAdapter implements ProviderAdapter {
   readonly name = 'anthropic->gemini';
+  /** The translated upstream call is always streamed (see ProviderAdapter). */
+  readonly alwaysStream = true;
 
   constructor(private readonly opts: GeminiNativeOptions) {}
 
@@ -483,7 +557,9 @@ export class GeminiNativeAdapter implements ProviderAdapter {
       /* leave {} */
     }
     if (!canTranslateAnthropicToGemini(body)) {
-      throw new Error('request has provider-affine content; refusing cross-family translation');
+      throw new ProviderRequestError(
+        'request carries provider-affine content (a URL image or an unknown block) that cannot be translated to Gemini',
+      );
     }
 
     const geminiBody = anthropicToGemini(body);
@@ -502,6 +578,7 @@ export class GeminiNativeAdapter implements ProviderAdapter {
       headers: {},
       credential,
       signal: req.signal,
+      headersTimeoutMs: req.headersTimeoutMs,
     });
 
     if (resp.statusCode >= 400) return resp; // upstream error passes through

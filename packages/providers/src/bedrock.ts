@@ -2,7 +2,12 @@ import { assertSafePathSegment } from '@gulley/egress';
 import type { Readable } from 'node:stream';
 import { request } from 'undici';
 import { bedrockToSse } from './bedrock-eventstream';
-import type { ForwardRequest, ForwardResponse, ProviderAdapter } from './types';
+import {
+  type ForwardRequest,
+  type ForwardResponse,
+  type ProviderAdapter,
+  ProviderRequestError,
+} from './types';
 
 export interface BedrockAdapterOptions {
   region?: string;
@@ -44,8 +49,25 @@ export class BedrockAdapter implements ProviderAdapter {
     if (!('anthropic_version' in rest)) rest['anthropic_version'] = 'bedrock-2023-05-31';
 
     // The model id becomes a URL path segment; validate it before encoding so a
-    // hostile id (path traversal / control chars) can't reshape the upstream URL.
-    if (model) assertSafePathSegment(model, 'model');
+    // hostile id (path traversal / control chars) can't reshape the upstream URL. An
+    // application-inference-profile / provisioned-throughput / imported-model ARN
+    // legitimately contains `/` (encodeURIComponent neutralises it), so ARNs get
+    // their own strict shape check instead of the generic segment rule — the
+    // generic rule threw, which the pipeline counted as an UPSTREAM fault (a breaker
+    // trip after five such requests) and answered 502.
+    if (model) {
+      if (model.startsWith('arn:aws:bedrock:')) {
+        if (!BEDROCK_MODEL_ARN.test(model)) {
+          throw new ProviderRequestError(`invalid Bedrock model ARN: ${JSON.stringify(model)}`);
+        }
+      } else {
+        try {
+          assertSafePathSegment(model, 'model');
+        } catch (err) {
+          throw new ProviderRequestError((err as Error).message);
+        }
+      }
+    }
     const path = `/model/${encodeURIComponent(model)}/invoke-with-response-stream`;
     const res = await request(`${this.baseUrl}${path}`, {
       method: 'POST',
@@ -69,10 +91,22 @@ export class BedrockAdapter implements ProviderAdapter {
       };
     }
 
+    // Keep the upstream's correlation headers (x-amzn-requestid, bedrock latency /
+    // token counts) — dropping them made a Bedrock-side incident untraceable.
+    const passthrough: Record<string, string | string[] | undefined> = {};
+    for (const [k, v] of Object.entries(res.headers)) {
+      if (!['content-type', 'content-length', 'transfer-encoding', 'connection'].includes(k))
+        passthrough[k] = v;
+    }
     return {
       statusCode: res.statusCode,
-      headers: { 'content-type': 'text/event-stream' },
+      headers: { ...passthrough, 'content-type': 'text/event-stream' },
       body: bedrockToSse(res.body as unknown as Readable),
     };
   }
 }
+
+/** arn:aws:bedrock:<region>:<account>:<resource-type>/<id> — the shapes Bedrock's
+ *  modelId path parameter accepts besides a bare model id. */
+const BEDROCK_MODEL_ARN =
+  /^arn:aws:bedrock:[a-z0-9-]{1,32}:\d{12}:(application-inference-profile|inference-profile|provisioned-model|imported-model|custom-model|prompt-router)\/[A-Za-z0-9._:-]{1,128}$/;

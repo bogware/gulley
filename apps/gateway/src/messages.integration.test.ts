@@ -19,6 +19,7 @@ import { OidcProvider } from '@gulley/oidc';
 import { createSign, generateKeyPairSync } from 'node:crypto';
 import {
   AnthropicAdapter,
+  AnthropicToOpenAIAdapter,
   AnthropicUsageExtractor,
   OpenAIUsageExtractor,
   SSEParser,
@@ -5903,6 +5904,96 @@ describe('hot-path hardening (refine cycle 2026-09)', () => {
     expect(ledger.entries[0]!.status).toBe('error');
     await app.close();
     await stalled.close();
+  });
+});
+
+describe('translated routes (refine cycle 2026-09)', () => {
+  const OPENAI_SSE =
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n' +
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n' +
+    'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\n' +
+    'data: [DONE]\n\n';
+
+  function translateRoute(url: string): ProviderRoute {
+    const inner = new AnthropicAdapter({ baseUrl: url });
+    return {
+      clientPaths: ['/v1/messages'],
+      createExtractor: () => new AnthropicUsageExtractor(),
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'openai-compat',
+          provider: 'openai',
+          adapter: new AnthropicToOpenAIAdapter({ inner, targetModel: 'gpt-x' }),
+          credential: { scheme: 'bearer', value: 'k' },
+          upstreamPath: '/v1/chat/completions',
+        },
+      },
+    };
+  }
+
+  it('a stream:false client on an always-streaming translator is metered from the SSE, not $0', async () => {
+    const up = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(OPENAI_SSE);
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.routes = [translateRoute(url)];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'gpt-x',
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+    await vi.waitFor(() => expect(ledger.entries.length).toBe(1));
+    expect(ledger.entries[0]!.cost.outputTokens).toBe(3);
+    expect(ledger.entries[0]!.cost.totalInputTokens).toBe(7);
+    await app.close();
+    await new Promise<void>((r) => up.close(() => r()));
+  });
+
+  it('an untranslatable request is a 400 client error: no retry, no failover, no breaker fault', async () => {
+    let hits = 0;
+    const up = http.createServer((_req, res) => {
+      hits += 1;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(OPENAI_SSE);
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, breaker } = buildContext(store);
+    ctx.routes = [translateRoute(url)];
+    ctx.retryMaxAttempts = 3;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'gpt-x',
+        max_tokens: 10,
+        tools: [{ name: 'lookup', input_schema: { type: 'object' } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const json = (await res.json()) as { error: { type: string; message: string } };
+    expect(res.status).toBe(400);
+    expect(json.error.type).toBe('invalid_request_error');
+    expect(json.error.message).toContain('translated');
+    expect(hits).toBe(0);
+    expect(breaker.errorRate('openai-compat')).toBe(0);
+    await app.close();
+    await new Promise<void>((r) => up.close(() => r()));
   });
 });
 

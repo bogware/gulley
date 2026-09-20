@@ -61,6 +61,7 @@ import {
   OpenAiSseRewriter,
   parseRetryAfterMs,
   ResponsesSseRewriter,
+  ProviderRequestError,
   SSEParser,
   type TextTransform,
   type UsageExtractor,
@@ -1893,6 +1894,7 @@ async function handleProxy(
   let anyRealAttempt = false; // we actually forwarded to at least one upstream
   let credentialUnavailable = false; // a tenant credential could not be resolved
   let headersTimedOut = false; // the upstream accepted the request but never answered
+  let requestError: ProviderRequestError | undefined; // the adapter refused the request itself
   let dispatchMs: number | undefined; // when we dispatched to the serving target
   let firstByteMs: number | undefined; // when its response headers arrived
 
@@ -2050,6 +2052,12 @@ async function handleProxy(
         if (limiterAcquired) ctx.limiter?.release(target.name);
         ctx.breaker.releaseProbe(target.name);
         return { kind: 'aborted', target };
+      }
+      if (err instanceof ProviderRequestError) {
+        requestError = err;
+        if (limiterAcquired) ctx.limiter?.release(target.name);
+        ctx.breaker.releaseProbe(target.name);
+        return { kind: 'failed', target };
       }
       request.log.warn({ target: target.name, err }, 'hedge branch error');
       ctx.breaker.recordFailure(target.name);
@@ -2260,6 +2268,12 @@ async function handleProxy(
           resp = r;
           break;
         } catch (err) {
+          if (err instanceof ProviderRequestError) {
+            // A CLIENT error (untranslatable request, unsafe model id): no same-target
+            // retry, no failover, no breaker fault — answer 400 below.
+            requestError = err;
+            break;
+          }
           request.log.warn({ target: target.name, err, attempt }, 'target attempt error');
           if (controller.signal.aborted) break;
           if (isHeadersTimeout(err)) {
@@ -2283,6 +2297,11 @@ async function handleProxy(
       }
 
       if (!resp) {
+        if (requestError) {
+          if (limiterAcquired) ctx.limiter?.release(target.name);
+          ctx.breaker.releaseProbe(target.name);
+          break;
+        }
         // An abort — client disconnect OR the pre-first-byte deadline — is NOT an
         // upstream fault: free the limiter slot without adapting the limit and do
         // not blame the breaker (mirrors the hedge path). Attributing a gateway/
@@ -2339,7 +2358,10 @@ async function handleProxy(
   let cascadeEscalatedFrom: string | undefined;
   if (cascade && upstream && served && upstream.statusCode < 400) {
     const capLimit = ctx.responseBufferLimit ?? JSON_PARSE_CAP;
-    const tier0Streamed = served.alwaysStream === true || parsed['stream'] === true;
+    const tier0Streamed =
+      served.alwaysStream === true ||
+      served.adapter.alwaysStream === true ||
+      parsed['stream'] === true;
     // Charge a billed-but-discarded cascade leg at worst-case (never $0/refund) — the
     // provider generated + billed it, and (unlike the served leg) its bytes are NOT
     // replayed to the client, so nothing else meters it. Charged even on a client abort:
@@ -2470,11 +2492,13 @@ async function handleProxy(
               signal: controller.signal,
               headersTimeoutMs: ctx.upstreamHeadersTimeoutMs,
             });
-          } catch {
+          } catch (err) {
             resp1 = undefined;
-            // A genuine connection fault (not an abort) is a breaker fault — mirror the
-            // main failover loop, else tier-1's circuit never opens on a hard-down target.
-            if (!controller.signal.aborted) ctx.breaker.recordFailure(t1.name);
+            // A genuine connection fault (not an abort, not a client-input refusal) is a
+            // breaker fault — mirror the main failover loop, else tier-1's circuit never
+            // opens on a hard-down target.
+            if (!controller.signal.aborted && !(err instanceof ProviderRequestError))
+              ctx.breaker.recordFailure(t1.name);
             // Free the admission slot (fault → adapt the limit down), never leak it.
             if (t1LimiterAcquired) ctx.limiter?.record(t1.name, Date.now() - t1ForwardStart, true);
           }
@@ -2580,7 +2604,10 @@ async function handleProxy(
     }
   }
 
-  const streamed = served?.alwaysStream === true || parsed['stream'] === true;
+  const streamed =
+    served?.alwaysStream === true ||
+    served?.adapter.alwaysStream === true ||
+    parsed['stream'] === true;
   const provider = served?.provider ?? provider0;
 
   // Metering parser: bound its internal buffer and DROP a pathological oversized event
@@ -3231,7 +3258,7 @@ async function handleProxy(
     const shed = anySaturation && !anyRealAttempt;
     const credentialOutage = credentialUnavailable && !anyRealAttempt && !shed;
     status = abortReason === 'client' ? 'aborted' : 'error';
-    statusCode = shed || credentialOutage ? 503 : deadlineExceeded ? 504 : 502;
+    statusCode = requestError ? 400 : shed || credentialOutage ? 503 : deadlineExceeded ? 504 : 502;
     if (shed) ctx.metrics?.recordShed('capacity');
     await runTeardown();
     if (!reply.sent) {
@@ -3243,6 +3270,11 @@ async function handleProxy(
             type: 'error',
             error: { type: 'overloaded_error', message: 'all upstreams at capacity' },
           });
+      } else if (requestError) {
+        await reply.code(400).send({
+          type: 'error',
+          error: { type: 'invalid_request_error', message: requestError.message },
+        });
       } else if (credentialOutage) {
         await reply
           .code(503)

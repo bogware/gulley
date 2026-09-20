@@ -15,7 +15,34 @@ const HOP_BY_HOP = new Set([
 
 // Client auth + framing headers we never forward. The gateway attaches the
 // upstream credential itself, so the client's virtual key never reaches upstream.
-const STRIP = new Set(['authorization', 'x-api-key', 'host', 'content-length', 'accept-encoding']);
+// Also stripped: the caller's network identity (an ALB stamps x-forwarded-for with
+// the END USER's IP, browsers send cookies), proxy tracing, the gateway's own
+// x-gulley-* headers, and OpenAI org/project selectors (a client must not steer
+// which org the gateway's key bills).
+const STRIP = new Set([
+  'authorization',
+  'x-api-key',
+  'host',
+  'content-length',
+  'accept-encoding',
+  'cookie',
+  'set-cookie',
+  'forwarded',
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-forwarded-port',
+  'x-real-ip',
+  'via',
+  'x-amzn-trace-id',
+  'x-amz-cf-id',
+  'cf-connecting-ip',
+  'true-client-ip',
+  'openai-organization',
+  'openai-project',
+  'proxy-connection',
+]);
+const STRIP_PREFIXES = ['x-gulley-'];
 
 /** Drain undici's keep-alive connection pool. Call on graceful shutdown (or at
  *  the end of a short-lived script) so the event loop can exit cleanly. */
@@ -52,6 +79,7 @@ export class PassthroughAdapter implements ProviderAdapter {
       if (v === undefined) continue;
       const key = k.toLowerCase();
       if (STRIP.has(key) || HOP_BY_HOP.has(key)) continue;
+      if (STRIP_PREFIXES.some((p) => key.startsWith(p))) continue;
       headers[key] = Array.isArray(v) ? v.join(', ') : v;
     }
     for (const [k, v] of Object.entries(this.defaultHeaders)) {
