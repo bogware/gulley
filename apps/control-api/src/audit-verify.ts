@@ -95,10 +95,10 @@ async function main(): Promise<void> {
   process.exit(chain.verified ? 0 : 1);
 }
 
-// Run only when invoked directly (not when imported by a test).
-if (
-  import.meta.url === `file://${process.argv[1]}` ||
-  process.argv[1]?.endsWith('audit-verify.ts')
-) {
+// Run only when invoked directly — `tsx src/audit-verify.ts` or the bundled
+// `dist/control-api/audit-verify.mjs` — never when imported (evidence-bundle imports
+// reviveRows, and the control-api bundle inlines this module: an `import.meta.url ===
+// argv[1]` check was TRUE inside that bundle and ran this CLI instead of the server).
+if (/audit-verify\.(ts|mjs|js)$/.test(process.argv[1] ?? '')) {
   void main();
 }

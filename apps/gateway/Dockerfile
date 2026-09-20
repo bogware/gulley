@@ -3,8 +3,8 @@
 # the entry). Three stages:
 #   build      — full workspace install, esbuild-bundle both apps (dist/*.mjs) with the
 #                version + git sha stamped in.
-#   prod-deps  — production-ONLY dependencies of the two apps, installed HOISTED so the
-#                bundled entries resolve third-party packages from /app/node_modules.
+#   prod-deps  — production-ONLY dependencies per app (`pnpm deploy`), copied next to
+#                each bundled entry so it resolves third-party packages from there.
 #   runtime    — distroless Node 22 (no shell, no package manager, no toolchain):
 #                dist/ + node_modules/ only. Node is PID 1 (SIGTERM reaches the drain).
 #
@@ -28,25 +28,29 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile --filter @gulley/gateway... --filter @gulley/control-api...
 RUN GULLEY_VERSION="${GULLEY_VERSION:-0.0.0}" GULLEY_BUILD_SHA="$GULLEY_BUILD_SHA" node scripts/bundle.mjs
 
-FROM base AS prod-deps
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-COPY apps/gateway/package.json apps/gateway/package.json
-COPY apps/control-api/package.json apps/control-api/package.json
-COPY packages ./packages
-# Hoisted layout: every production package lands flat under /app/node_modules, which is
-# where the bundled entries (bare specifiers) resolve from. devDependencies (tsx, vitest,
-# esbuild, drizzle-kit, pglite) are NOT installed — the runtime carries no toolchain.
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
-    pnpm install --frozen-lockfile --prod --config.node-linker=hoisted \
-      --filter @gulley/gateway... --filter @gulley/control-api...
+FROM build AS prod-deps
+# Per-app production dependency trees via `pnpm deploy`: each app gets ONLY its own
+# production dependencies (plus the workspace packages it uses), resolved from the
+# lockfile — devDependencies (tsx, esbuild, vitest, drizzle-kit, PGlite) and other
+# workspaces' packages (the console's next/playwright) never enter the runtime.
+# A hoisted workspace install would have linked the whole lockfile.
+# Hoisted layout INSIDE each deploy: the bundles inline the workspace packages, so
+# their transitive third-party imports must sit at the top level of that tree.
+# The final rm prunes what the bundles never import: @gulley/cli's tsx (only its
+# global bin shim needs it) and PGlite, which pnpm carries as drizzle-orm's
+# optional-peer resolution.
+RUN pnpm --filter @gulley/gateway deploy --prod --config.node-linker=hoisted /out/gateway  && pnpm --filter @gulley/control-api deploy --prod --config.node-linker=hoisted /out/control-api  && rm -rf /out/*/node_modules/tsx /out/*/node_modules/esbuild /out/*/node_modules/@esbuild            /out/*/node_modules/get-tsconfig /out/*/node_modules/@electric-sql
 
 FROM gcr.io/distroless/nodejs22-debian12:nonroot AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     GATEWAY_PORT=8080 CONTROL_API_PORT=8081 \
     GULLEY_MIGRATIONS_DIR=/app/dist/migrations
-COPY --from=prod-deps --chown=nonroot:nonroot /app/node_modules ./node_modules
+# Each entry resolves its packages from the node_modules beside it (Node walks up from
+# the entry file's directory), so the two trees never mix.
 COPY --from=build --chown=nonroot:nonroot /app/dist ./dist
+COPY --from=prod-deps --chown=nonroot:nonroot /out/gateway/node_modules ./dist/gateway/node_modules
+COPY --from=prod-deps --chown=nonroot:nonroot /out/control-api/node_modules ./dist/control-api/node_modules
 EXPOSE 8080 8081 9090
 # distroless has no shell: exec-form probe through node itself.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s CMD \

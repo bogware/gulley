@@ -24,8 +24,8 @@ toolchain in it. At build time `scripts/bundle.mjs` (esbuild) bundles every
 `dist/control-api/main.mjs`, `dist/control-api/migrate.mjs`,
 `dist/control-api/audit-verify.mjs` and `dist/gateway/doctor.mjs`, stamping the
 version and git sha in (`/health`, `gulley_build_info`, OTel `service.version`,
-every log line). Third-party packages are installed **production-only** and
-hoisted next to `dist/`; `tsx`, esbuild, vitest, drizzle-kit and PGlite never
+every log line). Third-party packages are installed **production-only, per app** (`pnpm deploy`)
+next to each bundled entry; `tsx`, esbuild, vitest, drizzle-kit and PGlite never
 enter the runtime. The SQL migrations travel with the image (`dist/migrations`)
 so the migrate entry and the schema-version readiness probe read the same set.
 

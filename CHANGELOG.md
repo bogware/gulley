@@ -75,7 +75,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   both apps (and the migrate / doctor / audit-verify entries) into `dist/`, stamps
   the version + git sha (`/health`, `gulley_build_info`, OTel `service.version`,
   log lines), and copies the migrations; the image is
-  `gcr.io/distroless/nodejs22` with production-only hoisted dependencies — no tsx,
+  `gcr.io/distroless/nodejs22` with production-only, per-app dependency trees
+  (`pnpm deploy`) — no tsx,
   esbuild, vitest, drizzle-kit, shell or package manager at runtime. The console
   image runs Next's standalone server on the same base. Trivy scans run **before**
   every push with no exceptions (`.trivyignore` and the esbuild skip-dirs are gone).

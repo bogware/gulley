@@ -5,7 +5,7 @@
  * The runtime image runs plain `node` on a distroless base with NO TypeScript
  * toolchain: every `@gulley/*` workspace package (TypeScript source, no build step)
  * is bundled INTO each entry by esbuild, while third-party packages stay external
- * and are installed as production-only, hoisted node_modules next to `dist/`.
+ * and are installed as production-only node_modules beside each entry (`pnpm deploy`).
  *
  *   node scripts/bundle.mjs            # → dist/{gateway,control-api}/*.mjs + dist/migrations
  *   GULLEY_VERSION=1.2.3 GULLEY_BUILD_SHA=abc1234 node scripts/bundle.mjs
@@ -29,7 +29,7 @@ const version =
 const sha = process.env.GULLEY_BUILD_SHA ?? '';
 
 /** Bundle `@gulley/*` (workspace TypeScript); everything else (third-party packages and
- *  Node builtins) stays external and resolves from the hoisted production node_modules. */
+ *  Node builtins) stays external and resolves from the production node_modules beside the entry. */
 const workspaceOnly = {
   name: 'workspace-only',
   setup(b) {
@@ -64,7 +64,7 @@ for (const [entry, target] of ENTRIES) {
     target: 'node22',
     sourcemap: true,
     // Bundle the workspace packages (TypeScript source); leave every third-party
-    // package external so it resolves from the hoisted production node_modules.
+    // package external so it resolves from the production node_modules beside the entry.
     plugins: [workspaceOnly],
     define: {
       __GULLEY_VERSION__: JSON.stringify(version),

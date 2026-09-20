@@ -274,7 +274,7 @@ One distroless image (`gcr.io/distroless/nodejs22`, `node` as the entrypoint, no
 shell or package manager) runs either plane. `scripts/bundle.mjs` (esbuild) bundles
 the workspace packages into `dist/<app>/main.mjs` (+ `migrate.mjs`, `doctor.mjs`,
 `audit-verify.mjs`), stamps the version/sha, and copies the migrations; third-party
-packages are installed production-only and hoisted next to `dist/`. Every
+packages are installed production-only per app (`pnpm deploy`) next to each entry. Every
 deployment (compose, Helm, ECS) runs the same entries and probes through node in
 exec form; the DB schema is checked against the bundled journal on `/ready`.
 
