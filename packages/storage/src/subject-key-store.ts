@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { Encryptor, EnvelopeCiphertext, SubjectKeyStore } from '@gulley/crypto';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 
 import type { Database } from './db';
 import { subjectKey } from './schema';
@@ -33,19 +33,30 @@ export class PostgresSubjectKeyStore implements SubjectKeyStore {
     return Buffer.from(raw);
   }
 
+  /** First writer wins. Two replicas serving a new subject's first masked requests
+   *  concurrently both miss `load` and both mint a key; an unconditional upsert let the
+   *  second overwrite the first's wrapped key — every reversal row already encrypted
+   *  under key #1 became unrecoverable (an accidental crypto-shred). The conflict
+   *  update now applies ONLY to an absent/shredded key (wrapped_key IS NULL); when it
+   *  does not apply, the persisted key is re-read and returned instead of ours. */
   async getOrCreate(subject: string): Promise<Buffer> {
     const existing = await this.load(subject);
     if (existing) return existing;
     const key = randomBytes(32);
     const wrapped = await this.master.encrypt(key, { keyClass: KEY_CLASS, aad: subject });
-    await this.db
+    const rows = await this.db
       .insert(subjectKey)
       .values({ subject, wrappedKey: wrapped, shreddedAt: null })
       .onConflictDoUpdate({
         target: subjectKey.subject,
         set: { wrappedKey: wrapped, shreddedAt: null },
-      });
-    return key;
+        setWhere: sql`${subjectKey.wrappedKey} is null`,
+      })
+      .returning({ wrappedKey: subjectKey.wrappedKey });
+    if (rows.length > 0) return key; // our insert/update landed
+    const persisted = await this.load(subject);
+    if (!persisted) throw new Error('subject key vanished between conflict and re-read');
+    return persisted;
   }
 
   async get(subject: string): Promise<Buffer | undefined> {

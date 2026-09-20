@@ -1,7 +1,14 @@
 import type { CachedResponse, ExactCacheStore, VectorIndex, VectorMatch } from '@gulley/cache';
-import { and, eq, gt, lt, sql } from 'drizzle-orm';
+import { and, eq, gt, sql } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import type { Database } from './db';
+import {
+  type BatchSweepOptions,
+  type BatchSweepResult,
+  deleteExpiredBatch,
+  MAINTENANCE_LOCK,
+  sweepInBatches,
+} from './maintenance';
 import { cacheEntry, semanticVector } from './schema';
 
 function scopeOf(key: string): string {
@@ -15,11 +22,22 @@ function scopeOf(key: string): string {
 export class PostgresExactCache implements ExactCacheStore {
   constructor(private readonly db: Database) {}
 
-  /** Delete expired rows (semantic_vector rows cascade). Returns rows removed.
-   *  Call periodically from a maintenance loop. */
-  async sweepExpired(now: Date = new Date()): Promise<number> {
-    const res = await this.db.delete(cacheEntry).where(lt(cacheEntry.expiresAt, now));
-    return (res as { rowCount?: number }).rowCount ?? 0;
+  /** Delete expired rows (semantic_vector rows cascade) in bounded batches under an
+   *  advisory lock. Returns rows removed. A single unbounded DELETE used to run under
+   *  the data plane's statement_timeout: once the backlog grew past what 8 s could
+   *  clear it was cancelled every tick (zero progress, error swallowed) and the table
+   *  — full response bodies plus the HNSW index — grew without bound. */
+  async sweepExpired(now: Date = new Date(), opts: BatchSweepOptions = {}): Promise<number> {
+    return (await this.sweepExpiredDetailed(now, opts)).removed;
+  }
+
+  async sweepExpiredDetailed(
+    now: Date = new Date(),
+    opts: BatchSweepOptions = {},
+  ): Promise<BatchSweepResult> {
+    return sweepInBatches(this.db, { lockId: MAINTENANCE_LOCK.cacheSweep, ...opts }, (tx, n) =>
+      deleteExpiredBatch(tx, 'cache_entry', 'expires_at', now, n),
+    );
   }
 
   async get(key: string): Promise<CachedResponse | null> {
@@ -61,7 +79,19 @@ export class PostgresExactCache implements ExactCacheStore {
       })
       .onConflictDoUpdate({
         target: cacheEntry.key,
-        set: { body, statusCode: value.statusCode, expiresAt },
+        // Refresh EVERY value column: a re-stored key previously kept its first
+        // headers/token counts/created_at and replayed stale ones.
+        set: {
+          model: value.model,
+          statusCode: value.statusCode,
+          streamed: value.streamed,
+          headers: value.headers,
+          body,
+          inputTokens: value.inputTokens,
+          outputTokens: value.outputTokens,
+          createdAt: sql`now()`,
+          expiresAt,
+        },
       });
   }
 }
@@ -162,8 +192,11 @@ export class RedisVectorIndex implements VectorIndex {
         'DISTANCE_METRIC',
         'COSINE',
       );
-    } catch {
-      /* index already exists — RediSearch returns an error we can ignore */
+    } catch (err) {
+      // Only "already exists" means the index is there. Any other failure (connection
+      // refused, timeout, no RediSearch module) must NOT latch, or every later
+      // FT.SEARCH fails "no such index" until the process restarts.
+      if (!/index already exists/i.test((err as Error).message ?? '')) throw err;
     }
     this.ensured = true;
   }

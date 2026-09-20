@@ -1,6 +1,13 @@
-import { and, eq, lt, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
 import type { Database } from './db';
+import {
+  type BatchSweepOptions,
+  type BatchSweepResult,
+  deleteExpiredBatch,
+  MAINTENANCE_LOCK,
+  sweepInBatches,
+} from './maintenance';
 import { maskVault } from './schema';
 
 export type MaskDirection = 'input' | 'output';
@@ -100,8 +107,16 @@ export class PostgresMaskVaultStore implements MaskVaultStore {
     return rows.map((r) => this.toView(r));
   }
 
-  async sweepExpired(now: Date): Promise<number> {
-    const res = await this.db.delete(maskVault).where(lt(maskVault.expiresAt, now));
-    return (res as unknown as { rowCount?: number }).rowCount ?? 0;
+  /** Delete rows past their TTL in bounded batches under an advisory lock (see
+   *  PostgresExactCache.sweepExpired for why a single DELETE was a silent leak). This
+   *  table holds encrypted PII, so its declared retention must actually hold. */
+  async sweepExpired(now: Date, opts: BatchSweepOptions = {}): Promise<number> {
+    return (await this.sweepExpiredDetailed(now, opts)).removed;
+  }
+
+  async sweepExpiredDetailed(now: Date, opts: BatchSweepOptions = {}): Promise<BatchSweepResult> {
+    return sweepInBatches(this.db, { lockId: MAINTENANCE_LOCK.maskVaultSweep, ...opts }, (tx, n) =>
+      deleteExpiredBatch(tx, 'mask_vault', 'expires_at', now, n),
+    );
   }
 }

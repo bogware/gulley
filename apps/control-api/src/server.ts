@@ -1,6 +1,6 @@
 import { GULLEY_VERSION } from '@gulley/core';
 import { randomUUID } from 'node:crypto';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { registerConfigRoutes } from './config-routes';
 import type { ControlContext } from './context';
@@ -39,7 +39,19 @@ function makeAuthThrottle(maxPerWindow: number, windowMs: number) {
 // The unauthenticated OAuth/OIDC protocol surface — the highest-value brute-force target.
 const AUTH_SURFACE = /^\/(oauth|auth)\//;
 
-export function buildServer(config: Config, ctx?: ControlContext): FastifyInstance {
+/** Header paths pino must never emit (credentials). Shared with main.ts's logger. */
+export const LOG_REDACT_PATHS = [
+  'req.headers.authorization',
+  'req.headers["x-api-key"]',
+  'req.headers["api-key"]',
+  'req.headers.cookie',
+];
+
+export function buildServer(
+  config: Config,
+  ctx?: ControlContext,
+  logger?: FastifyBaseLogger,
+): FastifyInstance {
   const app = Fastify({
     // Trust a FIXED number of proxy hops (1 = the ALB), not every hop — `trustProxy:true`
     // lets a client spoof req.ip via X-Forwarded-For, defeating any IP-based control.
@@ -52,18 +64,11 @@ export function buildServer(config: Config, ctx?: ControlContext): FastifyInstan
     genReqId: () => `req_${randomUUID()}`,
     // Outlive the load balancer's idle timeout so it never reuses a socket we closed.
     keepAliveTimeout: config.HTTP_KEEPALIVE_TIMEOUT_MS,
-    logger: {
-      level: config.LOG_LEVEL,
-      redact: {
-        paths: [
-          'req.headers.authorization',
-          'req.headers["x-api-key"]',
-          'req.headers["api-key"]',
-          'req.headers.cookie',
-        ],
-        remove: true,
-      },
-    },
+    // One process logger (pino) when main.ts provides it, so boot warnings and request
+    // lines share a level + redaction; tests/smoke scripts get a built-in logger.
+    ...(logger
+      ? { loggerInstance: logger }
+      : { logger: { level: config.LOG_LEVEL, redact: { paths: LOG_REDACT_PATHS, remove: true } } }),
   });
 
   app.server.headersTimeout = config.HTTP_KEEPALIVE_TIMEOUT_MS + 1_000;

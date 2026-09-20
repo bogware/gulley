@@ -134,6 +134,12 @@ export const spendLedger = pgTable(
   (t) => [
     index('spend_ledger_workspace_idx').on(t.workspaceId),
     index('spend_ledger_created_idx').on(t.createdAt),
+    // Every rollup (chargeback, ledger totals, boot-time budget heal) filters by
+    // workspace AND time; the composite keeps them an index range scan as the ledger grows.
+    index('spend_ledger_ws_created_idx').on(t.workspaceId, t.createdAt),
+    // Idempotency + dispute lookup: one ledger row per request id (cascade legs carry
+    // their own `<id>#<leg>` ids). PostgresLedger.record is ON CONFLICT DO NOTHING.
+    uniqueIndex('spend_ledger_request_idx').on(t.requestId),
   ],
 );
 
@@ -169,6 +175,9 @@ export const requestLog = pgTable(
     index('request_log_created_idx').on(t.createdAt),
     // Keyset pagination + workspace-scoped browse: (workspace, created desc, id).
     index('request_log_ws_created_idx').on(t.workspaceId, t.createdAt),
+    // Request detail lookup (`WHERE request_id = $1 ORDER BY created_at DESC`) —
+    // without it every console "open request" click seq-scanned the biggest table.
+    index('request_log_request_id_idx').on(t.requestId, t.createdAt),
   ],
 );
 
@@ -365,7 +374,12 @@ export const adminSession = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   },
-  (t) => [uniqueIndex('admin_session_hash_idx').on(t.tokenHash)],
+  (t) => [
+    uniqueIndex('admin_session_hash_idx').on(t.tokenHash),
+    // Deprovision revokes by subject; the console lists newest-first.
+    index('admin_session_subject_idx').on(t.subject),
+    index('admin_session_created_idx').on(t.createdAt),
+  ],
 );
 
 export const provider = pgTable(
@@ -564,7 +578,10 @@ export const oauthGrant = pgTable(
     absoluteExpiresAt: timestamp('absolute_expires_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('oauth_grant_client_idx').on(t.clientId)],
+  (t) => [
+    index('oauth_grant_client_idx').on(t.clientId),
+    index('oauth_grant_created_idx').on(t.createdAt),
+  ],
 );
 
 export const deviceCode = pgTable(
@@ -580,20 +597,28 @@ export const deviceCode = pgTable(
     lastPolledAt: bigint('last_polled_at', { mode: 'number' }).notNull().default(0),
     intervalMs: integer('interval_ms').notNull().default(5000),
   },
-  (t) => [uniqueIndex('device_code_user_idx').on(t.userCode)],
+  (t) => [
+    uniqueIndex('device_code_user_idx').on(t.userCode),
+    // Backs the expiry sweep (purgeExpiredOAuthCodes).
+    index('device_code_expires_idx').on(t.expiresAt),
+  ],
 );
 
-export const authCode = pgTable('auth_code', {
-  code: text('code').primaryKey(),
-  clientId: text('client_id').notNull(),
-  redirectUri: text('redirect_uri').notNull(),
-  codeChallenge: text('code_challenge').notNull(),
-  principalId: text('principal_id').notNull(),
-  displayName: text('display_name').notNull(),
-  orgId: uuid('org_id').notNull(),
-  workspaceId: uuid('workspace_id').notNull(),
-  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
-});
+export const authCode = pgTable(
+  'auth_code',
+  {
+    code: text('code').primaryKey(),
+    clientId: text('client_id').notNull(),
+    redirectUri: text('redirect_uri').notNull(),
+    codeChallenge: text('code_challenge').notNull(),
+    principalId: text('principal_id').notNull(),
+    displayName: text('display_name').notNull(),
+    orgId: uuid('org_id').notNull(),
+    workspaceId: uuid('workspace_id').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  },
+  (t) => [index('auth_code_expires_idx').on(t.expiresAt)],
+);
 
 // --- M5.3 config / GitOps --------------------------------------------------
 

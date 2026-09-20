@@ -1,14 +1,19 @@
 import { setAirGappedEgress } from '@gulley/egress';
 import { type MetricsServerHandle, startMetricsServer } from '@gulley/metrics';
 import { closeUpstreamPool } from '@gulley/providers';
+import pino from 'pino';
 import { loadConfig } from './config';
 import { buildConfigWatcher } from './config-reload';
 import { createProductionContext } from './context';
 import type { ConfigWatcher } from './reconcile';
 import type { GatewayContext } from './routes/messages';
-import { buildServer } from './server';
+import { buildServer, LOG_REDACT_PATHS } from './server';
 
 const config = loadConfig();
+// One structured logger for the whole process: context build (pool/Redis/maintenance
+// warnings used to go to console.warn as unstructured text), Fastify request lines,
+// and the drain — same level, same redaction.
+const log = pino({ level: config.LOG_LEVEL, redact: { paths: LOG_REDACT_PATHS, remove: true } });
 // Air-gapped posture is process-wide, set before any egress can happen: fail-closed on
 // any guarded outbound without an explicit allowlist.
 setAirGappedEgress(config.AIR_GAPPED);
@@ -18,7 +23,7 @@ let configWatcher: ConfigWatcher | undefined;
 let context: GatewayContext | undefined;
 let degradedReason: string | undefined;
 try {
-  context = createProductionContext(config);
+  context = createProductionContext(config, log);
 } catch (err) {
   // Boot health-only so the container stays inspectable while config is finished.
   // The messages route is simply not registered until the context is complete. The
@@ -33,6 +38,7 @@ const drainState = { active: false };
 const app = buildServer(config, context, {
   isDraining: () => drainState.active,
   degradedReason: () => degradedReason,
+  logger: log,
 });
 if (degradedReason) app.log.warn({ reason: degradedReason }, 'proxy disabled — health-only boot');
 
@@ -97,6 +103,7 @@ async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 
   if (shuttingDown) return;
   shuttingDown = true;
   drainState.active = true; // /ready → 503 so endpoints deregister before app.close()
+  context?.metrics?.setDegraded('draining');
   app.log.info({ signal, graceMs }, 'draining');
   // Two-stage backstop. Stage 1 (a few seconds before the deadline): sever every
   // connection still open — a long or stalled stream that outlives the grace period —
@@ -125,6 +132,7 @@ async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 
   backstop.unref();
   await settle('config-watcher', () => configWatcher?.stop()); // stop reloads before draining
   await settle('breaker-sync', () => context?.breakerSync?.stop()); // cross-replica refresh timer
+  await settle('maintenance', () => context?.stopMaintenance?.()); // sweeps / retention timers
   await settle('http-close', () => app.close());
   // Drain the upstream pool BEFORE flushing the log sinks: closeUpstreamPool()
   // completes in-flight streams, and their single teardown writes the request/

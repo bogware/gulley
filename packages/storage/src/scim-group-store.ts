@@ -69,49 +69,60 @@ export class PostgresScimGroupStore {
     return out;
   }
 
-  /** Grant the group's role to a user (idempotent) and track the membership row. */
+  /** Grant the group's role to a user (idempotent) and track the membership row.
+   *  One transaction, with the membership link claimed FIRST via the unique
+   *  (group, user) index: an IdP that retries a PATCH-add (routine on a 5xx/timeout)
+   *  previously passed the "already a member" read on both calls and left a second,
+   *  unlinked `membership` grant that no later SCIM removal could ever revoke. */
   async addMember(groupId: string, userId: string, displayName: string): Promise<void> {
-    const existing = await this.db
-      .select({ userId: scimGroupMember.userId })
-      .from(scimGroupMember)
-      .where(and(eq(scimGroupMember.groupId, groupId), eq(scimGroupMember.userId, userId)))
-      .limit(1);
-    if (existing[0]) return; // already a member — no duplicate grant
-    const mapped = this.roleFor(displayName);
-    let membershipId: string | null = null;
-    if (mapped) {
-      const [m] = await this.db
+    await this.db.transaction(async (tx) => {
+      const claimed = await tx
+        .insert(scimGroupMember)
+        .values({ groupId, userId, membershipId: null })
+        .onConflictDoNothing()
+        .returning({ userId: scimGroupMember.userId });
+      if (claimed.length === 0) return; // already a member — no duplicate grant
+      const mapped = this.roleFor(displayName);
+      if (!mapped) return;
+      const [m] = await tx
         .insert(membership)
         .values({ userId, role: mapped.role, orgId: mapped.orgId, workspaceId: null })
         .returning({ id: membership.id });
-      membershipId = m!.id;
-    }
-    await this.db.insert(scimGroupMember).values({ groupId, userId, membershipId });
+      await tx
+        .update(scimGroupMember)
+        .set({ membershipId: m!.id })
+        .where(and(eq(scimGroupMember.groupId, groupId), eq(scimGroupMember.userId, userId)));
+    });
   }
 
-  /** Remove a user from the group and revoke exactly the membership its grant produced. */
+  /** Remove a user from the group and revoke exactly the membership its grant
+   *  produced — atomically, so a crash between the two deletes cannot orphan a grant. */
   async removeMember(groupId: string, userId: string): Promise<void> {
-    const rows = await this.db
-      .delete(scimGroupMember)
-      .where(and(eq(scimGroupMember.groupId, groupId), eq(scimGroupMember.userId, userId)))
-      .returning({ membershipId: scimGroupMember.membershipId });
-    const mid = rows[0]?.membershipId;
-    if (mid) await this.db.delete(membership).where(eq(membership.id, mid));
+    await this.db.transaction(async (tx) => {
+      const rows = await tx
+        .delete(scimGroupMember)
+        .where(and(eq(scimGroupMember.groupId, groupId), eq(scimGroupMember.userId, userId)))
+        .returning({ membershipId: scimGroupMember.membershipId });
+      const mid = rows[0]?.membershipId;
+      if (mid) await tx.delete(membership).where(eq(membership.id, mid));
+    });
   }
 
-  /** Delete the group, revoking every membership its grants produced first. */
+  /** Delete the group, revoking every membership its grants produced first (one tx). */
   async delete(id: string): Promise<boolean> {
-    const members = await this.db
-      .select({ membershipId: scimGroupMember.membershipId })
-      .from(scimGroupMember)
-      .where(eq(scimGroupMember.groupId, id));
-    for (const m of members) {
-      if (m.membershipId) await this.db.delete(membership).where(eq(membership.id, m.membershipId));
-    }
-    const rows = await this.db
-      .delete(scimGroup)
-      .where(eq(scimGroup.id, id))
-      .returning({ id: scimGroup.id });
-    return rows.length > 0;
+    return this.db.transaction(async (tx) => {
+      const members = await tx
+        .select({ membershipId: scimGroupMember.membershipId })
+        .from(scimGroupMember)
+        .where(eq(scimGroupMember.groupId, id));
+      for (const m of members) {
+        if (m.membershipId) await tx.delete(membership).where(eq(membership.id, m.membershipId));
+      }
+      const rows = await tx
+        .delete(scimGroup)
+        .where(eq(scimGroup.id, id))
+        .returning({ id: scimGroup.id });
+      return rows.length > 0;
+    });
   }
 }

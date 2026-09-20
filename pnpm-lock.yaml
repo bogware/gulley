@@ -98,6 +98,9 @@ importers:
       fastify:
         specifier: ^5.2.0
         version: 5.11.3
+      pino:
+        specifier: ^10.3.1
+        version: 10.3.1
       zod:
         specifier: ^3.24.1
         version: 3.25.76
@@ -195,6 +198,9 @@ importers:
       fastify:
         specifier: ^5.2.0
         version: 5.11.3
+      pino:
+        specifier: ^10.3.1
+        version: 10.3.1
       zod:
         specifier: ^3.24.1
         version: 3.25.76
@@ -291,6 +297,9 @@ importers:
 
   packages/budget:
     dependencies:
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
       '@gulley/cost':
         specifier: workspace:*
         version: link:../cost
@@ -306,6 +315,10 @@ importers:
         version: 3.2.7(@types/node@22.20.1)(jsdom@25.0.1)
 
   packages/cache:
+    dependencies:
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
@@ -322,6 +335,9 @@ importers:
       '@gulley/cost':
         specifier: workspace:*
         version: link:../cost
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
@@ -601,6 +617,10 @@ importers:
         version: 3.2.7(@types/node@22.20.1)(jsdom@25.0.1)
 
   packages/ratelimit:
+    dependencies:
+      '@gulley/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

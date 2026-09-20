@@ -77,13 +77,36 @@ export class PostgresKeyStore implements KeyStore {
     };
   }
 
+  /** last_used_at is bookkeeping, not billing: coalesce to one UPDATE per key per
+   *  TOUCH_INTERVAL. Unthrottled, a busy key (a CI runner) serialised a row-lock UPDATE
+   *  per request on the small isolated authn pool — the very starvation that pool
+   *  exists to prevent. The in-process guard skips the round-trip; the SQL predicate
+   *  keeps replicas from stacking writes on the same tuple. */
   async touchLastUsed(id: string): Promise<void> {
+    const now = Date.now();
+    const prev = this.lastTouch.get(id);
+    if (prev !== undefined && now - prev < TOUCH_INTERVAL_MS) return;
+    this.lastTouch.set(id, now);
+    if (this.lastTouch.size > TOUCH_MAP_MAX) {
+      for (const [k, t] of this.lastTouch)
+        if (now - t >= TOUCH_INTERVAL_MS) this.lastTouch.delete(k);
+    }
     await this.db
       .update(virtualKey)
       .set({ lastUsedAt: sql`now()` })
-      .where(eq(virtualKey.id, id));
+      .where(
+        and(
+          eq(virtualKey.id, id),
+          sql`(${virtualKey.lastUsedAt} is null or ${virtualKey.lastUsedAt} < now() - interval '60 seconds')`,
+        ),
+      );
   }
+
+  private readonly lastTouch = new Map<string, number>();
 }
+
+const TOUCH_INTERVAL_MS = 60_000;
+const TOUCH_MAP_MAX = 10_000;
 
 interface KeyViewRow {
   id: string;
@@ -305,25 +328,31 @@ export class PostgresMembershipStore {
 export class PostgresLedger implements Ledger {
   constructor(private readonly db: Database) {}
 
+  /** Idempotent on request_id (unique index): a retried or duplicated write can never
+   *  double-charge a request in the durable ledger. Cascade legs carry their own
+   *  `<requestId>#<leg>` ids and so stay distinct rows. */
   async record(e: SpendRecord): Promise<void> {
-    await this.db.insert(spendLedger).values({
-      requestId: e.requestId,
-      principalId: e.principalId,
-      orgId: e.orgId,
-      workspaceId: e.workspaceId,
-      provider: e.provider,
-      model: e.model,
-      status: e.status,
-      inputTokens: e.cost.totalInputTokens,
-      outputTokens: e.cost.outputTokens,
-      cacheReadTokens: e.cost.cacheReadTokens,
-      cacheWriteTokens: e.cost.cacheWriteTokens,
-      cacheSavedMicroUsd: Math.round(e.cost.cacheSavedUsd * 1_000_000),
-      costMicroUsd: e.costMicroUsd,
-      priced: e.cost.priced,
-      attributes: e.attributes ?? null,
-      createdAt: e.createdAt,
-    });
+    await this.db
+      .insert(spendLedger)
+      .values({
+        requestId: e.requestId,
+        principalId: e.principalId,
+        orgId: e.orgId,
+        workspaceId: e.workspaceId,
+        provider: e.provider,
+        model: e.model,
+        status: e.status,
+        inputTokens: e.cost.totalInputTokens,
+        outputTokens: e.cost.outputTokens,
+        cacheReadTokens: e.cost.cacheReadTokens,
+        cacheWriteTokens: e.cost.cacheWriteTokens,
+        cacheSavedMicroUsd: Math.round(e.cost.cacheSavedUsd * 1_000_000),
+        costMicroUsd: e.costMicroUsd,
+        priced: e.cost.priced,
+        attributes: e.attributes ?? null,
+        createdAt: e.createdAt,
+      })
+      .onConflictDoNothing({ target: spendLedger.requestId });
   }
 }
 

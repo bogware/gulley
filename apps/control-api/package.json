@@ -26,9 +26,9 @@
     "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",
     "@gulley/cost": "workspace:*",
+    "@gulley/crypto": "workspace:*",
     "@gulley/egress": "workspace:*",
     "@gulley/http-edge": "workspace:*",
-    "@gulley/crypto": "workspace:*",
     "@gulley/oauth": "workspace:*",
     "@gulley/oidc": "workspace:*",
     "@gulley/pipeline": "workspace:*",
@@ -39,6 +39,7 @@
     "@gulley/worm": "workspace:*",
     "drizzle-orm": "^0.45.2",
     "fastify": "^5.2.0",
+    "pino": "^10.3.1",
     "zod": "^3.24.1"
   },
   "devDependencies": {

@@ -1,4 +1,4 @@
-import { type Counter, type Histogram, Registry } from './registry';
+import { type Counter, type Gauge, type Histogram, type Labels, Registry } from './registry';
 
 /**
  * The per-request data metrics consume — a structural subset of the telemetry
@@ -66,6 +66,18 @@ export class GatewayMetrics {
   private readonly classifierOutcomes: Counter;
   private readonly duration: Histogram;
   private readonly budgetUtilization: Histogram;
+  // --- operational signals (were log-only or silent) ---
+  private readonly sinkErrors: Counter;
+  private readonly storeErrors: Counter;
+  private readonly maintenanceRuns: Counter;
+  private readonly requestLogDropped: Counter;
+  private readonly sheds: Counter;
+  private readonly aborts: Counter;
+  private readonly unhandled: Counter;
+  private readonly otelExportFailures: Counter;
+  private readonly buildInfo: Gauge;
+  private readonly maintenanceLastSuccess: Gauge;
+  private readonly degraded: Gauge;
   /** Distinct verified model labels seen, to bound cardinality (see MAX_MODEL_LABELS). */
   private readonly modelLabels = new Set<string>();
 
@@ -133,6 +145,103 @@ export class GatewayMetrics {
       'Workspace budget utilization (used/cap) sampled at admission.',
       UTILIZATION_BUCKETS,
     );
+    this.sinkErrors = this.registry.counter(
+      'gulley_sink_errors_total',
+      'Teardown durable-sink write failures by sink (budget_commit|ledger|request_log|access_log|audit|cache_store|mask_vault).',
+    );
+    this.storeErrors = this.registry.counter(
+      'gulley_store_errors_total',
+      'Governance-store faults by store (budget|ratelimit|auth|cache) and the policy applied (fail_open|fail_closed|bypass|error).',
+    );
+    this.maintenanceRuns = this.registry.counter(
+      'gulley_maintenance_runs_total',
+      'Background maintenance runs by job (cache_sweep|mask_vault_sweep|request_log_retention|config_poll|budget_heal) and result (ok|error|skipped).',
+    );
+    this.requestLogDropped = this.registry.counter(
+      'gulley_request_log_dropped_total',
+      'request_log rows dropped because a batch flush failed.',
+    );
+    this.sheds = this.registry.counter(
+      'gulley_shed_total',
+      'Requests shed before dispatch by reason (half_open_probe|adaptive_limit|budget_store|capacity).',
+    );
+    this.aborts = this.registry.counter(
+      'gulley_request_aborts_total',
+      'Aborted in-flight requests by reason (client|watchdog|deadline|transform|guardrail|socket).',
+    );
+    this.unhandled = this.registry.counter(
+      'gulley_unhandled_errors_total',
+      'Pipeline exceptions caught by the route-level handler (a 5xx the client saw), by stage.',
+    );
+    this.otelExportFailures = this.registry.counter(
+      'gulley_otel_export_failures_total',
+      'OTLP export failures / dropped items by signal (traces|logs).',
+    );
+    this.buildInfo = this.registry.gauge(
+      'gulley_build_info',
+      'Build metadata (always 1); version/sha carried as labels.',
+    );
+    this.registry.gauge(
+      'gulley_request_log_backlog',
+      'request_log rows buffered and not yet flushed.',
+      () => [{ value: this.backlogSampler?.() ?? 0 }],
+    );
+    this.maintenanceLastSuccess = this.registry.gauge(
+      'gulley_maintenance_last_success_timestamp_seconds',
+      'Unix time of the last successful run per maintenance job.',
+    );
+    this.degraded = this.registry.gauge(
+      'gulley_gateway_degraded',
+      '1 when the data plane is not serving (health-only boot / draining), by reason.',
+    );
+  }
+
+  private backlogSampler: (() => number) | undefined;
+
+  /** Wire the request-log backlog gauge to the batching sink's `backlog()`. */
+  setRequestLogBacklogSampler(fn: () => number): void {
+    this.backlogSampler = fn;
+  }
+
+  setBuildInfo(labels: Labels): void {
+    this.buildInfo.set(labels, 1);
+  }
+
+  setDegraded(reason: string | undefined): void {
+    this.degraded.set({ reason: reason ?? 'none' }, reason ? 1 : 0);
+  }
+
+  recordSinkError(sink: string): void {
+    this.sinkErrors.inc({ sink });
+  }
+
+  recordStoreError(store: string, policy: string): void {
+    this.storeErrors.inc({ store, policy });
+  }
+
+  recordMaintenance(job: string, result: 'ok' | 'error' | 'skipped'): void {
+    this.maintenanceRuns.inc({ job, result });
+    if (result === 'ok') this.maintenanceLastSuccess.set({ job }, Math.floor(this.now() / 1000));
+  }
+
+  recordRequestLogDropped(n: number): void {
+    if (n > 0) this.requestLogDropped.inc({}, n);
+  }
+
+  recordShed(reason: string): void {
+    this.sheds.inc({ reason });
+  }
+
+  recordAbort(reason: string): void {
+    this.aborts.inc({ reason });
+  }
+
+  recordUnhandled(stage: string): void {
+    this.unhandled.inc({ stage });
+  }
+
+  recordOtelExportFailure(signal: 'traces' | 'logs', n = 1): void {
+    if (n > 0) this.otelExportFailures.inc({ signal }, n);
   }
 
   /** Bound the client-influenced `model` label. On a non-2xx exit the model is the

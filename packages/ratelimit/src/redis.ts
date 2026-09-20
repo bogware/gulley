@@ -1,22 +1,25 @@
+import { LuaScript, type ScriptRedis } from '@gulley/core';
 import type { RateLimit, RateLimitOutcome, RateLimitStore, RuleDecision } from './types';
 import { finalizeOutcome, resetSecondsUntil } from './util';
 
 /** Minimal Redis surface (ioredis satisfies this) so this package needn't depend
  *  on ioredis directly — same shape used by `@gulley/budget`. */
-export interface EvalRedis {
-  eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>;
-}
+export type EvalRedis = ScriptRedis;
 
 // Atomic multi-rule reserve. All rule counters share the `{scope}` hash slot so
 // one script can touch them under Redis Cluster. Request-rule counters are only
 // incremented when EVERY rule passes (all-or-nothing) so a later rejection never
 // leaves an earlier rule over-counted. Token rules are checked but not charged
 // here — their real cost is added at commit once the response is metered.
-// ARGV: scope, nowMs, ruleCount, then [id, limit, windowSeconds, unit] per rule.
-// Returns: [allowed, (used, limit, resetMs) per rule...].
-const RESERVE_LUA = `
+// ARGV: scope, nowMs (fallback only), ruleCount, then [id, limit, windowSeconds, unit]
+// per rule. Window boundaries are computed from the Redis server clock (TIME), not the
+// gateway's: replicas with skewed clocks otherwise straddle a boundary and split one
+// window's traffic across two counters (under-counting). Returns: [allowed, (used,
+// limit, resetMs) per rule...].
+const RESERVE_LUA = new LuaScript(`
 local scope = ARGV[1]
-local now = tonumber(ARGV[2])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local n = tonumber(ARGV[3])
 local idx = 4
 local rules = {}
@@ -48,13 +51,15 @@ for r = 1, n do
   out[#out + 1] = c.reset
 end
 return out
-`;
+`);
 
 // Add the metered token count to each token rule's current window.
-// ARGV: scope, nowMs, actualTokens, ruleCount, then [id, windowSeconds] per token rule.
-const COMMIT_LUA = `
+// ARGV: scope, nowMs (fallback only), actualTokens, ruleCount, then [id, windowSeconds]
+// per token rule.
+const COMMIT_LUA = new LuaScript(`
 local scope = ARGV[1]
-local now = tonumber(ARGV[2])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local actual = tonumber(ARGV[3])
 local n = tonumber(ARGV[4])
 local idx = 5
@@ -68,7 +73,7 @@ for r = 1, n do
   redis.call('PEXPIRE', key, (wstart + win - now) + 1000)
 end
 return 1
-`;
+`);
 
 export class RedisRateLimitStore implements RateLimitStore {
   constructor(
@@ -82,7 +87,7 @@ export class RedisRateLimitStore implements RateLimitStore {
     const argv: (string | number)[] = [scope, String(nowMs), String(rules.length)];
     for (const r of rules) argv.push(r.id, String(r.limit), String(r.windowSeconds), r.unit);
 
-    const res = (await this.redis.eval(RESERVE_LUA, 0, ...argv)) as number[];
+    const res = (await RESERVE_LUA.run(this.redis, 0, ...argv)) as number[];
     const allowed = res[0] === 1;
     const decisions: RuleDecision[] = rules.map((rule, i) => {
       const used = Number(res[1 + i * 3]);
@@ -118,6 +123,6 @@ export class RedisRateLimitStore implements RateLimitStore {
       String(tokenRules.length),
     ];
     for (const r of tokenRules) argv.push(r.id, String(r.windowSeconds));
-    await this.redis.eval(COMMIT_LUA, 0, ...argv);
+    await COMMIT_LUA.run(this.redis, 0, ...argv);
   }
 }

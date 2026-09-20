@@ -83,7 +83,14 @@ export function computeCost(
   // tokens with priced: false rather than guessing.
   const pricing = PROVIDER_PRICING[provider];
   const override = resolve?.(provider, model);
-  const rate = override ?? pricing?.rates[pricing.normalize(model)];
+  const candidate = override ?? pricing?.rates[pricing.normalize(model)];
+  // A rate that is not a finite number (a malformed catalog row) must surface as
+  // UNPRICED — NaN would otherwise propagate into the reservation (silently skipped)
+  // and the ledger (a bigint column that rejects the row on every request).
+  const rate =
+    candidate && Number.isFinite(candidate.input) && Number.isFinite(candidate.output)
+      ? candidate
+      : undefined;
   const cache = override?.cache ?? pricing?.cache ?? NEUTRAL_CACHE;
   if (!rate) {
     return {

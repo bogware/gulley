@@ -1,6 +1,8 @@
 import { inArray, lt } from 'drizzle-orm';
+import { affectedRows } from './affected-rows';
 import type { Database } from './db';
-import { authCode, deviceCode, requestLog } from './schema';
+import { deleteExpiredBatch, MAINTENANCE_LOCK, sweepInBatches } from './maintenance';
+import { requestLog } from './schema';
 
 /**
  * Bounded retention / expiry sweeps for the high-write, self-cleaning tables. These run
@@ -48,7 +50,7 @@ export async function purgeRequestLogsOlderThan(
         victims.map((v) => v.id),
       ),
     );
-    removed = (res as { rowCount?: number }).rowCount ?? victims.length;
+    removed = affectedRows(res);
     total += removed;
   }
   return total;
@@ -63,12 +65,14 @@ export async function purgeExpiredOAuthCodes(
   db: Database,
   now: Date = new Date(),
 ): Promise<{ deviceCodes: number; authCodes: number }> {
-  const dc = await db.delete(deviceCode).where(lt(deviceCode.expiresAt, now));
-  const ac = await db.delete(authCode).where(lt(authCode.expiresAt, now));
-  return {
-    deviceCodes: (dc as { rowCount?: number }).rowCount ?? 0,
-    authCodes: (ac as { rowCount?: number }).rowCount ?? 0,
-  };
+  const lock = { lockId: MAINTENANCE_LOCK.oauthEphemera };
+  const dc = await sweepInBatches(db, lock, (tx, n) =>
+    deleteExpiredBatch(tx, 'device_code', 'expires_at', now, n),
+  );
+  const ac = await sweepInBatches(db, lock, (tx, n) =>
+    deleteExpiredBatch(tx, 'auth_code', 'expires_at', now, n),
+  );
+  return { deviceCodes: dc.removed, authCodes: ac.removed };
 }
 
 /** Days → the absolute cutoff instant, for {@link purgeRequestLogsOlderThan}. */

@@ -25,11 +25,50 @@ export type RedisClients = Record<RedisRole, Redis>;
  * silently under-charges; evicting vectors silently degrades recall).
  * See docs/ARCHITECTURE.md §13.
  */
-export function createRedisClient(url: string, onError?: RedisErrorLogger): Redis {
+export interface RedisClientOptions {
+  /** Which role this client serves — selects the command-timeout default and labels
+   *  the connection-error log line. */
+  role?: RedisRole;
+  onError?: RedisErrorLogger;
+  /** Per-command deadline (ms). A connected-but-silent server (AOF fsync stall, swap,
+   *  a half-open socket after a failover) otherwise parks every budget/rate-limit EVAL
+   *  forever — `maxRetriesPerRequest` only counts reconnects, so nothing rejects and
+   *  the fail-open/closed policy never runs. Queued (offline) commands are covered too. */
+  commandTimeoutMs?: number;
+  /** TCP connect deadline (ms); ioredis defaults to 10 s per attempt. */
+  connectTimeoutMs?: number;
+}
+
+/** Default per-command deadlines by role: the counters store gates admission on the
+ *  hot path (tight); the cache is bounded again by the lookup timeout above it; vector
+ *  queries are the heaviest. */
+const DEFAULT_COMMAND_TIMEOUT_MS: Record<RedisRole, number> = {
+  counters: 2_000,
+  cache: 1_500,
+  vector: 3_000,
+};
+const DEFAULT_CONNECT_TIMEOUT_MS = 3_000;
+
+export function createRedisClient(
+  url: string,
+  onErrorOrOpts?: RedisErrorLogger | RedisClientOptions,
+): Redis {
+  const opts: RedisClientOptions =
+    typeof onErrorOrOpts === 'function' ? { onError: onErrorOrOpts } : (onErrorOrOpts ?? {});
+  const role = opts.role;
+  const onError = opts.onError;
   const client = new Redis(url, {
     lazyConnect: true,
     maxRetriesPerRequest: 2,
     enableAutoPipelining: true,
+    commandTimeout: opts.commandTimeoutMs ?? (role ? DEFAULT_COMMAND_TIMEOUT_MS[role] : 2_000),
+    connectTimeout: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+    // Managed-Redis failover (ElastiCache/MemoryDB promotes a replica and flips the
+    // primary endpoint's DNS) leaves ioredis holding a socket to the DEMOTED node,
+    // which answers every write with READONLY until that socket happens to drop. For
+    // the counters role that is a fleet-wide fail-open storm. Reconnect (and resend the
+    // failed command) on READONLY, per the AWS guidance.
+    reconnectOnError: (err) => (err.message.startsWith('READONLY') ? 2 : false),
   });
   // CRITICAL: an ioredis client is an EventEmitter that THROWS on an 'error' event
   // with no listener — a connection-level fault (DNS/refused/reset/failover) would
@@ -44,16 +83,16 @@ export function createRedisClient(url: string, onError?: RedisErrorLogger): Redi
     if (now - lastLoggedAt < REDIS_ERROR_LOG_INTERVAL_MS) return;
     lastLoggedAt = now;
     if (onError) onError(err);
-    else console.warn(`[redis] connection error: ${err.message}`);
+    else console.warn(`[redis${role ? `:${role}` : ''}] connection error: ${err.message}`);
   });
   return client;
 }
 
 export function createRedisClients(urls: RedisUrls, onError?: RedisErrorLogger): RedisClients {
   return {
-    cache: createRedisClient(urls.cache, onError),
-    counters: createRedisClient(urls.counters, onError),
-    vector: createRedisClient(urls.vector, onError),
+    cache: createRedisClient(urls.cache, { role: 'cache', onError }),
+    counters: createRedisClient(urls.counters, { role: 'counters', onError }),
+    vector: createRedisClient(urls.vector, { role: 'vector', onError }),
   };
 }
 

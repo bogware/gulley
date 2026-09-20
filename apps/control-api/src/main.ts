@@ -12,6 +12,7 @@ import { EntraGraphIdp } from '@gulley/oauth';
 import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus, purgeExpiredOAuthCodes } from '@gulley/storage';
 import { S3AuditMirror } from '@gulley/worm';
+import pino from 'pino';
 import { type Anchor, HttpAnchor } from './anchor';
 import { buildSiemConnector, type SiemConnector } from './siem';
 import { type EvalRunner, GatewayEvalRunner } from './eval-runner';
@@ -25,7 +26,7 @@ import {
   type OidcSessionConfig,
 } from './context';
 import { parseRoleMap } from './oidc-gate';
-import { buildServer } from './server';
+import { buildServer, LOG_REDACT_PATHS } from './server';
 import {
   anthropicAdminUsageSource,
   openAiUsageSource,
@@ -220,9 +221,9 @@ function buildContext(config: Config): ControlContext | undefined {
     attestationKey: config.AUDIT_ATTESTATION_KEY,
     attestationSubject: config.AUDIT_ATTESTATION_SUBJECT,
     auditSigner,
-    worm: buildWorm(config, auditSigner, (m) => process.stderr.write(`${m}\n`)),
+    worm: buildWorm(config, auditSigner, bootWarn),
     anchor: buildAnchor(config),
-    siem: buildSiem(config, (m) => process.stderr.write(`${m}\n`)),
+    siem: buildSiem(config, bootWarn),
     // Mask-vault reveal decryptor — the SAME envelope key the gateway used (KMS in
     // prod; the in-memory dev cipher only decrypts records written in-process).
     maskVaultEncryptor: config.MASK_VAULT_ENABLED
@@ -235,7 +236,7 @@ function buildContext(config: Config): ControlContext | undefined {
     // The context builds the PostgresSubjectKeyStore when a DB + mask encryptor are present.
     cryptoShredEnabled: config.CRYPTO_SHRED_ENABLED,
     // Eval-in-the-loop rollout: a gateway-backed runner (offline golden-set gate).
-    evalRunner: buildEvalRunner(config, (m) => process.stderr.write(`${m}\n`)),
+    evalRunner: buildEvalRunner(config, bootWarn),
     // Live gateway observability: fetch + parse the gateway's Prometheus /metrics.
     gatewayMetrics: config.GATEWAY_METRICS_URL
       ? buildGatewayMetricsProvider({
@@ -295,11 +296,15 @@ function parseScimGroupRoleMap(json: string): Record<string, { role: string; org
 }
 
 const config = loadConfig();
+// One structured logger for the process: boot-time warnings (previously raw
+// process.stderr.write lines that broke JSON log ingestion), request lines, drain.
+const log = pino({ level: config.LOG_LEVEL, redact: { paths: LOG_REDACT_PATHS, remove: true } });
+const bootWarn = (m: string): void => log.warn(m);
 // Air-gapped posture is process-wide, set before any egress can happen: every guarded
 // control-plane outbound then requires an explicit allowlist (fail-closed).
 setAirGappedEgress(config.AIR_GAPPED);
 const context = buildContext(config);
-const app = buildServer(config, context);
+const app = buildServer(config, context, log);
 if (!context) {
   app.log.warn(
     'control-api booting health-only — set GULLEY_ADMIN_SESSION_SECRET to serve admin routes',

@@ -101,8 +101,49 @@ export class Histogram implements Metric {
   }
 }
 
+/** A settable value (last write wins), optionally sampled from a callback at
+ *  render time so a backlog/size can be exposed without a hot-path write. */
+export class Gauge implements Metric {
+  private readonly series = new Map<string, { labels: Labels; value: number }>();
+
+  constructor(
+    readonly name: string,
+    readonly help: string,
+    private readonly collect?: () => Array<{ labels?: Labels; value: number }>,
+  ) {}
+
+  set(labels: Labels = {}, value: number): void {
+    this.series.set(seriesKey(labels), { labels, value });
+  }
+
+  render(): string {
+    const lines = [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} gauge`];
+    if (this.collect) {
+      try {
+        for (const s of this.collect()) this.set(s.labels ?? {}, s.value);
+      } catch {
+        /* a failing sampler must never break the scrape */
+      }
+    }
+    for (const s of this.series.values()) {
+      lines.push(`${this.name}${renderLabels(s.labels)} ${s.value}`);
+    }
+    return lines.join('\n');
+  }
+}
+
 export class Registry {
   private readonly metrics: Metric[] = [];
+
+  gauge(
+    name: string,
+    help: string,
+    collect?: () => Array<{ labels?: Labels; value: number }>,
+  ): Gauge {
+    const g = new Gauge(name, help, collect);
+    this.metrics.push(g);
+    return g;
+  }
 
   counter(name: string, help: string): Counter {
     const c = new Counter(name, help);

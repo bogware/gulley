@@ -21,10 +21,7 @@ import { authCode, deviceCode, oauthClient, oauthGrant } from './schema';
  * `.rowCount`. A generation-guarded CAS therefore MUST read this — never Array.isArray,
  * which is always true on the postgres-js Result and reports a lost race as a success.
  */
-export function affectedRows(res: unknown): number {
-  const r = res as { rowCount?: number; count?: number };
-  return r?.rowCount ?? r?.count ?? 0;
-}
+import { affectedRows } from './affected-rows';
 
 const ms = (d: Date | null): number => (d ? d.getTime() : 0);
 const dt = (n: number): Date => new Date(n);

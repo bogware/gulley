@@ -40,7 +40,8 @@ import {
   RequestMirror,
   type RequestMirrorConfig,
 } from '@gulley/http-edge';
-import type { RateResolver } from '@gulley/cost';
+import { GULLEY_VERSION, memoizeAsync } from '@gulley/core';
+import { PRICING_AS_OF, type RateResolver } from '@gulley/cost';
 import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulley/auth';
 import { OidcProvider } from '@gulley/oidc';
 import { readFileSync } from 'node:fs';
@@ -106,6 +107,7 @@ import {
   PostgresVectorIndex,
   RedisExactCache,
   RedisVectorIndex,
+  type BatchSweepResult,
 } from '@gulley/storage';
 import { resolveBrokerAccessToken } from '@gulley/oauth';
 import {
@@ -205,14 +207,92 @@ export function buildGuardrails(config: Config): GuardrailEngine | undefined {
   );
 }
 
-/** Boot-time warnings sink (the Fastify logger isn't wired yet at context build). */
-const bootLog = {
-  warn: (obj: object, msg: string): void => console.warn(`[gulley] ${msg}`, obj),
+/** Structured logger the context build + maintenance loops write to. main.ts passes
+ *  the process pino instance; the console fallback keeps tests/smoke scripts working. */
+export interface BootLogger {
+  info(obj: object, msg: string): void;
+  warn(obj: object, msg: string): void;
+  error(obj: object, msg: string): void;
+}
+const consoleLog: BootLogger = {
+  info: (obj, msg) => console.info(`[gulley] ${msg}`, obj),
+  warn: (obj, msg) => console.warn(`[gulley] ${msg}`, obj),
+  error: (obj, msg) => console.error(`[gulley] ${msg}`, obj),
 };
+
+/** Wraps a background job so every run is LOGGED and METERED (result ok|error|skipped,
+ *  last-success timestamp). The previous `.catch(() => {})` timers made a permanently
+ *  failing sweep (statement_timeout, schema drift) invisible until disk filled. */
+export type MaintenanceRunner = (
+  job: string,
+  fn: () => Promise<number | BatchSweepResult | void>,
+) => () => void;
+
+export function makeMaintenanceRunner(
+  log: BootLogger,
+  metrics?: GatewayMetrics,
+): MaintenanceRunner {
+  return (job, fn) => () => {
+    void (async () => {
+      const started = Date.now();
+      try {
+        const r = await fn();
+        const detail = typeof r === 'number' ? { removed: r } : r ? r : {};
+        const skipped = typeof r === 'object' && r !== null && r.skipped === true;
+        metrics?.recordMaintenance(job, skipped ? 'skipped' : 'ok');
+        const removed = typeof r === 'number' ? r : (r?.removed ?? 0);
+        if (removed > 0 || (typeof r === 'object' && r?.capped))
+          log.info({ job, ...detail, durationMs: Date.now() - started }, 'maintenance run');
+      } catch (err) {
+        log.error({ err, job, durationMs: Date.now() - started }, 'maintenance run failed');
+        metrics?.recordMaintenance(job, 'error');
+      }
+    })();
+  };
+}
+
+/** An unref'd repeating timer with ±10% jitter, so a fleet of replicas does not fire
+ *  the same sweep in lock-step (on top of the per-job advisory lock). Returns stop(). */
+export function scheduleJittered(fn: () => void, intervalMs: number, jitter = 0.1): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const next = (): void => {
+    if (stopped) return;
+    const delay = Math.max(1_000, intervalMs * (1 + (Math.random() * 2 - 1) * jitter));
+    timer = setTimeout(() => {
+      fn();
+      next();
+    }, delay);
+    timer.unref?.();
+  };
+  next();
+  return () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+  };
+}
 
 /** Assemble the two-tier cache from config: pluggable exact store + optional
  *  semantic tier (embeddings + vector index). pgvector is the vector default. */
-export function buildCache(config: Config, db: Database): CacheEngine {
+export function buildCache(
+  config: Config,
+  db: Database,
+  log: BootLogger = consoleLog,
+  maintenance?: MaintenanceRunner,
+  stops?: Array<() => void>,
+): CacheEngine {
+  // Validate the semantic tier's prerequisites BEFORE any store/timer is allocated, so
+  // a bad knob throws out of a clean function (health-only boot, no orphaned timer).
+  if (config.CACHE_SEMANTIC_ENABLED) {
+    if (!config.EMBEDDINGS_API_KEY)
+      throw new Error('EMBEDDINGS_API_KEY required for the semantic cache');
+    if (config.CACHE_VECTOR_BACKEND === 'redis' && !config.REDIS_VECTOR_URL)
+      throw new Error('REDIS_VECTOR_URL required for the redis vector index');
+  }
+  if (config.CACHE_EXACT_BACKEND === 'redis' && !config.REDIS_CACHE_URL)
+    throw new Error('REDIS_CACHE_URL required for the redis exact cache');
+  const redisLog = (role: string) => (err: Error) =>
+    log.warn({ err, role }, 'redis connection error');
   let exact: ExactCacheStore;
   switch (config.CACHE_EXACT_BACKEND) {
     case 'memory':
@@ -221,8 +301,11 @@ export function buildCache(config: Config, db: Database): CacheEngine {
     case 'redis': {
       if (!config.REDIS_CACHE_URL)
         throw new Error('REDIS_CACHE_URL required for the redis exact cache');
-      const cacheClient = createRedisClient(config.REDIS_CACHE_URL);
-      void checkEvictionPolicy(cacheClient, 'cache', bootLog);
+      const cacheClient = createRedisClient(config.REDIS_CACHE_URL, {
+        role: 'cache',
+        onError: redisLog('cache'),
+      });
+      void checkEvictionPolicy(cacheClient, 'cache', log);
       exact = new RedisExactCache(cacheClient);
       break;
     }
@@ -230,19 +313,16 @@ export function buildCache(config: Config, db: Database): CacheEngine {
       const pg = new PostgresExactCache(db);
       exact = pg;
       if (config.CACHE_SWEEP_INTERVAL_SECONDS > 0) {
-        const timer = setInterval(
-          () => void pg.sweepExpired().catch(() => {}),
-          config.CACHE_SWEEP_INTERVAL_SECONDS * 1000,
-        );
-        timer.unref?.(); // best-effort maintenance; never keeps the process alive
+        const run = maintenance
+          ? maintenance('cache_sweep', () => pg.sweepExpiredDetailed())
+          : () => void pg.sweepExpired().catch(() => {});
+        stops?.push(scheduleJittered(run, config.CACHE_SWEEP_INTERVAL_SECONDS * 1000));
       }
     }
   }
 
   let semantic: { embed: EmbeddingProvider; index: VectorIndex; threshold: number } | undefined;
-  if (config.CACHE_SEMANTIC_ENABLED) {
-    if (!config.EMBEDDINGS_API_KEY)
-      throw new Error('EMBEDDINGS_API_KEY required for the semantic cache');
+  if (config.CACHE_SEMANTIC_ENABLED && config.EMBEDDINGS_API_KEY) {
     const embed = new OpenAIEmbeddingProvider({
       apiKey: config.EMBEDDINGS_API_KEY,
       model: config.EMBEDDINGS_MODEL,
@@ -257,8 +337,11 @@ export function buildCache(config: Config, db: Database): CacheEngine {
       case 'redis': {
         if (!config.REDIS_VECTOR_URL)
           throw new Error('REDIS_VECTOR_URL required for the redis vector index');
-        const vectorClient = createRedisClient(config.REDIS_VECTOR_URL);
-        void checkEvictionPolicy(vectorClient, 'vector', bootLog);
+        const vectorClient = createRedisClient(config.REDIS_VECTOR_URL, {
+          role: 'vector',
+          onError: redisLog('vector'),
+        });
+        void checkEvictionPolicy(vectorClient, 'vector', log);
         index = new RedisVectorIndex(vectorClient, config.EMBEDDINGS_DIMENSIONS);
         break;
       }
@@ -578,9 +661,39 @@ export function buildCustomProviders(config: Config): {
   return { routes, modelRules, models };
 }
 
-export function createProductionContext(config: Config): GatewayContext {
+export function createProductionContext(
+  config: Config,
+  log: BootLogger = consoleLog,
+): GatewayContext {
   if (!config.DATABASE_URL) throw new Error('DATABASE_URL is required to run the data plane');
   if (!config.GULLEY_KEY_PEPPER) throw new Error('GULLEY_KEY_PEPPER is required to validate keys');
+
+  // Pure config parsing FIRST: anything that can throw on a bad knob runs before any
+  // pool / timer / telemetry provider is allocated, so a health-only boot never leaves
+  // orphaned connections or ticking sweeps behind the failed context.
+  const cascade = parseCascadePolicy(config.CASCADE_POLICY);
+  const headerModifier = config.HEADER_MODIFIER
+    ? (JSON.parse(config.HEADER_MODIFIER) as HeaderModifierConfig)
+    : undefined;
+  const mirror = buildMirror(config);
+  const secretResolver = config.CONFIG_SOURCE === 'db' ? buildSecretResolver(config) : undefined;
+  const guardrails = buildGuardrails(config);
+
+  // Prometheus registry + the maintenance runner it feeds are created up front so every
+  // background job below (sweeps, heal, retention) is metered from its first tick.
+  const metrics = config.METRICS_ENABLED ? new GatewayMetrics() : undefined;
+  const maintenance = makeMaintenanceRunner(log, metrics);
+  const maintenanceStops: Array<() => void> = [];
+  const redisLog = (role: string) => (err: Error) =>
+    log.warn({ err, role }, 'redis connection error');
+  /** Rate-limit a repeating warning to once per window (per key). */
+  const lastWarn = new Map<string, number>();
+  const warnThrottled = (key: string, obj: object, msg: string): void => {
+    const now = Date.now();
+    if (now - (lastWarn.get(key) ?? 0) < 30_000) return;
+    lastWarn.set(key, now);
+    log.warn(obj, msg);
+  };
 
   let routes = buildRoutes(config);
   const custom = buildCustomProviders(config);
@@ -756,11 +869,12 @@ export function createProductionContext(config: Config): GatewayContext {
   // data-minimization regression. Mirror the exact-cache sweep: an unref'd best-effort
   // timer, guarded on the store actually existing and a non-zero interval.
   if (maskVault && config.MASK_VAULT_SWEEP_INTERVAL_SECONDS > 0) {
-    const timer = setInterval(
-      () => void maskVault.sweepExpired(new Date()).catch(() => {}),
-      config.MASK_VAULT_SWEEP_INTERVAL_SECONDS * 1000,
+    maintenanceStops.push(
+      scheduleJittered(
+        maintenance('mask_vault_sweep', () => maskVault.sweepExpiredDetailed(new Date())),
+        config.MASK_VAULT_SWEEP_INTERVAL_SECONDS * 1000,
+      ),
     );
-    timer.unref?.();
   }
 
   // Request-log retention: bounded batched DELETE of request_log rows past the retention
@@ -768,14 +882,14 @@ export function createProductionContext(config: Config): GatewayContext {
   // (the durable budget/chargeback source of truth) is deliberately NOT swept.
   if (config.REQUEST_LOG_RETENTION_DAYS > 0) {
     const retentionDays = config.REQUEST_LOG_RETENTION_DAYS;
-    const timer = setInterval(
-      () =>
-        void purgeRequestLogsOlderThan(db, retentionCutoff(new Date(), retentionDays)).catch(
-          () => {},
+    maintenanceStops.push(
+      scheduleJittered(
+        maintenance('request_log_retention', () =>
+          purgeRequestLogsOlderThan(db, retentionCutoff(new Date(), retentionDays)),
         ),
-      config.REQUEST_LOG_RETENTION_SWEEP_INTERVAL_SECONDS * 1000,
+        config.REQUEST_LOG_RETENTION_SWEEP_INTERVAL_SECONDS * 1000,
+      ),
     );
-    timer.unref?.();
   }
 
   // Deployment-wide data-residency / ZDR policy (env-config path), computed once.
@@ -789,7 +903,7 @@ export function createProductionContext(config: Config): GatewayContext {
   // Warn loudly at boot so this surfaces as a config task, not a silent outage later
   // (Bedrock stamps its region from baseUrl, so it is exempt from the warning).
   if (config.CONFIG_SOURCE === 'db' && !isEmptyResidencyPolicy(residencyPolicy)) {
-    bootLog.warn(
+    log.warn(
       { allowedRegions: residencyPolicy?.allowedRegions, requireZdr: residencyPolicy?.requireZdr },
       'residency policy is active with CONFIG_SOURCE=db: every non-bedrock provider in the ' +
         'config document MUST set region (and zdr where required) or its traffic will be ' +
@@ -827,10 +941,22 @@ export function createProductionContext(config: Config): GatewayContext {
       : scopeKey.startsWith('attr:')
         ? attrCapFor(scopeKey)
         : null;
-  const dbCapResolver = createBudgetCapResolver(db);
+  // Caps are memoised (fresh for GOVERNANCE_CACHE_TTL_MS, stale-while-erroring for
+  // minutes): the lookup is a per-request admission dependency, and a Postgres blip
+  // previously failed every reserve/commit outright.
+  const dbCapResolver = memoizeAsync(createBudgetCapResolver(db), {
+    ttlMs: config.GOVERNANCE_CACHE_TTL_MS,
+    onError: (err) => {
+      warnThrottled('cap-resolver', { err }, 'budget cap lookup failed — serving cached cap');
+      metrics?.recordStoreError('budget', 'cap_lookup');
+    },
+  });
   const budgets: BudgetStore = config.REDIS_COUNTERS_URL
     ? new RedisBudgetStore(
-        createRedisClient(config.REDIS_COUNTERS_URL),
+        createRedisClient(config.REDIS_COUNTERS_URL, {
+          role: 'counters',
+          onError: redisLog('counters'),
+        }),
         (scopeKey) =>
           // Compose: `model:` + `attr:` scopes resolve from config; else from the DB.
           scopeKey.startsWith('model:') || scopeKey.startsWith('attr:')
@@ -851,8 +977,11 @@ export function createProductionContext(config: Config): GatewayContext {
   // evicts counters under memory pressure → under-charging + cap bypass with no error.
   // A transient probe client keeps the check off the long-lived store clients.
   if (config.REDIS_COUNTERS_URL) {
-    const probe = createRedisClient(config.REDIS_COUNTERS_URL);
-    void checkEvictionPolicy(probe, 'counters', bootLog).finally(() => {
+    const probe = createRedisClient(config.REDIS_COUNTERS_URL, {
+      role: 'counters',
+      onError: redisLog('counters'),
+    });
+    void checkEvictionPolicy(probe, 'counters', log).finally(() => {
       void probe.quit().catch(() => {});
     });
   }
@@ -864,14 +993,13 @@ export function createProductionContext(config: Config): GatewayContext {
   // every boot. Fire-and-forget (never blocks boot); rebuild seeds the ledger sum,
   // so concurrent replicas rebuilding to the same value is safe.
   if (config.REDIS_COUNTERS_URL && budgets.healCommitted) {
-    void (async () => {
-      try {
-        for (const d of await loadBudgetHealData(db)) {
-          await budgets.healCommitted?.(d.workspaceId, d.ledgerMicroUsd, d.periodSeconds);
-        }
-      } catch {
-        /* best-effort; enforcement still applies, just not pre-healed */
+    maintenance('budget_heal', async () => {
+      let healed = 0;
+      for (const d of await loadBudgetHealData(db)) {
+        const r = await budgets.healCommitted?.(d.workspaceId, d.ledgerMicroUsd, d.periodSeconds);
+        if (r?.healed) healed += 1;
       }
+      return healed;
     })();
   }
 
@@ -882,7 +1010,6 @@ export function createProductionContext(config: Config): GatewayContext {
 
   // Prometheus metrics tee off the single telemetry event, so one recordRequest
   // call feeds both OTel spans and the /metrics counters/histograms.
-  const metrics = config.METRICS_ENABLED ? new GatewayMetrics() : undefined;
   const telemetry: Telemetry = metrics
     ? {
         recordRequest: (d) => {
@@ -893,12 +1020,12 @@ export function createProductionContext(config: Config): GatewayContext {
           try {
             otel.recordRequest(d);
           } catch (err) {
-            console.warn(`[gulley] otel recordRequest failed: ${(err as Error).message}`);
+            warnThrottled('otel-record', { err }, 'otel recordRequest failed');
           }
           try {
             metrics.record(d);
           } catch (err) {
-            console.warn(`[gulley] metrics record failed: ${(err as Error).message}`);
+            warnThrottled('metrics-record', { err }, 'metrics record failed');
           }
         },
         forceFlush: () => otel.forceFlush(),
@@ -937,12 +1064,23 @@ export function createProductionContext(config: Config): GatewayContext {
   let rateLimiter: RateLimiter | undefined;
   if (config.RATELIMIT_ENABLED) {
     const store: RateLimitStore = config.REDIS_COUNTERS_URL
-      ? new RedisRateLimitStore(createRedisClient(config.REDIS_COUNTERS_URL))
+      ? new RedisRateLimitStore(
+          createRedisClient(config.REDIS_COUNTERS_URL, {
+            role: 'counters',
+            onError: redisLog('counters'),
+          }),
+        )
       : new InMemoryRateLimitStore();
+    const policy = config.RATELIMIT_FAIL_OPEN ? 'fail_open' : 'fail_closed';
     rateLimiter = new RateLimiter({
       store,
-      resolve: createRateLimitResolver(db),
+      resolve: memoizeAsync(createRateLimitResolver(db), { ttlMs: config.GOVERNANCE_CACHE_TTL_MS }),
       failOpen: config.RATELIMIT_FAIL_OPEN,
+      // A degraded limiter used to be completely silent: no log, no metric.
+      onError: (err, stage) => {
+        warnThrottled(`ratelimit-${stage}`, { err, stage, policy }, 'rate-limit store unavailable');
+        metrics?.recordStoreError('ratelimit', stage === 'commit' ? 'commit' : policy);
+      },
     });
   }
 
@@ -951,20 +1089,50 @@ export function createProductionContext(config: Config): GatewayContext {
   const requestLog = new BatchingRequestLog(new PostgresRequestLog(db), {
     maxBatch: config.LOG_BATCH_MAX,
     intervalMs: config.LOG_BATCH_INTERVAL_MS,
+    // A failed flush drops the batch (never re-buffered unbounded). It used to drop
+    // SILENTLY — the teardown's own catch can never see a batched write fail.
+    onError: (err, dropped) => {
+      log.error(
+        { err, dropped, sink: 'request_log' },
+        'request_log batch flush failed — rows dropped',
+      );
+      metrics?.recordRequestLogDropped(dropped);
+    },
   });
+  metrics?.setRequestLogBacklogSampler(() => requestLog.backlog());
 
   // Cross-replica breaker sharing rides the counters Redis (noeviction). The
   // refresh timer is started here and stopped on drain via breakerSync.stop().
   const breakerSync =
     config.BREAKER_SHARED && config.REDIS_COUNTERS_URL
-      ? new RedisBreakerSync(createRedisClient(config.REDIS_COUNTERS_URL), {
-          prefix: config.BREAKER_SHARED_PREFIX,
-          refreshMs: config.BREAKER_SHARED_REFRESH_MS,
-        })
+      ? new RedisBreakerSync(
+          createRedisClient(config.REDIS_COUNTERS_URL, {
+            role: 'counters',
+            onError: redisLog('counters'),
+          }),
+          {
+            prefix: config.BREAKER_SHARED_PREFIX,
+            refreshMs: config.BREAKER_SHARED_REFRESH_MS,
+          },
+        )
       : undefined;
   breakerSync?.start();
 
+  metrics?.setBuildInfo({ version: GULLEY_VERSION, node: process.version });
+  metrics?.setDegraded(undefined);
+  log.info(
+    {
+      pricingAsOf: PRICING_AS_OF,
+      catalog: config.MODELS_CATALOG_FILE ?? 'seed',
+      version: GULLEY_VERSION,
+    },
+    'pricing tables loaded',
+  );
+
   return {
+    stopMaintenance: () => {
+      for (const stop of maintenanceStops) stop();
+    },
     routes,
     keyStore: new PostgresKeyStore(authDb),
     pepper: config.GULLEY_KEY_PEPPER,
@@ -1012,8 +1180,10 @@ export function createProductionContext(config: Config): GatewayContext {
     maskVaultEncryptor,
     maskVaultTtlSeconds: config.MASK_VAULT_TTL_SECONDS,
     telemetry,
-    guardrails: buildGuardrails(config),
-    cache: config.CACHE_ENABLED ? buildCache(config, db) : undefined,
+    guardrails,
+    cache: config.CACHE_ENABLED
+      ? buildCache(config, db, log, maintenance, maintenanceStops)
+      : undefined,
     rateLimiter,
     metrics,
     modelRouter,
@@ -1026,7 +1196,7 @@ export function createProductionContext(config: Config): GatewayContext {
     residencyPolicy,
     // Cascade routing policies (env-config). Empty = off. Parse THROWS on bad JSON so a
     // malformed policy fails boot rather than silently disabling escalation.
-    cascade: parseCascadePolicy(config.CASCADE_POLICY),
+    cascade,
     models: catalogModels,
     rateResolver,
     streamInactivityMs: config.STREAM_INACTIVITY_MS,
@@ -1043,7 +1213,7 @@ export function createProductionContext(config: Config): GatewayContext {
     basicAuth,
     scoreboard: config.LB_LEAST_LOAD ? new LoadScoreboard() : undefined,
     sessionAffinityHeader: config.LB_SESSION_AFFINITY_HEADER,
-    accessLog: buildAccessLog(config.ACCESS_LOG_FIELDS),
+    accessLog: buildAccessLog(config.ACCESS_LOG_FIELDS, log),
     accessLogSink: config.ACCESS_LOG_OTLP
       ? initAccessLogExporter({
           endpoint: config.OTEL_EXPORTER_OTLP_ENDPOINT,
@@ -1069,18 +1239,15 @@ export function createProductionContext(config: Config): GatewayContext {
     spotlightDirective: config.GUARDRAILS_SPOTLIGHT_DIRECTIVE,
     streamEnforce: config.STREAMING_ENFORCE,
     streamEnforceWindowChars: config.STREAMING_ENFORCE_WINDOW_CHARS,
-    headerModifier: config.HEADER_MODIFIER
-      ? (JSON.parse(config.HEADER_MODIFIER) as HeaderModifierConfig)
-      : undefined,
-    mirror: buildMirror(config),
+    headerModifier,
+    mirror,
     tracer: config.DEBUG_TRACE_TOKEN ? new RequestTracer(config.DEBUG_TRACE_BUFFER) : undefined,
     debugTraceToken: config.DEBUG_TRACE_TOKEN,
     // Multi-tenant per-tenant upstream credentials (db config mode): each tenant
     // authenticates upstream with its own key, resolved from Postgres + secrets.
-    tenantCredentials:
-      config.CONFIG_SOURCE === 'db'
-        ? new DbTenantCredentialResolver(db, buildSecretResolver(config))
-        : undefined,
+    tenantCredentials: secretResolver
+      ? new DbTenantCredentialResolver(db, secretResolver)
+      : undefined,
   };
 }
 
@@ -1095,13 +1262,17 @@ export function buildMirror(config: Config): RequestMirror | undefined {
 /** Build the access-log field engine, FAIL-OPEN: a bad JSON/CEL config disables
  *  the access log (with a warning) rather than crashing the data plane — an
  *  observability knob must never take down proxying. */
-export function buildAccessLog(raw: string | undefined): AccessLogFieldEngine | undefined {
+export function buildAccessLog(
+  raw: string | undefined,
+  log: BootLogger = consoleLog,
+): AccessLogFieldEngine | undefined {
   if (!raw) return undefined;
   try {
     return new AccessLogFieldEngine(JSON.parse(raw) as AccessLogConfig);
   } catch (err) {
-    console.warn(
-      `[gulley] ACCESS_LOG_FIELDS is invalid; access log disabled: ${(err as Error).message}`,
+    log.warn(
+      { err },
+      `ACCESS_LOG_FIELDS is invalid; access log disabled: ${(err as Error).message}`,
     );
     return undefined;
   }

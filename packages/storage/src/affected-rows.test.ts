@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { affectedRows } from './oauth-stores';
+import { affectedRows } from './affected-rows';
 
 /**
  * Regression for the generation-guarded CAS bug: the prod postgres-js driver returns a

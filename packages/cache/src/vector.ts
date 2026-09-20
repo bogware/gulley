@@ -17,34 +17,71 @@ export function cosineSimilarity(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
+interface Entry {
+  embedding: number[];
+  /** Epoch ms; Infinity when stored without a TTL. */
+  expiresAtMs: number;
+}
+
+export interface InMemoryVectorIndexOptions {
+  /** Upper bound on vectors per scope (oldest-inserted evicted). Default 5_000. */
+  maxPerScope?: number;
+  now?: () => number;
+}
+
 /**
  * Brute-force in-memory vector index, partitioned by scope. Correct and fine for
  * CI/tests and modest single-node caches; pgvector (HNSW) is the prod default.
+ * Honours the TTL it is given (lazy purge on query/upsert) and bounds each scope,
+ * since the backend is selectable in production config.
  */
 export class InMemoryVectorIndex implements VectorIndex {
-  private readonly byScope = new Map<string, Map<string, number[]>>();
+  private readonly byScope = new Map<string, Map<string, Entry>>();
+  private readonly maxPerScope: number;
+  private readonly now: () => number;
 
-  async upsert(
-    scope: string,
-    id: string,
-    embedding: number[],
-    _ttlSeconds?: number,
-  ): Promise<void> {
-    // In-memory index is CI/test-scale; no TTL needed (it dies with the process).
+  constructor(opts: InMemoryVectorIndexOptions = {}) {
+    this.maxPerScope = Math.max(1, opts.maxPerScope ?? 5_000);
+    this.now = opts.now ?? (() => Date.now());
+  }
+
+  async upsert(scope: string, id: string, embedding: number[], ttlSeconds?: number): Promise<void> {
     let m = this.byScope.get(scope);
     if (!m) {
       m = new Map();
       this.byScope.set(scope, m);
     }
-    m.set(id, embedding);
+    m.delete(id);
+    m.set(id, {
+      embedding,
+      expiresAtMs: ttlSeconds && ttlSeconds > 0 ? this.now() + ttlSeconds * 1000 : Infinity,
+    });
+    while (m.size > this.maxPerScope) {
+      const oldest = m.keys().next().value;
+      if (oldest === undefined) break;
+      m.delete(oldest);
+    }
   }
 
   async query(scope: string, embedding: number[], topK: number): Promise<VectorMatch[]> {
     const m = this.byScope.get(scope);
     if (!m) return [];
+    const t = this.now();
     const scored: VectorMatch[] = [];
-    for (const [id, vec] of m) scored.push({ id, score: cosineSimilarity(embedding, vec) });
+    for (const [id, e] of m) {
+      if (e.expiresAtMs <= t) {
+        m.delete(id);
+        continue;
+      }
+      scored.push({ id, score: cosineSimilarity(embedding, e.embedding) });
+    }
+    if (m.size === 0) this.byScope.delete(scope);
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, topK);
+  }
+
+  /** Test/inspection helper: live vectors in a scope. */
+  size(scope: string): number {
+    return this.byScope.get(scope)?.size ?? 0;
   }
 }

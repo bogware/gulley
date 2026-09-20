@@ -598,6 +598,11 @@ const EnvShape = z.object({
   // still bills the abandoned generation). Default 10 min; the pre-first-byte
   // REQUEST_DEADLINE_MS remains the per-request operator cap.
   UPSTREAM_HEADERS_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
+  // Freshness of the per-request governance lookups (workspace budget cap, rate-limit
+  // rules) read from Postgres. Within this window the cached value is served; while
+  // Postgres is failing a stale value keeps being served for minutes so a database blip
+  // is never a per-request admission failure. Default 10 s.
+  GOVERNANCE_CACHE_TTL_MS: z.coerce.number().int().positive().default(10_000),
   // HTTP keep-alive idle timeout for the listener. MUST exceed the load balancer's idle
   // timeout (ALB default 60 s, the shipped Terraform sets 300 s) — when the target
   // closes an idle keep-alive connection first, the LB can reuse it a moment later and

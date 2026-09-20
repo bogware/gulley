@@ -1,3 +1,4 @@
+import { CACHE_MULTIPLIERS } from '@gulley/cost';
 import type { CatalogEntry } from './catalog';
 
 /**
@@ -47,7 +48,14 @@ export function parseModelsDev(payload: unknown): CatalogEntry[] {
       if (input > 0 && (cacheRead !== undefined || cacheWrite !== undefined)) {
         const read = cacheRead !== undefined ? cacheRead / input : 1;
         const write = cacheWrite !== undefined ? cacheWrite / input : 1;
-        entry.cache = { read, write5m: write, write1h: write };
+        // models.dev publishes ONE cache-write price (the 5-minute tier). The 1-hour
+        // tier is priced at a fixed ratio to it (Anthropic: 2.0x vs 1.25x the input
+        // rate); copying the 5m figure into write1h under-billed 1h writes by 37.5%.
+        const write1h =
+          cacheWrite !== undefined
+            ? write * (CACHE_MULTIPLIERS.write1h / CACHE_MULTIPLIERS.write5m)
+            : write;
+        entry.cache = { read, write5m: write, write1h };
       }
       const context = num(m?.limit?.context);
       if (context !== undefined) entry.contextLength = context;

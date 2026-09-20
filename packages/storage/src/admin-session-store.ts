@@ -1,5 +1,6 @@
 import type { AdminSessionInfo, AdminSessionStore } from '@gulley/auth';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
+import { affectedRows } from './affected-rows';
 
 import type { Database } from './db';
 import { adminSession } from './schema';
@@ -51,6 +52,17 @@ export class PostgresAdminSessionStore implements AdminSessionStore {
           expiresAt: new Date(rec.expiresAt),
         },
       });
+  }
+
+  /** Revoke EVERY live session of a subject (deprovisioning). Returns rows revoked.
+   *  The previous approach scanned `list()` (capped at the 500 newest rows), so an
+   *  offboarded user's older sessions could survive until their natural expiry. */
+  async revokeBySubject(subject: string): Promise<number> {
+    const res = await this.db
+      .update(adminSession)
+      .set({ revoked: true })
+      .where(and(eq(adminSession.subject, subject), eq(adminSession.revoked, false)));
+    return affectedRows(res);
   }
 
   async list(): Promise<AdminSessionInfo[]> {

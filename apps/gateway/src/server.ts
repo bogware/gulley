@@ -1,6 +1,6 @@
 import { GULLEY_VERSION } from '@gulley/core';
 import { randomUUID } from 'node:crypto';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { type GatewayContext, registerRoutes, RouteHolder } from './routes/messages';
 
@@ -20,6 +20,14 @@ export function parseTrustProxy(value: string): boolean | number | string {
   return v; // CIDR or comma-separated list
 }
 
+/** Header paths pino must never emit (credentials). Shared with main.ts's logger. */
+export const LOG_REDACT_PATHS = [
+  'req.headers.authorization',
+  'req.headers["x-api-key"]',
+  'req.headers["api-key"]',
+  'req.headers.cookie',
+];
+
 export function buildServer(
   config: Config,
   context?: GatewayContext,
@@ -27,6 +35,9 @@ export function buildServer(
     isDraining?: () => boolean;
     /** Why the proxy is disabled (health-only boot), surfaced on /ready. */
     degradedReason?: () => string | undefined;
+    /** The process logger (pino). When given, Fastify logs through it (one JSON
+     *  stream for boot, maintenance and request lines); else a logger is built here. */
+    logger?: FastifyBaseLogger;
   },
 ): GatewayServer {
   const app = Fastify({
@@ -43,18 +54,14 @@ export function buildServer(
     // and the mask-vault (whose reversal record is an upsert + AAD component), so a
     // collision would cross-attribute or overwrite. Mint a globally-unique id.
     genReqId: () => `req_${randomUUID()}`,
-    logger: {
-      level: config.LOG_LEVEL,
-      redact: {
-        paths: [
-          'req.headers.authorization',
-          'req.headers["x-api-key"]',
-          'req.headers["api-key"]',
-          'req.headers.cookie',
-        ],
-        remove: true,
-      },
-    },
+    ...(opts?.logger
+      ? { loggerInstance: opts.logger }
+      : {
+          logger: {
+            level: config.LOG_LEVEL,
+            redact: { paths: LOG_REDACT_PATHS, remove: true },
+          },
+        }),
   });
 
   // Node closes a connection whose headers arrive slower than headersTimeout; keep it

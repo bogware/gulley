@@ -283,6 +283,8 @@ export interface GatewayContext {
   streamInactivityMs?: number;
   /** Hard deadline for the whole cache lookup (config.CACHE_LOOKUP_TIMEOUT_MS). */
   cacheLookupTimeoutMs?: number;
+  /** Stop every background maintenance timer this context started (SIGTERM drain). */
+  stopMaintenance?: () => void;
   /** Request header names whose values are captured as cost-attribution tags on the
    *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
   attributionHeaders?: string[];
