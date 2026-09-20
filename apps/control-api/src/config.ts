@@ -291,6 +291,14 @@ const EnvShape = z.object({
   // grants nothing. Empty {} => SCIM Groups accepted but no role provisioning.
   SCIM_GROUP_ROLE_MAP: z.string().default('{}'),
 
+  // DB mode readiness gate: compare drizzle's applied-migrations table with the
+  // migrations this build ships; /ready is 503 while the schema is behind (or the
+  // database was never migrated). Off only for a deliberately partial schema.
+  DB_SCHEMA_CHECK: envBool(true),
+  // DB mode read-model refresh (seconds): the console's providers/collections/tenancy
+  // read model re-hydrates from Postgres on every bus signal AND on this interval, so
+  // a second replica converges even if a NOTIFY is missed. 0 = signal-only.
+  CONTROL_API_HYDRATE_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(60),
   // Postgres connect timeout for the control-plane pool. The statement timeout is
   // deliberately left off (long audit-chain scans), but a connect attempt must fail
   // fast so an unreachable database surfaces as a quick 5xx, not a 30 s hang per call.

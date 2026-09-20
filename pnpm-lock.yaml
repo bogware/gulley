@@ -710,6 +710,9 @@ importers:
       '@gulley/pipeline':
         specifier: workspace:*
         version: link:../pipeline
+      '@gulley/prompts':
+        specifier: workspace:*
+        version: link:../prompts
       drizzle-orm:
         specifier: ^0.45.2
         version: 0.45.2(@electric-sql/pglite@0.5.8)(@opentelemetry/api@1.9.1)(gel@2.2.0)(postgres@3.4.9)

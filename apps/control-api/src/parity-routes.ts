@@ -2,17 +2,9 @@ import { GULLEY_VERSION } from '@gulley/core';
 import { assertEgressAllowed, EgressError } from '@gulley/egress';
 import type { FastifyInstance } from 'fastify';
 
-import {
-  adminRoute,
-  auditedWrite,
-  body,
-  forbidden,
-  notFound,
-  scopeForProvider,
-  str,
-  uuidParam,
-} from './admin';
+import { adminRoute, body, forbidden, notFound, scopeForProvider, str, uuidParam } from './admin';
 import type { ControlContext } from './context';
+import { consoleWrite } from './durable-config';
 
 /**
  * Console-parity read/update endpoints that don't belong to an existing route module:
@@ -134,13 +126,25 @@ export function registerParityRoutes(app: FastifyInstance, ctx: ControlContext):
       const patch: { enabled?: boolean; baseUrl?: string } = {};
       if (typeof b['enabled'] === 'boolean') patch.enabled = b['enabled'];
       if (baseUrl !== undefined) patch.baseUrl = baseUrl;
-      const r = await auditedWrite(ctx, admin, {
+      const r = await consoleWrite(ctx, admin, {
         perm: 'provider:update',
         at,
         action: 'provider.update',
         target: id,
         diff: patch,
-        mutate: () => ctx.providers.update(id, patch),
+        memory: () => ctx.providers.update(id, patch),
+        durable: async (b) => {
+          const p = await b.updateProviderById(id, patch);
+          return p
+            ? {
+                id: p.id,
+                workspaceId: p.workspaceId,
+                kind: p.kind,
+                baseUrl: p.baseUrl,
+                enabled: p.enabled,
+              }
+            : undefined;
+        },
       });
       if (!r.ok) return forbidden(reply);
       if (!r.value) return notFound(reply, 'provider');

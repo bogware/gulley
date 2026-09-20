@@ -166,7 +166,17 @@ export function buildServer(
   app.get('/ready', async (_req, reply) => {
     if (!ctx) {
       reply.code(503);
-      return { status: 'degraded' };
+      return { status: 'degraded', reason: 'no admin context (health-only boot)' };
+    }
+    // DB mode: not ready while the database schema is behind this build (or was never
+    // migrated) — the failure mode was a healthy-looking boot that 500'd on first use.
+    if (ctx.schemaStatus) {
+      const schema = await ctx.schemaStatus();
+      if (!schema.ok) {
+        reply.code(503);
+        return { status: 'degraded', reason: `database schema: ${schema.reason}`, schema };
+      }
+      return { status: 'ready', schema };
     }
     return { status: 'ready' };
   });

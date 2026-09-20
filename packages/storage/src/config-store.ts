@@ -270,6 +270,160 @@ export class PostgresConfigBackend implements ConfigBackend {
   runInTransaction<T>(fn: (b: ConfigBackend) => Promise<T>): Promise<T> {
     return this.db.transaction((tx) => fn(new PostgresConfigBackend(tx as unknown as Database)));
   }
+
+  // --- console primitives (id-addressed, bulk reads) ---------------------------
+  // The admin console edits ONE row at a time and keeps an in-memory read model of the
+  // whole config; these complement the name-keyed reconcile primitives above. They are
+  // deliberately not on the ConfigBackend interface (reconcile never needs them).
+
+  /** Every provider row with its workspace (one query, for the read-model hydrate). */
+  async listAllProviders(): Promise<Array<BackendProvider & { workspaceId: string }>> {
+    return this.db
+      .select({
+        id: provider.id,
+        workspaceId: provider.workspaceId,
+        kind: provider.kind,
+        baseUrl: provider.baseUrl,
+        enabled: provider.enabled,
+        region: provider.region,
+        zdr: provider.zdr,
+      })
+      .from(provider);
+  }
+
+  /** Every credential REFERENCE (never a value), keyed by provider id. */
+  async listAllCredentials(): Promise<Array<{ providerId: string; ref: SecretRef }>> {
+    const rows = await this.db
+      .select({
+        providerId: providerCredential.providerId,
+        arn: providerCredential.secretArn,
+        version: providerCredential.secretVersion,
+      })
+      .from(providerCredential);
+    return rows.map((r) => ({ providerId: r.providerId, ref: secretRef(r.arn, r.version) }));
+  }
+
+  /** Every entity of one kind across all workspaces (one query per kind). */
+  async listAllEntities(
+    kind: ConfigCollectionKind,
+  ): Promise<Array<BackendEntity & { workspaceId: string }>> {
+    if (kind === 'budget') {
+      const rows = await this.db
+        .select({
+          id: budget.id,
+          workspaceId: budget.workspaceId,
+          name: budget.name,
+          cap: budget.capMicroUsd,
+          period: budget.periodSeconds,
+        })
+        .from(budget);
+      return rows.map((r) => ({
+        id: r.id,
+        workspaceId: r.workspaceId,
+        name: r.name,
+        config:
+          r.period == null
+            ? { capMicroUsd: r.cap }
+            : { capMicroUsd: r.cap, periodSeconds: r.period },
+      }));
+    }
+    const t = jsonbTable(kind);
+    const rows = await this.db
+      .select({ id: t.id, workspaceId: t.workspaceId, name: t.name, config: t.config })
+      .from(t);
+    return rows.map((r) => ({
+      id: r.id,
+      workspaceId: r.workspaceId,
+      name: r.name,
+      config: r.config as Record<string, unknown>,
+    }));
+  }
+
+  /** Create one entity and return its id (budget: the workspace's singular row). */
+  async createEntityReturning(
+    kind: ConfigCollectionKind,
+    workspaceId: string,
+    name: string,
+    config: Record<string, unknown>,
+  ): Promise<string> {
+    await this.createEntity(kind, workspaceId, name, config);
+    const rows = await this.listEntities(kind, workspaceId);
+    const row = kind === 'budget' ? rows[0] : rows.find((r) => r.name === name);
+    return row?.id ?? '';
+  }
+
+  /** Update name and/or config of one entity by id; false when no such row. */
+  async updateEntityById(
+    kind: ConfigCollectionKind,
+    id: string,
+    patch: { name?: string; config?: Record<string, unknown> },
+  ): Promise<boolean> {
+    if (kind === 'budget') {
+      const set: Record<string, unknown> = {};
+      if (patch.name !== undefined) set['name'] = patch.name;
+      if (patch.config) {
+        set['capMicroUsd'] = Number(patch.config['capMicroUsd'] ?? 0);
+        set['periodSeconds'] =
+          patch.config['periodSeconds'] == null ? null : Number(patch.config['periodSeconds']);
+      }
+      if (Object.keys(set).length === 0) return true;
+      const rows = await this.db
+        .update(budget)
+        .set(set)
+        .where(eq(budget.id, id))
+        .returning({ id: budget.id });
+      return rows.length > 0;
+    }
+    const t = jsonbTable(kind);
+    const set: { name?: string; config?: Record<string, unknown> } = {};
+    if (patch.name !== undefined) set.name = patch.name;
+    if (patch.config) set.config = patch.config;
+    if (Object.keys(set).length === 0) return true;
+    const rows = await this.db.update(t).set(set).where(eq(t.id, id)).returning({ id: t.id });
+    return rows.length > 0;
+  }
+
+  /** Delete one entity by id; false when no such row. */
+  async deleteEntityById(kind: ConfigCollectionKind, id: string): Promise<boolean> {
+    const t = kind === 'budget' ? budget : jsonbTable(kind);
+    const rows = await this.db.delete(t).where(eq(t.id, id)).returning({ id: t.id });
+    return rows.length > 0;
+  }
+
+  /** Enable/disable or re-point one provider by id; the row, or undefined. */
+  async updateProviderById(
+    id: string,
+    patch: { enabled?: boolean; baseUrl?: string | null },
+  ): Promise<(BackendProvider & { workspaceId: string }) | undefined> {
+    const set: { enabled?: boolean; baseUrl?: string | null } = {};
+    if (patch.enabled !== undefined) set.enabled = patch.enabled;
+    if (patch.baseUrl !== undefined) set.baseUrl = patch.baseUrl;
+    const rows =
+      Object.keys(set).length === 0
+        ? await this.db.select().from(provider).where(eq(provider.id, id))
+        : await this.db.update(provider).set(set).where(eq(provider.id, id)).returning();
+    const r = rows[0];
+    return r
+      ? {
+          id: r.id,
+          workspaceId: r.workspaceId,
+          kind: r.kind,
+          baseUrl: r.baseUrl,
+          enabled: r.enabled,
+          region: r.region,
+          zdr: r.zdr,
+        }
+      : undefined;
+  }
+
+  /** Delete one provider by id (its credential cascades); false when no such row. */
+  async deleteProviderById(id: string): Promise<boolean> {
+    const rows = await this.db
+      .delete(provider)
+      .where(eq(provider.id, id))
+      .returning({ id: provider.id });
+    return rows.length > 0;
+  }
 }
 
 /** Durable `ConfigStore` over Postgres — reconcile runs in one transaction. */

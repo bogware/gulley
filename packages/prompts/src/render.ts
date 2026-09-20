@@ -28,7 +28,8 @@ export function renderPrompt(body: string, vars: Record<string, unknown>): strin
   const missing: string[] = [];
   PLACEHOLDER.lastIndex = 0;
   const out = body.replace(PLACEHOLDER, (_full, name: string) => {
-    if (!(name in vars) || vars[name] === undefined || vars[name] === null) {
+    // Own properties only: `{{constructor}}` must not resolve to Object.prototype.
+    if (!Object.hasOwn(vars, name) || vars[name] === undefined || vars[name] === null) {
       missing.push(name);
       return '';
     }

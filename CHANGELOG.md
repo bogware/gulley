@@ -25,6 +25,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (driver messages, hosts) in 5xx responses; a lost audit row is a structured
   `audit_lost` log event and an `audit_unavailable` response.
 
+### Fixed
+
+- **DB mode: console edits are durable.** Creating, updating or deleting a
+  provider, credential reference, route, policy, budget, rate limit, guardrail or
+  model alias in the admin console now commits to the Postgres config tables the
+  gateway reconciles from — in one transaction with its audit row and a new
+  `config_version` (content hash, YAML, diff summary), followed by a bus signal —
+  instead of writing a process-local registry that a restart wiped and the gateway
+  never saw. The console's read model re-hydrates from Postgres at boot, after every
+  commit, on a foreign config signal and on `CONTROL_API_HYDRATE_INTERVAL_SECONDS`,
+  so replicas converge. Duplicate entity names within a workspace are now a 409.
+- **Prompt registry is durable in DB mode** (`prompt_template` / `prompt_version`,
+  migration 0022): append-only, hash-chained rows; the chain hash now also covers the
+  author, timestamp and message, so rewriting who/when is detectable; template
+  renders resolve own properties only.
+- **Schema-version readiness.** Both apps compare drizzle's applied-migrations table
+  with the migrations the build ships and report `/ready` 503 while the database is
+  behind (or was never migrated) — `DB_SCHEMA_CHECK`.
+
 ### Changed
 
 - SCIM deprovision revokes every live session for the user (set-based, by subject

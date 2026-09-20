@@ -109,6 +109,7 @@ import {
   RedisExactCache,
   RedisVectorIndex,
   type BatchSweepResult,
+  schemaStatusProbe,
 } from '@gulley/storage';
 import { resolveBrokerAccessToken } from '@gulley/oauth';
 import {
@@ -856,6 +857,9 @@ export function createProductionContext(
     idleTimeoutMs: config.DB_IDLE_TIMEOUT_MS,
   };
   const db = createDatabase(config.DATABASE_URL, { max: config.DB_POOL_MAX, ...dbTimeouts });
+  // /ready compares the applied migrations with this build's (memoized, never on the
+  // request path) so a schema-behind deployment is pulled from the load balancer.
+  const schemaStatus = config.DB_SCHEMA_CHECK ? schemaStatusProbe(db) : undefined;
   // Hot-path auth (KeyStore + brokered-token grant lookups) reads from its OWN small pool,
   // physically separate from the teardown/durable-sink pool above, so audit/ledger write
   // pressure — including the single global audit advisory lock — can never exhaust the
@@ -1254,6 +1258,7 @@ export function createProductionContext(
     cacheLookupTimeoutMs: config.CACHE_LOOKUP_TIMEOUT_MS,
     upstreamHeadersTimeoutMs: config.UPSTREAM_HEADERS_TIMEOUT_MS,
     inflightTeardowns: new Set<Promise<void>>(),
+    schemaStatus,
     retryMaxAttempts: config.RETRY_MAX_ATTEMPTS,
     retryBackoffMs: config.RETRY_BACKOFF_MS,
     authorizer,

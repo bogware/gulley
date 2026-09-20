@@ -620,6 +620,45 @@ export const authCode = pgTable(
   (t) => [index('auth_code_expires_idx').on(t.expiresAt)],
 );
 
+// --- Governed prompt registry (durable) --------------------------------------
+// A named, workspace-scoped template and its append-only, per-template hash-chained
+// versions. The chain (hash over prev_hash + body/variables/author/timestamp/message)
+// is verified by @gulley/prompts' verifyChain; rows are never updated in place.
+
+export const promptTemplate = pgTable(
+  'prompt_template',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('prompt_template_ws_name_idx').on(t.workspaceId, t.name)],
+);
+
+export const promptVersion = pgTable(
+  'prompt_version',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    templateId: uuid('template_id')
+      .notNull()
+      .references(() => promptTemplate.id, { onDelete: 'cascade' }),
+    version: integer('version').notNull(),
+    body: text('body').notNull(),
+    variables: jsonb('variables')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    hash: text('hash').notNull(),
+    prevHash: text('prev_hash'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    createdBy: text('created_by').notNull(),
+    message: text('message'),
+  },
+  (t) => [uniqueIndex('prompt_version_template_version_idx').on(t.templateId, t.version)],
+);
+
 // --- M5.3 config / GitOps --------------------------------------------------
 
 // Append-only version log. content_hash is NON-unique so a revert (re-applying

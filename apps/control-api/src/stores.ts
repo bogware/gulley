@@ -184,6 +184,11 @@ export class ProviderStore {
   all(): Provider[] {
     return [...this.byId.values()];
   }
+  /** DB mode: replace the read model with the durable rows (hydrate). */
+  replaceAll(rows: Provider[]): void {
+    this.byId.clear();
+    for (const r of rows) this.byId.set(r.id, { ...r });
+  }
 }
 
 export class ProviderCredentialStore {
@@ -195,6 +200,10 @@ export class ProviderCredentialStore {
   }
   get(providerId: string): ProviderCredential | undefined {
     return this.byProvider.get(providerId);
+  }
+  replaceAll(rows: ProviderCredential[]): void {
+    this.byProvider.clear();
+    for (const r of rows) this.byProvider.set(r.providerId, { ...r });
   }
 }
 
@@ -224,6 +233,10 @@ export class ScopedCollection {
   }
   all(): ScopedEntity[] {
     return [...this.byId.values()];
+  }
+  replaceAll(rows: ScopedEntity[]): void {
+    this.byId.clear();
+    for (const r of rows) this.byId.set(r.id, { ...r });
   }
 }
 

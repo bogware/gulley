@@ -33,6 +33,10 @@ import {
   PostgresAuthCodeStore,
   PostgresOAuthClientStore,
   PostgresTenancyStore,
+  PostgresConfigBackend,
+  PostgresPromptRegistry,
+  type SchemaStatus,
+  schemaStatusProbe,
   auditHeadSeq,
   iterateAuditRows,
   readAuditPage,
@@ -66,6 +70,7 @@ import type { GatewayMetricsProvider } from './gateway-metrics';
 import type { ApplyCommitDeps } from '@gulley/config';
 import type { OidcProvider } from '@gulley/oidc';
 import { WormShipper } from './worm-shipper';
+import { DurableConfigWriter } from './durable-config';
 import {
   type ProviderUsageSource,
   runShadowSpendReconciliation,
@@ -128,6 +133,13 @@ export class SignalingAuditSink implements AuditSink {
   }
 }
 
+/** The tx-bound stores a config commit runs over (DB mode): the reconcile-facing
+ *  ConfigStore + audit sink + version store that `applyConfig` needs, plus the raw
+ *  backend for the console's id-addressed edits. */
+export interface DurableCommitDeps extends ApplyCommitDeps {
+  backend: PostgresConfigBackend;
+}
+
 /** Tx-bound durable stores for a mutation that must commit atomically with its audit
  *  row (DB mode). Built per call by {@link ControlContext.durableAtomic}. */
 export interface DurableTx {
@@ -143,6 +155,20 @@ export interface ControlContext {
   /** DB mode: reload the org/workspace read models from Postgres (boot + after a
    *  config apply that may have created tenancy rows). Absent ⇒ in-memory only. */
   hydrateTenancy?: () => Promise<{ orgs: number; workspaces: number }>;
+  /** DB mode: reload providers / credentials / config collections from Postgres into
+   *  the in-memory read model (boot, after every commit, on a bus signal, on a TTL). */
+  hydrateConfig?: () => Promise<{ providers: number; entities: number }>;
+  /** DB mode: tenancy + config read models in one call. */
+  hydrate?: () => Promise<{
+    orgs: number;
+    workspaces: number;
+    providers: number;
+    entities: number;
+  }>;
+  /** DB mode: the durable console commit path (see DurableConfigWriter). */
+  durableConfig?: DurableConfigWriter;
+  /** DB mode (opt-in): readiness probe comparing the applied migrations with this build's. */
+  schemaStatus?: () => Promise<SchemaStatus>;
   projects: ProjectStore;
   memberships: MembershipStore;
   providers: ProviderStore;
@@ -160,7 +186,7 @@ export interface ControlContext {
   configStore?: ConfigStore;
   /** Runs a config apply's reconcile + audit + version-append in ONE Postgres
    *  transaction; absent = the in-memory path (no cross-store atomicity needed). */
-  configAtomic?: <T>(fn: (deps: ApplyCommitDeps) => Promise<T>) => Promise<T>;
+  configAtomic?: <T>(fn: (deps: DurableCommitDeps) => Promise<T>) => Promise<T>;
   /** Read side of the request log: admin log browser + usage analytics. */
   requestLogQuery: RequestLogQuery;
   /** Chargeback/showback over the durable spend ledger (grouped by workspace / model
@@ -331,6 +357,9 @@ export interface InMemoryContextOptions {
   db?: Database;
   /** Structured hook for a failing durable membership loader (see AdminResolverDeps). */
   onLoaderError?: (subject: string, err: unknown) => void;
+  /** DB mode: gate readiness on the database schema matching this build's migrations
+   *  (main.ts sets it from DB_SCHEMA_CHECK; tests over a raw PGlite schema leave it off). */
+  schemaCheck?: boolean;
   /** HMAC key that signs auditor attestations; absent = attestation export off. */
   attestationKey?: string;
   /** Optional label stamped on the attestation. */
@@ -601,14 +630,16 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   // the whole apply back). Postgres audit here keeps the config-apply audit row
   // durable + atomic with the change.
   const configAtomic = db
-    ? <T>(fn: (deps: ApplyCommitDeps) => Promise<T>): Promise<T> =>
-        db.transaction((tx) =>
-          fn({
-            store: new PostgresConfigStore(tx as unknown as Database),
-            audit: new PostgresAuditSink(tx as unknown as Database),
-            versions: new PostgresConfigVersionStore(tx as unknown as Database),
-          }),
-        )
+    ? <T>(fn: (deps: DurableCommitDeps) => Promise<T>): Promise<T> =>
+        db.transaction((tx) => {
+          const h = tx as unknown as Database;
+          return fn({
+            store: new PostgresConfigStore(h),
+            audit: new SignalingAuditSink(new GuardedAuditSink(new PostgresAuditSink(h))),
+            versions: new PostgresConfigVersionStore(h),
+            backend: new PostgresConfigBackend(h),
+          });
+        })
     : undefined;
 
   // DB mode: a durable mutation and its audit row commit in one transaction (the
@@ -632,19 +663,75 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   const tenancy = opts.tenancy ?? (db ? new PostgresTenancyStore(db) : undefined);
   const orgs = new OrgStore(tenancy);
   const workspaces = new WorkspaceStore(tenancy);
+  const hydrateTenancy = tenancy
+    ? async () => ({ orgs: await orgs.hydrate(), workspaces: await workspaces.hydrate() })
+    : undefined;
+
+  // DB mode: providers / credentials / collections are a READ MODEL of the Postgres
+  // config tables (the same rows the gateway reconciles from). Every console commit,
+  // config apply, bus signal and TTL tick refreshes it; writes go through
+  // DurableConfigWriter, never into these maps directly.
+  const providers = new ProviderStore();
+  const credentials = new ProviderCredentialStore();
+  const consoleBackend = db ? new PostgresConfigBackend(db) : undefined;
+  const hydrateConfig = consoleBackend
+    ? async (): Promise<{ providers: number; entities: number }> => {
+        const [provs, creds, ...ents] = await Promise.all([
+          consoleBackend.listAllProviders(),
+          consoleBackend.listAllCredentials(),
+          ...COLLECTION_KINDS.map((k) => consoleBackend.listAllEntities(k)),
+        ]);
+        providers.replaceAll(
+          provs.map((p) => ({
+            id: p.id,
+            workspaceId: p.workspaceId,
+            kind: p.kind,
+            baseUrl: p.baseUrl,
+            enabled: p.enabled,
+          })),
+        );
+        credentials.replaceAll(
+          creds.map((c) => ({ id: c.providerId, providerId: c.providerId, credential: c.ref })),
+        );
+        let entities = 0;
+        COLLECTION_KINDS.forEach((k, i) => {
+          const rows = ents[i] ?? [];
+          entities += rows.length;
+          collections[k].replaceAll(rows);
+        });
+        return { providers: provs.length, entities };
+      }
+    : undefined;
+  const hydrate =
+    hydrateTenancy && hydrateConfig
+      ? async () => ({ ...(await hydrateTenancy()), ...(await hydrateConfig()) })
+      : undefined;
+  const originId = newOriginId();
+  const durableConfig =
+    configAtomic && hydrateConfig
+      ? new DurableConfigWriter({
+          atomic: configAtomic,
+          hydrate: hydrateConfig,
+          notifier: opts.notifier,
+          originId,
+        })
+      : undefined;
 
   return {
     orgs,
     workspaces,
-    hydrateTenancy: tenancy
-      ? async () => ({ orgs: await orgs.hydrate(), workspaces: await workspaces.hydrate() })
-      : undefined,
+    hydrateTenancy,
+    hydrateConfig,
+    hydrate,
+    durableConfig,
+    schemaStatus: db && opts.schemaCheck ? schemaStatusProbe(db) : undefined,
     projects: new ProjectStore(),
     memberships: new MembershipStore(),
-    providers: new ProviderStore(),
-    credentials: new ProviderCredentialStore(),
+    providers,
+    credentials,
     collections,
-    prompts: new InMemoryPromptRegistry(),
+    // Prompts are durable in DB mode (append-only, hash-chained rows); in-memory otherwise.
+    prompts: db ? new PostgresPromptRegistry(db) : new InMemoryPromptRegistry(),
     keys: db
       ? new PostgresKeyAdminStore(db, opts.pepper)
       : new KeyAdminStore(keyStore, opts.pepper),
@@ -742,7 +829,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     onboardingSigningKey: opts.onboardingSigningKey,
     oidc: opts.oidc,
     notifier: opts.notifier,
-    originId: newOriginId(),
+    originId,
     db,
   };
 }

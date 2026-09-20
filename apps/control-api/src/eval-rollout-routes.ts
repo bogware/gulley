@@ -191,7 +191,11 @@ export function buildRolloutPromoter(ctx: ControlContext): RolloutPromoter {
             })
         : undefined,
     });
-    if (r.ok) return { ok: true, version: r.value.version };
+    if (r.ok) {
+      // DB mode: the alias now lives in Postgres; refresh the console read model.
+      await ctx.hydrate?.().catch(() => undefined);
+      return { ok: true, version: r.value.version };
+    }
     const msg = 'message' in r.error && typeof r.error.message === 'string' ? r.error.message : '';
     return { ok: false, error: `${r.error.kind}${msg ? `: ${msg}` : ''}` };
   };

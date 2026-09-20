@@ -15,3 +15,5 @@ export * from './admin-session-store';
 export * from './scim-group-store';
 export * from './config-store';
 export * from './tenancy-store';
+export * from './prompt-store';
+export * from './schema-status';

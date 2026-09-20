@@ -189,6 +189,8 @@ function buildContext(config: Config): ControlContext | undefined {
     configBus = new PostgresConfigBus(
       createListenConnection(config.DATABASE_URL),
       config.CONFIG_NOTIFY_CHANNEL,
+      // (Re)connect hook: LISTEN drops signals while the socket is down — resync.
+      () => void rehydrate('listen-reconnect'),
     );
   }
 
@@ -291,6 +293,7 @@ function buildContext(config: Config): ControlContext | undefined {
           }
         : undefined,
     scimGroupRoleMap: parseScimGroupRoleMap(config.SCIM_GROUP_ROLE_MAP),
+    schemaCheck: config.DB_SCHEMA_CHECK,
     // A failing durable membership loader degrades a session to its token grants; that
     // used to be silent. Log it structured so a broken directory is visible.
     onLoaderError: (subject, err) =>
@@ -323,10 +326,27 @@ const config = loadConfig();
 // process.stderr.write lines that broke JSON log ingestion), request lines, drain.
 const log = pino({ level: config.LOG_LEVEL, redact: { paths: LOG_REDACT_PATHS, remove: true } });
 const bootWarn = (m: string): void => log.warn(m);
+
+/** DB mode: refresh the console's read model (tenancy + providers + collections) from
+ *  Postgres. Fired on a foreign bus signal, on listen (re)connect and on a TTL, so a
+ *  replica that did not perform a write still converges. Single-flight + best-effort. */
+let rehydrating: Promise<void> | undefined;
+function rehydrate(reason: string): Promise<void> {
+  const target = context?.hydrate;
+  if (!target) return Promise.resolve();
+  if (rehydrating) return rehydrating;
+  rehydrating = target()
+    .then((counts) => log.debug({ reason, ...counts }, 'read model re-hydrated'))
+    .catch((err: unknown) => log.warn({ err, reason }, 'read-model re-hydration failed'))
+    .finally(() => {
+      rehydrating = undefined;
+    });
+  return rehydrating;
+}
 // Air-gapped posture is process-wide, set before any egress can happen: every guarded
 // control-plane outbound then requires an explicit allowlist (fail-closed).
 setAirGappedEgress(config.AIR_GAPPED);
-const context = buildContext(config);
+const context: ControlContext | undefined = buildContext(config);
 const app = buildServer(config, context, log);
 if (!context) {
   app.log.warn(
@@ -419,6 +439,7 @@ if (context?.siemExporter) {
 // Expiry is enforced at read/consume time, so this is pure space reclamation for a
 // long-lived broker deployment. Unref'd + best-effort. Only in DB mode with the broker on.
 let oauthSweepTimer: NodeJS.Timeout | undefined;
+let hydrateTimer: NodeJS.Timeout | undefined;
 if (context?.db && context.oauthBroker && config.OAUTH_EPHEMERA_SWEEP_INTERVAL_SECONDS > 0) {
   const sweepDb = context.db;
   const tick = (): void => {
@@ -436,12 +457,28 @@ if (context?.db && context.oauthBroker && config.OAUTH_EPHEMERA_SWEEP_INTERVAL_S
 
 async function start(): Promise<void> {
   try {
-    // DB mode: load the org/workspace read models from Postgres BEFORE serving, so the
-    // console lists the durable tenancy (seeded / config-applied / created earlier) and
-    // scope checks resolve against it from the first request.
-    if (context?.hydrateTenancy) {
-      const counts = await context.hydrateTenancy();
-      app.log.info(counts, 'tenancy hydrated from database');
+    // DB mode: load the tenancy AND config read models from Postgres BEFORE serving, so
+    // the console lists the durable state (seeded / config-applied / console-created)
+    // and scope checks resolve against it from the first request.
+    if (context?.hydrate) {
+      const counts = await context.hydrate();
+      app.log.info(counts, 'read model hydrated from database');
+    }
+    // DB mode: also SUBSCRIBE to the config bus (it was emit-only) so an apply or a
+    // console edit on another replica refreshes this one's read model, plus a TTL tick.
+    if (configBus && context?.hydrate) {
+      const own = context.originId;
+      configBus.onSignal((sig) => {
+        if (sig.origin !== own) void rehydrate(`signal v${sig.v}`);
+      });
+      await configBus.start();
+      if (config.CONTROL_API_HYDRATE_INTERVAL_SECONDS > 0) {
+        hydrateTimer = setInterval(
+          () => void rehydrate('interval'),
+          config.CONTROL_API_HYDRATE_INTERVAL_SECONDS * 1000,
+        );
+        hydrateTimer.unref();
+      }
     }
     await app.listen({ host: config.CONTROL_API_HOST, port: config.CONTROL_API_PORT });
   } catch (error) {
@@ -484,6 +521,7 @@ async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 
   if (anchorTimer) clearInterval(anchorTimer);
   if (siemTimer) clearInterval(siemTimer);
   if (oauthSweepTimer) clearInterval(oauthSweepTimer);
+  if (hydrateTimer) clearInterval(hydrateTimer);
   await settle('http-close', () => app.close());
   await settle('config-bus', () => configBus?.close());
   clearTimeout(backstop);

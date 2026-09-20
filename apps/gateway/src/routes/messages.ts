@@ -67,7 +67,7 @@ import {
   type UsageExtractor,
 } from '@gulley/providers';
 import type { Encryptor } from '@gulley/crypto';
-import type { MaskDirection, MaskVaultStore } from '@gulley/storage';
+import type { MaskDirection, MaskVaultStore, SchemaStatus } from '@gulley/storage';
 import { type RateLimit, type RateLimiter, rateLimitHeaders } from '@gulley/ratelimit';
 import {
   allTargets,
@@ -287,6 +287,8 @@ export interface GatewayContext {
   cacheLookupTimeoutMs?: number;
   /** Stop every background maintenance timer this context started (SIGTERM drain). */
   stopMaintenance?: () => void;
+  /** DB mode: readiness probe comparing the applied migrations with this build's. */
+  schemaStatus?: () => Promise<SchemaStatus>;
   /** Teardowns still writing their ledger/audit/budget rows; the SIGTERM drain awaits
    *  them (bounded) so a deploy never exits mid-write. */
   inflightTeardowns?: Set<Promise<void>>;

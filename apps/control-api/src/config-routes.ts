@@ -82,11 +82,12 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
         // DB mode: the durable config store may have created org/workspace rows;
         // refresh the in-memory tenancy read model so the console / RBAC scopes see
         // them immediately rather than after the next restart.
-        if (ctx.hydrateTenancy) {
+        const rehydrate = ctx.hydrate ?? ctx.hydrateTenancy;
+        if (rehydrate) {
           try {
-            await ctx.hydrateTenancy();
+            await rehydrate();
           } catch (err) {
-            request.log.warn({ err }, 'tenancy re-hydration after config apply failed');
+            request.log.warn({ err }, 'read-model re-hydration after config apply failed');
           }
         }
         return reply.send({

@@ -212,6 +212,10 @@ const EnvShape = z.object({
   DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(8000),
   DB_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   DB_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  // Readiness gate: /ready is 503 while the database schema is behind this build's
+  // migrations (or was never migrated) — a boot that looks healthy and 500s on first
+  // use was the failure mode. Off only for a deliberately partial schema.
+  DB_SCHEMA_CHECK: envBool(true),
   // Request-log retention: bounded batched DELETE of request_log rows older than this many
   // days (0 = off, keep forever). Runs off the hot path on an unref'd timer. NOTE: only
   // request_log (the operational log) is swept — spend_ledger is the durable source of

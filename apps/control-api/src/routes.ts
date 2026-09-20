@@ -42,6 +42,7 @@ import {
   visibleWorkspaceIds,
 } from './admin';
 import { detectChainRewrite } from './anchor';
+import { consoleWrite } from './durable-config';
 import { signCtxAttestation } from './audit-signing';
 import { buildEvidenceBundle } from './evidence-bundle';
 import type { ControlContext } from './context';
@@ -55,6 +56,19 @@ function invalid(reply: FastifyReply, message: string): FastifyReply {
 
 function paramId(request: { params: unknown }): string {
   return (request.params as { id: string }).id;
+}
+
+function conflict(reply: FastifyReply, message: string): FastifyReply {
+  return reply.code(409).send({ error: { type: 'conflict', message } });
+}
+
+function nameTaken(
+  ctx: ControlContext,
+  kind: CollectionKind,
+  workspaceId: string,
+  name: string,
+): boolean {
+  return ctx.collections[kind].all().some((e) => e.workspaceId === workspaceId && e.name === name);
 }
 
 const MAX_LABEL = 128;
@@ -295,14 +309,25 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
           });
         }
       }
-      const r = await auditedWrite(ctx, admin, {
+      const r = await consoleWrite(ctx, admin, {
         perm: 'provider:create',
         at,
         action: 'provider.create',
         target: workspaceId,
         diff: { kind, baseUrl: baseUrl ?? null },
-        mutate: () =>
+        memory: () =>
           ctx.providers.create({ workspaceId, kind, baseUrl: baseUrl ?? null, enabled: true }),
+        // Providers reconcile by kind (one per workspace): the durable create is an upsert.
+        durable: async (b) => {
+          const p = await b.upsertProvider(workspaceId, {
+            kind,
+            baseUrl: baseUrl ?? null,
+            enabled: true,
+            region: null,
+            zdr: false,
+          });
+          return { id: p.id, workspaceId, kind: p.kind, baseUrl: p.baseUrl, enabled: p.enabled };
+        },
       });
       return r.ok ? reply.code(201).send({ provider: r.value }) : forbidden(reply);
     }),
@@ -324,13 +349,17 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       } catch (e) {
         return invalid(reply, (e as Error).message);
       }
-      const r = await auditedWrite(ctx, admin, {
+      const r = await consoleWrite(ctx, admin, {
         perm: 'provider:update',
         at,
         action: 'provider.credential.set',
         target: id,
         diff: { credential: ref },
-        mutate: () => ctx.credentials.set(id, ref),
+        memory: () => ctx.credentials.set(id, ref),
+        durable: async (b) => {
+          await b.setCredential(id, ref);
+          return { id, providerId: id, credential: ref };
+        },
       });
       return r.ok
         ? reply
@@ -698,13 +727,23 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
             .code(422)
             .send({ error: { type: 'inline_secret', message: (e as Error).message } });
         }
-        const r = await auditedWrite(ctx, admin, {
+        // Names are the GitOps reconcile key within a workspace: a duplicate would make
+        // export/apply ambiguous (budget is singular per workspace and upserts instead).
+        if (c.kind !== 'budget' && nameTaken(ctx, c.kind, workspaceId, name))
+          return conflict(reply, `${c.resource} "${name}" already exists in this workspace`);
+        const r = await consoleWrite(ctx, admin, {
           perm: `${c.resource}:create` as Permission,
           at,
           action: `${c.kind}.create`,
           target: workspaceId,
           diff: { name },
-          mutate: () => ctx.collections[c.kind].create(workspaceId, name, config),
+          memory: () => ctx.collections[c.kind].create(workspaceId, name, config),
+          durable: async (b) => ({
+            id: await b.createEntityReturning(c.kind, workspaceId, name, config),
+            workspaceId,
+            name,
+            config,
+          }),
         });
         return r.ok ? reply.code(201).send({ entity: r.value }) : forbidden(reply);
       }),
@@ -749,7 +788,14 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         // said nothing about the change.
         const beforeHash = configHash(existing.config);
         const afterHash = patch.config ? configHash(patch.config) : beforeHash;
-        const r = await auditedWrite(ctx, admin, {
+        if (
+          patch.name !== undefined &&
+          patch.name !== existing.name &&
+          c.kind !== 'budget' &&
+          nameTaken(ctx, c.kind, existing.workspaceId, patch.name)
+        )
+          return conflict(reply, `${c.resource} "${patch.name}" already exists in this workspace`);
+        const r = await consoleWrite(ctx, admin, {
           perm: `${c.resource}:update` as Permission,
           at,
           action: `${c.kind}.update`,
@@ -761,7 +807,9 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
             configHashBefore: beforeHash,
             configHashAfter: afterHash,
           },
-          mutate: () => ctx.collections[c.kind].update(id, patch),
+          memory: () => ctx.collections[c.kind].update(id, patch),
+          durable: async (b) =>
+            (await b.updateEntityById(c.kind, id, patch)) ? { ...existing, ...patch } : undefined,
         });
         return r.ok ? reply.send({ entity: r.value }) : forbidden(reply);
       }),
@@ -774,13 +822,14 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         if (!existing) return notFound(reply, c.resource);
         const at = scopeForWorkspace(ctx, existing.workspaceId);
         if (!at) return notFound(reply, 'workspace');
-        const r = await auditedWrite(ctx, admin, {
+        const r = await consoleWrite(ctx, admin, {
           perm: `${c.resource}:delete` as Permission,
           at,
           action: `${c.kind}.delete`,
           target: id,
           diff: { id, name: existing.name },
-          mutate: () => ctx.collections[c.kind].delete(id),
+          memory: () => ctx.collections[c.kind].delete(id),
+          durable: (b) => b.deleteEntityById(c.kind, id),
         });
         return r.ok ? reply.send({ deleted: r.value }) : forbidden(reply);
       }),
@@ -794,13 +843,14 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       const id = paramId(request);
       const at = scopeForProvider(ctx, id);
       if (!at) return notFound(reply, 'provider');
-      const r = await auditedWrite(ctx, admin, {
+      const r = await consoleWrite(ctx, admin, {
         perm: 'provider:delete',
         at,
         action: 'provider.delete',
         target: id,
         diff: { id },
-        mutate: () => ctx.providers.delete(id),
+        memory: () => ctx.providers.delete(id),
+        durable: (b) => b.deleteProviderById(id),
       });
       return r.ok ? reply.send({ deleted: r.value }) : forbidden(reply);
     }),
@@ -824,8 +874,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   );
 
   // --- governed prompt registry (versioned, hash-chained templates) ---
-  const promptScope = (id: string): { at: ReturnType<typeof scopeForWorkspace>; wsId?: string } => {
-    const t = ctx.prompts.get(id);
+  const promptScope = async (
+    id: string,
+  ): Promise<{ at: ReturnType<typeof scopeForWorkspace>; wsId?: string }> => {
+    const t = isUuid(id) ? await ctx.prompts.get(id) : undefined;
     if (!t) return { at: undefined };
     return { at: scopeForWorkspace(ctx, t.workspaceId), wsId: t.workspaceId };
   };
@@ -845,7 +897,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       if (!(await ctx.access.can(admin, 'prompt:create', at))) return forbidden(reply);
       let created;
       try {
-        created = ctx.prompts.create(workspaceId, name, {
+        created = await ctx.prompts.create(workspaceId, name, {
           body: promptBody,
           createdBy: admin.subject,
           ...(message !== undefined ? { message } : {}),
@@ -871,14 +923,14 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     '/prompts/:id/versions',
     adminRoute(ctx, async (request, reply, admin) => {
       const id = paramId(request);
-      const { at } = promptScope(id);
+      const { at } = await promptScope(id);
       if (!at) return notFound(reply, 'prompt');
       const b = body(request);
       const promptBody = typeof b['body'] === 'string' ? b['body'] : undefined;
       const message = str(b['message']);
       if (promptBody === undefined) return invalid(reply, 'body required');
       if (!(await ctx.access.can(admin, 'prompt:update', at))) return forbidden(reply);
-      const v = ctx.prompts.addVersion(id, {
+      const v = await ctx.prompts.addVersion(id, {
         body: promptBody,
         createdBy: admin.subject,
         ...(message !== undefined ? { message } : {}),
@@ -899,16 +951,16 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     '/prompts',
     adminRoute(ctx, async (_req, reply, admin) => {
       const visible = visibleWorkspaceIds(ctx, admin);
-      return reply.send({ prompts: ctx.prompts.list([...visible]) });
+      return reply.send({ prompts: await ctx.prompts.list([...visible]) });
     }),
   );
 
   app.get(
     '/prompts/:id',
     adminRoute(ctx, async (request, reply, admin) => {
-      const id = paramId(request);
-      const t = ctx.prompts.get(id);
-      if (!t) return notFound(reply, 'prompt');
+      const id = uuidParam(request);
+      const t = id ? await ctx.prompts.get(id) : undefined;
+      if (!t || !id) return notFound(reply, 'prompt');
       const at = scopeForWorkspace(ctx, t.workspaceId) ?? {};
       if (!(await ctx.access.can(admin, 'prompt:read', at))) return forbidden(reply);
       return reply.send({ prompt: t });
@@ -918,12 +970,12 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   app.get(
     '/prompts/:id/verify',
     adminRoute(ctx, async (request, reply, admin) => {
-      const id = paramId(request);
-      const t = ctx.prompts.get(id);
-      if (!t) return notFound(reply, 'prompt');
+      const id = uuidParam(request);
+      const t = id ? await ctx.prompts.get(id) : undefined;
+      if (!t || !id) return notFound(reply, 'prompt');
       const at = scopeForWorkspace(ctx, t.workspaceId) ?? {};
       if (!(await ctx.access.can(admin, 'prompt:read', at))) return forbidden(reply);
-      return reply.send(ctx.prompts.verifyChain(id));
+      return reply.send(await ctx.prompts.verifyChain(id));
     }),
   );
 
@@ -932,9 +984,9 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
   app.post(
     '/prompts/:id/render',
     adminRoute(ctx, async (request, reply, admin) => {
-      const id = paramId(request);
-      const t = ctx.prompts.get(id);
-      if (!t) return notFound(reply, 'prompt');
+      const id = uuidParam(request);
+      const t = id ? await ctx.prompts.get(id) : undefined;
+      if (!t || !id) return notFound(reply, 'prompt');
       const at = scopeForWorkspace(ctx, t.workspaceId) ?? {};
       if (!(await ctx.access.can(admin, 'prompt:read', at))) return forbidden(reply);
       const b = body(request);
@@ -943,7 +995,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         b['variables'] && typeof b['variables'] === 'object'
           ? (b['variables'] as Record<string, unknown>)
           : {};
-      const v = versionNum ? ctx.prompts.version(id, versionNum) : ctx.prompts.head(id);
+      const v = versionNum ? await ctx.prompts.version(id, versionNum) : await ctx.prompts.head(id);
       if (!v) return notFound(reply, 'version');
       try {
         return reply.send({ version: v.version, rendered: renderPrompt(v.body, vars) });
@@ -961,10 +1013,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
     '/prompts/:id',
     adminRoute(ctx, async (request, reply, admin) => {
       const id = paramId(request);
-      const { at } = promptScope(id);
+      const { at } = await promptScope(id);
       if (!at) return notFound(reply, 'prompt');
       if (!(await ctx.access.can(admin, 'prompt:delete', at))) return forbidden(reply);
-      const deleted = ctx.prompts.delete(id);
+      const deleted = await ctx.prompts.delete(id);
       await ctx.audit.append({
         orgId: at.orgId ?? null,
         actor: admin.subject,

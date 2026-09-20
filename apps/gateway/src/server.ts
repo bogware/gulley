@@ -138,7 +138,13 @@ export function buildServer(
         (!holder ? 'no gateway context (health-only boot)' : 'no routes loaded yet');
       return { status: 'degraded', reason, providers };
     }
-    return { status: 'ready', providers };
+    // DB mode: a schema behind this build (or never migrated) is not ready either.
+    const schema = holder.ctx.schemaStatus ? await holder.ctx.schemaStatus() : undefined;
+    if (schema && !schema.ok) {
+      reply.code(503);
+      return { status: 'degraded', reason: `database schema: ${schema.reason}`, providers, schema };
+    }
+    return { status: 'ready', providers, ...(schema ? { schema } : {}) };
   });
   app.get('/', async () => ({ name: 'gulley-gateway', version: GULLEY_VERSION }));
 
