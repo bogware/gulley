@@ -3,7 +3,8 @@
 
 image:
   repository: ghcr.io/bogware/gulley
-  # Defaults to the chart's appVersion when empty.
+  # Defaults to the chart's appVersion when empty. Pin a release tag (or a digest) in
+  # production; a mutable `latest` tag is pulled with pullPolicy Always automatically.
   tag: ''
   pullPolicy: IfNotPresent
 
@@ -21,6 +22,10 @@ serviceAccount:
 # Secret VALUES never live here (secret-ARNs-only): put provider keys, the KMS
 # pepper, etc. in a Kubernetes Secret and name it under `existingSecret`.
 config:
+  # A credential-bearing URL (postgres://user:PASSWORD@…) must NOT go here — the
+  # ConfigMap is readable by anyone who can read the namespace. Put DATABASE_URL in the
+  # Secret named by `existingSecret` instead; the chart refuses to render a value with
+  # `@` in it (set allowCredentialsInConfig: true to override, e.g. IAM-auth URLs).
   DATABASE_URL: ''
   REDIS_CACHE_URL: ''
   REDIS_COUNTERS_URL: ''
@@ -28,6 +33,7 @@ config:
   LOG_LEVEL: info
   # Arbitrary extra non-secret env (merged verbatim into the ConfigMap).
   extra: {}
+allowCredentialsInConfig: false
 
 # Name of a pre-existing Kubernetes Secret whose keys are projected as env into
 # both pods (envFrom). Empty = no secret env (dev / secrets injected elsewhere).
@@ -41,7 +47,13 @@ gateway:
   replicaCount: 2
   port: 8080
   metricsPort: 9090
-  command: ['node', '--import', 'tsx', 'apps/gateway/src/main.ts']
+  # The image's ENTRYPOINT is node; the command is the bundled entry (WORKDIR /app).
+  command: ['dist/gateway/main.mjs']
+  # Node heap cap. Keep it ~75% of resources.limits.memory: an uncapped heap lets a
+  # burst grow into the cgroup limit and get OOM-killed mid-stream instead of GC'ing.
+  nodeOptions: '--max-old-space-size=384'
+  # Prometheus scrape annotations on the pod (for annotation-based discovery).
+  metricsAnnotations: true
   service:
     type: ClusterIP
     port: 80
@@ -75,15 +87,25 @@ gateway:
   # otherwise an in-flight SSE stream is cut mid-drain and its single teardown()
   # (budget-commit + ledger + hash-chained audit row) never runs.
   terminationGracePeriodSeconds: 120
-  # SHUTDOWN_GRACE_MS is derived into the ConfigMap as
-  # (terminationGracePeriodSeconds - drainBufferSeconds) * 1000, so the two stay
-  # coupled if an operator retunes the grace period.
+  # SHUTDOWN_GRACE_MS is derived per plane as
+  # (terminationGracePeriodSeconds - preStopSleepSeconds - drainBufferSeconds) * 1000,
+  # so the app's drain backstop fires before SIGKILL even after the preStop sleep. The
+  # chart refuses to render when that comes out <= 0.
   drainBufferSeconds: 10
   # preStop sleep (seconds): on SIGTERM the pod sleeps this long BEFORE the app
   # begins draining, so Service endpoint removal propagates first and in-flight
   # requests stop landing on a terminating pod (kills the deregistration-race 502s).
-  # Must fit inside terminationGracePeriodSeconds.
+  # Must fit inside terminationGracePeriodSeconds. (The image has no shell: the sleep
+  # runs through node.)
   preStopSleepSeconds: 10
+  # Probe budgets: 5 s timeouts (1 s false-fails a GC pause or a cold DB pool), and a
+  # startupProbe that gives a DB-config gateway up to failureThreshold*periodSeconds to
+  # load its route table before liveness can restart it.
+  probes:
+    timeoutSeconds: 5
+    startup:
+      periodSeconds: 5
+      failureThreshold: 24
   podDisruptionBudget:
     enabled: true
     # maxUnavailable (not minAvailable) so a scale-down to 1 replica can't deadlock
@@ -95,7 +117,8 @@ controlApi:
   enabled: true
   replicaCount: 1
   port: 8081
-  command: ['node', '--import', 'tsx', 'apps/control-api/src/main.ts']
+  command: ['dist/control-api/main.mjs']
+  nodeOptions: '--max-old-space-size=384'
   service:
     type: ClusterIP
     port: 80
@@ -109,6 +132,11 @@ controlApi:
   terminationGracePeriodSeconds: 120
   drainBufferSeconds: 10
   preStopSleepSeconds: 5
+  probes:
+    timeoutSeconds: 5
+    startup:
+      periodSeconds: 5
+      failureThreshold: 24
 
 podAnnotations: {}
 podSecurityContext:
@@ -154,7 +182,13 @@ networkPolicy:
   egressPorts: []
 
 # Opt-in Ingress for the gateway (default off; operators often front it with their
-# own gateway/ALB). TLS is emitted when tls[] is set.
+# own gateway/ALB). TLS is emitted when tls[] is set. Streaming responses (SSE) run
+# for minutes: raise the controller's proxy read/send timeouts above the longest
+# expected stream, e.g. for ingress-nginx:
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: '600'
+#     nginx.ingress.kubernetes.io/proxy-send-timeout: '600'
+#     nginx.ingress.kubernetes.io/proxy-buffering: 'off'
 ingress:
   enabled: false
   className: ''

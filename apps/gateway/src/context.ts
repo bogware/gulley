@@ -40,7 +40,7 @@ import {
   RequestMirror,
   type RequestMirrorConfig,
 } from '@gulley/http-edge';
-import { GULLEY_VERSION, memoizeAsync } from '@gulley/core';
+import { GULLEY_BUILD, GULLEY_VERSION, memoizeAsync } from '@gulley/core';
 import { PRICING_AS_OF, type RateResolver } from '@gulley/cost';
 import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulley/auth';
 import { OidcProvider } from '@gulley/oidc';
@@ -1166,7 +1166,11 @@ export function createProductionContext(
       : undefined;
   breakerSync?.start();
 
-  metrics?.setBuildInfo({ version: GULLEY_VERSION, node: process.version });
+  metrics?.setBuildInfo({
+    version: GULLEY_VERSION,
+    sha: GULLEY_BUILD.sha || 'unknown',
+    node: process.version,
+  });
   metrics?.setDegraded(undefined);
   log.info(
     {

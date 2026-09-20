@@ -43,8 +43,16 @@ try {
     const v = path.split('.').reduce((o, k) => (o == null ? o : o[k]), values);
     if (v === undefined) fail(`values.yaml missing ${path}`);
   }
-  if (!Array.isArray(values.gateway.command) || values.gateway.command[0] !== 'node')
-    fail('values.yaml gateway.command must be a node argv array');
+  // The runtime image is distroless with node as ENTRYPOINT: a command is the bundled
+  // entry file (relative to WORKDIR /app), never `node --import tsx …`.
+  for (const [plane, entry] of [
+    ['gateway', 'dist/gateway/main.mjs'],
+    ['controlApi', 'dist/control-api/main.mjs'],
+  ]) {
+    const cmd = values[plane]?.command;
+    if (!Array.isArray(cmd) || cmd[0] !== entry)
+      fail(`values.yaml ${plane}.command must start with ${entry} (bundled runtime entry)`);
+  }
   ok('values.yaml');
 } catch (e) {
   fail(`values.yaml parse: ${e.message}`);
@@ -98,21 +106,25 @@ try {
   }
   if ((svc['redis-cache']?.command ?? []).join(' ').includes('noeviction'))
     fail('redis-cache must be allkeys-lru, not noeviction');
-  // Both planes run the one image with a plane-selecting command. A service may either
-  // use the image's DEFAULT command (which starts that plane from its app dir — the
-  // gateway does this) or override it; an override must launch the plane's main.ts, and
-  // `tsx` only resolves from the app dir, so the path is workdir-relative
-  // (`src/main.ts` with working_dir /app/apps/<app>) or absolute (`apps/<app>/src/main.ts`).
+  // Both planes run the one image with a plane-selecting command: the bundled entry
+  // (the image's ENTRYPOINT is node). A service may use the image default (gateway).
+  for (const [app, entry] of [
+    ['gateway', 'dist/gateway/main.mjs'],
+    ['control-api', 'dist/control-api/main.mjs'],
+  ]) {
+    const cmd = svc[app]?.command ?? [];
+    if (cmd.length === 0) continue; // image default — starts the gateway
+    if (cmd[0] !== entry) fail(`${app} command must be ['${entry}'] (bundled runtime entry)`);
+  }
+  if (!svc['migrate'] || (svc['migrate'].command ?? [])[0] !== 'dist/control-api/migrate.mjs')
+    fail(
+      'docker-compose.prod.yml must run the one-off migrate service (dist/control-api/migrate.mjs)',
+    );
   for (const app of ['gateway', 'control-api']) {
-    const def = svc[app] ?? {};
-    const cmd = def.command ?? [];
-    if (cmd.length === 0) continue; // image default — starts the correct plane
-    const wd = def.working_dir ?? '';
-    const launchesMain = cmd[0] === 'node' && cmd.some((a) => a.includes('src/main.ts'));
-    const rightApp =
-      cmd.some((a) => a.includes(`apps/${app}/src/main.ts`)) || wd.includes(`apps/${app}`);
-    if (!launchesMain || !rightApp)
-      fail(`${app} command must launch apps/${app}/src/main.ts (workdir-relative or absolute)`);
+    if (svc[app]?.depends_on?.migrate?.condition !== 'service_completed_successfully')
+      fail(`${app} must depend on migrate: service_completed_successfully`);
+    if (!svc[app]?.stop_grace_period)
+      fail(`${app} needs a stop_grace_period above SHUTDOWN_GRACE_MS`);
   }
   ok('docker-compose.prod.yml');
 } catch (e) {

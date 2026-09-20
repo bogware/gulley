@@ -35,8 +35,11 @@ gateway rebuilds them. The only hard dependency is Postgres.
 3. **Verify audit-chain integrity** on the restored data — the hash chain
    (`prevHash → rowHash`, `computeRowHash`) must be continuous, and it must match
    the S3 WORM mirror. A break means the restore is incomplete or tampered:
-   - re-run `pnpm --filter @gulley/control-api worm:check` against the restored
-     rows + the Object-Lock mirror.
+   - run `pnpm --filter @gulley/control-api audit:verify` (or, from the image,
+     `node dist/control-api/audit-verify.mjs`) against the restored database: it
+     re-walks the chain and emits a signed attestation, non-zero on a break;
+   - then `GET /audit/worm/verify` (control-api) to confirm the restored chain
+     matches the Object-Lock mirror batch by batch.
 4. **Rebuild the counters**: bring up an empty `counters` Redis. Budgets/rate
    limits re-warm from live traffic; historical spend is intact in the ledger, so
    no spend is lost or double-counted.

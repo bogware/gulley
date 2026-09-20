@@ -126,8 +126,10 @@ resource "aws_eks_node_group" "this" {
 }
 
 # --- core addons -----------------------------------------------------------
+# metrics-server is what the chart's HorizontalPodAutoscaler reads CPU from; without
+# it the HPA sits at "unknown" and never scales.
 resource "aws_eks_addon" "this" {
-  for_each                    = toset(["vpc-cni", "kube-proxy", "coredns"])
+  for_each                    = toset(["vpc-cni", "kube-proxy", "coredns", "metrics-server"])
   cluster_name                = aws_eks_cluster.this.name
   addon_name                  = each.value
   resolve_conflicts_on_create = "OVERWRITE"
@@ -189,7 +191,7 @@ resource "aws_iam_role" "gateway_irsa" {
 data "aws_iam_policy_document" "gateway_irsa" {
   statement {
     sid       = "BedrockInvoke"
-    actions   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+    actions   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream", "bedrock:ApplyGuardrail"]
     resources = ["*"]
   }
   statement {

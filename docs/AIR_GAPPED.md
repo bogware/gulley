@@ -12,13 +12,20 @@ is allow-listed implicitly.
 
 Two ways an outbound call stays reachable under air-gap:
 
-- It targets a host on `OUTBOUND_HOST_ALLOWLIST` (control-api: WORM/SIEM/anchor/shadow-spend/
-  eval-runner and provider base URLs).
-- It uses a feature's `*_ALLOW_INTERNAL` bypass (gateway: `GUARDRAILS_WEBHOOK_ALLOW_INTERNAL`,
-  `EXTERNAL_AUTHZ_ALLOW_INTERNAL`, `REQUEST_MIRROR_ALLOW_INTERNAL`) pointed at an internal host.
+- **control-api**: it targets a host on `OUTBOUND_HOST_ALLOWLIST` (WORM/SIEM/anchor/
+  shadow-spend/eval-runner/OIDC/Entra and provider base URLs registered through the
+  console).
+- **gateway**: it uses a feature's `*_ALLOW_INTERNAL` bypass
+  (`GUARDRAILS_WEBHOOK_ALLOW_INTERNAL`, `EXTERNAL_AUTHZ_ALLOW_INTERNAL`,
+  `REQUEST_MIRROR_ALLOW_INTERNAL`) pointed at an internal host. The gateway has **no**
+  `OUTBOUND_HOST_ALLOWLIST`, and the **provider upstream URLs
+  (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `EMBEDDINGS_BASE_URL`, `CUSTOM_PROVIDERS`)
+  are deliberately not egress-guarded** — they are the product's purpose — so a public
+  provider endpoint left in place fails at the first request, not at boot.
 
-Run `gulley doctor` (gateway) — it prints an `air-gapped` section flagging any feature that
-would try to reach a public host, so a misconfiguration fails at preflight, not at runtime.
+Run `gulley doctor` (gateway) — it prints an `air-gapped` section flagging any feature
+that would try to reach a public host, **including a provider still pointed at its
+public endpoint (an error)**, so a misconfiguration fails at preflight, not at runtime.
 
 > **Caveat — SDK egress.** The fetch-based egress guard does **not** cover AWS SDK traffic
 > (S3 Object Lock for WORM, KMS for envelope/signing). In an air-gapped VPC these must reach
@@ -28,14 +35,17 @@ would try to reach a public host, so a misconfiguration fails at preflight, not 
 
 ## 1. Bring the images in
 
-There is one container image per app (`apps/gateway/Dockerfile`, `apps/control-api/Dockerfile`).
-On a connected build host:
+One distroless image runs both planes (`apps/gateway/Dockerfile`; the entry file selects
+the plane) plus the console image (`apps/web/Dockerfile`). On a connected build host:
 
 ```bash
-docker build -t gulley-gateway:<ver> -f apps/gateway/Dockerfile .
-docker build -t gulley-control-api:<ver> -f apps/control-api/Dockerfile .
-docker save gulley-gateway:<ver> gulley-control-api:<ver> | gzip > gulley-images.tar.gz
+docker build -t gulley:<ver> -f apps/gateway/Dockerfile .
+docker build -t gulley-web:<ver> -f apps/web/Dockerfile .
+docker save gulley:<ver> gulley-web:<ver> | gzip > gulley-images.tar.gz
 ```
+
+The image carries its own migrations: run `docker run --rm -e DATABASE_URL=… gulley:<ver>
+dist/control-api/migrate.mjs` once per release inside the enclave.
 
 Transfer `gulley-images.tar.gz` across the air-gap (approved media), then on the target:
 

@@ -5,9 +5,12 @@ description: >-
   plane (the stateless gateway data plane or the control-plane admin API); this
   chart deploys both, wired to Postgres and the role-split Redis instances.
 type: application
-version: 0.1.0
+version: 0.2.0
 # The application version this chart deploys by default (the container image tag).
-appVersion: '1.0.0'
+# 0.2.x of the chart targets the bundled/distroless runtime image (entries under
+# dist/, node-based probes/preStop) shipped from v0.4.0 — it does NOT run the tsx-
+# based v0.3.x images.
+appVersion: 'v0.4.0'
 home: https://github.com/bogware/gulley
 sources:
   - https://github.com/bogware/gulley

@@ -54,10 +54,12 @@ resource "aws_kms_key_policy" "audit_export" {
 
 # Secrets are provisioned empty; values are written out-of-band (never in TF state).
 resource "aws_secretsmanager_secret" "this" {
-  for_each                = toset(local.secret_names)
-  name                    = each.value
-  kms_key_id              = aws_kms_key.this["secrets"].arn
-  recovery_window_in_days = 0 # allow immediate delete/recreate on teardown+redeploy
+  for_each   = toset(local.secret_names)
+  name       = each.value
+  kms_key_id = aws_kms_key.this["secrets"].arn
+  # Immediate delete/recreate while iterating on a test stack; a recovery window in
+  # prod so a mistaken `terraform destroy` cannot vaporise the pepper/session secrets.
+  recovery_window_in_days = local.deletion_protection ? 7 : 0
   tags                    = merge(var.tags, { Name = each.value })
 }
 
@@ -158,8 +160,15 @@ resource "aws_iam_role" "control_task" {
 data "aws_iam_policy_document" "control_task" {
   statement {
     sid       = "WormRead"
-    actions   = ["s3:GetObject", "s3:ListBucket"]
+    actions   = ["s3:GetObject", "s3:ListBucket", "s3:GetObjectRetention", "s3:GetBucketObjectLockConfiguration"]
     resources = [local.worm_bucket_arn, "${local.worm_bucket_arn}/*"]
+  }
+  # The control plane is the WORM SHIPPER (it mirrors signed audit batches into the
+  # Object Lock bucket); it needs to write objects with their retention.
+  statement {
+    sid       = "WormShip"
+    actions   = ["s3:PutObject", "s3:PutObjectRetention"]
+    resources = ["${local.worm_bucket_arn}/*"]
   }
   statement {
     sid       = "OauthDecrypt"

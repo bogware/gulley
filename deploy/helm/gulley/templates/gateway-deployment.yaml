@@ -17,9 +17,16 @@ spec:
     metadata:
       labels:
         {{- include "gulley.selectorLabels" (dict "root" . "plane" "gateway") | nindent 8 }}
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.podAnnotations .Values.gateway.metricsAnnotations }}
       annotations:
+        {{- if .Values.gateway.metricsAnnotations }}
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: {{ .Values.gateway.metricsPort | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "gulley.serviceAccountName" . }}
@@ -33,19 +40,26 @@ spec:
       containers:
         - name: gateway
           image: {{ include "gulley.image" . }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "gulley.pullPolicy" . }}
           command:
             {{- toYaml .Values.gateway.command | nindent 12 }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # Drain budget for THIS plane (see the shutdownGraceMs helper).
+            - name: SHUTDOWN_GRACE_MS
+              value: {{ include "gulley.shutdownGraceMs" (dict "plane" .Values.gateway "name" "gateway") | quote }}
+            {{- with .Values.gateway.nodeOptions }}
+            - name: NODE_OPTIONS
+              value: {{ . | quote }}
+            {{- end }}
           # preStop sleep: on SIGTERM, wait for Service endpoint removal to propagate
           # before the app starts refusing, so in-flight requests stop landing on a
           # terminating pod (avoids the deregistration-race 502s on every rollout).
           {{- if gt (int .Values.gateway.preStopSleepSeconds) 0 }}
           lifecycle:
             preStop:
-              exec:
-                command: ['sh', '-c', 'sleep {{ .Values.gateway.preStopSleepSeconds }}']
+              {{- include "gulley.preStop" .Values.gateway.preStopSleepSeconds | nindent 14 }}
           {{- end }}
           ports:
             - name: http
@@ -59,20 +73,30 @@ spec:
             - secretRef:
                 name: {{ .Values.existingSecret }}
             {{- end }}
-          # /health = liveness (always 200 once up); /ready = 503 until routes are
-          # wired, so the LB only sends traffic to a fully-configured task.
+          # startup = /health until the process is up (bounded), so liveness cannot
+          # restart a slow boot; liveness = /health; readiness = /ready (503 until routes
+          # are wired and the DB schema matches, so traffic only reaches a ready task).
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ .Values.gateway.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.gateway.probes.startup.failureThreshold }}
+            timeoutSeconds: {{ .Values.gateway.probes.timeoutSeconds }}
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 15
             periodSeconds: 20
+            timeoutSeconds: {{ .Values.gateway.probes.timeoutSeconds }}
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /ready
               port: http
-            initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: {{ .Values.gateway.probes.timeoutSeconds }}
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
           volumeMounts:

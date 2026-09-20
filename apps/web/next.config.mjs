@@ -1,3 +1,5 @@
+import { fileURLToPath } from 'node:url';
+
 /** @type {import('next').NextConfig} */
 
 // The control-api the console proxies /control/* to is read at REQUEST time by
@@ -37,8 +39,19 @@ const securityHeaders = [
   { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
 ];
 
+// The container image runs the self-contained standalone server (node server.js: no
+// pnpm/next CLI at runtime). Opt-in via NEXT_STANDALONE=1 at build so `next start`
+// (dev, e2e) keeps working from a normal build.
+const standalone = process.env.NEXT_STANDALONE === '1';
+
 const nextConfig = {
   reactStrictMode: true,
+  ...(standalone
+    ? {
+        output: 'standalone',
+        outputFileTracingRoot: fileURLToPath(new URL('../../', import.meta.url)),
+      }
+    : {}),
   // Web linting (next lint / eslint-config-next) is wired up in a later milestone;
   // don't fail production builds on it yet. TypeScript checking stays enabled.
   eslint: {

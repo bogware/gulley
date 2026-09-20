@@ -1,3 +1,4 @@
+import { GULLEY_BUILD } from '@gulley/core';
 import { setAirGappedEgress } from '@gulley/egress';
 import { type MetricsServerHandle, startMetricsServer } from '@gulley/metrics';
 import { closeUpstreamPool } from '@gulley/providers';
@@ -13,7 +14,17 @@ const config = loadConfig();
 // One structured logger for the whole process: context build (pool/Redis/maintenance
 // warnings used to go to console.warn as unstructured text), Fastify request lines,
 // and the drain — same level, same redaction.
-const log = pino({ level: config.LOG_LEVEL, redact: { paths: LOG_REDACT_PATHS, remove: true } });
+const log = pino({
+  level: config.LOG_LEVEL,
+  redact: { paths: LOG_REDACT_PATHS, remove: true },
+  // Every line carries the build so a log stream from a mixed-version rollout is attributable.
+  base: {
+    pid: process.pid,
+    version: GULLEY_BUILD.version,
+    ...(GULLEY_BUILD.sha ? { sha: GULLEY_BUILD.sha } : {}),
+  },
+});
+log.info({ node: process.version, build: GULLEY_BUILD }, 'gulley gateway starting');
 // Air-gapped posture is process-wide, set before any egress can happen: fail-closed on
 // any guarded outbound without an explicit allowlist.
 setAirGappedEgress(config.AIR_GAPPED);

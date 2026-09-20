@@ -12,30 +12,24 @@ Every released image carries three artifacts, produced by the shared
    signature transparency-logged in Rekor.
 
 The image is also scanned with Trivy (build fails on fixable HIGH/CRITICAL),
-**before** the public multi-arch push.
+**before** any push — to GHCR and to ECR alike — with no skip-dirs and no ignore
+file.
 
-### Documented scanning exceptions
+### The runtime image
 
-The runtime currently executes TypeScript via `tsx`, so the image ships the full
-dev/build/install toolchain in `node_modules`. Two narrow, documented exceptions
-keep the gate meaningful without failing on unreachable build-tool CVEs:
+The API image is **distroless** (`gcr.io/distroless/nodejs22-debian12:nonroot`):
+`node` is the entrypoint and there is no shell, package manager, or build
+toolchain in it. At build time `scripts/bundle.mjs` (esbuild) bundles every
+`@gulley/*` workspace package into `dist/gateway/main.mjs`,
+`dist/control-api/main.mjs`, `dist/control-api/migrate.mjs`,
+`dist/control-api/audit-verify.mjs` and `dist/gateway/doctor.mjs`, stamping the
+version and git sha in (`/health`, `gulley_build_info`, OTel `service.version`,
+every log line). Third-party packages are installed **production-only** and
+hoisted next to `dist/`; `tsx`, esbuild, vitest, drizzle-kit and PGlite never
+enter the runtime. The SQL migrations travel with the image (`dist/migrations`)
+so the migrate entry and the schema-version readiness probe read the same set.
 
-1. **esbuild transpiler binary** — excluded via `--skip-dirs '**/@esbuild'`. `tsx`
-   bundles esbuild's Go binary purely to transpile local source; its embedded
-   Go-stdlib CVEs (`net/http`, `net/mail`, `crypto/tls` DoS/XSS) are unreachable
-   (no server, no untrusted parsing).
-2. **`.trivyignore`** (repo root) — a per-CVE list for the shipped dev/build/
-   install toolchain (vitest, vite, tar, pacote, sigstore, js-yaml, picomatch,
-   brace-expansion, ip-address), each verified _not_ in the runtime dependency
-   graph (`pnpm why --prod`), plus one runtime dependency whose vulnerable path is
-   unreachable (`@opentelemetry/propagator-jaeger` — the Jaeger propagator is
-   never instantiated). Every entry is commented with its justification.
-
-**OS packages and genuine runtime libraries are still scanned strictly** (the
-build fails on any fixable HIGH/CRITICAL). The durable fix that removes the need
-for these exceptions — pre-bundling to JS and running plain `node` on a distroless
-base, so `tsx`/esbuild and the toolchain are absent from the runtime — is a
-tracked follow-up.
+The console image is Next's standalone server on the same distroless base.
 
 ## The public image (GHCR)
 

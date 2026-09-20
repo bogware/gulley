@@ -52,9 +52,14 @@ variable "endpoint_public_access" {
 }
 
 variable "endpoint_public_access_cidrs" {
-  description = "CIDRs allowed to reach the public API endpoint. Default open; TIGHTEN for prod."
+  description = "CIDRs allowed to reach the public API endpoint. Default open for the test tier; the prod tier REFUSES 0.0.0.0/0 (set your office/VPN CIDRs, or turn endpoint_public_access off and use a bastion)."
   type        = list(string)
   default     = ["0.0.0.0/0"]
+
+  validation {
+    condition     = !(var.tier == "prod" && var.endpoint_public_access && contains(var.endpoint_public_access_cidrs, "0.0.0.0/0"))
+    error_message = "tier=prod must not expose the EKS API endpoint to 0.0.0.0/0 — restrict endpoint_public_access_cidrs or disable endpoint_public_access."
+  }
 }
 
 variable "node_ami_type" {

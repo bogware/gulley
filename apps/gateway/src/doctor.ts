@@ -174,6 +174,23 @@ export function runDoctor(config: Config): DoctorFinding[] {
           'EXTERNAL_AUTHZ_URL is set but EXTERNAL_AUTHZ_ALLOW_INTERNAL is off — air-gapped egress will block the authz hook. Use an internal endpoint + ALLOW_INTERNAL.',
       });
     }
+    // Provider base URLs are deliberately NOT egress-guarded (they are the product's
+    // whole purpose), so an air-gapped deployment that still points at a public
+    // provider endpoint would only fail at the first request. Flag the public defaults.
+    const publicProviders: string[] = [];
+    if (config.ANTHROPIC_UPSTREAM_API_KEY && /api\.anthropic\.com/.test(config.ANTHROPIC_BASE_URL))
+      publicProviders.push('anthropic (ANTHROPIC_BASE_URL)');
+    if (config.OPENAI_UPSTREAM_API_KEY && /api\.openai\.com/.test(config.OPENAI_BASE_URL))
+      publicProviders.push('openai (OPENAI_BASE_URL)');
+    if (config.EMBEDDINGS_API_KEY && /api\.openai\.com/.test(config.EMBEDDINGS_BASE_URL))
+      publicProviders.push('embeddings (EMBEDDINGS_BASE_URL)');
+    if (publicProviders.length > 0) {
+      f.push({
+        level: 'error',
+        check: 'air-gapped',
+        detail: `AIR_GAPPED is on but these providers point at their PUBLIC endpoints: ${publicProviders.join(', ')} — re-point them at an internal upstream (provider base URLs are not egress-guarded, so this would fail at the first request, not at boot).`,
+      });
+    }
     if (
       config.GUARDRAILS_MODERATION_BASE_URL ||
       config.GUARDRAILS_AZURE_CS_ENDPOINT ||
@@ -210,5 +227,6 @@ function main(): void {
   process.exit(errors > 0 ? 1 : 0);
 }
 
-// Run only when invoked directly (tsx src/doctor.ts), not when imported by a test.
-if (process.argv[1] && /doctor\.ts$/.test(process.argv[1])) main();
+// Run only when invoked directly (tsx src/doctor.ts, or the bundled dist/gateway/doctor.mjs),
+// not when imported by a test.
+if (process.argv[1] && /doctor\.(ts|mjs|js)$/.test(process.argv[1])) main();

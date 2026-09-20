@@ -18,7 +18,8 @@ resource "aws_ecr_repository" "this" {
   for_each             = local.ecr_repos
   name                 = each.value
   image_tag_mutability = local.ecr_tag_mutability
-  force_delete         = true # teardown removes the repo even with images present
+  # Test stacks tear down cleanly even with images present; prod keeps its images.
+  force_delete = !local.deletion_protection
 
   image_scanning_configuration {
     scan_on_push = true

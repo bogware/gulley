@@ -117,7 +117,8 @@ The release image is published multi-arch (amd64 + arm64) at
 - **AWS (Terraform)** — one adaptable module, `test` and `prod` tiers, with an exact
   agent/operator runbook: [`infra/terraform/INSTALL.md`](infra/terraform/INSTALL.md).
 - **Kubernetes** — [`deploy/helm/gulley`](deploy/helm/gulley).
-- **Single host** — [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml).
+- **Single host** — [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml)
+  (`up` migrates the database first, then starts both planes).
 - **Identity** — wire Microsoft Entra SSO + SCIM: [`docs/ENTRA_SETUP.md`](docs/ENTRA_SETUP.md).
 - **Air-gapped** — a no-egress posture: [`docs/AIR_GAPPED.md`](docs/AIR_GAPPED.md).
 

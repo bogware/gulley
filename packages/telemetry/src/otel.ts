@@ -1,3 +1,4 @@
+import { GULLEY_BUILD } from '@gulley/core';
 import {
   type Attributes,
   context,
@@ -153,7 +154,12 @@ export function initTelemetry(opts: TelemetryOptions): Telemetry {
   });
   // Bounded, non-blocking export; drops rather than back-pressuring the hot path.
   const provider = new NodeTracerProvider({
-    resource: resourceFromAttributes({ 'service.name': opts.serviceName ?? 'gulley-gateway' }),
+    resource: resourceFromAttributes({
+      'service.name': opts.serviceName ?? 'gulley-gateway',
+      'service.version': GULLEY_BUILD.version,
+      ...(GULLEY_BUILD.sha ? { 'service.build.sha': GULLEY_BUILD.sha } : {}),
+      'service.instance.id': process.env['HOSTNAME'] ?? String(process.pid),
+    }),
     spanProcessors: [
       new BatchSpanProcessor(exporter, {
         maxQueueSize: 2048,

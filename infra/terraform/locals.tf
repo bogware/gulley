@@ -32,6 +32,7 @@ locals {
       use_fargate_spot           = true
       deletion_protection        = false
       log_retention_days         = 7
+      backup_retention_days      = 1
     }
     prod = {
       az_count                   = 3
@@ -57,6 +58,7 @@ locals {
       use_fargate_spot           = false
       deletion_protection        = true
       log_retention_days         = 30
+      backup_retention_days      = 35
     }
   }
   p = local.presets[var.tier]
@@ -88,6 +90,7 @@ locals {
   use_fargate_spot           = var.use_fargate_spot != null ? var.use_fargate_spot : local.p.use_fargate_spot
   deletion_protection        = var.deletion_protection != null ? var.deletion_protection : local.p.deletion_protection
   log_retention_days         = coalesce(var.log_retention_days, local.p.log_retention_days)
+  backup_retention_days      = coalesce(var.backup_retention_days, local.p.backup_retention_days)
 
   # ---- derived ------------------------------------------------------------
   account_id  = data.aws_caller_identity.current.account_id

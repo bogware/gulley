@@ -95,7 +95,10 @@ locals {
     ["/scim/*", "/.well-known/*"],
   ]
   # Gateway's own paths, used only to carve gateway out of a web-default single host.
-  gateway_paths = ["/v1/*", "/health", "/ready", "/metrics", "/live"]
+  # NOT /metrics or /live: the Prometheus listener is a separate management port that
+  # the ALB does not front (scrape it inside the VPC / via the control-api's
+  # GATEWAY_METRICS_URL), so routing those paths only exposed a 404.
+  gateway_paths = ["/v1/*", "/health", "/ready"]
 }
 
 # Port 80: redirect to 443 when TLS is on, else it is the primary listener.
@@ -217,11 +220,29 @@ locals {
   # (.env.example) without editing the module.
   oauth_env = var.enable_oauth_broker ? { OAUTH_BROKER_ENABLED = "true" } : {}
 
+  # Node heap cap: ~75% of the task memory. An uncapped heap grows into the cgroup
+  # limit and is OOM-killed mid-stream instead of collecting.
+  gateway_node_options = "--max-old-space-size=${floor(local.gw_memory * 0.75)}"
+  control_node_options = "--max-old-space-size=${floor(local.control_memory * 0.75)}"
+
+  # WORM-live (prod tier): the control plane mirrors the audit chain to the Object Lock
+  # bucket, signed with the audit-export CMK. Previously the bucket existed but no task
+  # ever wrote to it. The migrations dir is where the bundled image copies them.
+  worm_env = local.enable_worm ? {
+    WORM_ENABLED                 = "true"
+    WORM_BUCKET                  = local.worm_bucket_name
+    WORM_REGION                  = var.aws_region
+    WORM_RETENTION_DAYS          = tostring(local.worm_retention_days)
+    GULLEY_AUDIT_SIGNING_KMS_ARN = aws_kms_key.this["audit-export"].arn
+    GULLEY_KMS_REGION            = var.aws_region
+  } : {}
+
   gateway_env = merge({
     NODE_ENV           = "production"
     GATEWAY_PORT       = tostring(local.ports.gateway)
     BEDROCK_REGION     = var.aws_region
     SHUTDOWN_GRACE_MS  = tostring(local.shutdown_grace_ms)
+    NODE_OPTIONS       = local.gateway_node_options
     REDIS_CACHE_URL    = "rediss://${local.redis_endpoints["cache"]}:6379"
     REDIS_COUNTERS_URL = "rediss://${local.redis_endpoints["counters"]}:6379"
     REDIS_VECTOR_URL   = "rediss://${local.redis_endpoints["vector"]}:6379"
@@ -244,10 +265,11 @@ locals {
     CONTROL_API_PUBLIC_URL = local.api_base_url
     CONSOLE_PUBLIC_URL     = var.enable_web ? local.base_url : local.api_base_url
     SHUTDOWN_GRACE_MS      = tostring(local.shutdown_grace_ms)
+    NODE_OPTIONS           = local.control_node_options
     }, var.bootstrap_admin_token_sha256 != "" ? {
     CONTROL_API_BOOTSTRAP_ENABLED       = "true"
     GULLEY_BOOTSTRAP_ADMIN_TOKEN_SHA256 = var.bootstrap_admin_token_sha256
-  } : {}, local.oauth_env, var.control_extra_env)
+  } : {}, local.oauth_env, local.worm_env, var.control_extra_env)
   control_secrets = merge({
     GULLEY_KEY_PEPPER           = aws_secretsmanager_secret.this["gulley/key-pepper"].arn
     GULLEY_ADMIN_SESSION_SECRET = aws_secretsmanager_secret.this["gulley/admin-session-secret"].arn
@@ -268,21 +290,22 @@ locals {
 
   log_opts = { region = var.aws_region, group = aws_cloudwatch_log_group.this.name }
 
+  # The image is distroless (node is the ENTRYPOINT; no shell): commands are the
+  # bundled entry files under /app/dist, and health checks run through node in exec
+  # form. The root filesystem is read-only (nothing writes to disk; /tmp is unused).
   gateway_container = [{
-    name = "gateway"
-    # Run from the app dir so pnpm's isolated node_modules resolve `tsx` (it lives
-    # in apps/<app>/node_modules, not /app/node_modules). Matches `pnpm start`.
-    workingDirectory = "/app/apps/gateway"
-    image            = local.api_image
-    essential        = true
-    command          = ["node", "--import", "tsx", "src/main.ts"]
-    linuxParameters  = { initProcessEnabled = true }
-    portMappings     = [{ containerPort = local.ports.gateway, protocol = "tcp" }]
-    environment      = [for k, v in local.gateway_env : { name = k, value = v }]
-    secrets          = [for k, v in local.gateway_secrets : { name = k, valueFrom = v }]
-    stopTimeout      = local.ecs_stop_timeout_seconds
+    name                   = "gateway"
+    image                  = local.api_image
+    essential              = true
+    command                = ["dist/gateway/main.mjs"]
+    readonlyRootFilesystem = true
+    linuxParameters        = { initProcessEnabled = true }
+    portMappings           = [{ containerPort = local.ports.gateway, protocol = "tcp" }]
+    environment            = [for k, v in local.gateway_env : { name = k, value = v }]
+    secrets                = [for k, v in local.gateway_secrets : { name = k, valueFrom = v }]
+    stopTimeout            = local.ecs_stop_timeout_seconds
     healthCheck = {
-      command     = ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:${local.ports.gateway}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      command     = ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:${local.ports.gateway}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval    = 30
       timeout     = 5
       retries     = 3
@@ -295,16 +318,23 @@ locals {
   }]
 
   control_container = [{
-    name             = "control-api"
-    workingDirectory = "/app/apps/control-api"
-    image            = local.api_image
-    essential        = true
-    command          = ["node", "--import", "tsx", "src/main.ts"]
-    linuxParameters  = { initProcessEnabled = true }
-    portMappings     = [{ containerPort = local.ports.control, protocol = "tcp" }]
-    environment      = [for k, v in local.control_env : { name = k, value = v }]
-    secrets          = [for k, v in local.control_secrets : { name = k, valueFrom = v }]
-    stopTimeout      = local.ecs_stop_timeout_seconds
+    name                   = "control-api"
+    image                  = local.api_image
+    essential              = true
+    command                = ["dist/control-api/main.mjs"]
+    readonlyRootFilesystem = true
+    linuxParameters        = { initProcessEnabled = true }
+    portMappings           = [{ containerPort = local.ports.control, protocol = "tcp" }]
+    environment            = [for k, v in local.control_env : { name = k, value = v }]
+    secrets                = [for k, v in local.control_secrets : { name = k, valueFrom = v }]
+    stopTimeout            = local.ecs_stop_timeout_seconds
+    healthCheck = {
+      command     = ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:${local.ports.control}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 30
+    }
     logConfiguration = {
       logDriver = "awslogs"
       options   = { "awslogs-group" = local.log_opts.group, "awslogs-region" = local.log_opts.region, "awslogs-stream-prefix" = "control-api" }
@@ -329,7 +359,7 @@ locals {
     name            = "migrate"
     image           = local.api_image
     essential       = true
-    command         = ["pnpm", "--filter", "@gulley/storage", "db:migrate"]
+    command         = ["dist/control-api/migrate.mjs"]
     linuxParameters = { initProcessEnabled = true }
     environment     = [{ name = "NODE_ENV", value = "production" }]
     secrets         = [{ name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.this["gulley/db-url"].arn }]

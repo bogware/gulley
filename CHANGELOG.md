@@ -69,6 +69,47 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **control-client.** Per-call deadline (`timeoutMs`), typed `ControlNetworkError`,
   and a non-JSON error page keeps its status instead of surfacing as a `SyntaxError`.
 
+### Changed (runtime + deploy)
+
+- **Distroless, pre-bundled runtime image.** `scripts/bundle.mjs` (esbuild) bundles
+  both apps (and the migrate / doctor / audit-verify entries) into `dist/`, stamps
+  the version + git sha (`/health`, `gulley_build_info`, OTel `service.version`,
+  log lines), and copies the migrations; the image is
+  `gcr.io/distroless/nodejs22` with production-only hoisted dependencies — no tsx,
+  esbuild, vitest, drizzle-kit, shell or package manager at runtime. The console
+  image runs Next's standalone server on the same base. Trivy scans run **before**
+  every push with no exceptions (`.trivyignore` and the esbuild skip-dirs are gone).
+  **Deployments must switch their commands** to the bundled entries
+  (`dist/gateway/main.mjs`, `dist/control-api/main.mjs`; migrations via
+  `dist/control-api/migrate.mjs`) — compose, the Helm chart (0.2.0, appVersion
+  v0.4.0) and the Terraform module are updated.
+- **Compose:** a one-off `migrate` service runs first and both planes wait for it;
+  `stop_grace_period` 120 s; per-service node-based healthchecks; control-api and
+  metrics ports bound to loopback; `NODE_ENV=production` forced and
+  `GULLEY_KEY_PEPPER` required; Node heap caps.
+- **Helm:** node-based `preStop` (no shell in the image), `/ready` readiness for the
+  control-api, 5 s probe timeouts + startupProbes, per-plane `SHUTDOWN_GRACE_MS`
+  derived from that plane's grace/preStop/buffer (render fails on a non-positive
+  budget), `NODE_OPTIONS` heap caps, Prometheus scrape annotations, a NetworkPolicy
+  for the control-api, `pullPolicy: Always` for a `latest` tag, and a refusal to
+  render a credential-bearing `DATABASE_URL` into the ConfigMap.
+- **Terraform (ECS):** bundled entries + exec-form health checks, read-only root
+  filesystems, Node heap caps, the prod WORM mirror actually wired (bucket, region,
+  retention, audit-export signing key) with `PutObject`/`PutObjectRetention` on the
+  control role, Aurora backup retention (prod 35 d / test 1 d, tags on snapshots,
+  Postgres logs to CloudWatch), `/metrics` and `/live` no longer routed by the ALB,
+  secret recovery window + ECR `force_delete` tier-conditional. **EKS:** the
+  `metrics-server` addon (the HPA had nothing to read), `bedrock:ApplyGuardrail` on
+  the IRSA role, prod refuses an API endpoint open to `0.0.0.0/0`.
+- **CI:** the deploy manifests (Helm lint/template + compose) are gated in both
+  CIs; the release workflow refuses `latest` from a manual run, scans before pushing
+  to ECR too, publishes the console image (`ghcr.io/bogware/gulley-web`), and the
+  Azure pipeline verifies the cosign binary's checksum; the hot-path guard fails in
+  strict mode when the base ref is missing; `pnpm bundle` is part of `ci/verify.sh`.
+- `gulley doctor` errors under `AIR_GAPPED` when a provider still points at its
+  public endpoint; the DR runbook verifies with `audit:verify`; docs describe the
+  runtime image, the console proxy and the gateway's egress model accurately.
+
 ### Changed
 
 - SCIM deprovision revokes every live session for the user (set-based, by subject

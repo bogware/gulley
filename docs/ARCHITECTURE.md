@@ -202,7 +202,7 @@ Two tiers, both **partitioned by authz scope** — every exact + semantic key is
 ## 9. Guardrails & data masking
 
 - **Native default fast path:** deterministic filters first (regex + secret-scan prefixes + entropy), ML/NER detectors second; **run checks in parallel, short-circuit on first BLOCK** (latency ≈ slowest check, not sum); cache verdicts by content hash.
-- **Streaming:** windowed incremental scan (see §4). Whole-document detectors gated behind per-route `buffered` mode.
+- **Streaming:** windowed incremental scan (see §4). Whole-document detectors gated behind per-route `buffered` mode. **Scope of the windowed in-stream enforcer (`STREAMING_ENFORCE`):** it rewrites the _text_ deltas of a stream (Anthropic `text_delta`, OpenAI `content` / Responses `output_text`); `thinking`, `input_json_delta` / tool-call argument fragments and other non-text frames pass through unchanged and are covered by the audit-only scan, not redacted in-stream. A policy that must enforce over tool arguments or reasoning uses the buffered (non-streamed) mode.
 - **Lifecycle hooks** (LiteLLM taxonomy): `pre_call` (block input) / `post_call` (input+output) / `during_call` (parallel, response held) / `logging_only`.
 - **Provider plugins** (opt-in per route): Bedrock Guardrails, Azure AI Content Safety / Prompt Shields, Azure Language PII.
 - **Reversible-tokenization vault** is treated as PHI-grade: KMS envelope-encrypted, **per-request/session scope (never global)**, bounded retention, access-audited. Detokenize only values tokenized within the same request/principal scope.
@@ -267,6 +267,16 @@ Two tiers, both **partitioned by authz scope** — every exact + semantic key is
 - **Terraform module layout:** `network` (VPC/subnets/endpoints), `data` (Aurora, Redis×3), `security` (KMS, Secrets Manager, IAM roles/policies), `compute` (ECS cluster/services/ALB/autoscaling), `edge` (ACM/DNS), `observability` (log groups, OTel collector sidecar optional). Root modules per workspace (`dev`, `prod`).
 
 ---
+
+### Runtime image
+
+One distroless image (`gcr.io/distroless/nodejs22`, `node` as the entrypoint, no
+shell or package manager) runs either plane. `scripts/bundle.mjs` (esbuild) bundles
+the workspace packages into `dist/<app>/main.mjs` (+ `migrate.mjs`, `doctor.mjs`,
+`audit-verify.mjs`), stamps the version/sha, and copies the migrations; third-party
+packages are installed production-only and hoisted next to `dist/`. Every
+deployment (compose, Helm, ECS) runs the same entries and probes through node in
+exec form; the DB schema is checked against the bundled journal on `/ready`.
 
 ## 15. Repository structure
 

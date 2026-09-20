@@ -95,16 +95,21 @@ Next.js console. Both build from the repo root.
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "${ECR_API%%/*}"
 
-# from the repo root:
+# from the repo root (stamp the version + sha into the image):
 ( cd ../.. && docker buildx build --platform linux/arm64 \
+    --build-arg GULLEY_VERSION="$(git describe --tags --always)" \
+    --build-arg GULLEY_BUILD_SHA="$(git rev-parse --short HEAD)" \
     -f apps/gateway/Dockerfile -t "$ECR_API:latest" --push . )
 
-# The console proxies /control/* to the control-api at BUILD time (Next.js bakes the
-# rewrite destination), so the api host MUST be passed as a build arg:
+# The console proxies /control/* to the control-api at RUNTIME (CONTROL_API_URL is a
+# task env the module sets), so no build arg is needed:
 ( cd ../.. && docker buildx build --platform linux/arm64 \
-    --build-arg CONTROL_API_URL="https://$API_DOMAIN" \  # optional: the task env sets it at runtime
     -f apps/web/Dockerfile     -t "$ECR_WEB:latest" --push . )
 ```
+
+Both images are distroless (node is the entrypoint; no shell). The API image runs
+`dist/gateway/main.mjs` / `dist/control-api/main.mjs`; the migrate task runs
+`dist/control-api/migrate.mjs`; the console runs Next's standalone `server.js`.
 
 (Host is x86_64? Set `cpu_architecture = "X86_64"` in tfvars and build
 `--platform linux/amd64` — native builds are much faster than QEMU cross-builds.)
@@ -139,8 +144,10 @@ put gulley/provider-bedrock      "disabled"               # placeholder; Bedrock
 
 ## 6. Run database migrations
 
-A fresh Aurora has no schema. Run the one-off migrate task (it uses the API image +
-the `db-url` secret) inside the VPC:
+A fresh Aurora has no schema. Run the one-off migrate task (it uses the API image's
+bundled migrations + the `db-url` secret) inside the VPC. Both planes report `/ready`
+503 ("database schema is behind this build") until it has run — re-run it after every
+image upgrade that ships a migration:
 
 ```sh
 NET=$(terraform output -json run_task_network)
@@ -160,6 +167,14 @@ aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
 
 If the exit code is not `0`, read the `migrate` log stream in the
 `/gulley/<name>` CloudWatch log group.
+
+### Gateway metrics
+
+The gateway's Prometheus listener (`METRICS_PORT`, 9090) is a management port that
+the ALB does not front and the task does not publish. Scrape it inside the VPC
+(a Prometheus/ADOT sidecar or a private scrape target), or let the control-api fetch
+it for the console by setting `GATEWAY_METRICS_URL=http://<gateway task ip>:9090/metrics`
+via `control_extra_env` (service discovery: Cloud Map / an internal NLB).
 
 ## 7. Phase-two apply — start the services
 

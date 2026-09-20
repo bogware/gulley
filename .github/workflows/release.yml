@@ -7,9 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: Image tag to build and push
+        # No default on purpose: a manual run must name the tag (a stray click used to
+        # overwrite :latest). `latest` itself is refused below on a non-tag run.
+        description: Image tag to build and push (e.g. v0.4.0-rc1); never "latest"
         required: true
-        default: latest
   push:
     tags: ['v*']
 
@@ -40,6 +41,15 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Refuse a mutable tag on a manual run
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          TAG: ${{ env.TAG }}
+        run: |
+          if [ "$TAG" = "latest" ]; then
+            echo "refusing to publish :latest from a manual run — only a v* tag push moves latest" >&2
+            exit 1
+          fi
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
@@ -51,7 +61,11 @@ jobs:
       - name: Build amd64 image locally for scanning
         run: |
           docker buildx build --platform linux/amd64 \
+            --build-arg "GULLEY_VERSION=${{ env.TAG }}" \
+            --build-arg "GULLEY_BUILD_SHA=$(git rev-parse --short HEAD)" \
             --file apps/gateway/Dockerfile --load --tag gulley-scan:${{ env.TAG }} .
+      # The runtime is distroless with production dependencies only (no tsx/esbuild/
+      # toolchain), so the scan is strict: no skip-dirs, no ignore file.
       - name: Scan image (fail on HIGH/CRITICAL) before publishing
         uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
         with:
@@ -59,21 +73,52 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: '1'
           ignore-unfixed: true
-          # The apps run via tsx, which bundles the esbuild Go binary purely as a
-          # TS->JS transpiler. Trivy flags esbuild's embedded Go stdlib CVEs
-          # (net/http, mail, xml, tls DoS/XSS), but none of those code paths are
-          # reachable here — esbuild runs no server and parses no untrusted input.
-          # Exclude the build-tool binary from the gate; everything else (OS
-          # packages, all other libraries) stays strict. Real fix tracked as the
-          # distroless + pre-bundled-JS runtime follow-up (see docs/SUPPLY_CHAIN.md).
-          skip-dirs: '**/esbuild@*,**/@esbuild+*,**/@esbuild'
-          # Documented per-CVE exceptions for the shipped dev/build toolchain
-          # (not in the runtime graph) + one unreachable runtime path.
-          trivyignores: .trivyignore
       - name: Build + push multi-arch (SBOM + provenance + cosign) to GHCR
         id: build
         env:
           IMAGE_TAG: ${{ env.TAG }}
+          PLATFORMS: linux/amd64,linux/arm64
+          TAG_LATEST: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+        run: bash ci/build-image.sh
+
+  # ── Public console image → GHCR ──────────────────────────────────────────────
+  # The Next.js admin console, same gates (scan before push, SBOM + provenance,
+  # cosign). Published as ghcr.io/bogware/gulley-web.
+  ghcr-web:
+    if: github.repository == 'bogware/gulley'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      IMAGE: ghcr.io/bogware/gulley-web
+      TAG: ${{ inputs.image_tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build amd64 console image locally for scanning
+        run: |
+          docker buildx build --platform linux/amd64 \
+            --file apps/web/Dockerfile --load --tag gulley-web-scan:${{ env.TAG }} .
+      - name: Scan console image (fail on HIGH/CRITICAL) before publishing
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
+        with:
+          image-ref: gulley-web-scan:${{ env.TAG }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+      - name: Build + push multi-arch console image
+        env:
+          IMAGE_TAG: ${{ env.TAG }}
+          DOCKERFILE: apps/web/Dockerfile
           PLATFORMS: linux/amd64,linux/arm64
           TAG_LATEST: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
         run: bash ci/build-image.sh
@@ -96,23 +141,27 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      # Scan BEFORE the push (a vulnerable image used to land in ECR first).
+      - name: Build amd64 image locally for scanning
+        run: |
+          docker buildx build --platform linux/amd64 \
+            --build-arg "GULLEY_VERSION=${{ inputs.image_tag || github.ref_name }}" \
+            --build-arg "GULLEY_BUILD_SHA=$(git rev-parse --short HEAD)" \
+            --file apps/gateway/Dockerfile --load --tag gulley-scan:ecr .
+      - name: Scan image (fail on HIGH/CRITICAL) before publishing
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
+        with:
+          image-ref: gulley-scan:ecr
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
       - name: Build + push image (SBOM + provenance + cosign signature)
         env:
           IMAGE_TAG: ${{ inputs.image_tag || github.ref_name }}
         run: bash ci/build-image.sh
-      - name: Scan image (fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8 # v0.24.0
-        with:
-          image-ref: ${{ env.ECR_REPOSITORY }}:${{ inputs.image_tag || github.ref_name }}
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-          ignore-unfixed: true
-          # Exclude the esbuild transpiler binary (unreachable build-tool Go CVEs);
-          # see the GHCR job above and docs/SUPPLY_CHAIN.md.
-          skip-dirs: '**/esbuild@*,**/@esbuild+*,**/@esbuild'
-          trivyignores: .trivyignore
 
   # ── GitHub Release (tag pushes only) ─────────────────────────────────────────
   # Publishes a Release whose notes are the CHANGELOG section for the tag, and

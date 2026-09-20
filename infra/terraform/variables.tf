@@ -71,6 +71,16 @@ variable "enable_tls" {
 
 # --- container images ------------------------------------------------------
 
+variable "backup_retention_days" {
+  description = "Aurora automated backup / PITR retention in days (1-35). Default: preset (test 1, prod 35)."
+  type        = number
+  default     = null
+  validation {
+    condition     = var.backup_retention_days == null || (var.backup_retention_days >= 1 && var.backup_retention_days <= 35)
+    error_message = "backup_retention_days must be between 1 and 35."
+  }
+}
+
 variable "image_tag" {
   description = "Tag of the API monorepo image (gateway + control-api) in the created ECR repo."
   type        = string

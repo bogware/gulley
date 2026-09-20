@@ -6,6 +6,7 @@ import {
   KmsSigner,
 } from '@gulley/crypto';
 import { loadCatalogFromFile } from '@gulley/catalog';
+import { GULLEY_BUILD } from '@gulley/core';
 import type { RateResolver } from '@gulley/cost';
 import { assertEgressAllowed, setAirGappedEgress } from '@gulley/egress';
 import { EntraGraphIdp } from '@gulley/oauth';
@@ -324,7 +325,16 @@ function parseScimGroupRoleMap(json: string): Record<string, { role: string; org
 const config = loadConfig();
 // One structured logger for the process: boot-time warnings (previously raw
 // process.stderr.write lines that broke JSON log ingestion), request lines, drain.
-const log = pino({ level: config.LOG_LEVEL, redact: { paths: LOG_REDACT_PATHS, remove: true } });
+const log = pino({
+  level: config.LOG_LEVEL,
+  redact: { paths: LOG_REDACT_PATHS, remove: true },
+  base: {
+    pid: process.pid,
+    version: GULLEY_BUILD.version,
+    ...(GULLEY_BUILD.sha ? { sha: GULLEY_BUILD.sha } : {}),
+  },
+});
+log.info({ node: process.version, build: GULLEY_BUILD }, 'gulley control-api starting');
 const bootWarn = (m: string): void => log.warn(m);
 
 /** DB mode: refresh the console's read model (tenancy + providers + collections) from

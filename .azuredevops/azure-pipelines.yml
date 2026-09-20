@@ -40,6 +40,21 @@ jobs:
       - script: HOTPATH_STRICT=1 bash ci/hotpath-guard.sh
         displayName: Hot-path review guard (strict)
 
+  - job: deploy_manifests
+    displayName: Deploy manifests (helm + compose)
+    steps:
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '22.x'
+        displayName: Install Node.js
+      - script: |
+          set -euo pipefail
+          curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/helm
+          bash ci/install.sh
+          bash ci/helm-check.sh
+        displayName: Helm lint/template + compose structural checks
+
   - job: terraform
     displayName: Terraform
     steps:

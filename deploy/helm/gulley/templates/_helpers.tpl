@@ -39,6 +39,30 @@ app.kubernetes.io/component: {{ .plane }}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
 
+{{/* pullPolicy: a mutable `latest` tag is always re-pulled (IfNotPresent would pin a
+     node to whatever it pulled first); otherwise the configured policy. */}}
+{{- define "gulley.pullPolicy" -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- if eq $tag "latest" -}}Always{{- else -}}{{ .Values.image.pullPolicy }}{{- end -}}
+{{- end -}}
+
+{{/* Per-plane SHUTDOWN_GRACE_MS: (terminationGracePeriodSeconds - preStopSleepSeconds -
+     drainBufferSeconds) * 1000. Fails the render when the budget is not positive, so an
+     operator cannot configure a drain that SIGKILL always cuts short. */}}
+{{- define "gulley.shutdownGraceMs" -}}
+{{- $g := sub (sub (int .plane.terminationGracePeriodSeconds) (int .plane.preStopSleepSeconds)) (int .plane.drainBufferSeconds) -}}
+{{- if le $g 0 -}}
+{{- fail (printf "%s: terminationGracePeriodSeconds (%d) must exceed preStopSleepSeconds (%d) + drainBufferSeconds (%d)" .name (int .plane.terminationGracePeriodSeconds) (int .plane.preStopSleepSeconds) (int .plane.drainBufferSeconds)) -}}
+{{- end -}}
+{{- mul $g 1000 -}}
+{{- end -}}
+
+{{/* preStop hook: the image is distroless (no /bin/sh), so the sleep runs in node. */}}
+{{- define "gulley.preStop" -}}
+exec:
+  command: ['/nodejs/bin/node', '-e', 'setTimeout(function () {}, {{ mul (int .) 1000 }})']
+{{- end -}}
+
 {{/* Affinity for a plane (pass dict root + plane): the user's `affinity` override if
      set, else a soft (preferred) pod anti-affinity that spreads that plane's replicas
      across nodes by its selector labels — so one node loss can't take out all replicas.

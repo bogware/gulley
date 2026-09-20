@@ -61,3 +61,18 @@ jobs:
           terraform_version: 1.15.8
       - name: Terraform fmt + validate
         run: bash ci/tf-check.sh
+
+  deploy-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: azure/setup-helm@fe7b79cd5ee1e45176fcad797de68ecaf3ca4814 # v4
+        with:
+          version: v3.16.4
+      - name: Install (the validator needs the workspace's yaml package)
+        run: bash ci/install.sh
+      - name: Helm lint/template + compose structural checks
+        run: bash ci/helm-check.sh

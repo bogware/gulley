@@ -1,19 +1,22 @@
-# Self-host: the gateway + control-api (one image, two commands) plus Postgres and
+# Self-host: the gateway + control-api (one image, two entries) plus Postgres and
 # the role-split Redis trio. From the repo root:
 #
 #   cp .env.example deploy/.env      # fill provider keys, GULLEY_KEY_PEPPER, POSTGRES_PASSWORD
-#   docker compose -f deploy/docker-compose.prod.yml up -d postgres
-#   docker compose -f deploy/docker-compose.prod.yml run --rm --workdir /app/packages/storage \
-#     control-api pnpm db:migrate         # apply the schema to a fresh database
 #   docker compose -f deploy/docker-compose.prod.yml up -d
 #
-# Secrets live only in deploy/.env (gitignored) — never commit it. POSTGRES_PASSWORD
-# is required (compose fails closed if unset). The image tag defaults to `latest`;
-# pin GULLEY_TAG for a real deployment.
+# `up` runs the one-off `migrate` service first (it applies the bundled SQL migrations
+# and exits 0); both planes wait for it, so a fresh database is schema-current before
+# either serves. Re-running `up` after an image bump re-migrates idempotently.
+#
+# Secrets live only in deploy/.env (gitignored) — never commit it. POSTGRES_PASSWORD and
+# GULLEY_KEY_PEPPER are required (compose fails closed if either is unset). The image
+# tag defaults to `latest`; pin GULLEY_TAG for a real deployment. Only the gateway's
+# data port is published on all interfaces; the control-api and the metrics listener
+# bind to loopback (put them behind your own reverse proxy / auth).
 services:
   postgres:
     # pgvector-enabled Postgres — the semantic-cache migration needs the `vector`
-    # extension (plain postgres:16 lacks it and db:migrate fails).
+    # extension (plain postgres:16 lacks it and the migration fails).
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: gulley
@@ -27,10 +30,16 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+    stop_grace_period: 60s
 
   redis-cache:
     image: redis:7-alpine
     command: ['redis-server', '--maxmemory', '256mb', '--maxmemory-policy', 'allkeys-lru']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   redis-counters:
@@ -38,58 +47,112 @@ services:
     command: ['redis-server', '--maxmemory-policy', 'noeviction', '--appendonly', 'yes']
     volumes:
       - gulley_redis_counters:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   redis-vector:
     image: redis:7-alpine
     command: ['redis-server', '--maxmemory-policy', 'noeviction']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
+
+  # One-off: apply the bundled migrations, then exit. Both planes depend on its success.
+  migrate:
+    image: ${GULLEY_IMAGE:-ghcr.io/bogware/gulley}:${GULLEY_TAG:-latest}
+    command: ['dist/control-api/migrate.mjs']
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://gulley:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/gulley
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
 
   gateway:
     image: ${GULLEY_IMAGE:-ghcr.io/bogware/gulley}:${GULLEY_TAG:-latest}
-    # The image's default command starts the gateway from its app dir (so pnpm's
-    # isolated `tsx` resolves); no command override needed.
+    # The image's default command is the gateway entry (dist/gateway/main.mjs).
     env_file:
       - .env
     environment:
+      # Overrides win over .env: a copied .env.example must not demote a self-host to
+      # a development posture (NODE_ENV=development, dev pepper, debug tracer).
+      NODE_ENV: production
       GATEWAY_PORT: '8080'
       METRICS_PORT: '9090'
+      NODE_OPTIONS: ${GATEWAY_NODE_OPTIONS:---max-old-space-size=768}
+      GULLEY_KEY_PEPPER: ${GULLEY_KEY_PEPPER:?set GULLEY_KEY_PEPPER in deploy/.env (>=16 chars, keep it secret)}
       DATABASE_URL: postgres://gulley:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/gulley
       REDIS_CACHE_URL: redis://redis-cache:6379
       REDIS_COUNTERS_URL: redis://redis-counters:6379
       REDIS_VECTOR_URL: redis://redis-vector:6379
     ports:
       - '8080:8080'
-      - '9090:9090'
+      - '127.0.0.1:9090:9090'
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis-cache:
-        condition: service_started
+        condition: service_healthy
       redis-counters:
-        condition: service_started
+        condition: service_healthy
       redis-vector:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          '/nodejs/bin/node',
+          '-e',
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Longer than SHUTDOWN_GRACE_MS (110 s default) so the drain finishes before SIGKILL.
+    stop_grace_period: 120s
     restart: unless-stopped
 
   control-api:
     image: ${GULLEY_IMAGE:-ghcr.io/bogware/gulley}:${GULLEY_TAG:-latest}
-    # Same image; run the control-api from its own app dir so `tsx` resolves.
-    working_dir: /app/apps/control-api
-    command: ['node', '--import', 'tsx', 'src/main.ts']
+    command: ['dist/control-api/main.mjs']
     env_file:
       - .env
     environment:
+      NODE_ENV: production
       CONTROL_API_PORT: '8081'
+      NODE_OPTIONS: ${CONTROL_API_NODE_OPTIONS:---max-old-space-size=768}
+      GULLEY_KEY_PEPPER: ${GULLEY_KEY_PEPPER:?set GULLEY_KEY_PEPPER in deploy/.env (>=16 chars, keep it secret)}
       DATABASE_URL: postgres://gulley:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/gulley
       REDIS_CACHE_URL: redis://redis-cache:6379
       REDIS_COUNTERS_URL: redis://redis-counters:6379
       REDIS_VECTOR_URL: redis://redis-vector:6379
     ports:
-      - '8081:8081'
+      - '127.0.0.1:8081:8081'
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          'CMD',
+          '/nodejs/bin/node',
+          '-e',
+          "fetch('http://127.0.0.1:8081/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 120s
     restart: unless-stopped
 
 volumes:

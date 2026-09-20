@@ -41,8 +41,14 @@ if [[ -z "$base_ref" ]]; then
   fi
 fi
 
-# Fall back gracefully if the base isn't available (shallow clone, fork, etc.).
+# A missing base is informational locally, but in strict (CI) mode it must FAIL: a
+# shallow checkout that silently skipped the guard would let an unreviewed hot-path
+# change merge.
 if ! git rev-parse --verify --quiet "$base_ref" >/dev/null; then
+  if [[ "${HOTPATH_STRICT:-0}" == "1" ]]; then
+    echo "hotpath-guard: base ref '$base_ref' not found in strict mode — fetch history (fetch-depth: 0) so the diff can be checked." >&2
+    exit 1
+  fi
   echo "hotpath-guard: base ref '$base_ref' not found; skipping (informational)."
   exit 0
 fi

@@ -9,7 +9,7 @@ pr: none
 parameters:
   - name: imageTag
     type: string
-    default: latest
+    # No default: a run must name the tag (never `latest`; the script refuses it).
 
 pool:
   vmImage: ubuntu-latest
@@ -32,23 +32,31 @@ stages:
               inlineScript: |
                 set -euo pipefail
                 export IMAGE_TAG='${{ parameters.imageTag }}'
-                # cosign for keyless signing (build-image.sh signs the digest).
-                # Keyless in Azure DevOps needs the pipeline OIDC to be enabled;
-                # set SKIP_SIGN=1 to build without signing.
-                curl -fsSL "https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64" -o /usr/local/bin/cosign
-                chmod +x /usr/local/bin/cosign
-                bash ci/build-image.sh
+                if [ "$IMAGE_TAG" = "latest" ]; then
+                  echo "refusing to publish :latest from a manual run" >&2; exit 1
+                fi
+                # cosign for keyless signing (build-image.sh signs the digest), with the
+                # binary verified against the release's published checksums. Keyless in
+                # Azure DevOps needs the pipeline OIDC to be enabled; SKIP_SIGN=1 skips.
+                COSIGN_VERSION=v2.4.1
+                curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -o cosign-linux-amd64
+                curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign_checksums.txt" -o cosign_checksums.txt
+                grep ' cosign-linux-amd64$' cosign_checksums.txt | sha256sum -c -
+                install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
                 # Pin the Trivy installer to a release TAG (never pipe the main
                 # branch into a shell in a credentialed stage).
                 TRIVY_VERSION=v0.74.0
                 curl -fsSL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" \
                   | sh -s -- -b /usr/local/bin "${TRIVY_VERSION}"
-                # Exclude the esbuild transpiler binary (unreachable build-tool Go
-                # CVEs; see docs/SUPPLY_CHAIN.md). Everything else stays strict.
-                trivy image --severity HIGH,CRITICAL --ignore-unfixed \
-                  --skip-dirs '**/esbuild@*' --skip-dirs '**/@esbuild+*' --skip-dirs '**/@esbuild' \
-                  --ignorefile .trivyignore \
-                  --exit-code 1 "$ECR_REPOSITORY:$IMAGE_TAG"
+                # Scan BEFORE the push: build the amd64 image locally, gate it, then
+                # build-image.sh pushes the (signed) target-platform image. Distroless +
+                # production deps only: no skip-dirs, no ignore file.
+                docker buildx build --platform linux/amd64 \
+                  --build-arg "GULLEY_VERSION=$IMAGE_TAG" \
+                  --build-arg "GULLEY_BUILD_SHA=$(git rev-parse --short HEAD)" \
+                  --file apps/gateway/Dockerfile --load --tag gulley-scan:local .
+                trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 gulley-scan:local
+                bash ci/build-image.sh
 
   # IaC sanity: fmt + validate the single Terraform module. A real prod plan/apply
   # is operator-driven with your own backend + tfvars (infra/terraform/INSTALL.md),

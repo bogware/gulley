@@ -33,6 +33,7 @@
     "nameOverride": { "type": "string" },
     "fullnameOverride": { "type": "string" },
     "existingSecret": { "type": "string" },
+    "allowCredentialsInConfig": { "type": "boolean" },
     "config": { "type": "object" },
     "serviceAccount": {
       "type": "object",

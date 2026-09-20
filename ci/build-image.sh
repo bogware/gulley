@@ -42,9 +42,16 @@ fi
 META="$(mktemp)"
 trap 'rm -f "$META"' EXIT
 
+# Stamp the build: the tag (or GULLEY_VERSION) + the git sha land in /health,
+# gulley_build_info, OTel service.version and every log line.
+BUILD_VERSION="${GULLEY_VERSION:-$IMAGE_TAG}"
+BUILD_SHA="${GULLEY_BUILD_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+
 docker buildx build \
   --platform "$PLATFORMS" \
   --file "$DOCKERFILE" \
+  --build-arg "GULLEY_VERSION=${BUILD_VERSION}" \
+  --build-arg "GULLEY_BUILD_SHA=${BUILD_SHA}" \
   "${tags[@]}" \
   --provenance=true \
   --sbom=true \

@@ -25,6 +25,14 @@ resource "aws_rds_cluster" "this" {
   skip_final_snapshot         = !local.deletion_protection
   final_snapshot_identifier   = local.deletion_protection ? "${var.name}-aurora-final" : null
 
+  # Point-in-time recovery window (days). The provider default is 1 day — one bad
+  # migration discovered on Monday would already be unrecoverable. prod = 35 (the
+  # maximum), test = 1. Snapshots inherit tags; Postgres logs go to CloudWatch.
+  backup_retention_period         = local.backup_retention_days
+  preferred_backup_window         = "03:00-04:00"
+  copy_tags_to_snapshot           = true
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+
   serverlessv2_scaling_configuration {
     min_capacity = local.min_acu
     max_capacity = local.max_acu
