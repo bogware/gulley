@@ -46,6 +46,13 @@ for the full findings and the remaining waves.
   plugins. Previously these had only a boot-time structural URL check, so a configured host
   whose A-record flipped to an internal/metadata address after the check (or a malicious IdP
   discovery document) could reach an internal endpoint.
+- **Counters-Redis role separation is enforced at boot.** Budget/rate-limit counters and
+  the semantic-vector index require `noeviction`; the cache runs `allkeys-lru`. Sharing one
+  Redis instance for the cache and a counter/vector role silently evicted counters under
+  memory pressure, bypassing spend enforcement with no error anywhere. Boot now refuses
+  `REDIS_COUNTERS_URL` or `REDIS_VECTOR_URL` equal to `REDIS_CACHE_URL` (the reliable guard;
+  the runtime `CONFIG GET maxmemory-policy` probe stays best-effort, since managed Redis
+  often disables `CONFIG`).
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook

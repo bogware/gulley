@@ -657,6 +657,28 @@ const Env = EnvShape.superRefine((c, ctx) => {
         'required in production when MASK_VAULT_PERSIST is on (the in-memory dev cipher is per-process, so persisted mask rows could never be revealed)',
     });
   }
+  // The cache instance runs `allkeys-lru` (it MUST shed entries under memory pressure),
+  // while counters and the vector index MUST be `noeviction`. Pointing a noeviction-role
+  // URL at the cache instance is a CORRUPTING misconfig with no runtime error — an evicted
+  // budget/rate-limit counter silently under-charges and bypasses the cap. Refuse it at
+  // boot (the runtime CONFIG-GET eviction probe is best-effort: managed Redis often
+  // disables CONFIG, so this URL distinctness check is the reliable guard).
+  if (c.REDIS_CACHE_URL && c.REDIS_CACHE_URL === c.REDIS_COUNTERS_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['REDIS_COUNTERS_URL'],
+      message:
+        'must not equal REDIS_CACHE_URL: the cache is allkeys-lru, so budget/rate-limit counters on it are silently evicted under memory pressure, bypassing spend enforcement — use a separate noeviction instance',
+    });
+  }
+  if (c.REDIS_CACHE_URL && c.REDIS_CACHE_URL === c.REDIS_VECTOR_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['REDIS_VECTOR_URL'],
+      message:
+        'must not equal REDIS_CACHE_URL: the cache is allkeys-lru, so semantic vectors on it are silently evicted, degrading recall — use a separate noeviction instance',
+    });
+  }
 });
 
 export type Config = z.infer<typeof Env>;
