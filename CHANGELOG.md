@@ -61,6 +61,11 @@ for the full findings and the remaining waves.
   then silently shadowed. A duplicate now returns 409 (console) / 422 (apply) instead of a
   500 or a shadowed row. Upgrades with pre-existing duplicate names must de-duplicate before
   migrating (the index creation surfaces them).
+- **Prompt registry is DB-tamper-evident.** `prompt_version` (append-only, hash-chained)
+  now refuses in-place `UPDATE` and `TRUNCATE` via a trigger + `REVOKE` (migration `0024`),
+  matching `audit_log`/`config_version` — closing the gap where a version body could be
+  rewritten with a recomputed forward chain undetectably. `DELETE` is intentionally left to
+  the `ON DELETE cascade` (dropping a version leaves a detectable gap in the sequence).
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook

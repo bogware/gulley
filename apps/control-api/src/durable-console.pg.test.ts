@@ -221,10 +221,14 @@ describe('durable prompt registry (F13/G10)', () => {
     const t = await other.prompts.get(id);
     expect(t?.versions.map((v) => v.version)).toEqual([1, 2]);
     expect(await other.prompts.verifyChain(id)).toEqual({ verified: true, count: 2 });
-    // Tampering with a stored author breaks the chain (the hash covers authorship).
+    // Tampering with a stored author breaks the chain (the hash covers authorship). The
+    // append-only trigger (migration 0024) blocks a normal UPDATE, so bypass it to simulate
+    // an attacker who disabled it and confirm chain verification still catches the tamper.
+    await db.execute(sql`set session_replication_role = replica`);
     await db.execute(
       sql`update prompt_version set created_by = 'mallory' where template_id = ${id} and version = 1`,
     );
+    await db.execute(sql`set session_replication_role = default`);
     expect((await get(`/prompts/${id}/verify`)).json()).toMatchObject({
       verified: false,
       brokenAt: 1,

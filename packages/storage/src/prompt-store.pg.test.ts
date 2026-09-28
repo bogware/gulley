@@ -71,10 +71,26 @@ describe('PostgresPromptRegistry', () => {
     const r = new PostgresPromptRegistry(db);
     const t = await r.create(workspaceId, 'tamper', args('one'));
     await r.addVersion(t.id, args('two'));
+    // The BEFORE UPDATE immutability trigger (migration 0024) blocks an in-place edit, so
+    // simulate an attacker who bypassed it (disabled the trigger / a superuser rewrite) and
+    // confirm the app-level chain verification is a backstop that still catches the tamper.
+    await db.execute(sql`set session_replication_role = replica`);
     await db.execute(
       sql`update prompt_version set created_by = 'mallory' where template_id = ${t.id} and version = 2`,
     );
+    await db.execute(sql`set session_replication_role = default`);
     expect(await r.verifyChain(t.id)).toMatchObject({ verified: false, brokenAt: 2 });
+  });
+
+  it('refuses an in-place UPDATE of a stored version (append-only trigger, migration 0024)', async () => {
+    const r = new PostgresPromptRegistry(db);
+    const t = await r.create(workspaceId, 'immutable', args('one'));
+    // The trigger raises; drizzle wraps the Postgres message, so assert rejection + that
+    // the body is genuinely unchanged (the mutation never applied).
+    await expect(
+      db.execute(sql`update prompt_version set body = 'rewritten' where template_id = ${t.id}`),
+    ).rejects.toThrow();
+    expect((await r.version(t.id, 1))?.body).toBe('one'); // body unchanged
   });
 
   it('lists secret-free summaries with heads, scoped by workspace', async () => {

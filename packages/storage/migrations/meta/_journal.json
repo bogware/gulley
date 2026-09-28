@@ -169,6 +169,13 @@
       "when": 1790637789566,
       "tag": "0023_military_prima",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790638312049,
+      "tag": "0024_prompt_registry_immutable",
+      "breakpoints": true
     }
   ]
 }
