@@ -38,6 +38,14 @@ for the full findings and the remaining waves.
   missed. And when a body exceeds the per-scan byte cap, the detector emits a full-span,
   high-confidence `scan_truncated` marker so the cache-sensitivity gate and block/mask
   enforcement fail CLOSED instead of treating the unscanned tail as clean.
+- **Guarded egress is DNS-rebind-pinned end to end.** The connect-time pinned agent (which
+  refuses an internal/metadata address at dial time) now backs the inbound-JWT and console
+  OIDC discovery/JWKS/token fetches, the OIDC token exchange (which carries the client
+  secret), Entra Graph, the external authorizer, the audit anchor, the SIEM export, the
+  gateway-metrics scrape and the eval runner — not only the DLP webhook and guardrail
+  plugins. Previously these had only a boot-time structural URL check, so a configured host
+  whose A-record flipped to an internal/metadata address after the check (or a malicious IdP
+  discovery document) could reach an internal endpoint.
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook

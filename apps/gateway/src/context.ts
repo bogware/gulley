@@ -34,7 +34,7 @@ import {
   CelTransformer,
   ExternalAuthorizer,
 } from '@gulley/cel';
-import { assertEgressAllowed, pinnedEgressAgent } from '@gulley/egress';
+import { assertEgressAllowed, pinnedEgressAgent, pinnedFetch } from '@gulley/egress';
 import {
   type HeaderModifierConfig,
   RequestMirror,
@@ -826,6 +826,9 @@ export function createProductionContext(
       ttlMs: config.EXTERNAL_AUTHZ_TTL_MS,
       timeoutMs: config.EXTERNAL_AUTHZ_TIMEOUT_MS,
       failMode: config.EXTERNAL_AUTHZ_FAIL_OPEN ? 'allow' : 'deny',
+      // Connect-time DNS-rebind defence (the boot-time assertEgressAllowed above is only a
+      // structural check); skipped when the operator opts into an internal endpoint.
+      ...(config.EXTERNAL_AUTHZ_ALLOW_INTERNAL ? {} : { dispatcher: pinnedEgressAgent() }),
     });
   }
 
@@ -833,7 +836,15 @@ export function createProductionContext(
   let jwtAuth: JwtAuthConfig | undefined;
   if (config.JWT_ISSUER && config.JWT_AUDIENCE) {
     jwtAuth = {
-      provider: new OidcProvider(config.JWT_ISSUER),
+      // Inbound-JWT discovery/JWKS egress is guarded like any other outbound: a pinned
+      // agent (connect-time DNS-rebind defence) plus the structural egress check on every
+      // fetched/advertised URL. This provider previously used bare global fetch, so a
+      // malicious IdP discovery doc — or a rebound issuer/JWKS host — could point key
+      // fetching at an internal endpoint whose keys then verified inbound client JWTs.
+      provider: new OidcProvider(config.JWT_ISSUER, {
+        fetchImpl: pinnedFetch(),
+        guard: { assertAllowed: (url) => assertEgressAllowed(url) },
+      }),
       audience: config.JWT_AUDIENCE,
       workspaceClaim: config.JWT_WORKSPACE_CLAIM,
       orgClaim: config.JWT_ORG_CLAIM,
