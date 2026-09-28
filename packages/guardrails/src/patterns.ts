@@ -158,6 +158,37 @@ export const SECRET_PATTERNS: PatternDef[] = [
   },
 ];
 
+/** A scanner for a bare (separator-less) digit run that fires ONLY when a category
+ *  CONTEXT_WORD sits within the boost window — so an otherwise-noisy shape (a bare
+ *  9-digit SSN, a bare 10/11-digit phone) is caught near "ssn"/"phone" without
+ *  over-firing on arbitrary digit runs. CONTEXT_WORDS is read lazily inside the returned
+ *  closure so it may be declared later in the module. */
+function contextGatedDigits(
+  category: PiiCategory,
+  digits: RegExp,
+): (text: string) => Array<{ index: number; value: string }> {
+  const CTX_BEFORE = 48; // mirrors applyContextBoost's window (detector.ts)
+  const CTX_AFTER = 24;
+  return (text) => {
+    const ctx = CONTEXT_WORDS[category];
+    if (!ctx) return [];
+    const out: Array<{ index: number; value: string }> = [];
+    digits.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = digits.exec(text)) !== null) {
+      if (m[0].length === 0) {
+        digits.lastIndex++;
+        continue;
+      }
+      const i = m.index;
+      const before = text.slice(Math.max(0, i - CTX_BEFORE), i);
+      const after = text.slice(i + m[0].length, i + m[0].length + CTX_AFTER);
+      if (ctx.test(before) || ctx.test(after)) out.push({ index: i, value: m[0] });
+    }
+    return out;
+  };
+}
+
 export const PII_PATTERNS: PatternDef[] = [
   {
     category: 'email',
@@ -172,6 +203,17 @@ export const PII_PATTERNS: PatternDef[] = [
     // 9-digit run. Excludes obvious invalids (000 area, 00 group, 0000 serial).
     regex: /\b(?!000|666|9\d\d)\d{3}[- ](?!00)\d{2}[- ](?!0000)\d{4}\b/g,
     confidence: 0.8,
+  },
+  {
+    category: 'ssn',
+    source: 'pattern',
+    // Separator-LESS 9-digit SSN ("123456789") — extremely common in pasted
+    // spreadsheets/CSV/JSON/DB dumps, and missed by the separator pattern above and by
+    // ca_sin (which Luhn-checks). A bare 9-digit run is too noisy to flag everywhere, so
+    // find() fires it ONLY near an SSN context word; the regex documents the shape.
+    regex: /\b\d{9}\b/g,
+    confidence: 0.85,
+    find: contextGatedDigits('ssn', /\b\d{9}\b/g),
   },
   {
     category: 'credit_card',
@@ -195,6 +237,15 @@ export const PII_PATTERNS: PatternDef[] = [
     regex: /(?:\+?\d{1,3}[ -])?(?:\(\d{3}\)[ -]?|\d{3}[ -])\d{3}[ -]\d{4}\b/g,
     confidence: 0.5,
     validate: phonePlausible,
+  },
+  {
+    category: 'phone',
+    source: 'pattern',
+    // Separator-less 10/11-digit phone ("5551234567"), context-gated (phone/mobile/tel/…
+    // nearby) so it does not swallow arbitrary long digit runs.
+    regex: /\b\d{10,11}\b/g,
+    confidence: 0.6,
+    find: contextGatedDigits('phone', /\b\d{10,11}\b/g),
   },
   {
     category: 'ca_sin',

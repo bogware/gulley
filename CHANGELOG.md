@@ -32,6 +32,12 @@ for the full findings and the remaining waves.
   shape (`(a+)+` and friends) at use (there is no native RE2 here by design); and the
   external-authorizer default cache key is depth-bounded, so a deeply-nested request body
   (with `EXTERNAL_AUTHZ_SEND_BODY` on) maps to the configured fail mode instead of a 500.
+- **DLP detector coverage.** The native detectors now catch separator-less SSNs and phone
+  numbers (`123456789` / `5551234567`) when a matching context word ("ssn", "phone", …)
+  sits nearby — the bare forms, common in pasted spreadsheets/CSV/JSON, were previously
+  missed. And when a body exceeds the per-scan byte cap, the detector emits a full-span,
+  high-confidence `scan_truncated` marker so the cache-sensitivity gate and block/mask
+  enforcement fail CLOSED instead of treating the unscanned tail as clean.
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook
