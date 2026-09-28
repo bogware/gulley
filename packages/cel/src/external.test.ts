@@ -115,4 +115,23 @@ describe('ExternalAuthorizer', () => {
     await authz.authorize(activation('b')); // same principal → cache hit
     expect(calls).toBe(1);
   });
+
+  it('an un-keyable (pathologically deep) activation maps to failMode, never a throw (#3)', async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return new Response(JSON.stringify({ allow: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+    // A deeply nested body (EXTERNAL_AUTHZ_SEND_BODY carries the attacker's body) used to
+    // stack-overflow the default cache-key hash with an uncaught RangeError → a 500.
+    let body: Record<string, unknown> = { v: 1 };
+    for (let i = 0; i < 1000; i++) body = { nested: body };
+    const deep = { request: { model: 'm', provider: 'p', body }, principal: { id: 'vk' } };
+
+    const closed = new ExternalAuthorizer({ url: 'u', fetchImpl });
+    await expect(closed.authorize(deep)).resolves.toMatchObject({ allowed: false });
+    const open = new ExternalAuthorizer({ url: 'u', failMode: 'allow', fetchImpl });
+    await expect(open.authorize(deep)).resolves.toMatchObject({ allowed: true });
+    expect(calls).toBe(0); // bailed at the un-keyable activation, never contacted the service
+  });
 });

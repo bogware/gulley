@@ -123,10 +123,22 @@ function codePointLength(s: string): number {
  *  in length so a pathological pattern cannot cost unbounded compile time. */
 const MAX_PATTERN_LENGTH = 512;
 const REGEX_CACHE_MAX = 256;
+/** An unbounded quantifier applied to a group that itself contains an unbounded
+ *  quantifier — the classic exponential-backtracking ReDoS shape (`(a+)+`, `(a*)*`,
+ *  `(\d+)+`). Conservative (single-level, low false-positive; bounded `(a+){2}` and
+ *  `(a+)?` are not flagged). */
+const NESTED_QUANTIFIER = /\([^()]*[*+][^()]*\)[*+]/;
 const regexCache = new Map<string, RegExp>();
 function cachedRegex(pattern: string): RegExp {
   if (pattern.length > MAX_PATTERN_LENGTH) {
     throw new CelEvalError(`matches() pattern longer than ${MAX_PATTERN_LENGTH} chars`);
+  }
+  // matches() patterns are operator-authored but run against attacker input on a
+  // single-threaded event loop, and there is no native RE2 here (a locked architecture
+  // decision) — so refuse a catastrophic-backtracking shape rather than risk a stall.
+  // For a deny rule this raises → fails CLOSED (see CelAuthorizer); for a transform it errors.
+  if (NESTED_QUANTIFIER.test(pattern)) {
+    throw new CelEvalError('matches() pattern rejected: nested unbounded quantifier (ReDoS risk)');
   }
   let re = regexCache.get(pattern);
   if (!re) {
@@ -149,8 +161,14 @@ function sizeOf(v: unknown): number {
   throw new CelEvalError(`size() not defined for ${typeName(v)}`);
 }
 
+/** Max evaluation recursion depth — a backstop below the native stack limit in case a
+ *  Program is built from an AST not produced by this parser (the parser already caps
+ *  nesting at MAX_PARSE_DEPTH). Throws a typed CelEvalError rather than a RangeError. */
+const MAX_EVAL_DEPTH = 512;
+
 export class Evaluator {
   private steps = 0;
+  private depth = 0;
   private readonly maxSteps: number;
   private readonly userFns: Record<string, CelFunction>;
   private readonly trace?: EvalOptions['trace'];
@@ -163,6 +181,7 @@ export class Evaluator {
 
   run(expr: Expr, root: Record<string, unknown>): unknown {
     this.steps = 0;
+    this.depth = 0;
     return this.eval(expr, { vars: new Map(), root });
   }
 
@@ -172,9 +191,17 @@ export class Evaluator {
 
   private eval(expr: Expr, scope: Scope): unknown {
     this.tick();
-    const v = this.evalInner(expr, scope);
-    if (this.trace) this.trace.push({ expr: expr.kind, value: v });
-    return v;
+    this.depth++;
+    try {
+      if (this.depth > MAX_EVAL_DEPTH) {
+        throw new CelEvalError(`expression nesting too deep (> ${MAX_EVAL_DEPTH})`);
+      }
+      const v = this.evalInner(expr, scope);
+      if (this.trace) this.trace.push({ expr: expr.kind, value: v });
+      return v;
+    } finally {
+      this.depth--;
+    }
   }
 
   private evalInner(expr: Expr, scope: Scope): unknown {

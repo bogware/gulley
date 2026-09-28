@@ -2,14 +2,24 @@ import { createHash } from 'node:crypto';
 import type { AuthzDecision } from './policy';
 import { compile, type Program } from './program';
 
-/** Deterministic JSON with sorted object keys, so two equal activations hash
- *  identically regardless of key order. */
-function stableStringify(value: unknown): string {
+/** Max nesting depth for the deterministic-hash walk of an activation. The activation can
+ *  carry the attacker-controlled request body (EXTERNAL_AUTHZ_SEND_BODY), so unbounded
+ *  recursion here would stack-overflow with a RangeError; bound it and let the caller map
+ *  the failure to failMode. Real activations are only a handful deep. */
+const MAX_STRINGIFY_DEPTH = 200;
+
+/** Deterministic JSON with sorted object keys, so two equal activations hash identically
+ *  regardless of key order. Depth-bounded (see MAX_STRINGIFY_DEPTH). */
+function stableStringify(value: unknown, depth = 0): string {
+  if (depth > MAX_STRINGIFY_DEPTH) throw new Error('stableStringify: value nesting too deep');
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v, depth + 1)).join(',')}]`;
   const keys = Object.keys(value as Record<string, unknown>).sort();
   return `{${keys
-    .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
+    .map(
+      (k) =>
+        `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k], depth + 1)}`,
+    )
     .join(',')}}`;
 }
 
@@ -71,7 +81,15 @@ export class ExternalAuthorizer {
   }
 
   async authorize(root: Record<string, unknown>): Promise<AuthzDecision> {
-    const key = this.cacheKey(root);
+    let key: string;
+    try {
+      key = this.cacheKey(root);
+    } catch {
+      // An un-keyable activation (e.g. a pathologically deep body) can't be cached or
+      // single-flighted — treat it as a policy-service failure so failMode decides
+      // (fail-closed by default) rather than throwing a 500 out of the request path.
+      return this.onFailure();
+    }
     const cached = this.cache.get(key);
     if (cached && cached.expiresAt > this.now()) return cached.decision;
 

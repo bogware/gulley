@@ -26,6 +26,12 @@ for the full findings and the remaining waves.
   `POST /config/plan` were scoped by the caller's org, so a merely workspace-scoped admin
   could read (and diff) every sibling workspace's full config document. They now gate on
   `config:read` at the platform scope, matching `/config/drift` and `/config/versions`.
+- **CEL evaluator resource bounds.** The parser and evaluator cap expression nesting depth,
+  so a pathological operator/GitOps policy raises a typed error instead of overflowing the
+  native stack with a `RangeError`; `matches()` rejects a catastrophic-backtracking pattern
+  shape (`(a+)+` and friends) at use (there is no native RE2 here by design); and the
+  external-authorizer default cache key is depth-bounded, so a deeply-nested request body
+  (with `EXTERNAL_AUTHZ_SEND_BODY` on) maps to the configured fail mode instead of a 500.
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook
