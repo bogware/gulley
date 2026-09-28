@@ -69,9 +69,18 @@ return {1, reserved + committed + worst}
 const COMMIT_LUA = new LuaScript(`
 local reservedKey = KEYS[1]
 local committedKey = KEYS[2]
+local committedIdsKey = KEYS[3]
 local field = ARGV[1]
 local actual = tonumber(ARGV[2])
 local ttlArg = tonumber(ARGV[3])
+local dedupTtl = tonumber(ARGV[4])
+-- Idempotency: a resent commit (ioredis auto-retries a command whose reply was lost after
+-- the script already ran server-side) must not double-count. SADD returns 1 only the FIRST
+-- time this request id commits to this scope; a resend sees 0 and skips the INCRBY. This is
+-- the idempotency token — NOT the reservation field, which is deleted on first commit — so
+-- a swept-then-committed request still records exactly once. A short TTL bounds the set.
+local fresh = redis.call('SADD', committedIdsKey, field)
+if dedupTtl > 0 then redis.call('EXPIRE', committedIdsKey, dedupTtl) end
 local raw = redis.call('HGET', reservedKey, field)
 local worst = 0
 local ttl = ttlArg or 0
@@ -90,7 +99,7 @@ if raw then
   end
 end
 local existed = redis.call('EXISTS', committedKey)
-if actual > 0 or existed == 1 then
+if fresh == 1 and (actual > 0 or existed == 1) then
   redis.call('INCRBY', committedKey, actual)
 end
 if raw then
@@ -210,6 +219,8 @@ export class RedisBudgetStore implements BudgetStore {
    *  blip used to strand every in-flight reservation until the orphan sweep. */
   async commit(workspaceId: string, requestId: string, actualMicroUsd: number): Promise<void> {
     const [reservedKey, committedKey] = this.keys(workspaceId);
+    // Same {workspaceId} hash-tag slot as the other two keys (Redis Cluster).
+    const committedIdsKey = `budget:{${workspaceId}}:committed_ids`;
     let ttlArg = '';
     try {
       const budget = await this.capFor(workspaceId);
@@ -217,14 +228,19 @@ export class RedisBudgetStore implements BudgetStore {
     } catch {
       /* fall back to the period carried on the reservation field */
     }
+    // Dedup window: a lost-reply retry lands within seconds, so the reservation lifetime is
+    // an ample, self-bounding TTL for the committed-ids set.
+    const dedupTtl = Math.ceil(this.maxReservationLifetimeMs / 1000);
     await COMMIT_LUA.run(
       this.redis,
-      2,
+      3,
       reservedKey,
       committedKey,
+      committedIdsKey,
       requestId,
       String(Math.max(0, Math.round(actualMicroUsd))),
       ttlArg,
+      String(dedupTtl),
     );
   }
 

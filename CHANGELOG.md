@@ -66,6 +66,13 @@ for the full findings and the remaining waves.
   matching `audit_log`/`config_version` — closing the gap where a version body could be
   rewritten with a recomputed forward chain undetectably. `DELETE` is intentionally left to
   the `ON DELETE cascade` (dropping a version leaves a detectable gap in the sequence).
+- **Budget commit is idempotent, and in-memory reservations are reclaimed.** The Redis commit
+  script dedupes a resent commit (an ioredis auto-retry after a lost reply) via a TTL-bounded
+  committed-ids set gating the increment, so it can no longer double-count committed spend
+  (which drove spurious 402s and projection drift). The in-memory (single-node) store gained
+  per-reservation expiry, an orphan sweep in `reserve()`, and a `refresh()`, so a request
+  that crashes between reserve and commit no longer strands its worst-case reservation and
+  permanently shrinks the cap — matching the Redis store's lifetime sweep.
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook

@@ -1,7 +1,10 @@
 import type { Budget, BudgetDecision, BudgetStore } from './types';
 
 interface Counters {
-  reserved: Map<string, number>;
+  /** requestId → { worst-case amount, expiry }. The expiry lets an orphaned reservation
+   *  (a request that crashed between reserve and commit) be swept instead of stranding its
+   *  worst-case forever and permanently shrinking the cap — mirroring the Redis store. */
+  reserved: Map<string, { amount: number; expiresAtMs: number }>;
   reservedTotal: number;
   committed: number;
   /** Start of the current fixed window (epoch ms); 0 = no spend yet / lifetime cap. */
@@ -42,6 +45,9 @@ export class InMemoryBudgetStore implements BudgetStore {
   constructor(
     caps: Map<string, Budget> | ((scope: string) => Budget | null),
     private readonly now: () => number = () => Date.now(),
+    /** Max lifetime of a reservation before it is swept as orphaned (ms); matches the
+     *  Redis store's default so the two paths reclaim on the same horizon. */
+    private readonly maxReservationLifetimeMs = 600_000,
   ) {
     this.capFor = typeof caps === 'function' ? caps : (scope) => caps.get(scope) ?? null;
   }
@@ -102,11 +108,24 @@ export class InMemoryBudgetStore implements BudgetStore {
     const c = this.counter(workspaceId);
     c.lastTouchedMs = nowMs;
     this.rollWindow(c, budget, nowMs);
+    // Sweep this scope's orphaned reservations (a request that crashed between reserve and
+    // commit) so their worst-case doesn't strand forever and shrink the cap — the in-memory
+    // analogue of the Redis lifetime sweep. A live long stream refreshes its expiry (see
+    // refresh), so it is never reaped mid-flight.
+    for (const [id, r] of c.reserved) {
+      if (r.expiresAtMs <= nowMs) {
+        c.reserved.delete(id);
+        c.reservedTotal = Math.max(0, c.reservedTotal - r.amount);
+      }
+    }
     const used = c.reservedTotal + c.committed;
     if (used + worstCaseMicroUsd > budget.capMicroUsd) {
       return { allowed: false, capMicroUsd: budget.capMicroUsd, usedMicroUsd: used };
     }
-    c.reserved.set(requestId, worstCaseMicroUsd);
+    c.reserved.set(requestId, {
+      amount: worstCaseMicroUsd,
+      expiresAtMs: nowMs + this.maxReservationLifetimeMs,
+    });
     c.reservedTotal += worstCaseMicroUsd;
     return {
       allowed: true,
@@ -120,13 +139,20 @@ export class InMemoryBudgetStore implements BudgetStore {
     const nowMs = this.now();
     c.lastTouchedMs = nowMs;
     this.rollWindow(c, this.capFor(workspaceId), nowMs);
-    const reserved = c.reserved.get(requestId) ?? 0;
+    const r = c.reserved.get(requestId);
     c.reserved.delete(requestId);
-    c.reservedTotal = Math.max(0, c.reservedTotal - reserved);
+    if (r) c.reservedTotal = Math.max(0, c.reservedTotal - r.amount);
     if (actualMicroUsd > 0) {
       if (c.windowStartMs === 0) c.windowStartMs = nowMs; // fixed window from first spend
       c.committed += actualMicroUsd;
     }
+  }
+
+  /** Re-stamp a live reservation's expiry so a long stream isn't swept mid-flight (the
+   *  in-memory analogue of the Redis refresh). No-op once the reservation is gone. */
+  async refresh(workspaceId: string, requestId: string): Promise<void> {
+    const r = this.counters.get(workspaceId)?.reserved.get(requestId);
+    if (r) r.expiresAtMs = this.now() + this.maxReservationLifetimeMs;
   }
 
   /** Test/inspection helper. */
