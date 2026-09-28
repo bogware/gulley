@@ -90,7 +90,13 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 function compare(a: unknown, b: unknown): number {
-  if (typeof a === 'number' && typeof b === 'number') return a < b ? -1 : a > b ? 1 : 0;
+  if (typeof a === 'number' && typeof b === 'number') {
+    // NaN has no ordering: comparing it silently returned 0 ("equal"), so `NaN > limit`
+    // was false and an ordering-based deny rule could be dodged. Refuse it (which fails
+    // closed for a deny rule; see CelAuthorizer).
+    if (Number.isNaN(a) || Number.isNaN(b)) throw new CelEvalError('cannot order-compare NaN');
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
   if (typeof a === 'string' && typeof b === 'string') return a < b ? -1 : a > b ? 1 : 0;
   throw new CelEvalError(`cannot compare ${typeName(a)} and ${typeName(b)}`);
 }
@@ -327,10 +333,18 @@ export class Evaluator {
     switch (func) {
       case 'size':
         return sizeOf(a0);
-      case 'int':
-        return Math.trunc(Number(a0));
-      case 'double':
-        return Number(a0);
+      case 'int': {
+        const n = Math.trunc(Number(a0));
+        // Number("abc") is NaN; returning it let `int(x) > limit` evaluate to a silent
+        // false (no throw), dodging a deny rule. A non-numeric conversion is an error.
+        if (!Number.isFinite(n)) throw new CelEvalError(`int() cannot convert ${typeName(a0)}`);
+        return n;
+      }
+      case 'double': {
+        const n = Number(a0);
+        if (!Number.isFinite(n)) throw new CelEvalError(`double() cannot convert ${typeName(a0)}`);
+        return n;
+      }
       case 'string':
         return a0 instanceof Uint8Array ? new TextDecoder().decode(a0) : String(a0);
       case 'bool':

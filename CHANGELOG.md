@@ -7,11 +7,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 Hardening follow-ups from the 2026-09-28 release-readiness audit (Wave 1 — the safe,
-non-hot-path fixes). See `RELEASE_READINESS_AUDIT.md` for the full findings and the
-remaining waves.
+non-hot-path fixes — plus Wave 2 items as they land). See `RELEASE_READINESS_AUDIT.md`
+for the full findings and the remaining waves.
 
 ### Security
 
+- **CEL authorization deny rules now fail CLOSED on an evaluation error.** A `deny` rule
+  that threw or yielded a non-boolean was silently treated as a non-match, so a request
+  could dodge a deny by making the rule error on the attacker-controlled body — e.g.
+  sending `"max_tokens": "999999"` (a string) to defeat
+  `deny: request.body.max_tokens > 100000`, forcing a NaN via `int()` of a non-number, or
+  tripping the evaluator step limit with a huge array. An erroring deny is now a MATCH
+  (denied); `int()`/`double()` of a non-numeric value and ordering-comparing a NaN now
+  raise instead of coercing silently. Guard a deny over an OPTIONAL field with
+  `has(field) && …` so a legitimately-absent field stays a clean allow. **Behavior
+  change** for deny rules that referenced unguarded optional/typed fields.
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook
