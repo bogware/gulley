@@ -31,6 +31,12 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
   app.get(
     '/config/export',
     adminRoute(ctx, async (_req, reply, admin) => {
+      // The full config document (routes, policies, guardrail patterns, provider config)
+      // is a privileged fleet read — gate on config:read like /config/drift and
+      // /config/versions. Without it a merely workspace-scoped admin's coveredOrgIds
+      // returns their PARENT org, and exportDocument then returns every workspace in that
+      // org (sibling-workspace config disclosure). The org-scope below is defense-in-depth.
+      if (!(await ctx.access.can(admin, 'config:read', {}))) return forbidden(reply);
       const doc = await store.exportDocument(readableOrgs(coveredOrgIds(admin)));
       return reply.send({ document: doc });
     }),
@@ -39,6 +45,9 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
   app.post(
     '/config/plan',
     adminRoute(ctx, async (request, reply, admin) => {
+      // A dry-run plan diffs the desired document against live config, so it discloses the
+      // same privileged config as /config/export — gate it on config:read identically.
+      if (!(await ctx.access.can(admin, 'config:read', {}))) return forbidden(reply);
       const desired = body(request)['document'];
       if (!isConfigDocument(desired)) {
         return reply

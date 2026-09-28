@@ -22,6 +22,10 @@ for the full findings and the remaining waves.
   raise instead of coercing silently. Guard a deny over an OPTIONAL field with
   `has(field) && …` so a legitimately-absent field stays a clean allow. **Behavior
   change** for deny rules that referenced unguarded optional/typed fields.
+- **Config export/plan now require platform `config:read`.** `GET /config/export` and
+  `POST /config/plan` were scoped by the caller's org, so a merely workspace-scoped admin
+  could read (and diff) every sibling workspace's full config document. They now gate on
+  `config:read` at the platform scope, matching `/config/drift` and `/config/versions`.
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook

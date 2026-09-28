@@ -69,6 +69,70 @@ describe('POST /config/apply broadcast', () => {
   });
 });
 
+describe('GET /config/export + POST /config/plan — config:read gated (finding #6)', () => {
+  const hdr = (bearer: string) => ({
+    authorization: `Bearer ${bearer}`,
+    'content-type': 'application/json',
+  });
+
+  it('a scoped admin cannot export/plan the fleet config; a platform admin can', async () => {
+    // A viewer HAS config:read, but only within its org — not at the platform scope a
+    // fleet-config read requires. Before the fix, coveredOrgIds returned its parent org
+    // and exportDocument leaked every sibling workspace in that org.
+    const orgId = (
+      (await app
+        .inject({
+          method: 'POST',
+          url: '/orgs',
+          headers: hdr(gadm),
+          payload: JSON.stringify({ name: 'Acme' }),
+        })
+        .then((r) => r.json())) as { org: { id: string } }
+    ).org.id;
+    const scoped = (
+      (await app
+        .inject({
+          method: 'POST',
+          url: '/admin/sessions',
+          headers: hdr(gadm),
+          payload: JSON.stringify({ name: 'ws-viewer', memberships: [{ role: 'viewer', orgId }] }),
+        })
+        .then((r) => r.json())) as { token: string }
+    ).token;
+    const planDoc = JSON.stringify({ document: { apiVersion: 'gulley/v1', orgs: [] } });
+
+    // Scoped admin: forbidden on both.
+    expect(
+      (await app.inject({ method: 'GET', url: '/config/export', headers: hdr(scoped) })).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/config/plan',
+          headers: hdr(scoped),
+          payload: planDoc,
+        })
+      ).statusCode,
+    ).toBe(403);
+
+    // Platform (bootstrap owner) admin: allowed.
+    expect(
+      (await app.inject({ method: 'GET', url: '/config/export', headers: hdr(gadm) })).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/config/plan',
+          headers: hdr(gadm),
+          payload: planDoc,
+        })
+      ).statusCode,
+    ).toBe(200);
+  });
+});
+
 describe('ControlConfigStore smartRoutingPolicies round-trip (M15)', () => {
   const mkStore = () =>
     new ControlConfigStore(
