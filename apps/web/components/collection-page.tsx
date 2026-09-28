@@ -44,6 +44,7 @@ export function CollectionPage({
   const [config, setConfig] = useState(placeholder);
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
 
   const list = items.data?.entities ?? [];
 
@@ -54,7 +55,7 @@ export function CollectionPage({
   };
 
   async function save(): Promise<void> {
-    if (!api || !name.trim()) return;
+    if (!api || !name.trim() || busy) return;
     setError(undefined);
     let parsed: Record<string, unknown>;
     try {
@@ -63,6 +64,7 @@ export function CollectionPage({
       setError('Config must be valid JSON.');
       return;
     }
+    setBusy(true);
     try {
       if (editing)
         await api.updateCollectionItem(kind, editing, { name: name.trim(), config: parsed });
@@ -74,6 +76,8 @@ export function CollectionPage({
       items.refetch();
     } catch (e) {
       setError(msg(e));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -185,9 +189,9 @@ export function CollectionPage({
               <Button
                 variant="primary"
                 onClick={() => void save()}
-                disabled={!name.trim() || (!editing && !ws)}
+                disabled={busy || !name.trim() || (!editing && !ws)}
               >
-                {editing ? 'Save changes' : 'Create'}
+                {busy ? (editing ? 'Saving…' : 'Creating…') : editing ? 'Save changes' : 'Create'}
               </Button>
               {editing ? (
                 <Button variant="ghost" onClick={reset}>

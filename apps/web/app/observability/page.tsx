@@ -35,21 +35,26 @@ export default function ObservabilityPage() {
   // back off to 60s while the fetch is failing, never poll an unconfigured listener,
   // and remember when the data on screen was last fresh.
   const [lastOk, setLastOk] = useState<number | null>(null);
-  const failures = useRef(0);
+  // A ref so the poll scheduler always reads the current value without re-subscribing,
+  // and so backoff is driven by success RECENCY rather than a failure counter keyed on
+  // the error string — consecutive identical errors used to not re-run the counting
+  // effect, so it stalled at the first step and the poll never backed off.
+  const lastOkRef = useRef<number | null>(null);
   useEffect(() => {
     if (metrics.data) {
-      setLastOk(Date.now());
-      failures.current = 0;
+      const now = Date.now();
+      setLastOk(now);
+      lastOkRef.current = now;
     }
   }, [metrics.data]);
-  useEffect(() => {
-    if (metrics.error) failures.current += 1;
-  }, [metrics.error]);
   useEffect(() => {
     if (notConfigured) return;
     let timer: number | undefined;
     const schedule = (): void => {
-      const delay = Math.min(60_000, 5_000 * 2 ** Math.min(failures.current, 4));
+      const sinceOk = lastOkRef.current === null ? 0 : Date.now() - lastOkRef.current;
+      // Fast while healthy or at startup; back off to 15s then 60s only after the
+      // listener has been unreachable for a sustained period.
+      const delay = sinceOk < 12_000 ? 5_000 : sinceOk < 60_000 ? 15_000 : 60_000;
       timer = window.setTimeout(() => {
         metrics.refetch();
         schedule();

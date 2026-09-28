@@ -326,14 +326,18 @@ function AddProvider({
   const [ws, setWs] = useState('');
   const [kind, setKind] = useState('anthropic');
   const [baseUrl, setBaseUrl] = useState('');
+  const [busy, setBusy] = useState(false);
 
   async function add(): Promise<void> {
-    if (!api || !ws) return;
+    if (!api || !ws || busy) return;
+    setBusy(true);
     try {
       await api.createProvider(ws, kind, baseUrl || undefined);
       onDone();
     } catch (e) {
       onError(msg(e));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -370,8 +374,8 @@ function AddProvider({
           />
         </Field>
         <div className="flex gap-2">
-          <Button variant="primary" onClick={() => void add()} disabled={!ws}>
-            Create provider
+          <Button variant="primary" onClick={() => void add()} disabled={busy || !ws}>
+            {busy ? 'Creating…' : 'Create provider'}
           </Button>
           <Button variant="ghost" onClick={onCancel}>
             Cancel

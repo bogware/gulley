@@ -33,6 +33,7 @@ export default function ConfigPage() {
   const [doc, setDoc] = useState('');
   const [plan, setPlan] = useState<unknown>(null);
   const [result, setResult] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+  const [applying, setApplying] = useState(false);
 
   useEffect(() => {
     if (exported.data?.document) setDoc(JSON.stringify(exported.data.document, null, 2));
@@ -60,12 +61,31 @@ export default function ConfigPage() {
   }
 
   async function apply(): Promise<void> {
-    if (!api) return;
+    if (!api || applying) return;
     const parsed = parse();
     if (parsed === null) return;
+    // Refuse to apply against an unknown base version: a `?? 0` fallback could force a
+    // spurious conflict or, if the API treats 0 as "skip the check", silently overwrite
+    // a newer live config. Require the current version to be loaded first.
+    const base = versions.data?.version;
+    if (base === undefined) {
+      setResult({
+        tone: 'err',
+        text: 'Current config version not loaded yet — retry in a moment.',
+      });
+      return;
+    }
+    if (
+      !window.confirm(
+        `Apply this config document to the live gateway (base version ${base})? It hot-applies to all replicas.`,
+      )
+    ) {
+      return;
+    }
     setResult(null);
+    setApplying(true);
     try {
-      const r = await api.configApply(parsed, versions.data?.version ?? 0);
+      const r = await api.configApply(parsed, base);
       setResult({
         tone: 'ok',
         text: `Applied — version ${r.version} (${r.contentHash.slice(0, 12)}…)`,
@@ -75,6 +95,8 @@ export default function ConfigPage() {
       drift.refetch();
     } catch (e) {
       setResult({ tone: 'err', text: msg(e) });
+    } finally {
+      setApplying(false);
     }
   }
 
@@ -113,8 +135,12 @@ export default function ConfigPage() {
             right={
               <div className="flex items-center gap-2">
                 <Button onClick={() => void dryRun()}>Dry-run plan</Button>
-                <Button variant="primary" onClick={() => void apply()}>
-                  Apply
+                <Button
+                  variant="primary"
+                  onClick={() => void apply()}
+                  disabled={applying || versions.data === undefined}
+                >
+                  {applying ? 'Applying…' : 'Apply'}
                 </Button>
               </div>
             }

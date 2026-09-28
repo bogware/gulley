@@ -172,7 +172,10 @@ data "aws_iam_policy_document" "control_task" {
   }
   statement {
     sid       = "OauthDecrypt"
-    actions   = ["kms:Decrypt", "kms:GenerateDataKey", "kms:Sign"]
+    # kms:GetPublicKey is required by KmsSigner.publicKeyPem() to serve the audit
+    # verification key (GET /.well-known/gulley-audit-key) and to verify the WORM/anchor
+    # chain offline; without it those routes + the DR drill 500 with AccessDenied.
+    actions   = ["kms:Decrypt", "kms:GenerateDataKey", "kms:Sign", "kms:GetPublicKey"]
     resources = [aws_kms_key.this["oauth"].arn, aws_kms_key.this["audit-export"].arn]
   }
   statement {

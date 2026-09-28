@@ -83,8 +83,9 @@ services:
       - .env
     environment:
       # Overrides win over .env: a copied .env.example must not demote a self-host to
-      # a development posture (NODE_ENV=development, dev pepper, debug tracer).
+      # a development posture (NODE_ENV=development, dev pepper, debug tracer, debug logs).
       NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
       GATEWAY_PORT: '8080'
       METRICS_PORT: '9090'
       NODE_OPTIONS: ${GATEWAY_NODE_OPTIONS:---max-old-space-size=768}
@@ -128,6 +129,7 @@ services:
       - .env
     environment:
       NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
       CONTROL_API_PORT: '8081'
       NODE_OPTIONS: ${CONTROL_API_NODE_OPTIONS:---max-old-space-size=768}
       GULLEY_KEY_PEPPER: ${GULLEY_KEY_PEPPER:?set GULLEY_KEY_PEPPER in deploy/.env (>=16 chars, keep it secret)}

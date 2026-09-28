@@ -6,6 +6,57 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Hardening follow-ups from the 2026-09-28 release-readiness audit (Wave 1 — the safe,
+non-hot-path fixes). See `RELEASE_READINESS_AUDIT.md` for the full findings and the
+remaining waves.
+
+### Security
+
+- **The bring-your-own DLP webhook now fails CLOSED by default**
+  (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
+  plugins and the documented "plugins fail closed by default" posture: a webhook
+  timeout/outage now withholds the request instead of forwarding it un-scanned. Set it
+  `false` to trade that safety for availability. **Behavior change.**
+- **`OIDC_COOKIE_SECURE` is enforced in production.** With SSO enabled (`OIDC_ISSUER` +
+  `OIDC_CLIENT_ID`) under `NODE_ENV=production`, boot now refuses a non-`Secure` admin
+  session cookie — set `OIDC_COOKIE_SECURE=true` (or `OIDC_ALLOW_INSECURE_HTTP=true` for
+  a deliberate non-TLS edge). **Behavior change.**
+- **Reversible-mask vault nonce widened** from 32 to 96 bits, so a mask token from one
+  request cannot collide with another's at enterprise request volume.
+- **Indirect-injection spotlighting now marks the legacy OpenAI `role:"function"`**
+  tool-output message as untrusted (previously only `role:"tool"` was).
+- **JWKS key selection tightened:** a token naming an unknown `kid` no longer falls back
+  to an arbitrary key when the JWKS holds more than one key of that type.
+- **The audit sanitizer recognizes Gulley's own credential formats**
+  (`gk_`/`gko_at_`/`gko_rt_`/`gadm_`/`gses_`), so a raw Gulley token misplaced in a
+  non-secret-named field is redacted, not only provider keys.
+
+### Fixed
+
+- **Cross-family SSE translators (OpenAI→Anthropic, Gemini→Anthropic) decode UTF-8 across
+  chunk boundaries** — a multi-byte code point split between two upstream chunks is no
+  longer corrupted to U+FFFD in the client-visible text.
+- **Admin console.** The FinOps chargeback CSV export quotes/escapes every field and
+  neutralizes spreadsheet-formula injection on the attribution key; config **Apply**
+  confirms, disables while in flight, and refuses an unknown base version (no more `?? 0`
+  silent-overwrite / spurious-conflict); create forms (keys, orgs, workspaces, the
+  routes/policies/budgets/guardrails/aliases/rate-limits collections, providers, prompts,
+  role grants) disable while a create is in flight (no double-submit duplicates); a
+  transient `/auth/me` failure no longer wipes a pasted break-glass token (only a real
+  401 does); the copy button reports failure instead of a false "Copied ✓" in an insecure
+  context; the observability poll backs off correctly against a persistently unreachable
+  metrics listener; and `global-error` / `not-found` boundaries render a styled page for a
+  layout-level throw or a bad URL instead of Next's default.
+
+### Changed (deploy)
+
+- **Terraform:** the control-api task role is granted `kms:GetPublicKey`, so the prod tier
+  can serve the offline audit-verification key (`GET /.well-known/gulley-audit-key`), the
+  WORM/anchor verify routes, and the DR drill — they previously failed with `AccessDenied`
+  under `tier=prod`.
+- **Compose self-host** pins `LOG_LEVEL` (default `info`) so a verbatim-copied
+  `.env.example` no longer runs the production self-host at `debug`.
+
 ## [0.4.0] — 2026-09-20
 
 The production-readiness release: a full review/refine pass over the data plane,

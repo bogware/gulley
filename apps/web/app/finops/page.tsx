@@ -67,6 +67,14 @@ function Chargeback() {
   const saved = rows.reduce((a, r) => a + (r.cacheSavedMicroUsd ?? 0), 0);
 
   function csv(): void {
+    // Quote+escape every field, and neutralize spreadsheet formula injection on the
+    // user-influenced attribution key (a value starting =,+,-,@ becomes a live formula
+    // in Excel). `r.key` is an attribution label (repo/dev/session), so it is untrusted.
+    const cell = (v: unknown): string => {
+      let s = String(v);
+      if (/^[=+\-@]/.test(s)) s = `'${s}`;
+      return `"${s.replace(/"/g, '""')}"`;
+    };
     const header = 'key,requests,inputTokens,outputTokens,costUsd,cacheSavedUsd\n';
     const body = rows
       .map((r) =>
@@ -77,7 +85,9 @@ function Chargeback() {
           r.outputTokens,
           (r.costMicroUsd / 1e6).toFixed(6),
           ((r.cacheSavedMicroUsd ?? 0) / 1e6).toFixed(6),
-        ].join(','),
+        ]
+          .map(cell)
+          .join(','),
       )
       .join('\n');
     const blob = new Blob([header + body], { type: 'text/csv' });

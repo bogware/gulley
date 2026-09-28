@@ -498,18 +498,34 @@ export function Tabs<T extends string>({
   );
 }
 
-/** Copy-to-clipboard button with a transient "copied" state. */
+/** Copy-to-clipboard button with a transient "copied" state. Only reports success when
+ *  the clipboard write actually resolves — in an insecure context (plain HTTP, non-
+ *  localhost) `navigator.clipboard` is undefined or rejects, and a false "Copied ✓" over
+ *  a one-time secret (e.g. a freshly minted key) would lose it. */
 export function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
-  const [done, setDone] = useState(false);
+  const [state, setState] = useState<'idle' | 'done' | 'fail'>('idle');
   return (
     <Button
       onClick={() => {
-        void navigator.clipboard?.writeText(text);
-        setDone(true);
-        window.setTimeout(() => setDone(false), 1200);
+        const p = navigator.clipboard?.writeText(text);
+        if (!p) {
+          setState('fail');
+          window.setTimeout(() => setState('idle'), 2500);
+          return;
+        }
+        p.then(
+          () => {
+            setState('done');
+            window.setTimeout(() => setState('idle'), 1200);
+          },
+          () => {
+            setState('fail');
+            window.setTimeout(() => setState('idle'), 2500);
+          },
+        );
       }}
     >
-      {done ? 'Copied ✓' : label}
+      {state === 'done' ? 'Copied ✓' : state === 'fail' ? 'Copy failed — select manually' : label}
     </Button>
   );
 }

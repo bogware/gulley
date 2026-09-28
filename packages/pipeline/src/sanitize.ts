@@ -20,6 +20,12 @@ const SECRET_VALUE_PATTERNS: RegExp[] = [
   /\bAIza[0-9A-Za-z_-]{35}\b/,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
   /-----BEGIN (?:[A-Z ]*)?PRIVATE KEY-----/,
+  // Gulley's own credential formats (virtual keys `gk_`, broker access/refresh tokens
+  // `gko_at_`/`gko_rt_`, admin/session tokens `gadm_`/`gses_`) so a raw Gulley
+  // credential misplaced in a non-secret-named field is redacted, not only provider keys.
+  /\bgk_[A-Za-z0-9_-]{16,}/,
+  /\bgko_(?:at|rt)_[A-Za-z0-9._-]{16,}/,
+  /\bg(?:ses|adm)_[A-Za-z0-9._-]{16,}/,
 ];
 
 export function looksLikeSecretMaterial(s: string): boolean {

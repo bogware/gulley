@@ -28,15 +28,19 @@ export default function OrgsPage() {
   const [wsOrg, setWsOrg] = useState('');
   const [wsName, setWsName] = useState('');
   const [error, setError] = useState<string | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
 
   async function run(fn: () => Promise<unknown>, after: () => void): Promise<void> {
-    if (!api) return;
+    if (!api || busy) return;
     setError(undefined);
+    setBusy(true);
     try {
       await fn();
       after();
     } catch (e) {
       setError(msg(e));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -65,7 +69,7 @@ export default function OrgsPage() {
                 />
                 <Button
                   variant="primary"
-                  disabled={!orgName.trim()}
+                  disabled={busy || !orgName.trim()}
                   onClick={() =>
                     void run(
                       () => api!.createOrg(orgName.trim()),

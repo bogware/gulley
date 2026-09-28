@@ -192,6 +192,7 @@ function AccessTab() {
   const orgs = useAdminQuery((a) => a.orgs(), []);
   const [form, setForm] = useState({ subject: '', role: 'viewer', orgId: '' });
   const [error, setError] = useState<string | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
 
   const list = memberships.data?.memberships ?? [];
 
@@ -238,9 +239,10 @@ function AccessTab() {
           <div className="flex items-end">
             <Button
               variant="primary"
-              disabled={!form.subject.trim() || !form.orgId}
+              disabled={busy || !form.subject.trim() || !form.orgId}
               onClick={async () => {
-                if (!api) return;
+                if (!api || busy) return;
+                setBusy(true);
                 try {
                   await api.createMembership({
                     subject: form.subject.trim(),
@@ -251,10 +253,12 @@ function AccessTab() {
                   memberships.refetch();
                 } catch (e) {
                   setError(msg(e));
+                } finally {
+                  setBusy(false);
                 }
               }}
             >
-              Grant
+              {busy ? 'Granting…' : 'Grant'}
             </Button>
           </div>
         </div>

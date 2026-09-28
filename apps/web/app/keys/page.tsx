@@ -34,11 +34,13 @@ export default function KeysPage() {
     null,
   );
   const [error, setError] = useState<string | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
   const keys = useAdminQuery((a) => (ws ? a.listKeys(ws) : Promise.resolve({ keys: [] })), [ws]);
 
   async function mint(): Promise<void> {
-    if (!api || !ws || !name.trim()) return;
+    if (!api || !ws || !name.trim() || busy) return;
     setError(undefined);
+    setBusy(true);
     try {
       const r = await api.createKey(ws, name.trim());
       setMinted(r);
@@ -46,6 +48,8 @@ export default function KeysPage() {
       keys.refetch();
     } catch (e) {
       setError(msg(e));
+    } finally {
+      setBusy(false);
     }
   }
   async function disable(id: string): Promise<void> {
@@ -166,8 +170,12 @@ export default function KeysPage() {
                 placeholder="claude-code · platform-eng"
               />
             </Field>
-            <Button variant="primary" onClick={() => void mint()} disabled={!ws || !name.trim()}>
-              Mint key
+            <Button
+              variant="primary"
+              onClick={() => void mint()}
+              disabled={busy || !ws || !name.trim()}
+            >
+              {busy ? 'Minting…' : 'Mint key'}
             </Button>
 
             {minted ? (

@@ -66,7 +66,7 @@ describe('TokenVault — per-vault token namespace', () => {
     const ma = a.tokenize(text, det.detect(text));
     const mb = b.tokenize(text, det.detect(text));
     expect(ma).not.toBe(mb);
-    expect(ma).toMatch(/<<GULLEY_EMAIL_[0-9A-F]{8}_1>>/);
+    expect(ma).toMatch(/<<GULLEY_EMAIL_[0-9A-F]+_1>>/);
     expect(b.detokenize(ma)).toBe(ma); // a's token is not b's
     expect(a.detokenize(ma)).toBe(text);
   });
@@ -109,7 +109,7 @@ describe('GuardrailEngine — plugin verdicts compose with the native transform'
     const r = await engine.inspectInput('{"m":"card 4242 4242 4242 4242 mail jane@example.com"}');
     expect(r.blocked).toBe(false);
     expect(r.transformedText).toContain('[CARD]');
-    expect(r.transformedText).toMatch(/<<GULLEY_EMAIL_[0-9A-F]{8}_1>>/);
+    expect(r.transformedText).toMatch(/<<GULLEY_EMAIL_[0-9A-F]+_1>>/);
     expect(r.transformedText).not.toContain('jane@example.com');
     expect(JSON.parse(r.transformedText!)).toBeTypeOf('object'); // still a JSON object
   });

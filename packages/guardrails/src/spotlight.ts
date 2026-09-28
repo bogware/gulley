@@ -89,8 +89,9 @@ export function extractContentSpans(body: unknown): ContentSpan[] {
     const role = typeof msg['role'] === 'string' ? (msg['role'] as string) : '';
     const content = msg['content'];
 
-    // OpenAI chat: a tool-role message carries untrusted tool output as its content.
-    if (role === 'tool') {
+    // OpenAI chat: a tool-role message (and the legacy `function` role many SDKs still
+    // emit) carries untrusted tool output as its content.
+    if (role === 'tool' || role === 'function') {
       if (typeof content === 'string' && content.length > 0)
         spans.push({ trust: 'untrusted', text: content, source: 'tool' });
       else if (Array.isArray(content))
@@ -201,7 +202,7 @@ export function spotlightUntrusted(body: unknown, options?: SpotlightOptions): S
     const role = typeof msg['role'] === 'string' ? (msg['role'] as string) : '';
     const content = msg['content'];
 
-    if (role === 'tool') {
+    if (role === 'tool' || role === 'function') {
       if (typeof content === 'string' && content.length > 0) {
         const wrapped = wrap(content, open, close);
         if (wrapped !== content) {

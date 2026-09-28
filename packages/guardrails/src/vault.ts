@@ -23,7 +23,7 @@ export class TokenVault {
    *  back as history in turn 2, whose own vault reused the token for a DIFFERENT
    *  value — the model saw two entities behind one placeholder and the detokenizer
    *  rewrote turn 1's token to turn 2's original (wrong PII substituted). */
-  private readonly nonce = randomBytes(4).toString('hex').toUpperCase();
+  private readonly nonce = randomBytes(12).toString('hex').toUpperCase();
 
   private tokenFor(category: string, original: string): string {
     const existing = this.byOriginal.get(original);

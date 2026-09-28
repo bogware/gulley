@@ -351,9 +351,12 @@ const EnvShape = z.object({
   // control-plane admin action. Must match the control-api CRYPTO_SHRED_ENABLED setting.
   CRYPTO_SHRED_ENABLED: envBool(false),
   // Optional bring-your-own-DLP webhook guardrail (runs on request input). A
-  // block/mask verdict is authoritative even under the audit-only default.
+  // block/mask verdict is authoritative even under the audit-only default. Like the
+  // managed enforcement plugins below it FAILS CLOSED by default: a webhook
+  // timeout/outage withholds the request rather than forwarding it un-scanned (set
+  // false to trade that safety for availability).
   GUARDRAILS_WEBHOOK_URL: z.string().url().optional(),
-  GUARDRAILS_WEBHOOK_FAIL_CLOSED: envBool(false),
+  GUARDRAILS_WEBHOOK_FAIL_CLOSED: envBool(true),
   GUARDRAILS_WEBHOOK_ALLOW_INTERNAL: envBool(false),
   // Managed guardrail plugins (composed with the native detectors + webhook).
   // These are DLP/moderation ENFORCEMENT controls, so they fail CLOSED by default: on a

@@ -9,7 +9,7 @@ import {
   useMemo,
   useState,
 } from 'react';
-import { controlApiUrl, GulleyAdminApi } from './api';
+import { ApiError, controlApiUrl, GulleyAdminApi } from './api';
 
 interface AdminContextValue {
   /** Authenticated via an OIDC session cookie or a pasted token — as VERIFIED by
@@ -68,11 +68,19 @@ export function AdminProvider({ children }: { children: ReactNode }) {
         setAuthed(true);
         setAuthNotice(null);
       })
-      .catch(() => {
-        // A stored token that no longer authenticates is dropped (not kept as "authed").
-        if (stored) clearStored();
-        setTokenState(null);
-        setAuthed(false);
+      .catch((e: unknown) => {
+        // Only a definitive 401 means the token is bad — drop it. A transient network
+        // or 5xx blip (control API unreachable) must NOT wipe a pasted break-glass
+        // token, or an outage forces a re-paste exactly when it is needed most.
+        const status = e instanceof ApiError ? e.status : undefined;
+        if (status === 401) {
+          if (stored) clearStored();
+          setTokenState(null);
+          setAuthed(false);
+        } else {
+          setAuthed(false);
+          if (stored) setAuthNotice('Control API unreachable — retry sign-in.');
+        }
       })
       .finally(() => setReady(true));
   }, [nonce]);

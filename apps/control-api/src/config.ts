@@ -131,7 +131,7 @@ const EnvShape = z.object({
 
   // Audit-export ASYMMETRIC signing key (KMS). When set, the audit attestation and
   // the WORM batch signatures are signed under this asymmetric CMK, and the auditor
-  // verifies them OFFLINE with only the published public key (GET /audit/public-key)
+  // verifies them OFFLINE with only the published public key (GET /.well-known/gulley-audit-key)
   // — no shared secret. Takes precedence over the HMAC keys (AUDIT_ATTESTATION_KEY /
   // WORM_SIGNING_KEY) for their respective signatures. Region from GULLEY_KMS_REGION.
   GULLEY_AUDIT_SIGNING_KMS_ARN: z.string().optional(),
@@ -322,6 +322,23 @@ const Env = EnvShape.superRefine((c, ctx) => {
       code: z.ZodIssueCode.custom,
       path: ['OIDC_ISSUER'],
       message: 'OIDC_ISSUER must be https in production (or set OIDC_ALLOW_INSECURE_HTTP=true)',
+    });
+  }
+  // The admin SSO session cookie must carry `Secure` in production so it can never be
+  // sent over a plaintext hop. Enforced (not silently defaulted) so an operator who
+  // enables SSO in prod without it gets a clear boot error, mirroring the issuer rule.
+  if (
+    c.NODE_ENV === 'production' &&
+    c.OIDC_ISSUER &&
+    c.OIDC_CLIENT_ID &&
+    !c.OIDC_COOKIE_SECURE &&
+    !c.OIDC_ALLOW_INSECURE_HTTP
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['OIDC_COOKIE_SECURE'],
+      message:
+        'OIDC_COOKIE_SECURE must be true in production when SSO is enabled (or set OIDC_ALLOW_INSECURE_HTTP=true for a deliberate non-TLS edge)',
     });
   }
 });
