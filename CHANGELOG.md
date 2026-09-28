@@ -53,6 +53,14 @@ for the full findings and the remaining waves.
   `REDIS_COUNTERS_URL` or `REDIS_VECTOR_URL` equal to `REDIS_CACHE_URL` (the reliable guard;
   the runtime `CONFIG GET maxmemory-policy` probe stays best-effort, since managed Redis
   often disables `CONFIG`).
+- **Config collection entity names are unique per workspace (DB-enforced).** The route,
+  route-policy, model-alias, smart-routing-policy, rate-limit and guardrail collections gain
+  a unique `(workspace_id, name)` index (migration `0023`). The name is the GitOps reconcile
+  key, but only an in-memory TOCTOU check guarded it, so a concurrent create — or a document
+  with two same-named entries — could persist duplicate rows that the name-keyed reconcile
+  then silently shadowed. A duplicate now returns 409 (console) / 422 (apply) instead of a
+  500 or a shadowed row. Upgrades with pre-existing duplicate names must de-duplicate before
+  migrating (the index creation surfaces them).
 - **The bring-your-own DLP webhook now fails CLOSED by default**
   (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
   plugins and the documented "plugins fail closed by default" posture: a webhook

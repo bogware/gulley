@@ -433,7 +433,11 @@ export const route = pgTable(
       .default(sql`'{}'::jsonb`),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('route_workspace_idx').on(t.workspaceId)],
+  // Unique per (workspace, name): the name is the GitOps reconcile key, so a duplicate
+  // would make export/apply ambiguous. workspace_id leads, so this also serves the
+  // workspace-scoped list query. (An in-memory TOCTOU check alone let a concurrent
+  // create — or a GitOps doc with two same-named entries — persist duplicate rows.)
+  (t) => [uniqueIndex('route_workspace_name_idx').on(t.workspaceId, t.name)],
 );
 
 export const routePolicy = pgTable(
@@ -449,7 +453,7 @@ export const routePolicy = pgTable(
       .default(sql`'{}'::jsonb`),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('route_policy_workspace_idx').on(t.workspaceId)],
+  (t) => [uniqueIndex('route_policy_workspace_name_idx').on(t.workspaceId, t.name)],
 );
 
 export const modelAlias = pgTable(
@@ -465,7 +469,7 @@ export const modelAlias = pgTable(
       .default(sql`'{}'::jsonb`),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('model_alias_workspace_idx').on(t.workspaceId)],
+  (t) => [uniqueIndex('model_alias_workspace_name_idx').on(t.workspaceId, t.name)],
 );
 
 // Smart-routing policies (M15): a name-keyed jsonb collection identical in shape
@@ -484,7 +488,7 @@ export const smartRoutingPolicy = pgTable(
       .default(sql`'{}'::jsonb`),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('smart_routing_policy_workspace_idx').on(t.workspaceId)],
+  (t) => [uniqueIndex('smart_routing_policy_workspace_name_idx').on(t.workspaceId, t.name)],
 );
 
 export const rateLimit = pgTable(
@@ -500,7 +504,7 @@ export const rateLimit = pgTable(
       .default(sql`'{}'::jsonb`),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('rate_limit_workspace_idx').on(t.workspaceId)],
+  (t) => [uniqueIndex('rate_limit_workspace_name_idx').on(t.workspaceId, t.name)],
 );
 
 export const guardrail = pgTable(
@@ -516,7 +520,7 @@ export const guardrail = pgTable(
       .default(sql`'{}'::jsonb`),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('guardrail_workspace_idx').on(t.workspaceId)],
+  (t) => [uniqueIndex('guardrail_workspace_name_idx').on(t.workspaceId, t.name)],
 );
 
 // Per-workspace spend cap (micro-USD). period_seconds null = lifetime cap.

@@ -66,8 +66,11 @@ export class DurableConfigWriter {
     try {
       out = await attempt();
     } catch (err) {
-      // A concurrent apply/edit took our version number (PK): the whole tx rolled back,
-      // so one retry re-reads the head and re-runs the mutation cleanly.
+      // A duplicate entity name (the (workspace, name) unique index) is a real conflict,
+      // NOT the retryable version-PK race — retrying would just conflict again → a 500.
+      if (isEntityNameConflict(err)) throw new DuplicateEntityError();
+      // A concurrent apply/edit took our version number (config_version PK): the whole tx
+      // rolled back, so one retry re-reads the head and re-runs the mutation cleanly.
       if (!isUniqueViolation(err)) throw err;
       out = await attempt();
     }
@@ -93,6 +96,23 @@ function isUniqueViolation(err: unknown): boolean {
   return e?.code === '23505' || e?.cause?.code === '23505';
 }
 
+/** A 23505 on a `<table>_workspace_name_idx` unique index = a duplicate entity name
+ *  (concurrent create, or a GitOps doc with two same-named entries) — distinct from the
+ *  retryable config_version PK race. */
+function isEntityNameConflict(err: unknown): boolean {
+  const e = err as { constraint_name?: string; cause?: { constraint_name?: string } };
+  const c = e?.constraint_name ?? e?.cause?.constraint_name;
+  return isUniqueViolation(err) && typeof c === 'string' && c.endsWith('_workspace_name_idx');
+}
+
+/** A duplicate config-entity name within a workspace; the route maps it to 409. */
+export class DuplicateEntityError extends Error {
+  constructor() {
+    super('an entity with this name already exists in this workspace');
+    this.name = 'DuplicateEntityError';
+  }
+}
+
 export interface ConsoleWriteArgs<T> {
   perm: Permission;
   at: ScopeRef;
@@ -113,7 +133,7 @@ export async function consoleWrite<T>(
   ctx: ControlContext,
   admin: AdminPrincipal,
   args: ConsoleWriteArgs<T>,
-): Promise<{ ok: true; value: T; version?: number } | { ok: false }> {
+): Promise<{ ok: true; value: T; version?: number } | { ok: false; conflict?: string }> {
   if (!ctx.durableConfig || !args.durable) {
     return auditedWrite(ctx, admin, {
       perm: args.perm,
@@ -125,12 +145,19 @@ export async function consoleWrite<T>(
     });
   }
   if (!(await ctx.access.can(admin, args.perm, args.at))) return { ok: false };
-  const r = await ctx.durableConfig.commit(admin, {
-    action: args.action,
-    target: args.target,
-    orgId: args.at.orgId ?? null,
-    diff: args.diff,
-    run: args.durable,
-  });
-  return { ok: true, value: r.value, version: r.version };
+  try {
+    const r = await ctx.durableConfig.commit(admin, {
+      action: args.action,
+      target: args.target,
+      orgId: args.at.orgId ?? null,
+      diff: args.diff,
+      run: args.durable,
+    });
+    return { ok: true, value: r.value, version: r.version };
+  } catch (err) {
+    // A duplicate entity name is a 409, not a 500: the (workspace, name) unique index is
+    // the durable backstop for the TOCTOU race the in-memory nameTaken check can't close.
+    if (err instanceof DuplicateEntityError) return { ok: false, conflict: err.message };
+    throw err;
+  }
 }
