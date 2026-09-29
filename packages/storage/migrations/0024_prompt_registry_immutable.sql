@@ -8,6 +8,7 @@
 -- the (template_id, version) sequence — whereas an in-place rewrite does not. The trigger
 -- fires for every role (the table owner too), so it is the real guard; the REVOKE mirrors
 -- the audit_log/config_version pattern for a least-privilege app login role.
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='gulley_app') THEN CREATE ROLE gulley_app NOLOGIN; END IF; END $$;--> statement-breakpoint
 REVOKE UPDATE ON "prompt_version" FROM gulley_app;--> statement-breakpoint
 CREATE OR REPLACE FUNCTION prompt_version_no_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'prompt_version is append-only (a version is immutable; delete the template to remove its versions)'; END $$;--> statement-breakpoint
 DROP TRIGGER IF EXISTS prompt_version_immutable ON "prompt_version";--> statement-breakpoint
