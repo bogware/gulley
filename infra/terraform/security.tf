@@ -171,7 +171,7 @@ data "aws_iam_policy_document" "control_task" {
     resources = ["${local.worm_bucket_arn}/*"]
   }
   statement {
-    sid       = "OauthDecrypt"
+    sid = "OauthDecrypt"
     # kms:GetPublicKey is required by KmsSigner.publicKeyPem() to serve the audit
     # verification key (GET /.well-known/gulley-audit-key) and to verify the WORM/anchor
     # chain offline; without it those routes + the DR drill 500 with AccessDenied.
