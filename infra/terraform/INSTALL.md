@@ -100,7 +100,7 @@ multi-arch (amd64 + arm64), cosign-signed images with SBOM + provenance to GHCR
 into ECR without pulling or rebuilding:
 
 ```sh
-export GULLEY_TAG=v0.4.0                     # the release you are deploying
+export GULLEY_TAG=v0.5.0                     # the release you are deploying
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "${ECR_API%%/*}"
 
@@ -108,7 +108,7 @@ docker buildx imagetools create -t "$ECR_API:$GULLEY_TAG" "ghcr.io/bogware/gulle
 docker buildx imagetools create -t "$ECR_WEB:$GULLEY_TAG" "ghcr.io/bogware/gulley-web:$GULLEY_TAG"
 ```
 
-Then set `image_tag = "v0.4.0"` and `web_image_tag = "v0.4.0"` in `test.tfvars`
+Then set `image_tag = "v0.5.0"` and `web_image_tag = "v0.5.0"` in `test.tfvars`
 (immutable tags are what the prod tier's ECR requires anyway).
 
 **Option B — build from source.** Both images build from the repo root; the

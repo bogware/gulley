@@ -46,7 +46,7 @@ reads that env per request, so the browser only ever talks to the console's orig
 ## Kubernetes (Helm)
 
 The chart (`deploy/helm/gulley`, 0.2.x) targets the bundled runtime image and defaults
-`image.tag` to its `appVersion` (`v0.4.0`); the tsx-era v0.3.x images do not start
+`image.tag` to its `appVersion` (`v0.5.0`); the tsx-era v0.3.x images do not start
 under it.
 
 ```bash
@@ -91,7 +91,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: migrate
-          image: ghcr.io/bogware/gulley:v0.4.0
+          image: ghcr.io/bogware/gulley:v0.5.0
           args: ['dist/control-api/migrate.mjs'] # the image's ENTRYPOINT is node
           envFrom:
             - secretRef:

@@ -38,7 +38,7 @@ kubectl -n gulley create secret generic gulley-secrets \
 
 # Phase 2 — install the chart (pin the release; the 0.2.x chart needs a v0.4.0+ image):
 terraform apply -var-file=test.tfvars -var install_chart=true \
-  -var existing_secret_name=gulley-secrets -var image_tag=v0.4.0
+  -var existing_secret_name=gulley-secrets -var image_tag=v0.5.0
 ```
 
 The chart's pre-install/pre-upgrade hook Job (`<release>-migrate`, `migrate.enabled`)

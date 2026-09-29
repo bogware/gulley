@@ -6,9 +6,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Hardening follow-ups from the 2026-09-28 release-readiness audit (Wave 1 — the safe,
-non-hot-path fixes — plus Wave 2 items as they land). See `RELEASE_READINESS_AUDIT.md`
-for the full findings and the remaining waves.
+## [0.5.0] — 2026-09-28
+
+A hardening release: two waves of security and correctness fixes from a full
+release-readiness audit, spanning the data-plane request pipeline, the control-plane
+APIs, the admin console, and the deploy assets. Every fix ships with regression tests;
+the data-plane (hot-path) changes went through the adversarial hot-path review.
+
+### Upgrade notes
+
+- **Run the new migrations** with `node dist/control-api/migrate.mjs` before starting the
+  planes (compose runs the `migrate` service first; the ECS module ships a one-off migrate
+  task; on Kubernetes run it once per release). This release adds `0023` — a unique
+  `(workspace_id, name)` index on the route, route-policy, model-alias, smart-routing,
+  rate-limit and guardrail collections — and `0024`, which makes the prompt registry
+  append-only (`UPDATE`/`TRUNCATE` refused by trigger + `REVOKE`, matching `audit_log`).
+- **De-duplicate config-collection names before migrating.** Migration `0023`'s unique
+  index will fail to create if a collection already holds two entries with the same name in
+  one workspace; resolve the duplicates first (the index creation surfaces them).
+- **`GUARDRAILS_WEBHOOK_FAIL_CLOSED` now defaults to `true`.** A bring-your-own DLP webhook
+  timeout/outage now withholds the request instead of forwarding it un-scanned, matching the
+  managed-plugin posture. Set it `false` to trade that safety for availability.
+- **`OIDC_COOKIE_SECURE` is enforced in production.** With SSO enabled under
+  `NODE_ENV=production`, boot refuses a non-`Secure` admin session cookie — set
+  `OIDC_COOKIE_SECURE=true` (or `OIDC_ALLOW_INSECURE_HTTP=true` for a deliberate non-TLS
+  edge).
 
 ### Security
 
@@ -411,6 +433,7 @@ _Resolved during pre-release hardening (these never shipped in a public release)
   token on `x-api-key` as well as the bearer; IPv6 loopback (`[::1]`) PKCE redirects
   are accepted; and `gulley init` merges into an existing settings file.
 
-[Unreleased]: https://github.com/bogware/gulley/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/bogware/gulley/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bogware/gulley/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bogware/gulley/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bogware/gulley/releases/tag/v0.3.0
