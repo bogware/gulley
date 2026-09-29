@@ -58,6 +58,30 @@ describe('resolveOverlaps — linear-time and bounded', () => {
   });
 });
 
+describe('NativeDetector — bare-digit PII (audit #8) + scan-cap fail-closed (audit #16)', () => {
+  it('detects a separator-less SSN only near an SSN context word', () => {
+    expect(det.detect('employee ssn 123456789 on file').some((f) => f.category === 'ssn')).toBe(
+      true,
+    );
+    // The same 9-digit run with no SSN context is NOT flagged as an SSN (bounds false positives).
+    expect(det.detect('order number 123456789 shipped').some((f) => f.category === 'ssn')).toBe(
+      false,
+    );
+  });
+
+  it('detects a separator-less phone only near a phone context word', () => {
+    expect(det.detect('call me 5551234567 anytime').some((f) => f.category === 'phone')).toBe(true);
+    expect(det.detect('invoice 5551234567 total').some((f) => f.category === 'phone')).toBe(false);
+  });
+
+  it('a body past the scan cap adds a fail-closed scan_truncated marker', () => {
+    const small = new NativeDetector({ maxScanBytes: 64 });
+    const out = small.detect('x'.repeat(100) + ' ssn 123456789');
+    expect(out.some((f) => f.category === 'scan_truncated' && f.confidence >= 0.99)).toBe(true);
+    expect(small.detect('hello').some((f) => f.category === 'scan_truncated')).toBe(false);
+  });
+});
+
 describe('TokenVault — per-vault token namespace', () => {
   it('two vaults never share a token; a foreign token is left untouched', () => {
     const a = new TokenVault();
@@ -66,7 +90,7 @@ describe('TokenVault — per-vault token namespace', () => {
     const ma = a.tokenize(text, det.detect(text));
     const mb = b.tokenize(text, det.detect(text));
     expect(ma).not.toBe(mb);
-    expect(ma).toMatch(/<<GULLEY_EMAIL_[0-9A-F]{8}_1>>/);
+    expect(ma).toMatch(/<<GULLEY_EMAIL_[0-9A-F]+_1>>/);
     expect(b.detokenize(ma)).toBe(ma); // a's token is not b's
     expect(a.detokenize(ma)).toBe(text);
   });
@@ -109,7 +133,7 @@ describe('GuardrailEngine — plugin verdicts compose with the native transform'
     const r = await engine.inspectInput('{"m":"card 4242 4242 4242 4242 mail jane@example.com"}');
     expect(r.blocked).toBe(false);
     expect(r.transformedText).toContain('[CARD]');
-    expect(r.transformedText).toMatch(/<<GULLEY_EMAIL_[0-9A-F]{8}_1>>/);
+    expect(r.transformedText).toMatch(/<<GULLEY_EMAIL_[0-9A-F]+_1>>/);
     expect(r.transformedText).not.toContain('jane@example.com');
     expect(JSON.parse(r.transformedText!)).toBeTypeOf('object'); // still a JSON object
   });

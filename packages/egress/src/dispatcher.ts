@@ -54,3 +54,17 @@ export function pinnedEgressAgent(): Agent {
   agent ??= new Agent({ connect: { lookup: guardedLookup as unknown as LookupFunction } });
   return agent;
 }
+
+/**
+ * A `fetch` bound to the DNS-pinned egress agent — the `fetchImpl` analogue of
+ * `pinnedEgressAgent()`, for guarded clients that take a `fetchImpl` rather than a
+ * `dispatcher` (OIDC discovery/JWKS/token, Entra Graph, the audit anchor, the eval
+ * runner). Connect-time rebind defence: the structural `assertEgressAllowed` URL check
+ * cannot see a host whose A-record flips to an internal/metadata address after the check.
+ */
+export function pinnedFetch(): typeof fetch {
+  const dispatcher = pinnedEgressAgent();
+  return ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+    // `dispatcher` is an undici extension not present in the DOM RequestInit type.
+    fetch(input, { ...(init ?? {}), ...({ dispatcher } as object) })) as typeof fetch;
+}

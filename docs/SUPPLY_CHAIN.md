@@ -58,13 +58,13 @@ section, with the API image's SBOM attached best-effort — or by a manual
 stray manual run can never move it):
 
 ```bash
-docker pull ghcr.io/bogware/gulley:v0.4.0     # or :latest
+docker pull ghcr.io/bogware/gulley:v0.5.0     # or :latest
 ```
 
 Verify the signature and inspect the attestations by digest before running it:
 
 ```bash
-IMAGE=ghcr.io/bogware/gulley:v0.4.0
+IMAGE=ghcr.io/bogware/gulley:v0.5.0
 DIGEST="ghcr.io/bogware/gulley@$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')"
 
 # 1) Signature: assert it was signed by THIS repo's release workflow via GitHub OIDC.

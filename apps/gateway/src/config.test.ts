@@ -94,6 +94,23 @@ describe('loadConfig — inter-dependent knobs', () => {
     ).not.toThrow();
   });
 
+  it('rejects a noeviction-required Redis role sharing the allkeys-lru cache instance', () => {
+    expect(() =>
+      loadConfig({ REDIS_CACHE_URL: 'redis://r:6379', REDIS_COUNTERS_URL: 'redis://r:6379' }),
+    ).toThrow(/REDIS_COUNTERS_URL/);
+    expect(() =>
+      loadConfig({ REDIS_CACHE_URL: 'redis://r:6379', REDIS_VECTOR_URL: 'redis://r:6379' }),
+    ).toThrow(/REDIS_VECTOR_URL/);
+    // Distinct instances are fine; counters==vector (both noeviction) is not a conflict.
+    expect(() =>
+      loadConfig({
+        REDIS_CACHE_URL: 'redis://cache:6379',
+        REDIS_COUNTERS_URL: 'redis://counters:6379',
+        REDIS_VECTOR_URL: 'redis://counters:6379',
+      }),
+    ).not.toThrow();
+  });
+
   it('defaults the KMS region to the Bedrock region only at the wiring site (knob stays optional)', () => {
     expect(loadConfig({}).GULLEY_KMS_REGION).toBeUndefined();
     expect(loadConfig({ GULLEY_KMS_REGION: 'eu-west-1' }).GULLEY_KMS_REGION).toBe('eu-west-1');

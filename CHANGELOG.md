@@ -6,6 +6,160 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-28
+
+A hardening release: two waves of security and correctness fixes from a full
+release-readiness audit, spanning the data-plane request pipeline, the control-plane
+APIs, the admin console, and the deploy assets. Every fix ships with regression tests;
+the data-plane (hot-path) changes went through the adversarial hot-path review.
+
+### Upgrade notes
+
+- **Run the new migrations** with `node dist/control-api/migrate.mjs` before starting the
+  planes (compose runs the `migrate` service first; the ECS module ships a one-off migrate
+  task; on Kubernetes run it once per release). This release adds `0023` — a unique
+  `(workspace_id, name)` index on the route, route-policy, model-alias, smart-routing,
+  rate-limit and guardrail collections — and `0024`, which makes the prompt registry
+  append-only (`UPDATE`/`TRUNCATE` refused by trigger + `REVOKE`, matching `audit_log`).
+- **De-duplicate config-collection names before migrating.** Migration `0023`'s unique
+  index will fail to create if a collection already holds two entries with the same name in
+  one workspace; resolve the duplicates first (the index creation surfaces them).
+- **`GUARDRAILS_WEBHOOK_FAIL_CLOSED` now defaults to `true`.** A bring-your-own DLP webhook
+  timeout/outage now withholds the request instead of forwarding it un-scanned, matching the
+  managed-plugin posture. Set it `false` to trade that safety for availability.
+- **`OIDC_COOKIE_SECURE` is enforced in production.** With SSO enabled under
+  `NODE_ENV=production`, boot refuses a non-`Secure` admin session cookie — set
+  `OIDC_COOKIE_SECURE=true` (or `OIDC_ALLOW_INSECURE_HTTP=true` for a deliberate non-TLS
+  edge).
+
+### Security
+
+- **CEL authorization deny rules now fail CLOSED on an evaluation error.** A `deny` rule
+  that threw or yielded a non-boolean was silently treated as a non-match, so a request
+  could dodge a deny by making the rule error on the attacker-controlled body — e.g.
+  sending `"max_tokens": "999999"` (a string) to defeat
+  `deny: request.body.max_tokens > 100000`, forcing a NaN via `int()` of a non-number, or
+  tripping the evaluator step limit with a huge array. An erroring deny is now a MATCH
+  (denied); `int()`/`double()` of a non-numeric value and ordering-comparing a NaN now
+  raise instead of coercing silently. Guard a deny over an OPTIONAL field with
+  `has(field) && …` so a legitimately-absent field stays a clean allow. **Behavior
+  change** for deny rules that referenced unguarded optional/typed fields.
+- **Config export/plan now require platform `config:read`.** `GET /config/export` and
+  `POST /config/plan` were scoped by the caller's org, so a merely workspace-scoped admin
+  could read (and diff) every sibling workspace's full config document. They now gate on
+  `config:read` at the platform scope, matching `/config/drift` and `/config/versions`.
+- **CEL evaluator resource bounds.** The parser and evaluator cap expression nesting depth,
+  so a pathological operator/GitOps policy raises a typed error instead of overflowing the
+  native stack with a `RangeError`; `matches()` rejects a catastrophic-backtracking pattern
+  shape (`(a+)+` and friends) at use (there is no native RE2 here by design); and the
+  external-authorizer default cache key is depth-bounded, so a deeply-nested request body
+  (with `EXTERNAL_AUTHZ_SEND_BODY` on) maps to the configured fail mode instead of a 500.
+- **DLP detector coverage.** The native detectors now catch separator-less SSNs and phone
+  numbers (`123456789` / `5551234567`) when a matching context word ("ssn", "phone", …)
+  sits nearby — the bare forms, common in pasted spreadsheets/CSV/JSON, were previously
+  missed. And when a body exceeds the per-scan byte cap, the detector emits a full-span,
+  high-confidence `scan_truncated` marker so the cache-sensitivity gate and block/mask
+  enforcement fail CLOSED instead of treating the unscanned tail as clean.
+- **Guarded egress is DNS-rebind-pinned end to end.** The connect-time pinned agent (which
+  refuses an internal/metadata address at dial time) now backs the inbound-JWT and console
+  OIDC discovery/JWKS/token fetches, the OIDC token exchange (which carries the client
+  secret), Entra Graph, the external authorizer, the audit anchor, the SIEM export, the
+  gateway-metrics scrape and the eval runner — not only the DLP webhook and guardrail
+  plugins. Previously these had only a boot-time structural URL check, so a configured host
+  whose A-record flipped to an internal/metadata address after the check (or a malicious IdP
+  discovery document) could reach an internal endpoint.
+- **Counters-Redis role separation is enforced at boot.** Budget/rate-limit counters and
+  the semantic-vector index require `noeviction`; the cache runs `allkeys-lru`. Sharing one
+  Redis instance for the cache and a counter/vector role silently evicted counters under
+  memory pressure, bypassing spend enforcement with no error anywhere. Boot now refuses
+  `REDIS_COUNTERS_URL` or `REDIS_VECTOR_URL` equal to `REDIS_CACHE_URL` (the reliable guard;
+  the runtime `CONFIG GET maxmemory-policy` probe stays best-effort, since managed Redis
+  often disables `CONFIG`).
+- **Config collection entity names are unique per workspace (DB-enforced).** The route,
+  route-policy, model-alias, smart-routing-policy, rate-limit and guardrail collections gain
+  a unique `(workspace_id, name)` index (migration `0023`). The name is the GitOps reconcile
+  key, but only an in-memory TOCTOU check guarded it, so a concurrent create — or a document
+  with two same-named entries — could persist duplicate rows that the name-keyed reconcile
+  then silently shadowed. A duplicate now returns 409 (console) / 422 (apply) instead of a
+  500 or a shadowed row. Upgrades with pre-existing duplicate names must de-duplicate before
+  migrating (the index creation surfaces them).
+- **Prompt registry is DB-tamper-evident.** `prompt_version` (append-only, hash-chained)
+  now refuses in-place `UPDATE` and `TRUNCATE` via a trigger + `REVOKE` (migration `0024`),
+  matching `audit_log`/`config_version` — closing the gap where a version body could be
+  rewritten with a recomputed forward chain undetectably. `DELETE` is intentionally left to
+  the `ON DELETE cascade` (dropping a version leaves a detectable gap in the sequence).
+- **Budget commit is idempotent, and in-memory reservations are reclaimed.** The Redis commit
+  script dedupes a resent commit (an ioredis auto-retry after a lost reply) via a TTL-bounded
+  committed-ids set gating the increment, so it can no longer double-count committed spend
+  (which drove spurious 402s and projection drift). The in-memory (single-node) store gained
+  per-reservation expiry, an orphan sweep in `reserve()`, and a `refresh()`, so a request
+  that crashes between reserve and commit no longer strands its worst-case reservation and
+  permanently shrinks the cap — matching the Redis store's lifetime sweep.
+- **The bring-your-own DLP webhook now fails CLOSED by default**
+  (`GUARDRAILS_WEBHOOK_FAIL_CLOSED`, previously `false`), matching the managed guardrail
+  plugins and the documented "plugins fail closed by default" posture: a webhook
+  timeout/outage now withholds the request instead of forwarding it un-scanned. Set it
+  `false` to trade that safety for availability. **Behavior change.**
+- **`OIDC_COOKIE_SECURE` is enforced in production.** With SSO enabled (`OIDC_ISSUER` +
+  `OIDC_CLIENT_ID`) under `NODE_ENV=production`, boot now refuses a non-`Secure` admin
+  session cookie — set `OIDC_COOKIE_SECURE=true` (or `OIDC_ALLOW_INSECURE_HTTP=true` for
+  a deliberate non-TLS edge). **Behavior change.**
+- **Reversible-mask vault nonce widened** from 32 to 96 bits, so a mask token from one
+  request cannot collide with another's at enterprise request volume.
+- **Indirect-injection spotlighting now marks the legacy OpenAI `role:"function"`**
+  tool-output message as untrusted (previously only `role:"tool"` was).
+- **JWKS key selection tightened:** a token naming an unknown `kid` no longer falls back
+  to an arbitrary key when the JWKS holds more than one key of that type.
+- **The audit sanitizer recognizes Gulley's own credential formats**
+  (`gk_`/`gko_at_`/`gko_rt_`/`gadm_`/`gses_`), so a raw Gulley token misplaced in a
+  non-secret-named field is redacted, not only provider keys.
+- **Unkeyed secrets in an audit-only response are excluded from the cache.** The output
+  cache-sensitivity gate consulted the policy-*filtered* findings, so on the audit-only
+  path (guardrails detect but don't redact/buffer) an opaque bearer/session token or
+  generic API key — which the detectors emit *below* the cache-exclusion confidence gate
+  and which the policy floor then drops — slipped through, and a response echoing it could
+  be cached and replayed to another caller in the same authz scope. The gate now consults
+  the raw scanner findings on that path and treats any secret- or entropy-sourced finding
+  as too sensitive to cache, regardless of confidence.
+- **A 200 whose BODY is an error object is booked as a failure.** An OpenAI-compatible or
+  degraded cross-provider-translated backend that reports failure in-band under a 200
+  (`{"error":…}` / `{"type":"error"…}`) was recorded as a $0 success, left cacheable, and
+  never reached the circuit breaker — the non-streamed analogue of the in-stream
+  error-frame handling. It is now recorded as an error, faults the breaker, and is excluded
+  from the cache; the raw bytes still reach the client verbatim.
+
+### Fixed
+
+- **Cross-family SSE translators (OpenAI→Anthropic, Gemini→Anthropic) decode UTF-8 across
+  chunk boundaries** — a multi-byte code point split between two upstream chunks is no
+  longer corrupted to U+FFFD in the client-visible text.
+- **A non-streamed hedge loser is metered at worst case.** When a hedged race is won by the
+  other leg, a *non-streamed* loser has already had its whole (billed) body generated
+  upstream before its headers arrived, yet its bytes are discarded — so it was booked at
+  $0. It is now charged worst-case beside the served leg, honoring "always meter partial
+  spend on abort/failover". A *streamed* loser is still aborted right after headers and not
+  charged (its worst-case would grossly over-bill), matching the existing cascade metering.
+- **Admin console.** The FinOps chargeback CSV export quotes/escapes every field and
+  neutralizes spreadsheet-formula injection on the attribution key; config **Apply**
+  confirms, disables while in flight, and refuses an unknown base version (no more `?? 0`
+  silent-overwrite / spurious-conflict); create forms (keys, orgs, workspaces, the
+  routes/policies/budgets/guardrails/aliases/rate-limits collections, providers, prompts,
+  role grants) disable while a create is in flight (no double-submit duplicates); a
+  transient `/auth/me` failure no longer wipes a pasted break-glass token (only a real
+  401 does); the copy button reports failure instead of a false "Copied ✓" in an insecure
+  context; the observability poll backs off correctly against a persistently unreachable
+  metrics listener; and `global-error` / `not-found` boundaries render a styled page for a
+  layout-level throw or a bad URL instead of Next's default.
+
+### Changed (deploy)
+
+- **Terraform:** the control-api task role is granted `kms:GetPublicKey`, so the prod tier
+  can serve the offline audit-verification key (`GET /.well-known/gulley-audit-key`), the
+  WORM/anchor verify routes, and the DR drill — they previously failed with `AccessDenied`
+  under `tier=prod`.
+- **Compose self-host** pins `LOG_LEVEL` (default `info`) so a verbatim-copied
+  `.env.example` no longer runs the production self-host at `debug`.
+
 ## [0.4.0] — 2026-09-20
 
 The production-readiness release: a full review/refine pass over the data plane,
@@ -279,6 +433,7 @@ _Resolved during pre-release hardening (these never shipped in a public release)
   token on `x-api-key` as well as the bearer; IPv6 loopback (`[::1]`) PKCE redirects
   are accepted; and `gulley init` merges into an existing settings file.
 
-[Unreleased]: https://github.com/bogware/gulley/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/bogware/gulley/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bogware/gulley/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bogware/gulley/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bogware/gulley/releases/tag/v0.3.0

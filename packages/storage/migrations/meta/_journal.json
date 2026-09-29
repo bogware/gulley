@@ -162,6 +162,20 @@
       "when": 1789940578176,
       "tag": "0022_public_smiling_tiger",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1790637789566,
+      "tag": "0023_military_prima",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790638312049,
+      "tag": "0024_prompt_registry_immutable",
+      "breakpoints": true
     }
   ]
 }

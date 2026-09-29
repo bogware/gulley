@@ -11,7 +11,7 @@
 #                dist/ + node_modules/ only. Node is PID 1 (SIGTERM reaches the drain).
 #
 #   docker buildx build --platform linux/arm64 -f apps/gateway/Dockerfile \
-#     --build-arg GULLEY_VERSION=v0.4.0 --build-arg GULLEY_BUILD_SHA=$(git rev-parse --short HEAD) .
+#     --build-arg GULLEY_VERSION=v0.5.0 --build-arg GULLEY_BUILD_SHA=$(git rev-parse --short HEAD) .
 #
 # Entries (all `node <file>`; the image's default is the gateway):
 #   dist/gateway/main.mjs          data plane            dist/gateway/doctor.mjs        preflight

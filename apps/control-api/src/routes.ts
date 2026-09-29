@@ -745,7 +745,11 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
             config,
           }),
         });
-        return r.ok ? reply.code(201).send({ entity: r.value }) : forbidden(reply);
+        return r.ok
+          ? reply.code(201).send({ entity: r.value })
+          : r.conflict
+            ? conflict(reply, r.conflict) // a duplicate name that raced past nameTaken
+            : forbidden(reply);
       }),
     );
     app.get(

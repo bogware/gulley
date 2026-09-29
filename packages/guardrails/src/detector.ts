@@ -71,7 +71,8 @@ export class NativeDetector implements Detector {
   detect(full: string): Finding[] {
     // Bound the scanned text so a pathological body can't drive unbounded regex work
     // (offsets stay valid — the scan is a prefix, so start/end index the original).
-    const text = full.length > this.maxScanBytes ? full.slice(0, this.maxScanBytes) : full;
+    const truncated = full.length > this.maxScanBytes;
+    const text = truncated ? full.slice(0, this.maxScanBytes) : full;
     const raw: Finding[] = [];
 
     for (const def of NATIVE_PATTERNS) {
@@ -120,6 +121,19 @@ export class NativeDetector implements Detector {
     }
 
     if (this.contextBoost) applyContextBoost(text, raw);
+    if (truncated) {
+      // The body exceeded the scan cap, so a secret PAST the scanned prefix is unseen.
+      // Mirror the detector_overflow fail-closed marker: one full-span, high-confidence
+      // finding so the cache-sensitivity gate and block/mask enforcement fail CLOSED
+      // rather than treat an only-partially-scanned body as clean.
+      raw.push({
+        category: 'scan_truncated',
+        start: 0,
+        end: text.length,
+        source: 'pattern',
+        confidence: 0.99,
+      });
+    }
     return resolveOverlaps(capFindings(raw, text.length));
   }
 }

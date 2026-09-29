@@ -8,7 +8,7 @@ import {
 import { loadCatalogFromFile } from '@gulley/catalog';
 import { GULLEY_BUILD } from '@gulley/core';
 import type { RateResolver } from '@gulley/cost';
-import { assertEgressAllowed, setAirGappedEgress } from '@gulley/egress';
+import { assertEgressAllowed, pinnedFetch, setAirGappedEgress } from '@gulley/egress';
 import { EntraGraphIdp } from '@gulley/oauth';
 import { OidcProvider } from '@gulley/oidc';
 import { createListenConnection, PostgresConfigBus, purgeExpiredOAuthCodes } from '@gulley/storage';
@@ -80,6 +80,7 @@ function buildAnchor(config: Config): Anchor | undefined {
   if (!config.AUDIT_ANCHOR_URL) return undefined;
   return new HttpAnchor(config.AUDIT_ANCHOR_URL, {
     allowlist: outboundAllowlist(config),
+    fetchImpl: pinnedFetch(), // connect-time DNS-rebind defence (the allowlist is structural)
     ...(config.AUDIT_ANCHOR_AUTHZ ? { headers: { authorization: config.AUDIT_ANCHOR_AUTHZ } } : {}),
   });
 }
@@ -106,7 +107,7 @@ function buildSiem(
       authorization: config.SIEM_AUTHZ,
       logType: config.SIEM_LOG_TYPE,
     },
-    { allowlist: outboundAllowlist(config) },
+    { allowlist: outboundAllowlist(config), fetchImpl: pinnedFetch() },
   );
   return connector ? { connector, batchMax: config.SIEM_BATCH_MAX } : undefined;
 }
@@ -134,6 +135,7 @@ function buildEvalRunner(config: Config, warn: (msg: string) => void): EvalRunne
     gatewayUrl: config.EVAL_GATEWAY_URL,
     apiKey: config.EVAL_GATEWAY_KEY,
     allowlist: outboundAllowlist(config),
+    fetchImpl: pinnedFetch(), // connect-time DNS-rebind defence
     rateResolver,
     timeoutMs: config.EVAL_TIMEOUT_MS,
     defaultMaxTokens: config.EVAL_MAX_TOKENS,
@@ -160,6 +162,7 @@ function buildContext(config: Config): ControlContext | undefined {
     };
     oidc = {
       provider: new OidcProvider(config.OIDC_ISSUER, {
+        fetchImpl: pinnedFetch(), // connect-time DNS-rebind defence (assertOidcEgress is structural)
         fetchTimeoutMs: config.OIDC_FETCH_TIMEOUT_MS,
         guard: {
           assertAllowed: assertOidcEgress,
@@ -177,6 +180,9 @@ function buildContext(config: Config): ControlContext | undefined {
       subjectClaim: config.OIDC_SUBJECT_CLAIM,
       exchangeTimeoutMs: config.OIDC_FETCH_TIMEOUT_MS,
       assertEgress: assertOidcEgress,
+      // exchangeCode POSTs the OIDC client secret to the advertised token_endpoint; pin
+      // its fetch so a rebound/malicious token_endpoint can't exfiltrate the secret.
+      fetchImpl: pinnedFetch(),
     };
   }
 
@@ -260,6 +266,7 @@ function buildContext(config: Config): ControlContext | undefined {
       ? buildGatewayMetricsProvider({
           url: config.GATEWAY_METRICS_URL,
           allowlist: outboundAllowlist(config),
+          fetchImpl: pinnedFetch(), // connect-time DNS-rebind defence
           timeoutMs: config.GATEWAY_METRICS_TIMEOUT_MS,
         })
       : undefined,
@@ -286,6 +293,7 @@ function buildContext(config: Config): ControlContext | undefined {
                     loginBase: config.ENTRA_LOGIN_BASE,
                     cacheTtlMs: config.ENTRA_ACTIVE_CACHE_MS,
                     timeoutMs: config.ENTRA_GRAPH_TIMEOUT_MS,
+                    fetchImpl: pinnedFetch(), // connect-time DNS-rebind defence
                     assertAllowed: (url) =>
                       assertEgressAllowed(url, { allowlist: outboundAllowlist(config) }),
                   }),

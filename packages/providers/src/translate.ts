@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { PassThrough, type Readable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import { SSEParser } from './sse';
 import {
   type ForwardRequest,
@@ -156,6 +157,9 @@ export function openaiChatSseToAnthropic(upstream: Readable, model: string): Rea
     });
   };
 
+  // Decode bytes across chunk boundaries: a multi-byte code point split between two
+  // TCP chunks must not become U+FFFD (the translated text is re-framed to the client).
+  const decoder = new StringDecoder('utf8');
   const handle = (chunk: string): void => {
     if (sawError) return;
     for (const ev of parser.push(chunk)) {
@@ -199,7 +203,7 @@ export function openaiChatSseToAnthropic(upstream: Readable, model: string): Rea
 
   upstream.on('data', (chunk: Buffer) => {
     try {
-      handle(chunk.toString('utf8'));
+      handle(decoder.write(chunk));
     } catch {
       /* best-effort */
     }
@@ -215,7 +219,7 @@ export function openaiChatSseToAnthropic(upstream: Readable, model: string): Rea
   });
   upstream.on('end', () => {
     try {
-      handle('\n\n');
+      handle(decoder.end() + '\n\n');
     } catch {
       /* best-effort */
     }

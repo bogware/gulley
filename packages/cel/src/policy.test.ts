@@ -51,6 +51,48 @@ describe('CelAuthorizer', () => {
     expect(az.authorize(req({ body: { temperature: 0.2 } })).allowed).toBe(true);
   });
 
+  it('deny FAILS CLOSED when an attacker-controlled body makes the rule error', () => {
+    const az = new CelAuthorizer([
+      { effect: 'deny', name: 'cap', expr: 'request.body.max_tokens > 100000' },
+    ]);
+    // A real numeric over-limit → denied (the rule matches).
+    expect(az.authorize(req({ body: { max_tokens: 200000 } })).allowed).toBe(false);
+    // Under-limit → allowed (a clean false, not an error).
+    expect(az.authorize(req({ body: { max_tokens: 50 } })).allowed).toBe(true);
+    // Attack: a STRING dodges the numeric compare so the rule throws — this used to be a
+    // non-match (allowed); it now fails CLOSED.
+    const s = az.authorize(req({ body: { max_tokens: '999999' } }));
+    expect(s.allowed).toBe(false);
+    expect(s.reason).toBe('deny_error:cap');
+    // A missing field also throws → fails closed (guard optional fields with has(), below).
+    expect(az.authorize(req({ body: {} })).allowed).toBe(false);
+  });
+
+  it('deny over an OPTIONAL field: has()-guarded so an absent field is a clean allow', () => {
+    const az = new CelAuthorizer([
+      {
+        effect: 'deny',
+        name: 'cap',
+        expr: 'has(request.body.max_tokens) && request.body.max_tokens > 100000',
+      },
+    ]);
+    expect(az.authorize(req({ body: {} })).allowed).toBe(true); // absent → non-match → allowed
+    expect(az.authorize(req({ body: { max_tokens: 200000 } })).allowed).toBe(false); // over → denied
+    // A hostile wrong-type value still fails closed (has() is true, then compare throws).
+    expect(az.authorize(req({ body: { max_tokens: '999999' } })).allowed).toBe(false);
+  });
+
+  it('deny FAILS CLOSED on the NaN-coercion dodge (int() of a non-number)', () => {
+    const az = new CelAuthorizer([
+      { effect: 'deny', name: 'cap', expr: 'int(request.body.max_tokens) > 100000' },
+    ]);
+    expect(az.authorize(req({ body: { max_tokens: 200000 } })).allowed).toBe(false); // real → denied
+    // int("abc") used to be NaN → NaN > 100000 is a silent false → allowed. int() now throws.
+    const s = az.authorize(req({ body: { max_tokens: 'abc' } }));
+    expect(s.allowed).toBe(false);
+    expect(s.reason).toBe('deny_error:cap');
+  });
+
   it('reports which attributes rules read', () => {
     const az = new CelAuthorizer([{ effect: 'deny', expr: 'request.body.stream == true' }]);
     expect(az.reads('request.body')).toBe(true);

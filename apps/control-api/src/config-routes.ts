@@ -31,6 +31,12 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
   app.get(
     '/config/export',
     adminRoute(ctx, async (_req, reply, admin) => {
+      // The full config document (routes, policies, guardrail patterns, provider config)
+      // is a privileged fleet read — gate on config:read like /config/drift and
+      // /config/versions. Without it a merely workspace-scoped admin's coveredOrgIds
+      // returns their PARENT org, and exportDocument then returns every workspace in that
+      // org (sibling-workspace config disclosure). The org-scope below is defense-in-depth.
+      if (!(await ctx.access.can(admin, 'config:read', {}))) return forbidden(reply);
       const doc = await store.exportDocument(readableOrgs(coveredOrgIds(admin)));
       return reply.send({ document: doc });
     }),
@@ -39,6 +45,9 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
   app.post(
     '/config/plan',
     adminRoute(ctx, async (request, reply, admin) => {
+      // A dry-run plan diffs the desired document against live config, so it discloses the
+      // same privileged config as /config/export — gate it on config:read identically.
+      if (!(await ctx.access.can(admin, 'config:read', {}))) return forbidden(reply);
       const desired = body(request)['document'];
       if (!isConfigDocument(desired)) {
         return reply
@@ -61,23 +70,36 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
           .code(422)
           .send({ error: { type: 'validation', message: 'document + baseVersion required' } });
       }
-      const r = await applyConfig(desired, baseVersion, admin, {
-        store,
-        versions: ctx.configVersions,
-        audit: ctx.audit,
-        access: ctx.access,
-        atomic: ctx.configAtomic,
-        egressAllowlist: ctx.outboundAllowlist,
-        onApplied: ctx.notifier
-          ? (e) =>
-              ctx.notifier?.emit({
-                v: e.version,
-                hash: e.contentHash,
-                origin: ctx.originId,
-                ts: Date.now(),
-              })
-          : undefined,
-      });
+      let r: Awaited<ReturnType<typeof applyConfig>>;
+      try {
+        r = await applyConfig(desired, baseVersion, admin, {
+          store,
+          versions: ctx.configVersions,
+          audit: ctx.audit,
+          access: ctx.access,
+          atomic: ctx.configAtomic,
+          egressAllowlist: ctx.outboundAllowlist,
+          onApplied: ctx.notifier
+            ? (e) =>
+                ctx.notifier?.emit({
+                  v: e.version,
+                  hash: e.contentHash,
+                  origin: ctx.originId,
+                  ts: Date.now(),
+                })
+            : undefined,
+        });
+      } catch (err) {
+        // A duplicate entity name within a workspace (the (workspace, name) unique index)
+        // makes the document ambiguous to the name-keyed reconcile — a 422, not a 500.
+        const e = err as { code?: string; cause?: { code?: string } };
+        if (e?.code === '23505' || e?.cause?.code === '23505') {
+          return reply.code(422).send({
+            error: { type: 'validation', message: 'duplicate entity name within a workspace' },
+          });
+        }
+        throw err;
+      }
       if (r.ok) {
         // DB mode: the durable config store may have created org/workspace rows;
         // refresh the in-memory tenancy read model so the console / RBAC scopes see

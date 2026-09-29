@@ -90,9 +90,13 @@ export function verifyJwtWithJwks(
   if (!alg || !(alg in ALG_TO_HASH)) return { ok: false, reason: 'unsupported-alg' };
 
   const wantKty = alg.startsWith('ES') ? 'EC' : 'RSA';
+  const ofType = jwks.filter((k) => k.kty === wantKty);
+  // Prefer a strict `kid` match. Fall back to a key of the right type only when the
+  // token carried NO kid, or when there is exactly one candidate of that type — never
+  // silently accept an arbitrary key when a specific but unknown kid was named.
   const jwk =
-    (header.kid ? jwks.find((k) => k.kid === header.kid) : undefined) ??
-    jwks.find((k) => k.kty === wantKty);
+    (header.kid ? ofType.find((k) => k.kid === header.kid) : undefined) ??
+    (header.kid && ofType.length !== 1 ? undefined : ofType[0]);
   if (!jwk) return { ok: false, reason: 'no-matching-key' };
 
   let key: KeyObject;

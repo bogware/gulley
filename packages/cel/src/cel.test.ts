@@ -136,3 +136,18 @@ describe('CEL user functions & tracing', () => {
     expect(() => compile('a b c')).toThrow(CelParseError);
   });
 });
+
+describe('CEL resource bounds (audit #18)', () => {
+  it('rejects pathologically deep nesting with a typed error, not a stack overflow', () => {
+    expect(() => compile('('.repeat(500) + '1' + ')'.repeat(500))).toThrow(CelParseError);
+    expect(() => compile('!'.repeat(500) + 'true')).toThrow(CelParseError);
+    expect(ev('((1 + 2) * 3) == 9')).toBe(true); // shallow expressions are unaffected
+  });
+
+  it('rejects a catastrophic-backtracking matches() pattern (no native RE2 here)', () => {
+    expect(() => ev('"aaaaaaaaaaaaaaaaaaaa!".matches("(a+)+$")')).toThrow(CelEvalError);
+    expect(() => ev('"x".matches("(a*)*")')).toThrow(CelEvalError);
+    expect(ev('"claude-3-5".matches("^claude-[0-9]")')).toBe(true); // a safe pattern still runs
+    expect(() => ev('"aa".matches("(a+){2}")')).not.toThrow(); // bounded re-quantification is fine
+  });
+});

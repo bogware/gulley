@@ -123,3 +123,30 @@ describe('InMemoryBudgetStore', () => {
     expect(await s.reserve('ws:unknown', 'r4', 10)).toBeNull();
   });
 });
+
+describe('InMemoryBudgetStore — orphan reservation reclamation (audit #10)', () => {
+  const caps = (): Map<string, Budget> => new Map([['ws', { capMicroUsd: 1000 }]]);
+
+  it('sweeps an orphaned reservation after its lifetime so the cap is not permanently shrunk', async () => {
+    let t = 0;
+    const s = new InMemoryBudgetStore(caps(), () => t, 1000); // 1s reservation lifetime
+    // A request reserves 800 then crashes — commit never runs.
+    expect((await s.reserve('ws', 'r1', 800))?.allowed).toBe(true);
+    // Within the lifetime the stale reservation still holds, so a 400 reserve is rejected.
+    t = 500;
+    expect((await s.reserve('ws', 'r2', 400))?.allowed).toBe(false);
+    // Past the lifetime the orphan is swept and the headroom returns.
+    t = 1500;
+    expect((await s.reserve('ws', 'r3', 400))?.allowed).toBe(true);
+  });
+
+  it('refresh() keeps a live long reservation from being swept mid-flight', async () => {
+    let t = 0;
+    const s = new InMemoryBudgetStore(caps(), () => t, 1000);
+    expect((await s.reserve('ws', 'long', 800))?.allowed).toBe(true);
+    t = 900;
+    await s.refresh('ws', 'long'); // re-stamp expiry to 1900
+    t = 1500; // past the ORIGINAL expiry (1000), before the refreshed one (1900)
+    expect((await s.reserve('ws', 'big', 400))?.allowed).toBe(false); // 'long' survived
+  });
+});

@@ -270,6 +270,7 @@ function CreatePrompt({
   const [ws, setWs] = useState('');
   const [name, setName] = useState('');
   const [body, setBody] = useState('');
+  const [busy, setBusy] = useState(false);
 
   return (
     <Panel>
@@ -304,18 +305,21 @@ function CreatePrompt({
         </Field>
         <Button
           variant="primary"
-          disabled={!ws || !name.trim() || !body.trim()}
+          disabled={busy || !ws || !name.trim() || !body.trim()}
           onClick={async () => {
-            if (!api) return;
+            if (!api || busy) return;
+            setBusy(true);
             try {
               await api.createPrompt(ws, name.trim(), body);
               onDone();
             } catch (e) {
               onError(msg(e));
+            } finally {
+              setBusy(false);
             }
           }}
         >
-          Create prompt
+          {busy ? 'Creating…' : 'Create prompt'}
         </Button>
       </div>
     </Panel>

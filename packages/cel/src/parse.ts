@@ -176,8 +176,15 @@ function lex(src: string): Tok[] {
   return toks;
 }
 
+/** Max expression nesting depth. Recursive-descent parsing (and evaluation) is bounded so
+ *  a pathological operator/GitOps-supplied policy (thousands of nested parens or unary
+ *  `!`/`-`) raises a typed CelParseError instead of overflowing the native stack with an
+ *  uncatchable RangeError. Real policies nest only a handful deep. */
+const MAX_PARSE_DEPTH = 200;
+
 class Parser {
   private pos = 0;
+  private depth = 0;
   constructor(private readonly toks: Tok[]) {}
 
   private peek(): Tok | undefined {
@@ -211,14 +218,21 @@ class Parser {
   }
 
   private ternary(): Expr {
-    const cond = this.or();
-    if (this.eatOp('?')) {
-      const then = this.ternary();
-      this.expectOp(':');
-      const otherwise = this.ternary();
-      return { kind: 'ternary', cond, then, otherwise };
+    if (++this.depth > MAX_PARSE_DEPTH) {
+      throw new CelParseError(`expression nesting too deep (> ${MAX_PARSE_DEPTH})`);
     }
-    return cond;
+    try {
+      const cond = this.or();
+      if (this.eatOp('?')) {
+        const then = this.ternary();
+        this.expectOp(':');
+        const otherwise = this.ternary();
+        return { kind: 'ternary', cond, then, otherwise };
+      }
+      return cond;
+    } finally {
+      this.depth--;
+    }
   }
 
   private or(): Expr {
@@ -270,11 +284,18 @@ class Parser {
     return left;
   }
   private unary(): Expr {
-    if (this.isOp('!') || this.isOp('-')) {
-      const op = (this.next() as { v: string }).v as '!' | '-';
-      return { kind: 'unary', op, operand: this.unary() };
+    if (++this.depth > MAX_PARSE_DEPTH) {
+      throw new CelParseError(`expression nesting too deep (> ${MAX_PARSE_DEPTH})`);
     }
-    return this.postfix();
+    try {
+      if (this.isOp('!') || this.isOp('-')) {
+        const op = (this.next() as { v: string }).v as '!' | '-';
+        return { kind: 'unary', op, operand: this.unary() };
+      }
+      return this.postfix();
+    } finally {
+      this.depth--;
+    }
   }
 
   private postfix(): Expr {

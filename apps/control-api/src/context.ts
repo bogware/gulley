@@ -247,7 +247,7 @@ export interface ControlContext {
   /** Optional label stamped on the attestation. */
   attestationSubject?: string;
   /** Audit-export ASYMMETRIC signer (KMS). When present it signs the attestation and
-   *  the WORM batches, and its public key is served at GET /audit/public-key so an
+   *  the WORM batches, and its public key is served at GET /.well-known/gulley-audit-key so an
    *  auditor verifies both offline. Absent = HMAC/shared-secret signing only. */
   auditSigner?: AsymmetricSigner;
   /** WORM-live shipper: mirrors the complete durable audit chain to S3 Object Lock

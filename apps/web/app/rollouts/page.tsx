@@ -53,6 +53,7 @@ export default function RolloutsPage() {
   const workspaces = useAdminQuery((a) => a.workspaces(), []);
   const [error, setError] = useState<string | undefined>(undefined);
   const [report, setReport] = useState<unknown>(null);
+  const [busy, setBusy] = useState(false);
 
   const [suiteText, setSuiteText] = useState(SAMPLE_SUITE);
   const [form, setForm] = useState({
@@ -64,13 +65,16 @@ export default function RolloutsPage() {
   });
 
   async function run<T>(fn: () => Promise<T>, after?: (r: T) => void): Promise<void> {
-    if (!api) return;
+    if (!api || busy) return;
     setError(undefined);
+    setBusy(true);
     try {
       const r = await fn();
       after?.(r);
     } catch (e) {
       setError(msg(e));
+    } finally {
+      setBusy(false);
     }
   }
 

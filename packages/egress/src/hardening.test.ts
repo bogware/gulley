@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { assertEgressAllowed, EgressError, isBlockedHostname, isBlockedIp } from './allow';
-import { guardedLookup } from './dispatcher';
+import { guardedLookup, pinnedEgressAgent, pinnedFetch } from './dispatcher';
 
 describe('egress guard — hostnames and IPv6 ranges', () => {
   it('blocks local / metadata names whatever DNS says', () => {
@@ -33,5 +33,21 @@ describe('egress guard — hostnames and IPv6 ranges', () => {
     );
     expect(err).toBeInstanceOf(Error);
     expect((err as NodeJS.ErrnoException).code).toBe('EEGRESS_BLOCKED');
+  });
+
+  it('pinnedFetch routes through the pinned egress agent (dispatcher injected)', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      seen.push((init ?? {}) as Record<string, unknown>);
+      return new Response('ok');
+    }) as typeof fetch;
+    try {
+      await pinnedFetch()('https://example.test/x', { method: 'GET' });
+    } finally {
+      globalThis.fetch = orig;
+    }
+    expect(seen[0]?.['dispatcher']).toBe(pinnedEgressAgent()); // rebind-safe agent injected
+    expect((seen[0] as { method?: string }).method).toBe('GET'); // caller's init preserved
   });
 });
