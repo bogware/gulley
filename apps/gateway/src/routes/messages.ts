@@ -2168,6 +2168,18 @@ async function handleProxy(
       if (r.limiterAcquired) ctx.limiter?.release(r.target.name);
       // A usable loser proved the upstream reachable — resolve any probe it claimed.
       ctx.breaker.recordSuccess(r.target.name);
+      // A NON-streamed leg's response headers arrive only after the provider generated
+      // (and most likely billed) the whole body, yet the loser's bytes are discarded, so
+      // nothing else meters it — charge it at worst-case beside the served leg ("always
+      // meter partial spend on abort/failover"). A STREAMED loser is aborted right after
+      // headers (little generated), so charging its worst-case would grossly over-bill.
+      const loserStreamed =
+        parsed['stream'] === true ||
+        r.target.alwaysStream === true ||
+        r.target.adapter.alwaysStream === true;
+      if (!loserStreamed) {
+        chargeDiscarded('hedge-loser', 'hedge', r.target.provider, requestedModel, body.length);
+      }
     }
   };
 
@@ -2916,10 +2928,24 @@ async function handleProxy(
         : outScanner && engine
           ? filterByPolicy(outScanner.findings(), engine.outputPolicy)
           : [];
-    // Fail SAFE: an incomplete audit scan (a swallowed throw) can't clear a response for
-    // caching — a secret in an un-scanned chunk would otherwise be cached and replayed.
+    // Findings that make a response too sensitive to cache. Two robustness rules:
+    //  1. Fail SAFE on an incomplete scan (a swallowed throw can't clear a response — a
+    //     secret in an un-scanned chunk must not be cached and replayed).
+    //  2. The detectors for UNKEYED secrets (bearer/session tokens, generic API keys) emit
+    //     BELOW the 0.8 cache gate (entropy = 0.4) and the output policy's confidence floor
+    //     drops them from `outFindings` — so on the audit-only path consult the RAW scanner
+    //     findings and treat ANY secret/entropy-source finding as sensitive, else a response
+    //     echoing an opaque token is cached and replayed to another caller in the same scope.
+    const cacheGateFindings =
+      outScanner && !redactor && !bufferOutput ? outScanner.findings() : outFindings;
     const outputSensitive =
-      outputScanFailed || outFindings.some((f) => f.confidence >= CACHE_SENSITIVE_CONFIDENCE);
+      outputScanFailed ||
+      cacheGateFindings.some(
+        (f) =>
+          f.confidence >= CACHE_SENSITIVE_CONFIDENCE ||
+          f.source === 'secret' ||
+          f.source === 'entropy',
+      );
     // The single guardrail-action label for the durable/telemetry rows: an input
     // mask/redact wins, else the M17 in-stream action, else a buffered-output block.
     const reportedGuardrailAction =
@@ -3665,6 +3691,20 @@ async function handleProxy(
           unknown
         >;
         usage.ingestJson(parsedResp);
+        // A 200 whose BODY is an error object ({"error":…} / {"type":"error"…}) — an
+        // OpenAI-compatible or degraded-translated backend reporting failure in-band — is a
+        // failure, exactly like the streamed in-band-error frame: record it as an error and
+        // fault the breaker (it was previously booked as a $0 success and left cacheable).
+        // The raw bytes still reach the client unchanged; only our accounting changes.
+        if (!sawUpstreamError && statusCode < 400 && isNonStreamedErrorBody(parsedResp)) {
+          sawUpstreamError = true;
+          status = 'error';
+          ctx.breaker.recordFailure(servedTarget.name);
+          request.log.warn(
+            { target: servedTarget.name },
+            'upstream returned an in-band error body under a 200',
+          );
+        }
         if (toolGovern) toolCalls = extractToolCalls(parsedResp);
       } catch {
         /* unparseable body — still forwarded verbatim */
@@ -3987,6 +4027,13 @@ function isUpstreamErrorEvent(ev: { event?: string; data: string }): boolean {
   if (ev.event === 'error') return true;
   const head = ev.data.slice(0, 64);
   return /^\s*\{\s*"(type)"\s*:\s*"error"/.test(head) || /^\s*\{\s*"error"\s*:/.test(head);
+}
+
+/** True when a NON-streamed 2xx body is itself an error object (`{"error":…}` or
+ *  `{"type":"error"…}`) — the parsed-JSON analogue of isUpstreamErrorEvent, for a backend
+ *  that reports failure in-band under a 200. */
+function isNonStreamedErrorBody(body: Record<string, unknown>): boolean {
+  return body['type'] === 'error' || (typeof body['error'] === 'object' && body['error'] !== null);
 }
 
 /** A terminal SSE error event in the served provider's streaming dialect, so a

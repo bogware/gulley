@@ -1514,6 +1514,65 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     await new Promise<void>((r) => srv.close(() => r()));
   });
 
+  it('books a non-streamed 200 whose BODY is an error object as a failure (audit #11)', async () => {
+    // A backend (OpenAI-compatible, or a degraded translation) that reports failure
+    // in-band under a 200 was previously booked as a $0 success, left cacheable, and
+    // the breaker never heard the fault. It must be recorded as an error, fault the
+    // breaker, and never be cached — while the raw bytes still reach the client verbatim.
+    const ERR_BODY = JSON.stringify({
+      type: 'error',
+      error: { type: 'overloaded_error', message: 'in-band 200 error' },
+    });
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        void b;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(ERR_BODY);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+    const { store, token } = seededStore();
+    const { ctx, requestLog, breaker } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    const failSpy = vi.spyOn(breaker, 'recordFailure');
+    const storeSpy = vi.spyOn(ctx.cache, 'store');
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', srvUrl) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+    // Raw byte fidelity: the client still receives the upstream body verbatim (200).
+    expect(res.status).toBe(200);
+    expect(text).toBe(ERR_BODY);
+    // But our accounting books it as a failure and tags the request-log row.
+    expect(requestLog.entries[0]?.status).toBe('error');
+    expect(requestLog.entries[0]?.attributes?.['upstreamErrorFrame']).toBe(true);
+    // The breaker hears the upstream fault, so repeated in-band errors can trip it.
+    expect(failSpy).toHaveBeenCalledWith('anthropic');
+    // And the error body is never cached (a later identical request must re-hit upstream).
+    expect(storeSpy).not.toHaveBeenCalled();
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+
   it('governs LLM tool calls: a denied call withholds the non-streamed response', async () => {
     const TOOL_RESP = JSON.stringify({
       id: 'msg_t',

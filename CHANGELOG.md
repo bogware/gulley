@@ -91,12 +91,32 @@ for the full findings and the remaining waves.
 - **The audit sanitizer recognizes Gulley's own credential formats**
   (`gk_`/`gko_at_`/`gko_rt_`/`gadm_`/`gses_`), so a raw Gulley token misplaced in a
   non-secret-named field is redacted, not only provider keys.
+- **Unkeyed secrets in an audit-only response are excluded from the cache.** The output
+  cache-sensitivity gate consulted the policy-*filtered* findings, so on the audit-only
+  path (guardrails detect but don't redact/buffer) an opaque bearer/session token or
+  generic API key — which the detectors emit *below* the cache-exclusion confidence gate
+  and which the policy floor then drops — slipped through, and a response echoing it could
+  be cached and replayed to another caller in the same authz scope. The gate now consults
+  the raw scanner findings on that path and treats any secret- or entropy-sourced finding
+  as too sensitive to cache, regardless of confidence.
+- **A 200 whose BODY is an error object is booked as a failure.** An OpenAI-compatible or
+  degraded cross-provider-translated backend that reports failure in-band under a 200
+  (`{"error":…}` / `{"type":"error"…}`) was recorded as a $0 success, left cacheable, and
+  never reached the circuit breaker — the non-streamed analogue of the in-stream
+  error-frame handling. It is now recorded as an error, faults the breaker, and is excluded
+  from the cache; the raw bytes still reach the client verbatim.
 
 ### Fixed
 
 - **Cross-family SSE translators (OpenAI→Anthropic, Gemini→Anthropic) decode UTF-8 across
   chunk boundaries** — a multi-byte code point split between two upstream chunks is no
   longer corrupted to U+FFFD in the client-visible text.
+- **A non-streamed hedge loser is metered at worst case.** When a hedged race is won by the
+  other leg, a *non-streamed* loser has already had its whole (billed) body generated
+  upstream before its headers arrived, yet its bytes are discarded — so it was booked at
+  $0. It is now charged worst-case beside the served leg, honoring "always meter partial
+  spend on abort/failover". A *streamed* loser is still aborted right after headers and not
+  charged (its worst-case would grossly over-bill), matching the existing cascade metering.
 - **Admin console.** The FinOps chargeback CSV export quotes/escapes every field and
   neutralizes spreadsheet-formula injection on the attribution key; config **Apply**
   confirms, disables while in flight, and refuses an unknown base version (no more `?? 0`
