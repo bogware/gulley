@@ -9,9 +9,21 @@ import { loadCatalogFromFile } from '@gulley/catalog';
 import { GULLEY_BUILD } from '@gulley/core';
 import type { RateResolver } from '@gulley/cost';
 import { assertEgressAllowed, pinnedFetch, setAirGappedEgress } from '@gulley/egress';
-import { EntraGraphIdp } from '@gulley/oauth';
+import { EntraGraphIdp, FederationVerifier } from '@gulley/oauth';
 import { OidcProvider } from '@gulley/oidc';
-import { createListenConnection, PostgresConfigBus, purgeExpiredOAuthCodes } from '@gulley/storage';
+import {
+  createListenConnection,
+  MAINTENANCE_LOCK,
+  PostgresConfigBus,
+  purgeExpiredGrants,
+  purgeExpiredOAuthCodes,
+  sessionCostStats,
+  withAdvisoryXactLock,
+} from '@gulley/storage';
+import { RunawayDetector } from './runaway-detector';
+import { AlertDispatcher } from '@gulley/alerts';
+import { buildAlertSink } from './alerts';
+import { KeyExpirySweeper, type KeyExpirySweepResult } from './key-expiry';
 import { S3AuditMirror } from '@gulley/worm';
 import pino from 'pino';
 import { type Anchor, HttpAnchor } from './anchor';
@@ -19,14 +31,22 @@ import { buildSiemConnector, type SiemConnector } from './siem';
 import { type EvalRunner, GatewayEvalRunner } from './eval-runner';
 import { buildGatewayMetricsProvider } from './gateway-metrics';
 import { signCtxAttestation } from './audit-signing';
-import { type Config, loadConfig, outboundAllowlist, sessionSecrets } from './config';
+import {
+  type Config,
+  loadConfig,
+  outboundAllowlist,
+  sessionSecrets,
+  workloadFederations,
+} from './config';
 import {
   type ControlContext,
   createInMemoryControlContext,
   type InMemoryContextOptions,
   type OidcSessionConfig,
+  type SamlSessionConfig,
 } from './context';
-import { parseRoleMap } from './oidc-gate';
+import { parseRoleMap } from './sso';
+import { readFileSync } from 'node:fs';
 import { buildServer, LOG_REDACT_PATHS } from './server';
 import {
   anthropicAdminUsageSource,
@@ -148,6 +168,59 @@ function buildEvalRunner(config: Config, warn: (msg: string) => void): EvalRunne
  * lets the admin console + OIDC gate run for real in dev. Returns undefined when
  * no admin credentials are configured (the server then boots health-only).
  */
+/** An inline PEM/value or the contents of its `_FILE` twin (trimmed); undefined when
+ *  neither is set. */
+function inlineOrFile(inline: string | undefined, file: string | undefined): string | undefined {
+  if (inline) return inline;
+  if (file) return readFileSync(file, 'utf8').trim();
+  return undefined;
+}
+
+/**
+ * SAML 2.0 session-gate config from env (validated as a set by config.ts's refine).
+ * The IdP entry point is a browser redirect, not a server egress, so it needs no
+ * outbound allowlisting. Several PEM certificates in SAML_IDP_CERT(_FILE) are split
+ * so a key rollover can list the old and the new one.
+ */
+function buildSaml(config: Config): SamlSessionConfig | undefined {
+  if (!config.SAML_ENABLED) return undefined;
+  const certRaw = inlineOrFile(config.SAML_IDP_CERT, config.SAML_IDP_CERT_FILE);
+  if (
+    !certRaw ||
+    !config.SAML_IDP_ENTRY_POINT ||
+    !config.SAML_IDP_ISSUER ||
+    !config.SAML_SP_ENTITY_ID ||
+    !config.SAML_SP_CALLBACK_URL
+  ) {
+    return undefined; // config.ts already refused this combination
+  }
+  // An inline PEM from an env file often arrives with literal "\n" escapes.
+  const unescaped = certRaw.includes('-----') ? certRaw.replace(/\\n/g, '\n') : certRaw;
+  const certs = unescaped.match(/-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----/g) ?? [
+    unescaped,
+  ];
+  const spPrivateKey = inlineOrFile(config.SAML_SP_PRIVATE_KEY, config.SAML_SP_PRIVATE_KEY_FILE);
+  const spCert = inlineOrFile(config.SAML_SP_CERT, config.SAML_SP_CERT_FILE);
+  return {
+    entryPoint: config.SAML_IDP_ENTRY_POINT,
+    idpIssuer: config.SAML_IDP_ISSUER,
+    idpCert: certs.length === 1 ? certs[0]! : certs,
+    spEntityId: config.SAML_SP_ENTITY_ID,
+    callbackUrl: config.SAML_SP_CALLBACK_URL,
+    ...(spPrivateKey ? { spPrivateKey: spPrivateKey.replace(/\\n/g, '\n') } : {}),
+    ...(spCert ? { spCert: spCert.replace(/\\n/g, '\n') } : {}),
+    groupsAttribute: config.SAML_GROUPS_ATTRIBUTE,
+    subjectAttribute: config.SAML_SUBJECT_ATTRIBUTE,
+    roleRules: parseRoleMap(config.SAML_ROLE_MAP),
+    postLoginRedirect: config.SAML_POST_LOGIN_REDIRECT,
+    cookieSecure: config.SAML_COOKIE_SECURE,
+    allowIdpInitiated: config.SAML_ALLOW_IDP_INITIATED,
+    wantAssertionsSigned: config.SAML_WANT_ASSERTIONS_SIGNED,
+    wantResponseSigned: config.SAML_WANT_RESPONSE_SIGNED,
+    acceptedClockSkewMs: config.SAML_CLOCK_SKEW_MS,
+  };
+}
+
 function buildContext(config: Config): ControlContext | undefined {
   const secrets = sessionSecrets(config);
   if (secrets.length === 0 && !config.CONTROL_API_BOOTSTRAP_ENABLED) return undefined;
@@ -185,6 +258,8 @@ function buildContext(config: Config): ControlContext | undefined {
       fetchImpl: pinnedFetch(),
     };
   }
+
+  const saml = buildSaml(config);
 
   // Config propagation: emit a NOTIFY on a successful apply so gateway replicas
   // reconcile live. Emit-only (never .start()); a dedicated connection just carries
@@ -239,6 +314,8 @@ function buildContext(config: Config): ControlContext | undefined {
     providerUsageSources,
     shadowSpendFlagBps: config.SHADOW_SPEND_FLAG_BPS,
     oidc,
+    saml,
+    onRoleLoadError: (err) => log.warn({ err }, 'role catalogue load failed (stale snapshot kept)'),
     databaseUrl: config.DATABASE_URL,
     dbConnectTimeoutMs: config.DB_CONNECT_TIMEOUT_MS,
     notifier: configBus,
@@ -248,6 +325,8 @@ function buildContext(config: Config): ControlContext | undefined {
     worm: buildWorm(config, auditSigner, bootWarn),
     anchor: buildAnchor(config),
     siem: buildSiem(config, bootWarn),
+    // Alert channels (SSRF-guarded at construction; a bad channel fails boot).
+    alerts: buildAlertSink(config, { log }),
     // Mask-vault reveal decryptor — the SAME envelope key the gateway used (KMS in
     // prod; the in-memory dev cipher only decrypts records written in-process).
     maskVaultEncryptor: config.MASK_VAULT_ENABLED
@@ -280,6 +359,8 @@ function buildContext(config: Config): ControlContext | undefined {
             refreshTtlMs: config.OAUTH_REFRESH_TTL_MS,
             absoluteTtlMs: config.OAUTH_ABSOLUTE_TTL_MS,
             deviceCodeTtlMs: config.OAUTH_DEVICE_CODE_TTL_MS,
+            // Workload identity (K8s / GitHub Actions → scoped service tokens).
+            federation: buildFederationVerifier(config),
             // Real Entra revoke-on-deprovision when Graph app creds are configured.
             ...(config.ENTRA_TENANT_ID &&
             config.ENTRA_GRAPH_CLIENT_ID &&
@@ -310,6 +391,29 @@ function buildContext(config: Config): ControlContext | undefined {
         { err, subject, event: 'membership_loader_failed' },
         'durable membership loader failed; session limited to token memberships',
       ),
+  });
+}
+
+/**
+ * Workload identity federation verifier (RFC 7523 JWT-bearer) from WORKLOAD_FEDERATIONS.
+ * Discovery/JWKS fetches of a public issuer (GitHub Actions, a cloud-hosted cluster's
+ * OIDC issuer) go through the SSRF/air-gap egress guard AND the DNS-pinned fetch like
+ * every other control-plane outbound; a federation marked `allowInternal` (an in-cluster
+ * Kubernetes API server on a cluster IP) bypasses both for ITS URLs only. Production
+ * requires https issuers/JWKS endpoints (validated at config load).
+ */
+function buildFederationVerifier(config: Config): FederationVerifier | undefined {
+  const federations = workloadFederations(config);
+  if (federations.length === 0) return undefined;
+  const allowlist = outboundAllowlist(config);
+  return new FederationVerifier({
+    federations,
+    fetchFor: (fed) => (fed.allowInternal ? fetch : pinnedFetch()),
+    assertEgress: (url, fed) => {
+      if (!fed.allowInternal) assertEgressAllowed(url, { allowlist });
+    },
+    requireHttps: config.NODE_ENV === 'production',
+    fetchTimeoutMs: config.OIDC_FETCH_TIMEOUT_MS,
   });
 }
 
@@ -374,6 +478,7 @@ if (!context) {
   app.log.info(
     {
       oidc: Boolean(context.oidc),
+      saml: Boolean(context.saml),
       durable: Boolean(context.db),
       oauthBroker: Boolean(context.oauthBroker),
     },
@@ -453,7 +558,9 @@ if (context?.siemExporter) {
     .catch((err: unknown) => app.log.error({ err }, 'SIEM seed failed'));
 }
 
-// OAuth-ephemera retention: periodically reclaim expired device_code / auth_code rows.
+// OAuth-ephemera retention: periodically reclaim expired device_code / auth_code rows
+// and oauth_grant families past their absolute + access expiry (workload JWT-bearer
+// grants are access-only and short-lived, so a busy cluster leaves many per hour).
 // Expiry is enforced at read/consume time, so this is pure space reclamation for a
 // long-lived broker deployment. Unref'd + best-effort. Only in DB mode with the broker on.
 let oauthSweepTimer: NodeJS.Timeout | undefined;
@@ -461,16 +568,110 @@ let hydrateTimer: NodeJS.Timeout | undefined;
 if (context?.db && context.oauthBroker && config.OAUTH_EPHEMERA_SWEEP_INTERVAL_SECONDS > 0) {
   const sweepDb = context.db;
   const tick = (): void => {
-    void purgeExpiredOAuthCodes(sweepDb)
-      .then((r) => {
-        if (r.deviceCodes + r.authCodes > 0)
-          app.log.info(r, 'swept expired OAuth device/auth codes');
+    void Promise.all([purgeExpiredOAuthCodes(sweepDb), purgeExpiredGrants(sweepDb)])
+      .then(([r, grants]) => {
+        if (r.deviceCodes + r.authCodes + grants > 0)
+          app.log.info({ ...r, grants }, 'swept expired OAuth device/auth codes and grants');
       })
       .catch((err: unknown) => app.log.error({ err }, 'OAuth-ephemera sweep failed'));
   };
   oauthSweepTimer = setInterval(tick, config.OAUTH_EPHEMERA_SWEEP_INTERVAL_SECONDS * 1000);
   oauthSweepTimer.unref();
   tick();
+}
+
+if (context?.alerts instanceof AlertDispatcher) {
+  app.log.info({ channels: context.alerts.describe() }, 'alert channels configured');
+}
+
+// Key-expiry alerts: announce virtual keys expiring within ALERT_KEY_EXPIRY_DAYS (and
+// once they lapse) to the alert channels + the audit trail. One replica per tick in DB
+// mode (advisory lock); the announced set is per process (docs/ALERTING.md). Unref'd.
+let keyExpiryTimer: NodeJS.Timeout | undefined;
+if (context && config.ALERT_KEY_EXPIRY_SWEEP_INTERVAL_SECONDS > 0) {
+  const ctx = context;
+  const db = ctx.db;
+  const intervalMs = config.ALERT_KEY_EXPIRY_SWEEP_INTERVAL_SECONDS * 1000;
+  const sweeper = new KeyExpirySweeper({
+    keys: ctx.keys,
+    audit: ctx.audit,
+    alerts: ctx.alerts,
+    orgIdOf: (workspaceId) => ctx.workspaces.get(workspaceId)?.orgId ?? null,
+    withinDays: config.ALERT_KEY_EXPIRY_DAYS,
+    expiredLookbackMs: Math.max(2 * intervalMs, 3_600_000),
+    ...(db
+      ? {
+          lock: (fn: () => Promise<KeyExpirySweepResult>) =>
+            withAdvisoryXactLock(db, MAINTENANCE_LOCK.keyExpiryAlert, fn),
+        }
+      : {}),
+  });
+  const tick = (): void => {
+    sweeper
+      .sweep()
+      .then((r) => {
+        if (r.expiring + r.expired > 0) app.log.info(r, 'key-expiry sweep announced');
+      })
+      .catch((err: unknown) => app.log.error({ err }, 'key-expiry sweep failed'));
+  };
+  keyExpiryTimer = setInterval(tick, intervalMs);
+  keyExpiryTimer.unref();
+  app.log.info(
+    { intervalMs, withinDays: config.ALERT_KEY_EXPIRY_DAYS, durable: Boolean(db) },
+    'key-expiry sweep started',
+  );
+  tick();
+}
+
+// Runaway-session detector (K5): score the sessions active in the last window against
+// their principal's / the scope's per-session spend baseline and flag or block the
+// outliers (session_block rows the gateway refuses). DB mode only; one replica per tick
+// (advisory lock); unref'd + best-effort. The first pass runs shortly after boot.
+let runawayTimer: NodeJS.Timeout | undefined;
+if (context?.db && context.sessionBlocks && config.RUNAWAY_DETECTOR_INTERVAL_SECONDS > 0) {
+  const detectorDb = context.db;
+  const detector = new RunawayDetector(
+    {
+      windowMinutes: config.RUNAWAY_WINDOW_MINUTES,
+      baselineDays: config.RUNAWAY_BASELINE_DAYS,
+      minCostUsd: config.RUNAWAY_MIN_COST_USD,
+      action: config.RUNAWAY_ACTION,
+      blockTtlMinutes: config.RUNAWAY_BLOCK_TTL_MINUTES,
+    },
+    {
+      stats: (w) => sessionCostStats(detectorDb, w),
+      blocks: context.sessionBlocks,
+      audit: context.audit,
+      alerts: context.alerts,
+      withLock: (fn) => withAdvisoryXactLock(detectorDb, MAINTENANCE_LOCK.runawayDetector, fn),
+      log: app.log,
+    },
+  );
+  const tick = (): void => {
+    detector
+      .tick()
+      .then((r) => {
+        if (r.runaway.length > 0)
+          app.log.warn(
+            { evaluated: r.evaluated, runaway: r.runaway.length, action: config.RUNAWAY_ACTION },
+            'runaway sessions detected',
+          );
+      })
+      .catch((err: unknown) => app.log.error({ err }, 'runaway detector tick failed'));
+  };
+  runawayTimer = setInterval(tick, config.RUNAWAY_DETECTOR_INTERVAL_SECONDS * 1000);
+  runawayTimer.unref();
+  app.log.info(
+    {
+      intervalSeconds: config.RUNAWAY_DETECTOR_INTERVAL_SECONDS,
+      action: config.RUNAWAY_ACTION,
+      windowMinutes: config.RUNAWAY_WINDOW_MINUTES,
+      baselineDays: config.RUNAWAY_BASELINE_DAYS,
+      minCostUsd: config.RUNAWAY_MIN_COST_USD,
+    },
+    'runaway-session detector started',
+  );
+  setTimeout(tick, 5_000).unref();
 }
 
 async function start(): Promise<void> {
@@ -540,7 +741,13 @@ async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 
   if (siemTimer) clearInterval(siemTimer);
   if (oauthSweepTimer) clearInterval(oauthSweepTimer);
   if (hydrateTimer) clearInterval(hydrateTimer);
+  if (runawayTimer) clearInterval(runawayTimer);
+  if (keyExpiryTimer) clearInterval(keyExpiryTimer);
   await settle('http-close', () => app.close());
+  // Let queued alert deliveries finish (bounded) before the process goes away.
+  await settle('alert-drain', () =>
+    context?.alerts instanceof AlertDispatcher ? context.alerts.drain(2_000) : undefined,
+  );
   await settle('config-bus', () => configBus?.close());
   clearTimeout(backstop);
   app.log.info({ signal }, 'drained');

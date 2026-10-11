@@ -5,6 +5,8 @@ import type {
   DeviceCodeStore,
   DeviceStatus,
   Grant,
+  GrantKind,
+  GrantScope,
   GrantStore,
   OAuthClient,
   OAuthClientStore,
@@ -26,6 +28,43 @@ import { affectedRows } from './affected-rows';
 const ms = (d: Date | null): number => (d ? d.getTime() : 0);
 const dt = (n: number): Date => new Date(n);
 
+/** The stored scope column → GrantScope (tolerant of a malformed/legacy value). */
+function readScope(raw: unknown): GrantScope | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const s = raw as Record<string, unknown>;
+  const list = (v: unknown): readonly string[] | '*' | undefined =>
+    v === '*'
+      ? '*'
+      : Array.isArray(v)
+        ? v.filter((x): x is string => typeof x === 'string')
+        : undefined;
+  const providers = list(s['allowedProviders']);
+  const models = list(s['allowedModels']);
+  if (providers === undefined || models === undefined) return undefined;
+  const groups = Array.isArray(s['groups'])
+    ? (s['groups'] as unknown[]).filter((x): x is string => typeof x === 'string')
+    : undefined;
+  return { allowedProviders: providers, allowedModels: models, ...(groups ? { groups } : {}) };
+}
+
+/** The federation-related columns of a grant row → Grant fields. */
+function identityFields(r: {
+  kind: string;
+  federation: string | null;
+  subject: string | null;
+  scope: unknown;
+  onBehalfOf: boolean;
+}): Pick<Grant, 'kind' | 'federation' | 'subject' | 'scope' | 'onBehalfOf'> {
+  const scope = readScope(r.scope);
+  return {
+    kind: (r.kind === 'service' ? 'service' : 'user') as GrantKind,
+    ...(r.federation ? { federation: r.federation } : {}),
+    ...(r.subject ? { subject: r.subject } : {}),
+    ...(scope ? { scope } : {}),
+    ...(r.onBehalfOf ? { onBehalfOf: true } : {}),
+  };
+}
+
 /** Durable token-family store. Mirrors InMemoryGrantStore; `rotate` uses a
  *  generation-guarded UPDATE for optimistic concurrency (a lost race updates 0 rows). */
 export class PostgresGrantStore implements GrantStore {
@@ -46,6 +85,17 @@ export class PostgresGrantStore implements GrantStore {
       prevRefreshTokenHash: g.prevRefreshTokenHash,
       refreshGeneration: g.refreshGeneration,
       absoluteExpiresAt: dt(g.absoluteExpiresAt),
+      kind: g.kind ?? 'user',
+      federation: g.federation ?? null,
+      subject: g.subject ?? null,
+      scope: g.scope
+        ? {
+            allowedProviders: g.scope.allowedProviders,
+            allowedModels: g.scope.allowedModels,
+            ...(g.scope.groups ? { groups: [...g.scope.groups] } : {}),
+          }
+        : null,
+      onBehalfOf: g.onBehalfOf === true,
     });
   }
 
@@ -70,6 +120,7 @@ export class PostgresGrantStore implements GrantStore {
       prevRefreshTokenHash: r.prevRefreshTokenHash,
       refreshGeneration: r.refreshGeneration,
       absoluteExpiresAt: ms(r.absoluteExpiresAt),
+      ...identityFields(r),
     };
   }
 
@@ -79,6 +130,14 @@ export class PostgresGrantStore implements GrantStore {
       .set({ status: 'revoked' })
       .where(eq(oauthGrant.handle, handle));
     return affectedRows(res) > 0;
+  }
+
+  async revokeByPrincipal(principalId: string): Promise<number> {
+    const res = await this.db
+      .update(oauthGrant)
+      .set({ status: 'revoked' })
+      .where(and(eq(oauthGrant.principalId, principalId), eq(oauthGrant.status, 'active')));
+    return affectedRows(res);
   }
 
   async setAccess(handle: string, hash: string, expiresAt: number): Promise<void> {
@@ -129,6 +188,7 @@ export class PostgresGrantStore implements GrantStore {
       accessTokenExpiresAt: ms(r.accessTokenExpiresAt),
       refreshGeneration: r.refreshGeneration,
       absoluteExpiresAt: ms(r.absoluteExpiresAt),
+      ...identityFields(r),
     }));
   }
 }

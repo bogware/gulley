@@ -222,14 +222,29 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
     return revoked;
   };
 
-  /** Deprovision: delete the admin_user (cascading its grants), revoke its sessions and
-   *  audit — in ONE transaction in DB mode, so a crash cannot leave a deleted user with
-   *  no audit row (or live sessions). */
+  // The user's BROKERED token families (gko_at_ / gko_rt_ minted by the OAuth broker
+  // at a device/auth-code consent) are keyed on the same subject. Without this an
+  // offboarded user's coding agent kept a working refresh token until the Entra Graph
+  // check (if wired) or the 90-day absolute TTL. Revoked first, before the row goes, so
+  // a failed transaction can only leave an undeleted user WITHOUT tokens, never the reverse.
+  const revokeSubjectGrants = async (row: AdminUserRow): Promise<number> => {
+    if (!ctx.oauthBroker) return 0;
+    const subjects = [...new Set([row.subject, row.email].filter((x): x is string => !!x))];
+    let revoked = 0;
+    for (const subject of subjects) revoked += await ctx.oauthBroker.revokePrincipal(subject);
+    return revoked;
+  };
+
+  /** Deprovision: revoke the user's brokered grants, delete the admin_user (cascading
+   *  its role grants), revoke its sessions and audit — the latter three in ONE
+   *  transaction in DB mode, so a crash cannot leave a deleted user with no audit row
+   *  (or live sessions). */
   const deprovision = async (
     row: AdminUserRow,
     actor: string,
     via: string,
-  ): Promise<{ revokedSessions: number }> => {
+  ): Promise<{ revokedSessions: number; revokedGrants: number }> => {
+    const revokedGrants = await revokeSubjectGrants(row);
     if (ctx.durableAtomic) {
       return ctx.durableAtomic(async (tx) => {
         await tx.adminUsers.delete(row.id);
@@ -238,9 +253,9 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
           actor,
           action: 'scim.user.deprovision',
           target: row.id,
-          payload: { userName: row.subject, via, revokedSessions },
+          payload: { userName: row.subject, via, revokedSessions, revokedGrants },
         });
-        return { revokedSessions };
+        return { revokedSessions, revokedGrants };
       });
     }
     await users!.delete(row.id);
@@ -249,9 +264,9 @@ export function registerScimRoutes(app: FastifyInstance, ctx: ControlContext): v
       actor,
       action: 'scim.user.deprovision',
       target: row.id,
-      payload: { userName: row.subject, via, revokedSessions },
+      payload: { userName: row.subject, via, revokedSessions, revokedGrants },
     });
-    return { revokedSessions };
+    return { revokedSessions, revokedGrants };
   };
 
   app.post(

@@ -13,7 +13,36 @@ export const MAINTENANCE_LOCK = {
   maskVaultSweep: 5138008702,
   requestLogRetention: 5138008703,
   oauthEphemera: 5138008704,
+  /** Key-expiry alert sweep (control-api): one replica announces per tick. */
+  keyExpiryAlert: 5138008705,
+  /** K5 runaway-session detector (control-api): one replica evaluates per tick. */
+  runawayDetector: 5138008706,
+  /** Expired oauth_grant families (workload JWT-bearer grants are access-only and
+   *  short-lived, so they accumulate fast). */
+  oauthGrants: 5138008707,
 } as const;
+
+/**
+ * Run `fn` while holding a transaction-scoped advisory lock, so a fleet of replicas
+ * runs a periodic job once per tick: the first replica to take the lock does the
+ * work, the others resolve `undefined` immediately. The lock lives on the wrapping
+ * transaction's connection and is released at commit — a crashed replica can never
+ * wedge it. `fn` may run its own queries on the pool (they need not share the tx).
+ */
+export async function withAdvisoryXactLock<T>(
+  db: Database,
+  lockId: number,
+  fn: () => Promise<T>,
+): Promise<T | undefined> {
+  return db.transaction(async (tx) => {
+    const r = (await tx.execute(
+      sql`select pg_try_advisory_xact_lock(${lockId}) as locked`,
+    )) as unknown as Array<{ locked: boolean }> | { rows?: Array<{ locked: boolean }> };
+    const row = Array.isArray(r) ? r[0] : r.rows?.[0];
+    if (row && row.locked !== true) return undefined;
+    return fn();
+  });
+}
 
 export interface BatchSweepOptions {
   /** Rows per DELETE statement. Default 5000 — each batch stays well inside the

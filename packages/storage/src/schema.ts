@@ -149,6 +149,29 @@ export const spendLedger = pgTable(
   ],
 );
 
+// Session kill switch (K5 FinOps). A row blocks one agent session (the `session`
+// attribution tag — Claude Code's x-claude-code-session-id, or the operator's own
+// mapped header) in one workspace: the gateway refuses the session's requests with
+// 403 `session_blocked` while a non-expired row exists. Written by the runaway-session
+// detector (`source = 'runaway'`, TTL-bounded) or an operator (`source = 'manual'`).
+// The gateway reads a periodic snapshot (SessionBlockSnapshot), never per request.
+export const sessionBlock = pgTable(
+  'session_block',
+  {
+    workspaceId: uuid('workspace_id').notNull(),
+    session: text('session').notNull(),
+    reason: text('reason').notNull(),
+    source: text('source').notNull(), // 'runaway' | 'manual' (CHECK in migration 0029)
+    createdBy: text('created_by').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workspaceId, t.session] }),
+    index('session_block_expires_idx').on(t.expiresAt),
+  ],
+);
+
 // Per-request operational log. High write volume — bounded today by a batched
 // retention DELETE on created_at (REQUEST_LOG_RETENTION_DAYS, see retention.ts); a
 // later milestone time-partitions this and drops old partitions instead.
@@ -341,6 +364,23 @@ export const membership = pgTable(
   (t) => [index('membership_user_idx').on(t.userId)],
 );
 
+// Role catalogue (P11 custom roles). A row per role id; the five built-ins are
+// seeded by migration 0028 with builtin=true and are immutable through the API (the
+// permission engine resolves a built-in from code, so a hand-edited builtin row never
+// changes what `owner` can do). `permissions` is a JSON array of permission names
+// validated against @gulley/rbac's ALL_PERMISSIONS on write. org_id is carried for a
+// future per-org catalogue; v1 roles are platform-wide (NULL).
+export const role = pgTable('role', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  description: text('description'),
+  permissions: jsonb('permissions').$type<string[]>().notNull(),
+  builtin: boolean('builtin').notNull().default(false),
+  orgId: uuid('org_id'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 // SCIM 2.0 Groups: an IdP-provisioned group. Its displayName maps (via
 // SCIM_GROUP_ROLE_MAP) to a role, and each member gets that role granted as a
 // `membership` row — so an Entra Enterprise-App group assignment provisions RBAC.
@@ -378,7 +418,7 @@ export const adminSession = pgTable(
     jti: uuid('jti').primaryKey(),
     tokenHash: text('token_hash').notNull().default(''),
     subject: text('subject').notNull(),
-    // How the session was minted: 'exchange' | 'oidc' | 'break-glass' (console list).
+    // How the session was minted: 'exchange' | 'oidc' | 'saml' | 'break-glass' (console list).
     source: text('source').notNull().default('exchange'),
     revoked: boolean('revoked').notNull().default(false),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -533,22 +573,37 @@ export const guardrail = pgTable(
   (t) => [uniqueIndex('guardrail_workspace_name_idx').on(t.workspaceId, t.name)],
 );
 
-// Per-workspace spend cap (micro-USD). period_seconds null = lifetime cap.
+// Spend caps (micro-USD) — hierarchical since 0.7 (K4). One row caps ONE entity:
+//   scope_kind='workspace' (the pre-0.7 row; scope_id = the workspace id),
+//   scope_kind='org' (workspace_id NULL; scope_id = the org id),
+//   scope_kind in key|user|team|project within a workspace (scope_id = the entity id,
+//   or '*' for the DEFAULT covering every entity of that kind without its own row).
+// `windows` is the multi-window spec [{capMicroUsd, period}] (period: none | daily |
+// weekly | monthly | {seconds}); NULL means the legacy single cap in cap_micro_usd /
+// period_seconds (a fixed window from first spend; null period = lifetime).
 export const budget = pgTable(
   'budget',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    workspaceId: uuid('workspace_id')
-      .notNull()
-      .references(() => workspace.id, { onDelete: 'cascade' }),
-    // Config-document entity name (singular per workspace; 'default' by convention).
-    // Carried so a GitOps round-trip preserves the authored name.
+    workspaceId: uuid('workspace_id').references(() => workspace.id, { onDelete: 'cascade' }),
+    // Config-document entity name. Carried so a GitOps round-trip preserves the
+    // authored name.
     name: text('name').notNull().default('default'),
+    scopeKind: text('scope_kind').notNull().default('workspace'),
+    scopeId: text('scope_id').notNull(),
     capMicroUsd: bigint('cap_micro_usd', { mode: 'number' }).notNull(),
     periodSeconds: integer('period_seconds'),
+    windows: jsonb('windows'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [uniqueIndex('budget_workspace_idx').on(t.workspaceId)],
+  (t) => [
+    uniqueIndex('budget_scope_idx')
+      .on(t.workspaceId, t.scopeKind, t.scopeId)
+      .where(sql`${t.workspaceId} is not null`),
+    uniqueIndex('budget_org_scope_idx')
+      .on(t.scopeKind, t.scopeId)
+      .where(sql`${t.workspaceId} is null`),
+  ],
 );
 
 // --- M5.2 OAuth broker -----------------------------------------------------
@@ -591,10 +646,24 @@ export const oauthGrant = pgTable(
     refreshGeneration: integer('refresh_generation').notNull().default(0),
     absoluteExpiresAt: timestamp('absolute_expires_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    // Workload identity federation (migration 0030): 'user' (consented device /
+    // auth-code family) or 'service' (RFC 7523 JWT-bearer exchange — access-only).
+    kind: text('kind').notNull().default('user'),
+    // Service grants: the federation (trust configuration) + the verified assertion sub.
+    federation: text('federation'),
+    subject: text('subject'),
+    // Stored data-plane scope ({ allowedProviders, allowedModels, groups? }); null on
+    // user grants (resolved as '*').
+    scope: jsonb('scope'),
+    // Service grants: may this principal assert an end user via x-user-id?
+    onBehalfOf: boolean('on_behalf_of').notNull().default(false),
   },
   (t) => [
     index('oauth_grant_client_idx').on(t.clientId),
     index('oauth_grant_created_idx').on(t.createdAt),
+    // Backs revoke-by-principal (SCIM deprovision) and the expired-grant sweep.
+    index('oauth_grant_principal_idx').on(t.principalId),
+    index('oauth_grant_absolute_expires_idx').on(t.absoluteExpiresAt),
   ],
 );
 

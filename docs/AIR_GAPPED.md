@@ -13,8 +13,9 @@ is allow-listed implicitly.
 Two ways an outbound call stays reachable under air-gap:
 
 - **control-api**: it targets a host on `OUTBOUND_HOST_ALLOWLIST` (WORM/SIEM/anchor/
-  shadow-spend/eval-runner/OIDC/Entra and provider base URLs registered through the
-  console). This knob exists only on the control-api.
+  shadow-spend/eval-runner/OIDC/Entra, the `ALERT_CHANNELS` sinks — Slack/Teams/webhook
+  hosts, `events.pagerduty.com`, the SMTP host — and provider base URLs registered
+  through the console). This knob exists only on the control-api.
 - **gateway**: it uses a feature's `*_ALLOW_INTERNAL` bypass
   (`GUARDRAILS_WEBHOOK_ALLOW_INTERNAL`, `EXTERNAL_AUTHZ_ALLOW_INTERNAL`,
   `REQUEST_MIRROR_ALLOW_INTERNAL`) pointed at an internal host. The gateway has **no**

@@ -60,6 +60,7 @@ export class GatewayMetrics {
   private readonly saved: Counter;
   private readonly unpriced: Counter;
   private readonly budgetAlerts: Counter;
+  private readonly budgetRejections: Counter;
   private readonly breakerStateChanges: Counter;
   private readonly hedges: Counter;
   private readonly classifierCost: Counter;
@@ -116,7 +117,11 @@ export class GatewayMetrics {
     );
     this.budgetAlerts = this.registry.counter(
       'gulley_budget_alerts_total',
-      'Soft-threshold budget alerts fired, by threshold.',
+      'Budget alerts fired, by threshold (1 = the hard rejection).',
+    );
+    this.budgetRejections = this.registry.counter(
+      'gulley_budget_rejections_total',
+      'Requests refused with 402 by the scope kind of the binding budget (workspace|org|key|user|team|project|model|attr).',
     );
     this.breakerStateChanges = this.registry.counter(
       'gulley_breaker_state_changes_total',
@@ -289,6 +294,11 @@ export class GatewayMetrics {
 
   recordBudgetAlert(threshold: number): void {
     this.budgetAlerts.inc({ threshold: String(threshold) });
+  }
+
+  /** A 402 budget rejection, by the kind of the scope that bound (bounded label set). */
+  recordBudgetRejection(scopeKind: string): void {
+    this.budgetRejections.inc({ scope_kind: scopeKind });
   }
 
   /** A circuit-breaker state transition (the key resiliency signal — a dead upstream

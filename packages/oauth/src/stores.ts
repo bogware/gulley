@@ -1,8 +1,23 @@
 export type GrantStatus = 'active' | 'revoked';
 
+/** Who a grant was issued to: a human who consented (device / auth-code flow) or a
+ *  workload admitted by a federation (RFC 7523 JWT-bearer exchange). */
+export type GrantKind = 'user' | 'service';
+
+/** The data-plane scope stored on a grant. User grants (legacy rows) carry none and
+ *  resolve to the client tenancy with `'*'` providers/models; service grants carry
+ *  the federation's scope verbatim. */
+export interface GrantScope {
+  allowedProviders: readonly string[] | '*';
+  allowedModels: readonly string[] | '*';
+  groups?: readonly string[];
+}
+
 /** One row per token family. Rotation advances `refreshGeneration` and moves the
  *  current refresh hash into `prevRefreshTokenHash` so a single-step reuse of the
- *  superseded token can be distinguished (→ revoke) from a forged/unknown one. */
+ *  superseded token can be distinguished (→ revoke) from a forged/unknown one.
+ *  A `service` grant is ACCESS-ONLY: `refreshTokenHash` is null, `absoluteExpiresAt`
+ *  equals the access expiry, and a refresh attempt is always `invalid_grant`. */
 export interface Grant {
   handle: string;
   clientId: string;
@@ -17,6 +32,15 @@ export interface Grant {
   prevRefreshTokenHash: string | null;
   refreshGeneration: number;
   absoluteExpiresAt: number;
+  kind: GrantKind;
+  /** Service grants: the workload federation (trust configuration) that admitted it. */
+  federation?: string;
+  /** Service grants: the verified assertion `sub` (the workload's identity). */
+  subject?: string;
+  /** Stored scope; absent on user grants (resolved as `'*'`). */
+  scope?: GrantScope;
+  /** Service grants: may this principal assert an end user via `x-user-id`? */
+  onBehalfOf?: boolean;
 }
 
 export interface RotateFields {
@@ -37,6 +61,10 @@ export interface GrantStore {
   /** Atomic compare-and-rotate: applies `next` only if the current generation is
    *  still `expectedGen` (optimistic concurrency). Returns false on a lost race. */
   rotate(handle: string, expectedGen: number, next: RotateFields): Promise<boolean>;
+  /** Revoke every ACTIVE family issued to `principalId` (an IdP/SCIM deprovision
+   *  must kill the user's brokered tokens, not only their admin sessions). Returns
+   *  the number of families revoked. */
+  revokeByPrincipal(principalId: string): Promise<number>;
 }
 
 export class InMemoryGrantStore implements GrantStore {
@@ -54,6 +82,16 @@ export class InMemoryGrantStore implements GrantStore {
     if (!g) return false;
     g.status = 'revoked';
     return true;
+  }
+  async revokeByPrincipal(principalId: string): Promise<number> {
+    let n = 0;
+    for (const g of this.byHandle.values()) {
+      if (g.principalId === principalId && g.status === 'active') {
+        g.status = 'revoked';
+        n++;
+      }
+    }
+    return n;
   }
   async setAccess(handle: string, hash: string, expiresAt: number): Promise<void> {
     const g = this.byHandle.get(handle);

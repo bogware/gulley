@@ -1,13 +1,14 @@
 import { err, ok, type Result } from '@gulley/core';
-import { type AdminPrincipal, isRole, type Membership } from '@gulley/rbac';
+import { type AdminPrincipal, isRoleId, type Membership } from '@gulley/rbac';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 /** How a session was minted. `exchange` = an admin delegated a scoped token
  *  (its memberships are the whole authority — the durable loader is NOT unioned in,
- *  so a delegated token can never widen to the minter's other grants); `oidc` = SSO
- *  login; `break-glass` = the audited bootstrap elevation. Tokens minted before this
- *  claim existed carry none and resolve as `legacy`. */
-export type AdminSessionSource = 'exchange' | 'oidc' | 'break-glass' | 'legacy';
+ *  so a delegated token can never widen to the minter's other grants); `oidc` /
+ *  `saml` = SSO login through the respective gate; `break-glass` = the audited
+ *  bootstrap elevation. Tokens minted before this claim existed carry none and
+ *  resolve as `legacy`. */
+export type AdminSessionSource = 'exchange' | 'oidc' | 'saml' | 'break-glass' | 'legacy';
 
 export interface AdminSessionClaims {
   /** subject (Entra oid, or the minting admin's own subject for a delegated token). */
@@ -106,11 +107,19 @@ export function verifyAdminSession(
   if (nowSec < claims.iat - 60) return err('not-yet-valid');
   if (nowSec >= claims.exp) return err('expired');
 
+  // A membership's role is an id: a built-in name OR a custom role id. Only the
+  // syntax is checked here — whether the id resolves to a role (and to which
+  // permissions) is decided at check time by the role resolver, so a deleted custom
+  // role simply grants nothing rather than invalidating the whole session.
   const memberships = (Array.isArray(claims.memberships) ? claims.memberships : []).filter(
-    (m): m is Membership => !!m && isRole((m as Membership).role),
+    (m): m is Membership =>
+      !!m && isRoleId((m as Membership).role) && typeof (m as Membership).orgId === 'string',
   );
   const source: AdminSessionSource =
-    claims.src === 'exchange' || claims.src === 'oidc' || claims.src === 'break-glass'
+    claims.src === 'exchange' ||
+    claims.src === 'oidc' ||
+    claims.src === 'saml' ||
+    claims.src === 'break-glass'
       ? claims.src
       : 'legacy';
   return ok({

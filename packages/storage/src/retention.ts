@@ -1,4 +1,4 @@
-import { inArray, lt } from 'drizzle-orm';
+import { inArray, lt, sql } from 'drizzle-orm';
 import { affectedRows } from './affected-rows';
 import type { Database } from './db';
 import { deleteExpiredBatch, MAINTENANCE_LOCK, sweepInBatches } from './maintenance';
@@ -73,6 +73,24 @@ export async function purgeExpiredOAuthCodes(
     deleteExpiredBatch(tx, 'auth_code', 'expires_at', now, n),
   );
   return { deviceCodes: dc.removed, authCodes: ac.removed };
+}
+
+/**
+ * Delete `oauth_grant` families that can no longer authenticate anything: past their
+ * absolute expiry AND past their last access-token expiry (a refresh just before the
+ * absolute deadline can mint an access token that outlives it, so both are checked).
+ * Revoked rows are swept on the same rule. Workload (JWT-bearer) grants are access-only
+ * with a TTL of at most a day, so a busy cluster accumulates many rows per hour; the
+ * user families join once their 90-day window has passed. Returns rows removed.
+ */
+export async function purgeExpiredGrants(db: Database, now: Date = new Date()): Promise<number> {
+  const r = await sweepInBatches(db, { lockId: MAINTENANCE_LOCK.oauthGrants }, async (tx, n) => {
+    const res = await tx.execute(
+      sql`delete from oauth_grant where ctid in (select ctid from oauth_grant where absolute_expires_at < ${now} and coalesce(access_token_expires_at, absolute_expires_at) < ${now} limit ${n})`,
+    );
+    return affectedRows(res);
+  });
+  return r.removed;
 }
 
 /** Days → the absolute cutoff instant, for {@link purgeRequestLogsOlderThan}. */

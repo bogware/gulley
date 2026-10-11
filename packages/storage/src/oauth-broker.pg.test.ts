@@ -96,7 +96,7 @@ async function issue(
   const tok = await b.tokenDeviceCode(da.value.device_code, clientId);
   expect(tok.ok).toBe(true);
   if (!tok.ok) throw new Error('token failed');
-  return { access: tok.value.access_token, refresh: tok.value.refresh_token };
+  return { access: tok.value.access_token, refresh: tok.value.refresh_token! };
 }
 
 describe('OAuth broker over durable Postgres stores (pglite)', () => {

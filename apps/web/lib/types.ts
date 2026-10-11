@@ -218,6 +218,63 @@ export interface ShadowSpendReport {
   [k: string]: unknown;
 }
 
+// --- finops: per-agent cost tree + session kill switch (K5) ---
+export interface AgentCostTotals {
+  requests: number;
+  legs: number;
+  inputTokens: number;
+  outputTokens: number;
+  costMicroUsd: number;
+  cacheSavedMicroUsd: number;
+  compactionMicroUsd: number;
+  subagentMicroUsd: number;
+}
+export interface AgentNode extends AgentCostTotals {
+  ccAgent: string;
+  ccParentAgent: string | null;
+  children: AgentNode[];
+}
+export interface PromptNode extends AgentCostTotals {
+  prompt: string | null;
+  direct: AgentCostTotals;
+  agents: AgentNode[];
+}
+export interface SessionNode extends AgentCostTotals {
+  workspaceId: string | null;
+  session: string;
+  principalId: string | null;
+  firstAt: string;
+  lastAt: string;
+  prompts: PromptNode[];
+}
+export interface AgentTreeQuery {
+  workspaceId?: string;
+  from?: string;
+  to?: string;
+  session?: string;
+}
+export interface AgentTreeResponse {
+  tree: SessionNode[];
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+export interface FocusExportQuery {
+  workspaceId?: string;
+  from?: string;
+  to?: string;
+  cursor?: string;
+}
+export interface SessionBlock {
+  workspaceId: string;
+  session: string;
+  reason: string;
+  source: 'runaway' | 'manual';
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string | null;
+}
+
 // --- eval rollouts ---
 export interface EvalSuite {
   id: string;
@@ -270,6 +327,21 @@ export interface Membership {
   role: string;
   orgId: string;
   workspaceId?: string | null;
+}
+/** A role from GET /roles: the five built-ins (immutable) or a custom role. */
+export interface RoleDefinition {
+  id: string;
+  name: string;
+  description?: string;
+  permissions: string[];
+  builtin: boolean;
+}
+/** Which browser SSO gates the control-api serves. */
+export interface AuthConfig {
+  enabled: boolean;
+  loginUrl: string;
+  oidc?: { enabled: boolean; loginUrl: string };
+  saml?: { enabled: boolean; loginUrl: string };
 }
 export interface AdminSessionInfo {
   jti: string;

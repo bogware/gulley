@@ -104,6 +104,21 @@ export interface ChainVerificationView {
   count: number;
   brokenAt?: number;
 }
+/** A role: the five built-ins (immutable, `builtin: true`) or a custom role. */
+export interface RoleView {
+  id: string;
+  name: string;
+  description?: string;
+  permissions: string[];
+  builtin: boolean;
+}
+export interface MembershipView {
+  id: string;
+  role: string;
+  orgId: string | null;
+  workspaceId: string | null;
+  userId?: string;
+}
 
 export class ControlClient {
   private readonly baseUrl: string;
@@ -175,6 +190,47 @@ export class ControlClient {
   }
   deleteWorkspace(id: string): Promise<{ deleted: boolean }> {
     return this.req('DELETE', `/workspaces/${encodeURIComponent(id)}`);
+  }
+
+  // --- memberships + roles ---
+  listMemberships(): Promise<{ memberships: MembershipView[] }> {
+    return this.req('GET', '/memberships');
+  }
+  /** Grant a role (built-in name or custom role id) at an org / workspace scope; the
+   *  role's permissions must be a subset of the caller's at that scope. */
+  createMembership(input: {
+    subject?: string;
+    userId?: string;
+    role: string;
+    orgId: string;
+    workspaceId?: string;
+    displayName?: string;
+  }): Promise<{ membership: MembershipView }> {
+    return this.req('POST', '/memberships', input);
+  }
+  deleteMembership(id: string): Promise<{ deleted: boolean }> {
+    return this.req('DELETE', `/memberships/${encodeURIComponent(id)}`);
+  }
+  /** The role catalogue plus the permission names a custom role may use. */
+  listRoles(): Promise<{ roles: RoleView[]; permissions: string[] }> {
+    return this.req('GET', '/roles');
+  }
+  createRole(input: {
+    id: string;
+    name: string;
+    description?: string;
+    permissions: readonly string[];
+  }): Promise<{ role: RoleView }> {
+    return this.req('POST', '/roles', input);
+  }
+  updateRole(
+    id: string,
+    patch: { name?: string; description?: string | null; permissions?: readonly string[] },
+  ): Promise<{ role: RoleView }> {
+    return this.req('PUT', `/roles/${encodeURIComponent(id)}`, patch);
+  }
+  deleteRole(id: string): Promise<{ deleted: boolean }> {
+    return this.req('DELETE', `/roles/${encodeURIComponent(id)}`);
   }
 
   // --- providers ---

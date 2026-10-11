@@ -1,3 +1,4 @@
+import { makeAlert } from '@gulley/alerts';
 import { type AdminSessionClaims, signAdminSession } from '@gulley/auth';
 import {
   assertNoInlineSecret,
@@ -14,16 +15,22 @@ import {
   signOnboardingPack,
 } from '@gulley/cli';
 import { routeGroupEntitySchema } from '@gulley/config';
+import {
+  budgetConfigToColumns,
+  deleteOrgBudget,
+  getOrgBudget,
+  orgBudgetProblem,
+  upsertOrgBudget,
+} from '@gulley/storage';
 import { GULLEY_VERSION, secretRef } from '@gulley/core';
 import { assertEgressAllowed, EgressError } from '@gulley/egress';
 import {
   can,
+  canGrant,
   coveredOrgIds,
-  isRole,
+  isRoleId,
   type Membership as RbacMembership,
-  maxRankAt,
   type Permission,
-  roleRank,
 } from '@gulley/rbac';
 import { randomUUID } from 'node:crypto';
 import {
@@ -145,17 +152,23 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       if (rawMemberships.length > MAX_DELEGATED_MEMBERSHIPS)
         return invalid(reply, `at most ${MAX_DELEGATED_MEMBERSHIPS} memberships`);
 
+      const roles = ctx.roleResolver;
+      await roles.ensureFresh();
       const memberships: RbacMembership[] = [];
       for (const m of rawMemberships) {
         const mm = (m ?? {}) as Record<string, unknown>;
         const role = mm['role'];
         const orgId = str(mm['orgId']);
         const workspaceId = str(mm['workspaceId']) ?? null;
-        if (!isRole(role) || !orgId) return invalid(reply, 'bad membership');
+        if (!isRoleId(role) || !orgId) return invalid(reply, 'bad membership');
+        if (!roles.get(role)) return invalid(reply, `unknown role "${role}"`);
         const at = { orgId, workspaceId };
-        if (!can(admin, 'membership:create', at)) return forbidden(reply);
-        if (role === 'owner' && !can(admin, 'membership:grant_owner', at)) return forbidden(reply);
-        if (roleRank[role] > maxRankAt(admin, at)) return forbidden(reply); // no amplification
+        if (!can(admin, 'membership:create', at, roles)) return forbidden(reply);
+        if (role === 'owner' && !can(admin, 'membership:grant_owner', at, roles))
+          return forbidden(reply);
+        // No amplification: the delegated role's permissions must be a subset of what
+        // the minter holds at that scope (custom roles included).
+        if (!canGrant(admin, role, at, roles)) return forbidden(reply);
         memberships.push({ role, orgId, workspaceId });
       }
 
@@ -244,6 +257,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         target: jti,
         payload: { reason, expiresAt, ttlSeconds },
       });
+      // Emergency elevation is exactly the event an on-call channel must see at once.
+      ctx.alerts.emit(
+        makeAlert({ kind: 'admin.break_glass', actor: admin.subject, reason, expiresAt }),
+      );
       return reply.code(201).send({ token, expiresAt });
     }),
   );
@@ -287,6 +304,73 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
           if (deleted) ctx.workspaces.deleteByOrg(id);
           return deleted;
         },
+      });
+      return r.ok ? reply.send({ deleted: r.value }) : forbidden(reply);
+    }),
+  );
+
+  // --- org budget (K4): the top of the budget hierarchy. One row per org with
+  // `workspace_id` NULL, outside the per-workspace GitOps document; the gateway's cap
+  // resolver reads it as `org:<id>` and checks it right after the workspace cap. DB mode
+  // only (the in-memory read model has no org budgets).
+  app.get(
+    '/orgs/:id/budget',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      if (!ctx.orgs.get(id)) return notFound(reply, 'org');
+      if (!(await ctx.access.can(admin, 'budget:read', { orgId: id }))) return forbidden(reply);
+      return reply.send({ budget: ctx.db ? await getOrgBudget(ctx.db, id) : null });
+    }),
+  );
+  app.put(
+    '/orgs/:id/budget',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      if (!ctx.orgs.get(id)) return notFound(reply, 'org');
+      const b = body(request);
+      const config =
+        b['config'] && typeof b['config'] === 'object'
+          ? (b['config'] as Record<string, unknown>)
+          : undefined;
+      if (!config) return invalid(reply, 'config required');
+      const problem = orgBudgetProblem(config);
+      if (problem) return invalid(reply, problem);
+      const name = str(b['name']) ?? 'default';
+      const db = ctx.db;
+      if (!db) {
+        return reply.code(501).send({
+          error: { type: 'not_supported', message: 'org budgets require DB mode' },
+        });
+      }
+      const r = await auditedWrite(ctx, admin, {
+        perm: 'budget:update',
+        at: { orgId: id },
+        action: 'budget.org_upsert',
+        target: id,
+        diff: { name, configHash: configHash(config) },
+        mutate: () => upsertOrgBudget(db, id, name, config),
+      });
+      return r.ok ? reply.send({ budget: r.value }) : forbidden(reply);
+    }),
+  );
+  app.delete(
+    '/orgs/:id/budget',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const id = paramId(request);
+      if (!ctx.orgs.get(id)) return notFound(reply, 'org');
+      const db = ctx.db;
+      if (!db) {
+        return reply.code(501).send({
+          error: { type: 'not_supported', message: 'org budgets require DB mode' },
+        });
+      }
+      const r = await auditedWrite(ctx, admin, {
+        perm: 'budget:delete',
+        at: { orgId: id },
+        action: 'budget.org_delete',
+        target: id,
+        diff: { orgId: id },
+        mutate: () => deleteOrgBudget(db, id),
       });
       return r.ok ? reply.send({ deleted: r.value }) : forbidden(reply);
     }),
@@ -421,23 +505,28 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       // Durable RBAC (DB mode) grants by SUBJECT (the identity a session carries) —
       // the admin_user is upserted so the grant is effective at the subject's next
       // auth. The in-memory path keeps the legacy opaque `userId`. Either way the
-      // grant requires membership:create, owner needs grant_owner, and no role may
-      // exceed the granter's rank at the scope (anti-amplification).
+      // grant requires membership:create, owner needs grant_owner, the role must exist
+      // (built-in or custom), and its permissions must be a SUBSET of the granter's at
+      // the scope (anti-amplification; replaces the old rank comparison).
       const subject = strMax(b['subject'], 512);
       const userId = str(b['userId']);
       const role = b['role'];
       const orgId = str(b['orgId']);
       const workspaceId = str(b['workspaceId']) ?? null;
-      if (!isRole(role) || !orgId) return invalid(reply, 'role, orgId required');
+      if (!isRoleId(role) || !orgId) return invalid(reply, 'role, orgId required');
+      const roles = ctx.roleResolver;
+      await roles.ensureFresh();
+      if (!roles.get(role)) return invalid(reply, `unknown role "${role}"`);
       // orgId "*" is a PLATFORM grant: it is checked at the empty deployment scope (only
       // a platform-wide membership covers it) and persisted as NULL org (the uuid column
       // cannot hold the sentinel — it used to 500 in DB mode).
       const platform = orgId === '*';
       if (platform && workspaceId) return invalid(reply, 'a platform grant has no workspace');
       const at = platform ? {} : { orgId, workspaceId };
-      if (!can(admin, 'membership:create', at)) return forbidden(reply);
-      if (role === 'owner' && !can(admin, 'membership:grant_owner', at)) return forbidden(reply);
-      if (roleRank[role] > maxRankAt(admin, at)) return forbidden(reply);
+      if (!can(admin, 'membership:create', at, roles)) return forbidden(reply);
+      if (role === 'owner' && !can(admin, 'membership:grant_owner', at, roles))
+        return forbidden(reply);
+      if (!canGrant(admin, role, at, roles)) return forbidden(reply);
       if (!platform && !isUuid(orgId) && ctx.durableMemberships)
         return invalid(reply, 'orgId must be a uuid');
       if (workspaceId && !isUuid(workspaceId) && ctx.durableMemberships)
@@ -511,7 +600,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
           error: { type: 'not_supported', message: 'durable memberships require a database' },
         });
       }
-      if (!can(admin, 'membership:delete', {})) return forbidden(reply);
+      if (!(await ctx.access.can(admin, 'membership:delete', {}))) return forbidden(reply);
       const id = uuidParam(request);
       if (!id) return notFound(reply, 'membership');
       const durable = ctx.durableMemberships;
@@ -741,7 +830,8 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       const view = id ? await ctx.keys.get(id) : undefined;
       if (!view) return notFound(reply, 'key');
       const at = scopeForWorkspace(ctx, view.workspaceId) ?? {};
-      if (!(await ctx.access.can(admin, 'key:create', at))) return forbidden(reply);
+      // Disabling is a lifecycle verb distinct from minting (`key:create`).
+      if (!(await ctx.access.can(admin, 'key:disable', at))) return forbidden(reply);
       const updated = await ctx.keys.disable(view.id);
       await ctx.audit.append({
         orgId: at.orgId ?? null,
@@ -761,7 +851,7 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       const view = id ? await ctx.keys.get(id) : undefined;
       if (!view) return notFound(reply, 'key');
       const at = scopeForWorkspace(ctx, view.workspaceId) ?? {};
-      if (!(await ctx.access.can(admin, 'key:create', at))) return forbidden(reply);
+      if (!(await ctx.access.can(admin, 'key:rotate', at))) return forbidden(reply);
       const rotated = await ctx.keys.rotate(view.id);
       await ctx.audit.append({
         orgId: at.orgId ?? null,
@@ -801,6 +891,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
           const parsed = routeGroupEntitySchema.safeParse(config);
           if (!parsed.success) return invalidRouteGroup(reply, parsed.error.issues);
         }
+        if (c.kind === 'budget') {
+          const parsed = budgetConfigToColumns(config, workspaceId);
+          if (parsed.problem !== undefined) return invalid(reply, parsed.problem);
+        }
         try {
           assertNoInlineSecret(config);
         } catch (e) {
@@ -809,7 +903,9 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
             .send({ error: { type: 'inline_secret', message: (e as Error).message } });
         }
         // Names are the GitOps reconcile key within a workspace: a duplicate would make
-        // export/apply ambiguous (budget is singular per workspace and upserts instead).
+        // export/apply ambiguous (a budget's key is its scope — one row per workspace /
+        // key / user / team / project entity or default — and a second entity for the
+        // same scope upserts instead).
         if (c.kind !== 'budget' && nameTaken(ctx, c.kind, workspaceId, name))
           return conflict(reply, `${c.resource} "${name}" already exists in this workspace`);
         const r = await consoleWrite(ctx, admin, {
@@ -860,6 +956,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
           if (c.kind === 'route') {
             const parsed = routeGroupEntitySchema.safeParse(config);
             if (!parsed.success) return invalidRouteGroup(reply, parsed.error.issues);
+          }
+          if (c.kind === 'budget') {
+            const parsed = budgetConfigToColumns(config, existing.workspaceId);
+            if (parsed.problem !== undefined) return invalid(reply, parsed.problem);
           }
           try {
             assertNoInlineSecret(config);

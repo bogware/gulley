@@ -392,3 +392,57 @@ describe('signed onboarding packs', () => {
     }
   });
 });
+
+describe('admin CRUD — hierarchical budgets (K4)', () => {
+  it('validates a budget config on create and update (422 with the problem)', async () => {
+    const bad = await post('/budgets', { workspaceId, name: 'neg', config: { capMicroUsd: -1 } });
+    expect(bad.statusCode).toBe(422);
+    expect((bad.json() as { error: { message: string } }).error.message).toMatch(
+      /positive integer/,
+    );
+    const org = await post('/budgets', {
+      workspaceId,
+      name: 'org-in-ws',
+      config: { scope: { kind: 'org' }, capMicroUsd: 1 },
+    });
+    expect(org.statusCode).toBe(422);
+    const created = await post('/budgets', {
+      workspaceId,
+      name: 'keys',
+      config: {
+        scope: { kind: 'key' },
+        windows: [
+          { capMicroUsd: 10_000_000, period: 'daily' },
+          { capMicroUsd: 100_000_000, period: 'monthly' },
+        ],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const id = (created.json() as { entity: { id: string } }).entity.id;
+    const badUpdate = await put(`/budgets/${id}`, {
+      config: { windows: [{ capMicroUsd: 1, period: 'yearly' }] },
+    });
+    expect(badUpdate.statusCode).toBe(422);
+    expect((badUpdate.json() as { error: { message: string } }).error.message).toMatch(/period/);
+    const ok = await put(`/budgets/${id}`, { config: { capMicroUsd: 5, periodSeconds: 60 } });
+    expect(ok.statusCode).toBe(200);
+  });
+
+  it('org budgets are DB-mode only: 501 in memory mode, 404 for an unknown org', async () => {
+    const r = await put(`/orgs/${orgId}/budget`, { config: { capMicroUsd: 5 } });
+    expect(r.statusCode).toBe(501);
+    const bad = await put(`/orgs/${orgId}/budget`, {
+      config: { scope: { kind: 'key' }, capMicroUsd: 5 },
+    });
+    expect(bad.statusCode).toBe(422); // validated before the mode check
+    const missing = await put('/orgs/nope/budget', { config: { capMicroUsd: 5 } });
+    expect(missing.statusCode).toBe(404);
+    const get = await app.inject({
+      method: 'GET',
+      url: `/orgs/${orgId}/budget`,
+      headers: authNoBody(),
+    });
+    expect(get.statusCode).toBe(200);
+    expect((get.json() as { budget: unknown }).budget).toBeNull();
+  });
+});

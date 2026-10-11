@@ -105,6 +105,7 @@ describe('OAuth stores — revoke reports existence; upsert follows tenancy', ()
       refreshTokenHash: 'r',
       prevRefreshTokenHash: null,
       refreshGeneration: 1,
+      kind: 'user',
       absoluteExpiresAt: Date.now() + 100_000,
     });
     expect(await grants.revoke('h1')).toBe(true);

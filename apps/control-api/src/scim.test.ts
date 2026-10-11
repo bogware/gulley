@@ -8,12 +8,13 @@ import { type Database, schema } from '@gulley/storage';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from './config';
-import { createInMemoryControlContext } from './context';
+import { type ControlContext, createInMemoryControlContext } from './context';
 import { buildServer } from './server';
 
 const SECRET = 'scim-session-secret-at-least-32-chars!!';
 let client: PGlite;
 let app: FastifyInstance;
+let ctx: ControlContext;
 let gadm: string;
 
 async function applyMigrations(pg: PGlite): Promise<void> {
@@ -58,13 +59,15 @@ beforeAll(async () => {
   const db = drizzle(client, { schema }) as unknown as Database;
   await applyMigrations(client);
   gadm = `gadm_${randomBytes(24).toString('base64url')}`;
-  const ctx = createInMemoryControlContext({
+  ctx = createInMemoryControlContext({
     pepper: 'scim-pepper-at-least-16-chars!!!',
     bootstrapEnabled: true,
     bootstrapTokenSha256: createHash('sha256').update(gadm).digest('hex'),
     sessionSecrets: [SECRET],
     maxSessionTtlMs: 900_000,
     db,
+    // The broker is on so a deprovision can be shown to revoke the user's grants.
+    oauthBroker: { enabled: true, pepper: 'scim-pepper-at-least-16-chars!!!', deviceIntervalMs: 0 },
   });
   app = buildServer(loadConfig({ LOG_LEVEL: 'silent' } as NodeJS.ProcessEnv), ctx);
 });
@@ -129,6 +132,28 @@ describe('SCIM 2.0 Users provisioning', () => {
     const before = await post('/routes', { workspaceId: wsId, name: 'r1', config: group }, session);
     expect(before.statusCode).toBe(201);
 
+    // 4b) The user also brokered a coding-agent token family (device flow consented
+    //     under their subject) — the credential an offboarding must kill too.
+    const broker = ctx.oauthBroker!;
+    await ctx.oauthAdmin!.clients.upsert({
+      clientId: 'claude-code',
+      name: 'Claude Code',
+      orgId,
+      workspaceId: wsId,
+      grantTypes: ['device_code', 'refresh_token'],
+      redirectAllowlist: [],
+      enabled: true,
+    });
+    const da = await broker.deviceAuthorization('claude-code');
+    if (!da.ok) throw new Error('device authorization failed');
+    await broker.deviceApprove(da.value.user_code, { subject: 'dev@corp', displayName: 'Dev' });
+    const tok = await broker.tokenDeviceCode(da.value.device_code, 'claude-code');
+    if (!tok.ok) throw new Error('token failed');
+    expect(await broker.introspectAccessToken(tok.value.access_token)).toMatchObject({
+      principalId: 'dev@corp',
+      kind: 'user',
+    });
+
     // 5) IdP deprovisions (SCIM DELETE) — cascades to the membership grant.
     const del = await app.inject({
       method: 'DELETE',
@@ -141,6 +166,14 @@ describe('SCIM 2.0 Users provisioning', () => {
     //    the membership loader now returns nothing for this subject.
     const after = await post('/routes', { workspaceId: wsId, name: 'r2', config: group }, session);
     expect(after.statusCode).toBe(403);
+
+    // 7) …and so does the brokered token family: the access token is dead and the
+    //    refresh token cannot rotate; the audit row counts the revoked grant.
+    expect(await broker.introspectAccessToken(tok.value.access_token)).toBeNull();
+    expect((await broker.resolveBrokerToken(tok.value.access_token)).ok).toBe(false);
+    expect((await broker.refresh(tok.value.refresh_token!, 'claude-code')).ok).toBe(false);
+    const [audit] = await ctx.auditByAction('scim.user.deprovision', 1);
+    expect(audit?.payload).toMatchObject({ userName: 'dev@corp', revokedGrants: 1 });
   });
 
   it('deactivation via PATCH active=false also deprovisions', async () => {

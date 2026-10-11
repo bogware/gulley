@@ -19,12 +19,24 @@ import {
   type UsageBucket,
   type UsageQuery,
 } from '@gulley/pipeline';
-import { and, asc, desc, eq, gt, gte, inArray, isNotNull, lt, type SQL, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  gte,
+  inArray,
+  isNotNull,
+  lt,
+  lte,
+  type SQL,
+  sql,
+} from 'drizzle-orm';
 import type { Database } from './db';
 import {
   adminUser,
   auditLog,
-  budget,
   membership,
   rateLimit,
   requestLog,
@@ -203,6 +215,23 @@ export class PostgresKeyAdminStore {
       .orderBy(desc(virtualKey.createdAt));
     const rows = orgIds === '*' ? await q : await q.where(inArray(workspace.orgId, [...orgIds]));
     return rows.map((r) => this.view(r.k));
+  }
+
+  /** Enabled keys whose expiry is at or before `before`, soonest first — the key-expiry
+   *  alert sweep. Keys without an expiry (or already disabled) are never returned. */
+  async listExpiring(before: Date): Promise<KeyViewRow[]> {
+    const rows = await this.db
+      .select()
+      .from(virtualKey)
+      .where(
+        and(
+          isNotNull(virtualKey.expiresAt),
+          lte(virtualKey.expiresAt, before),
+          eq(virtualKey.disabled, false),
+        ),
+      )
+      .orderBy(asc(virtualKey.expiresAt));
+    return rows.map((r) => this.view(r));
   }
 
   async disable(id: string): Promise<KeyViewRow | undefined> {
@@ -733,25 +762,6 @@ export function createRateLimitResolver(
   };
 }
 
-/** Reads per-workspace budget caps for the RedisBudgetStore. Structurally
- *  matches @gulley/budget's CapResolver without importing it. */
-export function createBudgetCapResolver(
-  db: Database,
-): (workspaceId: string) => Promise<{ capMicroUsd: number; periodSeconds?: number } | null> {
-  return async (workspaceId) => {
-    const rows = await db
-      .select({ cap: budget.capMicroUsd, period: budget.periodSeconds })
-      .from(budget)
-      .where(eq(budget.workspaceId, workspaceId))
-      .limit(1);
-    const b = rows[0];
-    if (!b) return null;
-    return b.period != null
-      ? { capMicroUsd: b.cap, periodSeconds: b.period }
-      : { capMicroUsd: b.cap };
-  };
-}
-
 export interface ChargebackRow {
   key: string | null;
   requests: number;
@@ -853,34 +863,4 @@ export async function ledgerSpendTotals(
     outputTokens: Number(r.outputTokens),
     costMicroUsd: Number(r.costMicroUsd),
   }));
-}
-
-/** Data to self-heal the Redis committed budget counters from the durable ledger:
- *  for each workspace with a ROLLING (period_seconds) cap, the ledger spend summed
- *  over the active window. Lifetime caps (null period) are skipped — their counter
- *  never rolls, so a full-ledger heal would be needed and is out of scope here.
- *  `nowMs` is injected so callers/tests control the window. */
-export async function loadBudgetHealData(
-  db: Database,
-  nowMs: number = Date.now(),
-): Promise<Array<{ workspaceId: string; ledgerMicroUsd: number; periodSeconds: number }>> {
-  const budgets = await db
-    .select({ workspaceId: budget.workspaceId, period: budget.periodSeconds })
-    .from(budget)
-    .where(isNotNull(budget.periodSeconds));
-  const out: Array<{ workspaceId: string; ledgerMicroUsd: number; periodSeconds: number }> = [];
-  for (const b of budgets) {
-    if (b.period == null) continue;
-    const since = new Date(nowMs - b.period * 1000);
-    const rows = await db
-      .select({ sum: sql<string>`coalesce(sum(${spendLedger.costMicroUsd}), 0)` })
-      .from(spendLedger)
-      .where(and(eq(spendLedger.workspaceId, b.workspaceId), gte(spendLedger.createdAt, since)));
-    out.push({
-      workspaceId: b.workspaceId,
-      ledgerMicroUsd: Number(rows[0]?.sum ?? 0),
-      periodSeconds: b.period,
-    });
-  }
-  return out;
 }

@@ -91,6 +91,37 @@ export async function fetchDiscovery(
   };
 }
 
+/**
+ * LENIENT discovery for a JWKS-only issuer: read `jwks_uri` from
+ * `<issuer>/.well-known/openid-configuration`, requiring only `issuer` + `jwks_uri`.
+ * Workload-identity issuers (a Kubernetes API server's service-account issuer, GitHub
+ * Actions' `https://token.actions.githubusercontent.com`) publish exactly that — no
+ * authorization/token endpoints — so {@link fetchDiscovery}'s full-OIDC requirement
+ * would reject them. The RFC 8414 issuer-match and the egress guard still apply.
+ */
+export async function fetchJwksUriFromDiscovery(
+  issuer: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = DEFAULT_OIDC_FETCH_TIMEOUT_MS,
+  guard?: OidcFetchGuard,
+): Promise<string> {
+  if (guard?.requireHttps && !/^https:\/\//i.test(issuer)) {
+    throw new Error('OIDC issuer must be https');
+  }
+  const url = `${normalizeIssuer(issuer)}/.well-known/openid-configuration`;
+  const res = await timedFetch(url, fetchImpl, timeoutMs, guard);
+  if (!res.ok) throw new Error(`OIDC discovery failed: ${res.status}`);
+  const d = (await res.json()) as Partial<Pick<OidcMetadata, 'issuer' | 'jwks_uri'>>;
+  if (!d.issuer || !d.jwks_uri) {
+    throw new Error('OIDC discovery document is missing issuer or jwks_uri');
+  }
+  if (normalizeIssuer(d.issuer) !== normalizeIssuer(issuer)) {
+    throw new Error('OIDC discovery issuer does not match the configured issuer');
+  }
+  assertEndpoint('jwks_uri', d.jwks_uri, guard);
+  return d.jwks_uri;
+}
+
 export async function fetchJwks(
   jwksUri: string,
   fetchImpl: typeof fetch = fetch,
@@ -112,16 +143,28 @@ export interface OidcProviderOptions {
   fetchTimeoutMs?: number;
   /** Egress guard + https policy for every URL fetched or advertised. */
   guard?: OidcFetchGuard;
+  /**
+   * JWKS-only issuer mode (workload identity: Kubernetes service-account issuers,
+   * GitHub Actions). `'lenient'` resolves `jwks_uri` through
+   * {@link fetchJwksUriFromDiscovery} (issuer + jwks_uri only); a fixed `jwksUri`
+   * skips discovery entirely. In either mode {@link OidcProvider.metadataDoc} is
+   * unavailable (no token/authorization endpoints exist) and `verify()` checks `iss`
+   * against the configured issuer. Default: full OIDC discovery.
+   */
+  discovery?: 'full' | 'lenient';
+  jwksUri?: string;
 }
 
 /**
  * An OIDC provider: caches the discovery document and JWKS, and verifies tokens
  * against them — refreshing the JWKS at most once a minute when a token's `kid`
- * is unknown (signing-key rotation). Reused by the control-plane session gate and
- * the data-plane inbound-JWT auth mode.
+ * is unknown (signing-key rotation). Reused by the control-plane session gate, the
+ * data-plane inbound-JWT auth mode and (in jwks-only mode) the workload-identity
+ * federation verifier.
  */
 export class OidcProvider {
   private metadata?: { value: OidcMetadata; at: number };
+  private jwksUri?: { value: string; at: number };
   private jwks?: { keys: Jwk[]; at: number };
   private lastRefresh = 0;
   private readonly fetchImpl: typeof fetch;
@@ -129,9 +172,12 @@ export class OidcProvider {
   private readonly nowFn: () => number;
   private readonly fetchTimeoutMs: number;
   private readonly guard: OidcFetchGuard | undefined;
+  private readonly discovery: 'full' | 'lenient';
+  private readonly fixedJwksUri: string | undefined;
   // Single-flight the network fetches: on a cold cache (boot) or a rotation refresh,
   // N concurrent JWT verifications would otherwise each fire an independent fetch.
   private metadataInflight?: Promise<OidcMetadata>;
+  private jwksUriInflight?: Promise<string>;
   private keysInflight?: Promise<Jwk[]>;
 
   constructor(
@@ -143,9 +189,20 @@ export class OidcProvider {
     this.nowFn = opts.now ?? Date.now;
     this.fetchTimeoutMs = opts.fetchTimeoutMs ?? DEFAULT_OIDC_FETCH_TIMEOUT_MS;
     this.guard = opts.guard;
+    this.discovery = opts.discovery ?? 'full';
+    this.fixedJwksUri = opts.jwksUri;
+    if (this.fixedJwksUri) assertEndpoint('jwks_uri', this.fixedJwksUri, this.guard);
+  }
+
+  /** True when this provider only knows how to verify signatures (no OIDC endpoints). */
+  get jwksOnly(): boolean {
+    return this.fixedJwksUri !== undefined || this.discovery === 'lenient';
   }
 
   async metadataDoc(): Promise<OidcMetadata> {
+    if (this.jwksOnly) {
+      throw new Error('OIDC provider is jwks-only: the issuer publishes no OIDC endpoints');
+    }
     if (this.metadata && this.nowFn() - this.metadata.at < this.ttlMs) return this.metadata.value;
     if (this.metadataInflight) return this.metadataInflight;
     this.metadataInflight = fetchDiscovery(
@@ -164,12 +221,35 @@ export class OidcProvider {
     return this.metadataInflight;
   }
 
+  /** Where the signing keys live: the fixed URI, the lenient discovery answer
+   *  (cached per TTL, single-flight), or the full discovery document's `jwks_uri`. */
+  private async resolveJwksUri(): Promise<string> {
+    if (this.fixedJwksUri) return this.fixedJwksUri;
+    if (this.discovery === 'full') return (await this.metadataDoc()).jwks_uri;
+    if (this.jwksUri && this.nowFn() - this.jwksUri.at < this.ttlMs) return this.jwksUri.value;
+    if (this.jwksUriInflight) return this.jwksUriInflight;
+    this.jwksUriInflight = fetchJwksUriFromDiscovery(
+      this.issuer,
+      this.fetchImpl,
+      this.fetchTimeoutMs,
+      this.guard,
+    )
+      .then((value) => {
+        this.jwksUri = { value, at: this.nowFn() };
+        return value;
+      })
+      .finally(() => {
+        this.jwksUriInflight = undefined;
+      });
+    return this.jwksUriInflight;
+  }
+
   private async keys(force = false): Promise<Jwk[]> {
     if (!force && this.jwks && this.nowFn() - this.jwks.at < this.ttlMs) return this.jwks.keys;
     if (this.keysInflight) return this.keysInflight;
     this.keysInflight = (async () => {
-      const md = await this.metadataDoc();
-      const keys = await fetchJwks(md.jwks_uri, this.fetchImpl, this.fetchTimeoutMs, this.guard);
+      const jwksUri = await this.resolveJwksUri();
+      const keys = await fetchJwks(jwksUri, this.fetchImpl, this.fetchTimeoutMs, this.guard);
       this.jwks = { keys, at: this.nowFn() };
       return keys;
     })().finally(() => {
@@ -202,7 +282,10 @@ export class OidcProvider {
     }
     const v = verifyJwtWithJwks(jwt, keys);
     if (!v.ok) return { ok: false, reason: v.reason };
-    const issuer = expectations.issuer ?? (await this.metadataDoc()).issuer;
+    // A jwks-only issuer has no discovery document to read the issuer back from; the
+    // configured issuer (which lenient discovery already matched) is authoritative.
+    const issuer =
+      expectations.issuer ?? (this.jwksOnly ? this.issuer : (await this.metadataDoc()).issuer);
     const c = validateClaims(v.claims, {
       issuer,
       audience: expectations.audience,

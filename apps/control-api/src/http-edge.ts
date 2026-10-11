@@ -9,6 +9,13 @@ import {
 import type { FastifyInstance } from 'fastify';
 import type { Config } from './config';
 import { corsOrigins } from './config';
+import { SAML_ACS_PATH } from './saml-routes';
+
+/** Unsafe-method paths the Sec-Fetch-Site CSRF check must NOT cover: the SAML ACS is
+ *  a cross-site POST by design (the IdP's browser form post). Its own defence is the
+ *  signed, browser-bound flow cookie + RelayState + InResponseTo binding and the
+ *  assertion signature (saml-routes.ts); it never acts on an existing session cookie. */
+const CSRF_EXEMPT: ReadonlySet<string> = new Set([SAML_ACS_PATH]);
 
 /**
  * Install the admin-surface HTTP edge: credentials-safe CORS + Sec-Fetch-Site
@@ -32,8 +39,10 @@ export function registerHttpEdge(app: FastifyInstance, config: Config): void {
     }
 
     // 2) CSRF — reject a cookie-authed cross-site unsafe request. An allowlisted
-    // origin is CORS-vetted and exempt; bearer/API and non-browser clients too.
-    if (csrfOn && !corsAllows(originStr, cors)) {
+    // origin is CORS-vetted and exempt; bearer/API and non-browser clients too; so is
+    // the SAML ACS (see CSRF_EXEMPT).
+    const path = request.url.split('?')[0] ?? request.url;
+    if (csrfOn && !corsAllows(originStr, cors) && !CSRF_EXEMPT.has(path)) {
       const secFetchSite = request.headers['sec-fetch-site'];
       const site = Array.isArray(secFetchSite) ? secFetchSite[0] : secFetchSite;
       const hasAuthHeader = typeof request.headers['authorization'] === 'string';

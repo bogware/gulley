@@ -6,6 +6,109 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Hierarchical hard budgets (K4).** A request must now be admitted by every budget in
+  the hierarchy that carries a cap — **workspace → org → key → user → team → project**
+  (`BUDGET_SCOPES`, default all) — before the per-model and per-attribution caps. A
+  `budget` entity caps one entity (`scope: { kind, id }`) or, with `scope.id` omitted,
+  every entity of that kind without its own row (the **default**: "$10/day per key"
+  without naming a key); an org budget caps all of its workspaces together
+  (`PUT /orgs/:id/budget`, DB mode). A budget is one or more **windows** that must all
+  admit — `{ windows: [{ capMicroUsd, period: daily | weekly | monthly | none |
+  { seconds } }] }`, calendar windows aligned to UTC midnight / Monday / the 1st with a
+  counter per window — and the legacy `{ capMicroUsd, periodSeconds }` shape still
+  works unchanged. The `user` scope is the end user the credential is bound to (a
+  brokered grant, an IdP JWT) or the `x-user-id` a federated service principal is
+  allowed to assert (K7); the `team` scopes are the principal's groups; the `project`
+  scope is the `project` attribution. A rejection releases every reservation the
+  request took and is a **typed `402`**: `error.type = quota_for_entity_exceeded`, a
+  message that names the entity, current spend, limit, window and what the request
+  needed, `error.scope` / `error.window` / `*_micro_usd` fields, `retry-after` until a
+  calendar window resets and `x-should-retry: false`. The boot-time counter heal, the
+  config document round-trip, the console Budgets page and the control-API validation
+  (`422` with the problem) understand the new shape; `gulley_budget_rejections_total`
+  counts rejections by scope kind. Migration `0027_hierarchical_budgets`.
+
+- **Agent and service identities — workload identity federation (K7).** A Kubernetes
+  service-account token or a GitHub Actions OIDC token is exchanged at the control
+  plane (`POST /oauth/token`, `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`,
+  RFC 7523) for a short-lived, **scoped, access-only** `gko_at_` token bound to the
+  service principal `svc:<federation>:<sub>` — no static key, no human consent, no
+  refresh token. Trust is configured per issuer in `WORKLOAD_FEDERATIONS` (zod-validated
+  at boot: issuer, optional `jwksUri` / `audience` / `allowInternal`, a `:`-segmented
+  subject glob and/or exact claim matches, org/workspace, provider/model/group scope,
+  TTL ≤ 24 h, `onBehalfOf`). Verification is asymmetric-only with `iss`/`aud`/`exp`/
+  `nbf`, a required `iat` no older than 10 minutes and a bounded per-process `jti`
+  replay guard; every failure is one generic `invalid_grant`, every success an
+  `oauth.token_exchanged` audit row. `@gulley/oidc` gained lenient discovery
+  (`fetchJwksUriFromDiscovery`) and a jwks-only `OidcProvider` mode for issuers that
+  publish no OIDC endpoints. The grant store carries `kind` / `federation` / `subject`
+  / `scope` / `on_behalf_of` (migration `0030_workload_federation`), `/oauth/introspect`
+  reports them, the RFC 8414 metadata advertises the grant type when configured, and
+  the token exchange has its own per-IP budget
+  (`CONTROL_API_TOKEN_EXCHANGE_RATE_LIMIT_PER_MIN`, default 600) so a NAT'd cluster
+  never starves human logins. **End-user propagation:** `Principal` gained `userId`
+  (set for brokered user grants and inbound IdP JWTs), `serviceAccount` and
+  `onBehalfOf` (service principals), so the gateway can honour `x-user-id` only from a
+  federation that permits it. Also: `gulley token exchange --k8s-sa | --github |
+--assertion-file` (prints the token or an `export ANTHROPIC_AUTH_TOKEN=` line, never
+  the assertion), expired token families are swept with the OAuth ephemera
+  (`purgeExpiredGrants`, advisory lock `5138008707`), and a SCIM deprovision now revokes
+  the user's broker grants as well as their sessions. `docs/WORKLOAD_IDENTITY.md`.
+
+- **Alert channels (P9).** A new `@gulley/alerts` package delivers operational alerts to
+  Slack, Microsoft Teams, PagerDuty (Events API v2, `dedup_key` per kind + entity,
+  `breaker.closed` resolves), email (SMTP via `nodemailer`) and HMAC-signed generic
+  webhooks (`x-gulley-signature: t=…,v1=…`, verifier exported), configured by one JSON
+  `ALERT_CHANNELS` value on either plane with per-channel event/severity filters. Delivery
+  is fire-and-forget off the hot path with 3 jittered retries on network / 429 / 5xx,
+  per-channel storm control, a bounded in-flight queue and the boot-time egress guard
+  (allowlist, https outside development, `AIR_GAPPED`). The control-api emits
+  `config.applied` and `admin.break_glass`, runs a key-expiry sweep
+  (`ALERT_KEY_EXPIRY_DAYS`, `ALERT_KEY_EXPIRY_SWEEP_INTERVAL_SECONDS`; `key.expiring` /
+  `key.expired` plus audit rows `key.expiring_soon` / `key.expired`, one replica per tick)
+  and serves `POST /admin/alerts/test` + `GET /admin/alerts/status`; the gateway's
+  `BudgetAlerter` now emits `budget.threshold` through the same sink. See
+  `docs/ALERTING.md`.
+
+- **Per-agent FinOps (K5).** `GET /admin/analytics/agent-tree` rolls the durable ledger
+  up by session → prompt → subagent (nested by `cc_parent_agent`), with the share spent
+  on context compaction and on subagents; cascade / hedge / classifier legs
+  (`<id>#<leg>`) are attributed to their parent request. The console's FinOps page
+  gains an **Agent tree** tab. Migration `0029` adds the `spend_ledger_session_idx`
+  expression index.
+- **FOCUS 1.2 export.** `GET /admin/analytics/focus?from&to&format=csv|jsonl` streams
+  every ledger row as a FinOps-Foundation FOCUS record (fixed column order, `x_gulley_*`
+  extension columns, RFC 4180 CSV with formula-injection escaping, or JSON Lines) in
+  50k-row pages continued through the `x-next-cursor` header. **FOCUS export** button
+  on the console's Chargeback tab. See `docs/FINOPS.md`.
+- **Runaway-session detector + session kill switch.** A control-api job
+  (`RUNAWAY_DETECTOR_INTERVAL_SECONDS`, default 300) scores every session active in the
+  last `RUNAWAY_WINDOW_MINUTES` against `2 × p95` of its principal's per-session spend
+  over `RUNAWAY_BASELINE_DAYS` (the scope-wide p95 for a thin principal) and the
+  scope-wide p99; a session above `max(RUNAWAY_MIN_COST_USD, baseline)` and above the
+  p99 is audited `session.runaway` and alerted (`session.runaway`), and — with
+  `RUNAWAY_ACTION=block` — written to the new `session_block` table (TTL
+  `RUNAWAY_BLOCK_TTL_MINUTES`). `GET /admin/sessions/blocked`,
+  `POST /admin/sessions/:session/block` and `DELETE …/block` (permission
+  `key:disable`, audited `session.blocked` / `session.unblocked`) manage blocks; the
+  console's **Runaway sessions** tab lists, unblocks and places them. `@gulley/storage`
+  ships `SessionBlockSnapshot` + `loadActiveSessionBlocks` for the gateway's
+  synchronous 403 `session_blocked` check.
+
+### Changed
+
+- **The budget rejection is `402 quota_for_entity_exceeded`** (was `budget_exceeded`),
+  with the entity, window and amounts in the body and `retry-after` for a calendar
+  window. Clients that matched on the old type string need the new one; the status
+  code is unchanged.
+- **`BUDGET_ALERT_THRESHOLDS` defaults to `0.5,0.75,1`** (was `0.8,0.9`): alerts are
+  per budget scope and per window, and the hard rejection itself is always reported
+  as the `1` level (`budget.exceeded` on the alert channels). The legacy
+  `BUDGET_ALERT_WEBHOOK_URL` payload gained `scope`, `scopeKind`, `entity` and
+  `window`; `workspaceId` is still present for workspace-partitioned scopes.
+
 ## [0.6.0] — 2026-10-11
 
 Wave 1 of the October 2026 cycle — **agent trust**: the changes that make Gulley safe

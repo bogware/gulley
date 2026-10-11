@@ -64,9 +64,14 @@ describe('durable OAuth + session stores (pglite)', () => {
       prevRefreshTokenHash: null,
       refreshGeneration: 0,
       absoluteExpiresAt: Date.now() + 86_400_000,
+      kind: 'user',
     });
     const got = await g.get('h1');
     expect(got?.clientId).toBe('claude-code');
+    expect(got?.kind).toBe('user');
+    expect(got?.scope).toBeUndefined();
+    expect(got?.federation).toBeUndefined();
+    expect(got?.onBehalfOf).toBeUndefined();
 
     // rotate is generation-guarded: wrong gen loses; correct gen wins.
     const next = {
@@ -86,6 +91,71 @@ describe('durable OAuth + session stores (pglite)', () => {
 
     await g.revoke('h1');
     expect((await g.get('h1'))?.status).toBe('revoked');
+  });
+
+  it('service (JWT-bearer) grant columns round-trip; revokeByPrincipal kills only that principal', async () => {
+    const g = new PostgresGrantStore(db);
+    const exp = Date.now() + 900_000;
+    const base = {
+      clientId: 'workload',
+      displayName: 'gh-main: repo:acme/api:ref:refs/heads/main',
+      orgId: ORG,
+      workspaceId: WS,
+      status: 'active' as const,
+      accessTokenHash: 'ah',
+      accessTokenExpiresAt: exp,
+      refreshTokenHash: null,
+      prevRefreshTokenHash: null,
+      refreshGeneration: 0,
+      absoluteExpiresAt: exp,
+      kind: 'service' as const,
+      federation: 'gh-main',
+      subject: 'repo:acme/api:ref:refs/heads/main',
+      onBehalfOf: true,
+    };
+    await g.create({
+      ...base,
+      handle: 'svc1',
+      principalId: 'svc:gh-main:repo:acme/api:ref:refs/heads/main',
+      scope: { allowedProviders: ['anthropic'], allowedModels: '*', groups: ['ci'] },
+    });
+    await g.create({
+      ...base,
+      handle: 'svc2',
+      principalId: 'svc:gh-main:repo:acme/api:ref:refs/heads/main',
+      scope: { allowedProviders: '*', allowedModels: ['claude-sonnet-4-6'] },
+    });
+    await g.create({
+      ...base,
+      handle: 'svc3',
+      principalId: 'svc:gh-main:repo:acme/other:ref:refs/heads/main',
+      onBehalfOf: false,
+    });
+    const one = await g.get('svc1');
+    expect(one).toMatchObject({
+      kind: 'service',
+      federation: 'gh-main',
+      subject: 'repo:acme/api:ref:refs/heads/main',
+      scope: { allowedProviders: ['anthropic'], allowedModels: '*', groups: ['ci'] },
+      onBehalfOf: true,
+      refreshTokenHash: null,
+      absoluteExpiresAt: exp,
+    });
+    expect((await g.get('svc2'))?.scope).toEqual({
+      allowedProviders: '*',
+      allowedModels: ['claude-sonnet-4-6'],
+    });
+    expect((await g.get('svc3'))?.onBehalfOf).toBeUndefined();
+    // The console listing carries the identity columns (secret-free).
+    const listed = (await g.list()).find((r) => r.handle === 'svc1');
+    expect(listed).toMatchObject({ kind: 'service', federation: 'gh-main', onBehalfOf: true });
+    expect(listed).not.toHaveProperty('accessTokenHash');
+
+    expect(await g.revokeByPrincipal('svc:gh-main:repo:acme/api:ref:refs/heads/main')).toBe(2);
+    expect((await g.get('svc1'))?.status).toBe('revoked');
+    expect((await g.get('svc2'))?.status).toBe('revoked');
+    expect((await g.get('svc3'))?.status).toBe('active');
+    expect(await g.revokeByPrincipal('svc:gh-main:repo:acme/api:ref:refs/heads/main')).toBe(0);
   });
 
   it('auth-code single-use consume (claim-first)', async () => {

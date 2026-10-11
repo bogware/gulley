@@ -175,10 +175,12 @@ describe('RedisBudgetStore.commit idempotency token', () => {
     await store.commit('ws_1', 'req_1', 100);
     const call = redis.calls[0];
     expect(call).toBeDefined();
+    // KEYS = [reserved, commit-id, committed window(s)…]; ARGV = [field, actual, dedupTtl, n, …]
     expect(call?.numKeys).toBe(3);
-    expect(call?.args[2]).toBe('budget:{ws_1}:cid:req_1');
+    expect(call?.args[1]).toBe('budget:{ws_1}:cid:req_1');
+    expect(call?.args[2]).toBe('budget:{ws_1}:committed');
     expect(call?.args[3]).toBe('req_1');
-    expect(Number(call?.args[6])).toBe(600); // dedup TTL = reservation lifetime, seconds
+    expect(Number(call?.args[5])).toBe(600); // dedup TTL = reservation lifetime, seconds
     expect(call?.script).toContain("'SET', commitIdKey, '1', 'NX', 'EX', dedupTtl");
     expect(call?.script).not.toContain('SADD');
     expect(call?.script).not.toContain('committed_ids');

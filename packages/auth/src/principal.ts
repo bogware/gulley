@@ -25,6 +25,24 @@ export interface Principal {
   displayName: string;
   authMode: AuthMode;
   scope: Scope;
+  /**
+   * The human end user this principal IS, when the credential is bound to one: a
+   * brokered user grant (= the consenting admin's subject) or an inbound IdP JWT
+   * (= `sub`). Undefined for a service principal (a workload-federated `gko_at_`
+   * token) and for virtual keys / Basic users, which are not user-bound.
+   */
+  userId?: string;
+  /**
+   * Set on a service principal: the name of the workload federation (trust
+   * configuration) that admitted it. `id` is then `svc:<federation>:<subject>`.
+   */
+  serviceAccount?: string;
+  /**
+   * A service principal whose federation permits it to ASSERT an end user per
+   * request (`x-user-id`). The gateway honours that header only when this is true;
+   * for every other principal the header is ignored and `userId` stands.
+   */
+  onBehalfOf?: boolean;
 }
 
 export function scopeAllowsProvider(scope: Scope, provider: string): boolean {

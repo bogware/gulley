@@ -15,7 +15,8 @@
   "dependencies": {
     "@gulley/auth": "workspace:*",
     "@gulley/core": "workspace:*",
-    "@gulley/egress": "workspace:*"
+    "@gulley/egress": "workspace:*",
+    "@gulley/oidc": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

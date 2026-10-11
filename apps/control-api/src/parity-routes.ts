@@ -60,6 +60,7 @@ export function registerParityRoutes(app: FastifyInstance, ctx: ControlContext):
           shadowSpend: Boolean(ctx.shadowSpend),
           gatewayMetrics: Boolean(ctx.gatewayMetrics),
           oidc: Boolean(ctx.oidc),
+          saml: Boolean(ctx.saml),
           onboarding: Boolean(ctx.onboardingSigningKey),
           clientConfig: Boolean(ctx.gatewayPublicUrl),
         },

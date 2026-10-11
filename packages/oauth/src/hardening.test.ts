@@ -61,7 +61,7 @@ async function issue(broker: BrokerService): Promise<string> {
   await broker.deviceApprove(da.value.user_code, { subject: 'user-1', displayName: 'User One' });
   const tok = await broker.tokenDeviceCode(da.value.device_code, 'claude-code');
   if (!tok.ok) throw new Error('token failed');
-  return tok.value.refresh_token;
+  return tok.value.refresh_token!;
 }
 
 describe('refresh: the secret is verified BEFORE the IdP is consulted', () => {

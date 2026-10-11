@@ -55,6 +55,9 @@ if (degradedReason) app.log.warn({ reason: degradedReason }, 'proxy disabled —
 
 async function start(): Promise<void> {
   try {
+    // Session kill switch: the first snapshot load is awaited so a blocked session is
+    // never admitted by a freshly started replica; later refreshes are stale-on-error.
+    await context?.sessionBlocks?.start();
     await app.listen({ host: config.GATEWAY_HOST, port: config.GATEWAY_PORT });
     if (context?.metrics) {
       metricsServer = await startMetricsServer({
@@ -163,6 +166,7 @@ async function shutdown(signal: string, graceMs = SHUTDOWN_GRACE_MS, exitCode = 
     ]);
   });
   await settle('request-log', () => context?.flushLogs?.()); // buffered request logs
+  await settle('alerts', () => context?.drainAlerts?.()); // queued alert deliveries
   await settle('access-log', () => context?.accessLogSink?.shutdown()); // OTLP access-log batch
   await settle('telemetry', () => context?.telemetry?.shutdown()); // OTel span pipeline
   await settle('metrics', () => metricsServer?.close());

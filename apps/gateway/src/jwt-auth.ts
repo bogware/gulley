@@ -151,5 +151,8 @@ export async function resolveJwtPrincipal(
     displayName: str(c['name']) ?? str(c['preferred_username']) ?? sub,
     authMode: 'oauth-broker',
     scope,
+    // An IdP JWT IS its end user: the subject is the user identity propagated
+    // downstream (an `x-user-id` header is never honoured on this principal).
+    userId: sub,
   };
 }

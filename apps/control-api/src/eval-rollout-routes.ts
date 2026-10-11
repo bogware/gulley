@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { makeAlert } from '@gulley/alerts';
 import { applyConfig } from '@gulley/config';
 import { type AdminPrincipal, coveredOrgIds } from '@gulley/rbac';
 import type { FastifyInstance } from 'fastify';
@@ -181,15 +182,24 @@ export function buildRolloutPromoter(ctx: ControlContext): RolloutPromoter {
       access: ctx.access,
       atomic: ctx.configAtomic,
       egressAllowlist: ctx.outboundAllowlist,
-      onApplied: ctx.notifier
-        ? (e) =>
-            ctx.notifier?.emit({
-              v: e.version,
-              hash: e.contentHash,
-              origin: ctx.originId,
-              ts: Date.now(),
-            })
-        : undefined,
+      // Post-commit: propagate to gateway replicas (DB mode) and announce the apply —
+      // a promotion is a config apply like any other.
+      onApplied: (e) => {
+        ctx.notifier?.emit({
+          v: e.version,
+          hash: e.contentHash,
+          origin: ctx.originId,
+          ts: Date.now(),
+        });
+        ctx.alerts.emit(
+          makeAlert({
+            kind: 'config.applied',
+            version: e.version,
+            contentHash: e.contentHash,
+            actor: admin.subject,
+          }),
+        );
+      },
     });
     if (r.ok) {
       // DB mode: the alias now lives in Postgres; refresh the console read model.

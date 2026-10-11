@@ -21,6 +21,10 @@
       "description": "orgs, workspaces, memberships"
     },
     {
+      "name": "roles",
+      "description": "the role catalogue: built-in + custom roles"
+    },
+    {
       "name": "providers",
       "description": "upstream providers + secret-ref credentials"
     },
@@ -250,8 +254,28 @@
       }
     },
     "/memberships": {
+      "get": {
+        "summary": "List role grants visible to the caller",
+        "operationId": "list_memberships",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
       "post": {
-        "summary": "Grant a membership",
+        "summary": "Grant a membership (built-in or custom role)",
         "operationId": "create_membership",
         "tags": [
           "tenancy"
@@ -279,7 +303,196 @@
             "description": "missing or invalid admin credentials"
           },
           "403": {
-            "description": "no amplification"
+            "description": "no amplification: the role’s permissions exceed the caller’s at that scope"
+          },
+          "422": {
+            "description": "unknown role or invalid scope"
+          }
+        }
+      }
+    },
+    "/memberships/{id}": {
+      "delete": {
+        "summary": "Revoke a durable role grant",
+        "operationId": "delete_membership",
+        "tags": [
+          "tenancy"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "501": {
+            "description": "needs a database"
+          }
+        }
+      }
+    },
+    "/roles": {
+      "get": {
+        "summary": "List roles and the permission catalogue",
+        "operationId": "list_roles",
+        "tags": [
+          "roles"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a custom role",
+        "operationId": "create_role",
+        "tags": [
+          "roles"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "403": {
+            "description": "a role may not grant permissions the caller does not hold"
+          },
+          "409": {
+            "description": "id is built-in or already exists"
+          },
+          "422": {
+            "description": "invalid id, name or permission name"
+          }
+        }
+      }
+    },
+    "/roles/{id}": {
+      "put": {
+        "summary": "Update a custom role",
+        "operationId": "update_role",
+        "tags": [
+          "roles"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "409": {
+            "description": "built-in roles are immutable"
+          },
+          "422": {
+            "description": "validation error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a custom role",
+        "operationId": "delete_role",
+        "tags": [
+          "roles"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid admin credentials"
+          },
+          "404": {
+            "description": "not found"
+          },
+          "409": {
+            "description": "built-in roles are immutable"
           }
         }
       }

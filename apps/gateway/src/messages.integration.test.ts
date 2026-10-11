@@ -5,6 +5,7 @@ import { generateVirtualKey, InMemoryKeyStore, parseHtpasswd, type Principal } f
 import { err, ok } from '@gulley/core';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
+import { SessionBlockSnapshot } from '@gulley/storage';
 import { InMemoryAesCipher } from '@gulley/crypto';
 import type { MaskVaultRecord } from '@gulley/storage';
 import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
@@ -2787,7 +2788,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     expect(res.status).toBe(402);
     const json = (await res.json()) as { error: { type: string } };
-    expect(json.error.type).toBe('budget_exceeded');
+    expect(json.error.type).toBe('quota_for_entity_exceeded');
     expect(requestLog.entries).toHaveLength(0); // never called upstream
 
     await app.close();
@@ -2844,7 +2845,9 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     });
 
     expect(res.status).toBe(402);
-    expect(((await res.json()) as { error: { type: string } }).error.type).toBe('budget_exceeded');
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe(
+      'quota_for_entity_exceeded',
+    );
     expect(requestLog.entries).toHaveLength(0); // never dispatched
 
     // The workspace reservation must have been released on the model-level rejection:
@@ -7785,5 +7788,241 @@ describe('hot-path review follow-ups (Wave 1)', () => {
     expect(storeSpy).not.toHaveBeenCalled();
     await app.close();
     await new Promise<void>((r) => up.close(() => r()));
+  });
+});
+
+describe('hierarchical hard budgets (K4)', () => {
+  const NOW = Date.UTC(2026, 9, 11, 22, 0, 0); // 22:00 UTC — the daily window resets in 2h
+  const request = (base: string, token: string, extra: Record<string, string> = {}) =>
+    fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token, ...extra },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
+        stream: true,
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+  type Exceeded = {
+    error: {
+      type: string;
+      message: string;
+      scope: { kind: string; id: string; workspace_id?: string };
+      window: { period: string; resets_at?: string };
+    };
+  };
+
+  it("a key's default daily cap 402s with the typed error, retry-after until the reset, and the workspace reservation rolled back", async () => {
+    const { store, token } = seededStore();
+    let now = NOW;
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        ['ws_1', { capMicroUsd: 10_000_000 }],
+        ['key:ws_1:vk_1', { windows: [{ capMicroUsd: 500, period: { kind: 'daily' as const } }] }],
+      ]),
+      () => now,
+    );
+    const { ctx, requestLog, audit } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await request(base, token);
+    expect(res.status).toBe(402);
+    expect(res.headers.get('x-should-retry')).toBe('false');
+    const json = (await res.json()) as Exceeded;
+    // retry-after counts down to the window's reset on the wall clock (the store's
+    // injected clock only decides WHICH window is active).
+    const untilReset = Math.ceil(
+      (Date.parse(json.error.window.resets_at ?? '') - Date.now()) / 1000,
+    );
+    expect(Math.abs(Number(res.headers.get('retry-after')) - untilReset)).toBeLessThanOrEqual(5);
+    expect(json.error.type).toBe('quota_for_entity_exceeded');
+    expect(json.error.scope).toEqual({ kind: 'key', id: 'vk_1', workspace_id: 'ws_1' });
+    expect(json.error.window).toEqual({ period: 'daily', resets_at: '2026-10-12T00:00:00.000Z' });
+    expect(json.error.message).toMatch(
+      /^Key vk_1 budget exceeded\. Current spend: \$0\.00, limit: \$0\.0005 \(daily\)/,
+    );
+    expect(requestLog.entries).toHaveLength(0); // never called upstream
+    const rejected = audit.rows.find((r) => r.action === 'budget.rejected');
+    expect(rejected?.payload).toMatchObject({
+      scope: 'key:ws_1:vk_1',
+      scopeKind: 'key',
+      entity: 'vk_1',
+    });
+    // The workspace reservation taken before the key check was released: the whole
+    // workspace cap is free again.
+    expect((await budgets.reserve('ws_1', 'probe', 10_000_000))?.allowed).toBe(true);
+    await budgets.commit('ws_1', 'probe', 0);
+
+    // The next day the key's window is fresh — but the cap is still too small for this
+    // request, so it is the SAME typed rejection with the new reset time.
+    now = Date.UTC(2026, 9, 12, 1, 0, 0);
+    const again = (await (await request(base, token)).json()) as Exceeded;
+    expect(again.error.window.resets_at).toBe('2026-10-13T00:00:00.000Z');
+    await app.close();
+  });
+
+  it('a daily cap that is exhausted today admits the same request after midnight UTC', async () => {
+    const { store, token } = seededStore();
+    let now = NOW;
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        [
+          'key:ws_1:vk_1',
+          { windows: [{ capMicroUsd: 9_010_000, period: { kind: 'daily' as const } }] },
+        ],
+      ]),
+      () => now,
+    );
+    // Spend most of today's cap already.
+    await budgets.reserve('key:ws_1:vk_1', 'earlier', 9_000_000);
+    await budgets.commit('key:ws_1:vk_1', 'earlier', 9_000_000);
+    const { ctx } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    expect((await request(base, token)).status).toBe(402);
+    now = Date.UTC(2026, 9, 12, 0, 0, 1); // the window rolled
+    const ok = await request(base, token);
+    expect(ok.status).toBe(200);
+    await ok.text();
+    await app.close();
+  });
+
+  it('team (principal groups) and org caps bind in hierarchy order, each naming its entity', async () => {
+    const store = new InMemoryKeyStore();
+    const gen = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_team',
+      keyPrefix: gen.keyPrefix,
+      keyHash: gen.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_1',
+      displayName: 'team key',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: '*',
+      allowedModels: '*',
+      groups: ['ml', 'platform'],
+    });
+    const caps = new Map<string, { capMicroUsd: number }>([
+      ['org:org_1', { capMicroUsd: 500 }],
+      ['team:ws_1:platform', { capMicroUsd: 500 }],
+    ]);
+    const budgets = new InMemoryBudgetStore(caps, () => NOW);
+    const { ctx } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    // The org is checked before any team: it binds first.
+    let json = (await (await request(base, gen.token)).json()) as Exceeded;
+    expect(json.error.scope).toEqual({ kind: 'org', id: 'org_1' });
+    expect(json.error.window).toEqual({ period: 'lifetime' });
+    expect(json.error.message).toMatch(/^Organization budget exceeded/);
+    // Lift the org cap: the second group's cap binds (the first group has none).
+    caps.delete('org:org_1');
+    json = (await (await request(base, gen.token)).json()) as Exceeded;
+    expect(json.error.scope).toEqual({ kind: 'team', id: 'platform', workspace_id: 'ws_1' });
+    // Restrict BUDGET_SCOPES to the org only: the team cap is no longer consulted.
+    ctx.budgetScopes = new Set(['org']);
+    const ok = await request(base, gen.token);
+    expect(ok.status).toBe(200);
+    await ok.text();
+    await app.close();
+  });
+
+  it('a project cap keys off the `project` attribution and fires the hard-rejection alert once per window', async () => {
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        [
+          'project:ws_1:checkout',
+          { windows: [{ capMicroUsd: 500, period: { kind: 'monthly' as const } }] },
+        ],
+      ]),
+      () => NOW,
+    );
+    const { ctx } = buildContext(store, budgets);
+    ctx.attributionHeaders = ['x-gulley-project'];
+    const alerts: Array<{ scope: string; threshold: number; exceeded?: boolean }> = [];
+    ctx.budgetAlerter = {
+      check: () => {},
+      exceeded: (scope, _u, _c, window) =>
+        alerts.push({ scope, threshold: 1, exceeded: true, ...(window ? {} : {}) }),
+    };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const other = await request(base, token, { 'x-gulley-project': 'search' });
+    expect(other.status).toBe(200); // a different project has no cap
+    await other.text();
+    const r1 = await request(base, token, { 'x-gulley-project': 'checkout' });
+    expect(r1.status).toBe(402);
+    const json = (await r1.json()) as Exceeded;
+    expect(json.error.scope).toEqual({ kind: 'project', id: 'checkout', workspace_id: 'ws_1' });
+    expect(json.error.window.period).toBe('monthly');
+    expect(alerts).toEqual([{ scope: 'project:ws_1:checkout', threshold: 1, exceeded: true }]);
+    await app.close();
+  });
+});
+
+describe('session kill switch (K5)', () => {
+  it('refuses a blocked session with 403 before any upstream work, audits it, and lifts an expired block', async () => {
+    const { store, token } = seededStore();
+    let now = Date.now();
+    const blocks = new SessionBlockSnapshot(
+      async () => [
+        { workspaceId: 'ws_1', session: 'sess-runaway', expiresAt: null },
+        { workspaceId: 'ws_1', session: 'sess-lapsed', expiresAt: new Date(now + 1_000) },
+        { workspaceId: 'ws_other', session: 'sess-ok', expiresAt: null }, // another workspace
+      ],
+      60_000,
+      () => now,
+    );
+    await blocks.start();
+    const { ctx, requestLog, audit } = buildContext(store);
+    ctx.sessionBlocks = blocks;
+    ctx.attributionHeaders = ['x-gulley-session'];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = (session: string) =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': token,
+          'x-gulley-session': session,
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+
+    const blocked = await send('sess-runaway');
+    expect(blocked.status).toBe(403);
+    expect(((await blocked.json()) as { error: { type: string } }).error.type).toBe(
+      'session_blocked',
+    );
+    expect(requestLog.entries).toHaveLength(0); // never reached an upstream
+    const row = audit.rows.find((r) => r.action === 'policy.session_blocked');
+    expect(row?.target).toBe('sess-runaway');
+    expect(row?.payload).toMatchObject({ session: 'sess-runaway', workspaceId: 'ws_1' });
+
+    const ok = await send('sess-ok'); // blocked only in another workspace
+    expect(ok.status).toBe(200);
+    await ok.text();
+    expect((await send('sess-lapsed')).status).toBe(403);
+    now += 2_000; // the block's TTL passed — it lifts locally without a reload
+    const lifted = await send('sess-lapsed');
+    expect(lifted.status).toBe(200);
+    await lifted.text();
+    blocks.stop();
+    await app.close();
   });
 });

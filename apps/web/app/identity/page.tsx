@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   Button,
   Cell,
@@ -35,10 +35,11 @@ import type {
   Membership,
   OAuthClient,
   OAuthGrant,
+  RoleDefinition,
 } from '../../lib/types';
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-type Tab = 'people' | 'access' | 'oauth' | 'onboarding';
+type Tab = 'people' | 'access' | 'roles' | 'oauth' | 'onboarding';
 
 export default function IdentityPage() {
   const [tab, setTab] = useState<Tab>('people');
@@ -55,6 +56,7 @@ export default function IdentityPage() {
           tabs={[
             { value: 'people', label: 'Users & sessions' },
             { value: 'access', label: 'Access (RBAC)' },
+            { value: 'roles', label: 'Roles' },
             { value: 'oauth', label: 'OAuth broker' },
             { value: 'onboarding', label: 'Onboarding' },
           ]}
@@ -62,6 +64,7 @@ export default function IdentityPage() {
       </div>
       {tab === 'people' ? <PeopleTab /> : null}
       {tab === 'access' ? <AccessTab /> : null}
+      {tab === 'roles' ? <RolesTab /> : null}
       {tab === 'oauth' ? <OAuthTab /> : null}
       {tab === 'onboarding' ? <OnboardingTab /> : null}
     </div>
@@ -190,7 +193,17 @@ function AccessTab() {
   const { api } = useAdmin();
   const memberships = useAdminQuery((a) => a.memberships(), []);
   const orgs = useAdminQuery((a) => a.orgs(), []);
+  const roles = useAdminQuery((a) => a.roles(), []);
   const [form, setForm] = useState({ subject: '', role: 'viewer', orgId: '' });
+  // The catalogue from /roles (built-ins + custom); the built-in names as a fallback
+  // while it loads or if the caller may not read it.
+  const roleOptions: RoleDefinition[] = roles.data?.roles ?? [
+    { id: 'viewer', name: 'viewer', permissions: [], builtin: true },
+    { id: 'billing', name: 'billing', permissions: [], builtin: true },
+    { id: 'editor', name: 'editor', permissions: [], builtin: true },
+    { id: 'admin', name: 'admin', permissions: [], builtin: true },
+    { id: 'owner', name: 'owner', permissions: [], builtin: true },
+  ];
   const [error, setError] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
 
@@ -215,9 +228,9 @@ function AccessTab() {
               onChange={(e) => setForm({ ...form, role: e.target.value })}
               className="w-full"
             >
-              {['viewer', 'billing', 'editor', 'admin', 'owner'].map((r) => (
-                <option key={r} value={r}>
-                  {r}
+              {roleOptions.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.builtin ? r.id : `${r.name} (${r.id})`}
                 </option>
               ))}
             </Select>
@@ -315,6 +328,261 @@ function AccessTab() {
                   ) : null}
                 </div>
               </GridRow>
+            ))}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+/** Group a permission list by its resource (`key:disable` → `key`) for the grid. */
+function groupPermissions(perms: readonly string[]): Array<{ resource: string; perms: string[] }> {
+  const by = new Map<string, string[]>();
+  for (const p of perms) {
+    const r = p.slice(0, p.indexOf(':'));
+    const arr = by.get(r) ?? [];
+    arr.push(p);
+    by.set(r, arr);
+  }
+  return [...by.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([resource, list]) => ({ resource, perms: list.sort() }));
+}
+
+const EMPTY_ROLE_FORM = { id: '', name: '', description: '', permissions: [] as string[] };
+
+function RolesTab() {
+  const { api } = useAdmin();
+  const roles = useAdminQuery((a) => a.roles(), []);
+  const [form, setForm] = useState(EMPTY_ROLE_FORM);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [error, setError] = useState<string | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+
+  const catalogue = roles.data?.permissions ?? [];
+  const groups = useMemo(() => groupPermissions(catalogue), [catalogue]);
+  const list = roles.data?.roles ?? [];
+  const selected = new Set(form.permissions);
+
+  const toggle = (p: string, on: boolean): void =>
+    setForm((f) => ({
+      ...f,
+      permissions: on ? [...new Set([...f.permissions, p])] : f.permissions.filter((x) => x !== p),
+    }));
+  const toggleGroup = (perms: string[], on: boolean): void =>
+    setForm((f) => ({
+      ...f,
+      permissions: on
+        ? [...new Set([...f.permissions, ...perms])]
+        : f.permissions.filter((x) => !perms.includes(x)),
+    }));
+  const startEdit = (r: RoleDefinition): void => {
+    setEditing(r.id);
+    setForm({
+      id: r.id,
+      name: r.name,
+      description: r.description ?? '',
+      permissions: [...r.permissions],
+    });
+    setError(undefined);
+  };
+  const reset = (): void => {
+    setEditing(null);
+    setForm(EMPTY_ROLE_FORM);
+  };
+
+  async function save(): Promise<void> {
+    if (!api || busy) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      if (editing) {
+        await api.updateRole(editing, {
+          name: form.name.trim(),
+          description: form.description.trim() || null,
+          permissions: form.permissions,
+        });
+      } else {
+        await api.createRole({
+          id: form.id.trim(),
+          name: form.name.trim(),
+          ...(form.description.trim() ? { description: form.description.trim() } : {}),
+          permissions: form.permissions,
+        });
+      }
+      reset();
+      roles.refetch();
+    } catch (e) {
+      setError(msg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {error ? <ErrorNote error={error} /> : null}
+      <Panel>
+        <PanelHeader
+          title={editing ? `Edit role — ${editing}` : 'Create a custom role'}
+          meta="a role may only hold permissions you hold yourself"
+          right={
+            editing ? (
+              <Button variant="ghost" onClick={reset}>
+                Cancel
+              </Button>
+            ) : undefined
+          }
+        />
+        <div className="grid grid-cols-1 gap-2.5 p-3.5 md:grid-cols-3">
+          <Field label="Role id (slug)">
+            <Input
+              value={form.id}
+              disabled={Boolean(editing)}
+              onChange={(e) => setForm({ ...form, id: e.target.value })}
+              placeholder="key-operator"
+            />
+          </Field>
+          <Field label="Display name">
+            <Input
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              placeholder="Key operator"
+            />
+          </Field>
+          <Field label="Description">
+            <Input
+              value={form.description}
+              onChange={(e) => setForm({ ...form, description: e.target.value })}
+              placeholder="Can disable and rotate keys, nothing else"
+            />
+          </Field>
+        </div>
+        <div className="px-3.5 pb-1 text-[11px] text-secondary">
+          Permissions ({form.permissions.length} selected)
+        </div>
+        <div className="grid grid-cols-1 gap-3 px-3.5 pb-3.5 md:grid-cols-2 lg:grid-cols-3">
+          {groups.map((g) => {
+            const allOn = g.perms.every((p) => selected.has(p));
+            return (
+              <div key={g.resource} className="rounded border border-line p-2.5">
+                <label className="flex items-center gap-1.5 text-[11.5px] font-medium text-ink">
+                  <input
+                    type="checkbox"
+                    checked={allOn}
+                    onChange={(e) => toggleGroup(g.perms, e.target.checked)}
+                  />
+                  {g.resource}
+                </label>
+                <div className="mt-1.5 flex flex-col gap-1 pl-5">
+                  {g.perms.map((p) => (
+                    <label
+                      key={p}
+                      className="flex items-center gap-1.5 font-mono text-[10.5px] text-body"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selected.has(p)}
+                        onChange={(e) => toggle(p, e.target.checked)}
+                      />
+                      {p.slice(p.indexOf(':') + 1)}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex justify-end gap-2 px-3.5 pb-3.5">
+          <Button
+            variant="primary"
+            disabled={busy || !form.name.trim() || (!editing && !form.id.trim())}
+            onClick={() => void save()}
+          >
+            {busy ? 'Saving…' : editing ? 'Save changes' : 'Create role'}
+          </Button>
+        </div>
+      </Panel>
+
+      <Panel className="overflow-hidden">
+        <PanelHeader title="Roles" meta={`${list.length}`} />
+        {roles.loading ? (
+          <Spinner />
+        ) : roles.error ? (
+          <div className="p-3">
+            <ErrorNote error={roles.error} onRetry={roles.refetch} />
+          </div>
+        ) : (
+          <div>
+            <GridRow cols="minmax(0,1fr) 90px 110px 150px" header>
+              <Cell>Role</Cell>
+              <Cell>Kind</Cell>
+              <Cell>Permissions</Cell>
+              <Cell align="right"> </Cell>
+            </GridRow>
+            {list.map((r) => (
+              <div key={r.id}>
+                <GridRow cols="minmax(0,1fr) 90px 110px 150px">
+                  <div className="min-w-0">
+                    <div className="truncate text-[11.5px] text-ink">{r.name}</div>
+                    <div className="font-mono text-[9px] text-secondary">
+                      {r.id}
+                      {r.description ? ` — ${r.description}` : ''}
+                    </div>
+                  </div>
+                  <Cell>
+                    <StatusChip tone={r.builtin ? 'neutral' : 'blue'}>
+                      {r.builtin ? 'built-in' : 'custom'}
+                    </StatusChip>
+                  </Cell>
+                  <Cell mono tone="secondary">
+                    {r.permissions.length}
+                  </Cell>
+                  <div className="flex justify-end gap-1">
+                    <Button
+                      variant="ghost"
+                      onClick={() => setExpanded(expanded === r.id ? null : r.id)}
+                    >
+                      {expanded === r.id ? 'Hide' : 'Show'}
+                    </Button>
+                    {!r.builtin ? (
+                      <>
+                        <Button variant="ghost" onClick={() => startEdit(r)}>
+                          Edit
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          onClick={async () => {
+                            if (
+                              !api ||
+                              !window.confirm(
+                                `Delete role "${r.id}"? Grants that name it keep showing but grant nothing.`,
+                              )
+                            )
+                              return;
+                            try {
+                              await api.deleteRole(r.id);
+                              if (editing === r.id) reset();
+                              roles.refetch();
+                            } catch (e) {
+                              setError(msg(e));
+                            }
+                          }}
+                        >
+                          Delete
+                        </Button>
+                      </>
+                    ) : null}
+                  </div>
+                </GridRow>
+                {expanded === r.id ? (
+                  <div className="border-b border-line px-3.5 py-2 font-mono text-[10px] leading-[1.8] text-body">
+                    {r.permissions.length === 0 ? '(no permissions)' : r.permissions.join('  ')}
+                  </div>
+                ) : null}
+              </div>
             ))}
           </div>
         )}

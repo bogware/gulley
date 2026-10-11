@@ -1,3 +1,4 @@
+import { makeAlert } from '@gulley/alerts';
 import { applyConfig, detectDrift, isConfigDocument, plan } from '@gulley/config';
 import { coveredOrgIds } from '@gulley/rbac';
 import type { FastifyInstance } from 'fastify';
@@ -79,15 +80,23 @@ export function registerConfigRoutes(app: FastifyInstance, ctx: ControlContext):
           access: ctx.access,
           atomic: ctx.configAtomic,
           egressAllowlist: ctx.outboundAllowlist,
-          onApplied: ctx.notifier
-            ? (e) =>
-                ctx.notifier?.emit({
-                  v: e.version,
-                  hash: e.contentHash,
-                  origin: ctx.originId,
-                  ts: Date.now(),
-                })
-            : undefined,
+          // Post-commit: propagate to gateway replicas (DB mode) and announce the apply.
+          onApplied: (e) => {
+            ctx.notifier?.emit({
+              v: e.version,
+              hash: e.contentHash,
+              origin: ctx.originId,
+              ts: Date.now(),
+            });
+            ctx.alerts.emit(
+              makeAlert({
+                kind: 'config.applied',
+                version: e.version,
+                contentHash: e.contentHash,
+                actor: admin.subject,
+              }),
+            );
+          },
         });
       } catch (err) {
         // A duplicate entity name within a workspace (the (workspace, name) unique index)
