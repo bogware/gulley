@@ -6,6 +6,101 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-10-10
+
+A correctness patch from the October 2026 audit: eight HIGH defects (one a regression
+from 0.5.0) in the data plane, the MEDIUM tail behind them, per-key scoping that the
+schema could not hold, and four console DTO mismatches. Every fix ships with regression
+tests; the data-plane changes went through the adversarial hot-path review.
+
+### Upgrade notes
+
+- **Run migration `0025`** (`node dist/control-api/migrate.mjs`): it adds the additive
+  `allowed_providers` / `allowed_models` columns to `virtual_key`. Existing keys stay
+  unrestricted.
+- **Pricing seeds are refreshed to October 2026**, so chargeback and budget figures
+  change: Claude Sonnet 5 was seeded at $3/$15 against its $2/$10 list price (reports
+  were a third too high); Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1 and Mythos 5.1
+  were absent and **metered $0 — budgets never consumed for the default model**; OpenAI
+  cached input is 0.1× on the GPT-5.x generation (older families keep their own
+  multiplier) and the GPT-5.x, o-series and `text-embedding-*` models are priced
+  (embeddings metered $0). Per-model cache-read multipliers (Opus 5.5 0.05×, Fable 5.1
+  0.025×) and long-context tiers (Haiku 5.5 above 100K, GPT-5.x above 272K) apply.
+- **`METER_UNPRICED_CONFIG`** (new, default `fail`): `/ready` reports 503 while an
+  operator-configured model (a model-alias target, `BUDGET_DOWNSHIFT_MODEL`, a cascade
+  escalation target, a `ROUTE_GROUPS` model map entry) has no price in the seed or the
+  catalog, since it would meter $0 on every request. Set `warn` to stay ready and list
+  them; local-runtime presets are exempt; `gulley doctor` runs the same check.
+- **Cache entries are now partitioned by delivery mode** (`stream`) and by
+  `anthropic-version`. Entries written by 0.5.0 are not reused (they expire within
+  `CACHE_TTL_SECONDS`).
+- **`TOOL_POLICY` governs only requests that declare `tools` or a `tool_choice`.** Every
+  other request streams unbuffered again. **Behavior change** — 0.5.0 buffered every
+  response deployment-wide once a tool policy was set.
+- **`STREAM_WATCHDOG_BREAKER_THRESHOLD`** (new, default `3`): an inactivity-watchdog abort
+  faults the circuit breaker only after that many consecutive aborts on one target; set
+  `1` for the 0.5.0 behavior.
+- **Bedrock answers `stream:false` with JSON** through `invoke` (0.5.0 always returned SSE).
+- **DB-config mode re-applies `CUSTOM_PROVIDERS` and `ROUTE_GROUPS` on every reconcile.**
+  Deployments that saw those routes vanish after the first reconcile get them back.
+
+### Security
+
+- **The budget commit idempotency token no longer grows without bound (regression from
+  0.5.0).** The committed-ids SET had its TTL re-stamped on every commit, so under steady
+  traffic it never expired and grew by one member per request on the noeviction counters
+  Redis until the store refused writes — at which point `BUDGET_FAIL_OPEN` (the default)
+  admitted every request with no reservation. The token is now one self-expiring key per
+  request (`SET NX EX`); verified against a live Redis over 5,000 commits.
+- **A budget downshift can no longer leave the key's model scope.** The downshift
+  reassigned the model after the authz gate without checking the key's own allow-list,
+  so a compliance pin to one model could be undone by the cap.
+- **Tool-call governance reads every chat choice and every OpenAI Responses `*_call`
+  item.** A tool call on a second choice (`n>1`), a `local_shell_call`,
+  `custom_tool_call`, `computer_call` or `mcp_call`, and the legacy `function_call` were
+  invisible to the policy, so an allow-list passed them as "no tool calls".
+- **A cached streamed response is never replayed to a non-streaming caller** (or the
+  reverse); the exact key stripped `stream` while the hit path returned the stored bytes
+  verbatim.
+- **The default model is priced again** (see upgrade notes): an unpriced flagship model
+  reserved at the floor but committed $0, so workspace, model and attribution caps never
+  consumed.
+
+### Fixed
+
+- **DB-config mode kept its env-only routing.** The first reconcile replaced the route
+  table with the document's provider-only single routes and never re-applied
+  `CUSTOM_PROVIDERS`, the shared chat path or `ROUTE_GROUPS` — the recommended production
+  mode ran with no failover, load-balance, hedge, arbitrage or OpenAI-compatible provider.
+- **`TOOL_POLICY` no longer disables streaming deployment-wide** (gated on declared tools).
+- **A quiet reasoning stream no longer opens the circuit.** A single watchdog abort was a
+  breaker fault; five long thinks on a provider without keepalives opened the breaker
+  (fleet-wide under `BREAKER_SHARED`).
+- **Embeddings requests reserve input-only.** They reserved the 8k default output at the
+  unknown-pricing floor (about $0.61 per call) and were refused with 402 near any real
+  cap; the unpriced-model warning is throttled to once a minute per model.
+- **In-stream enforcement no longer withholds sequential multi-block streams.** Every
+  Anthropic server-tool answer (text → `server_tool_use` → text) and multi-part Responses
+  streams were failed closed; only interleaved text blocks are now.
+- **Per-key allow-lists work in production.** The data-plane key store hard-coded `*`
+  because `virtual_key` had no such columns (migration `0025`).
+- **Console:** the keys list showed a blank name column (`displayName` vs `name`), the
+  shadow-spend ratio rendered `NaN%` (`shadowRatioBps` vs `shadowRatio`), durable role
+  grants showed "—" for every subject (`userId`), and the routes page offered
+  `latency` / `cost` / `conditional` strategies the gateway rejects on hot-reload (it
+  now offers `single` / `loadbalance` / `fallback`; the dry-run panel says it is a local
+  projection).
+- `CLAUDE.md` named the long-gone `envs/dev` / `envs/prod` Terraform roots.
+
+### Added
+
+- **Per-key scope on mint:** `POST /keys` takes `allowedModels`, `allowedProviders`,
+  `expiresAt` and `groups` (validated, audited, returned in the secret-free view); the
+  control client and the console key form expose them.
+- **Unpriced-model readiness check** (`METER_UNPRICED_CONFIG`, `/ready`, `gulley doctor`).
+- **Opt-in live Redis test** for the budget scripts (`GULLEY_TEST_REDIS_URL`).
+- `docs/research/competitor-landscape-2026-10.md` — the October 2026 competitor research.
+
 ## [0.5.0] — 2026-09-28
 
 A hardening release: two waves of security and correctness fixes from a full
@@ -433,7 +528,8 @@ _Resolved during pre-release hardening (these never shipped in a public release)
   token on `x-api-key` as well as the bearer; IPv6 loopback (`[::1]`) PKCE redirects
   are accepted; and `gulley init` merges into an existing settings file.
 
-[Unreleased]: https://github.com/bogware/gulley/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/bogware/gulley/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/bogware/gulley/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/bogware/gulley/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bogware/gulley/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bogware/gulley/releases/tag/v0.3.0
