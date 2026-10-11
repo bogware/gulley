@@ -70,6 +70,7 @@ let received: {
   auth?: string;
   traceparent?: string;
   tenant?: string;
+  ccSession?: string;
   body: string;
 } = { body: '' };
 
@@ -78,6 +79,7 @@ beforeAll(async () => {
     let body = '';
     received = { apiKey: undefined, auth: undefined, body: '' };
     received.apiKey = single(req.headers['x-api-key']);
+    received.ccSession = single(req.headers['x-claude-code-session-id']);
     received.auth = single(req.headers['authorization']);
     received.traceparent = single(req.headers['traceparent']);
     received.tenant = single(req.headers['x-tenant']);
@@ -7199,6 +7201,85 @@ describe('POST /v1/messages/count_tokens (gateway contract)', () => {
       'not_found_error',
     );
     expect(unknown.headers.get('x-should-retry')).toBe('false');
+    await app.close();
+  });
+});
+
+describe('zero-config agent attribution (x-claude-code-*, originator)', () => {
+  it('lands Claude Code session / subagent / prompt / request-class tags on the ledger and request log, and forwards the headers', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger, requestLog } = buildContext(store);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': token,
+        'user-agent': 'claude-cli/2.1.300 (external, cli)',
+        'x-claude-code-session-id': 'sess-attr-1',
+        'x-claude-code-agent-id': 'agent-7',
+        'x-claude-code-request-class': 'main',
+        'x-claude-code-prompt-id': 'p-1',
+        'x-claude-code-prev-tool-durations': 'Bash=742;Read=9',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).then(async (r) => {
+      const text = await r.text();
+      expect(r.status, text).toBe(200);
+    });
+
+    expect(ledger.entries[0]?.attributes).toMatchObject({
+      session: 'sess-attr-1',
+      cc_agent: 'agent-7',
+      request_class: 'main',
+      prompt: 'p-1',
+      agent: 'claude-code',
+    });
+    expect(ledger.entries[0]?.attributes).not.toHaveProperty('prev_tool_durations');
+    expect(requestLog.entries[0]?.attributes?.['session']).toBe('sess-attr-1');
+    expect(requestLog.entries[0]?.attributes?.['agent']).toBe('claude-code');
+    // Consumed AND forwarded: the upstream still sees the headers (contract: open list).
+    expect(received.ccSession).toBe('sess-attr-1');
+    await app.close();
+  });
+
+  it('a configured ATTRIBUTION_HEADERS mapping wins on a shared key, and the knob turns the zero-config tags off', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.attributionHeaders = ['x-gulley-session'];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': token,
+          'x-gulley-session': 'operator-session',
+          'x-claude-code-session-id': 'cc-session',
+          originator: 'codex_cli_rs',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      }).then((r) => r.text());
+    await send();
+    expect(ledger.entries[0]?.attributes).toMatchObject({
+      session: 'operator-session',
+      agent: 'codex',
+    });
+    ctx.agentHeaderAttribution = false;
+    await send();
+    expect(ledger.entries[1]?.attributes).toEqual({ session: 'operator-session' });
     await app.close();
   });
 });

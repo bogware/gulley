@@ -47,6 +47,7 @@ import {
   residencyAllowedRegions,
 } from '../residency-policy';
 import { type CascadePolicy, matchCascade, shouldEscalate } from '../cascade';
+import { agentAttribution } from '../agent-attribution';
 import { conversationIdentity, maskVaultKey } from '../conversation';
 import { COUNT_TOKENS_PATHS, type CountTokensDeps, handleCountTokens } from './count-tokens';
 import { hasSignedThinking, type SignedThinkingSubstitution } from '../thinking';
@@ -327,6 +328,10 @@ export interface GatewayContext {
   /** Request header names whose values are captured as cost-attribution tags on the
    *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
   attributionHeaders?: string[];
+  /** Consume Claude Code's `x-claude-code-*` headers and Codex's `originator` as
+   *  attribution tags (session / cc_agent / prompt / request_class / … / agent) with
+   *  no configuration. Default true. See ../agent-attribution.ts. */
+  agentHeaderAttribution?: boolean;
   /** Indirect-injection spotlighting: wrap untrusted request spans (tool_result /
    *  role:"tool" output) in trust-tag delimiters before forwarding. Absent = off. */
   spotlightUntrusted?: boolean;
@@ -816,7 +821,11 @@ async function handleProxy(
   // Cost-attribution tags from configured request headers (repo/branch/PR/session/
   // developer/…), captured once and threaded onto the ledger, request-log, and audit
   // so spend rolls up by any SDLC dimension for chargeback.
-  const attribution = buildAttribution(request, ctx.attributionHeaders);
+  const attribution = buildAttribution(
+    request,
+    ctx.attributionHeaders,
+    ctx.agentHeaderAttribution ?? true,
+  );
   let body = (request.body as Buffer | undefined) ?? Buffer.alloc(0);
 
   let parsed: Record<string, unknown> = {};
@@ -4453,9 +4462,13 @@ const ATTRIBUTION_VALUE_UNSAFE_RE = /[{}\p{Cc}]/u;
 function buildAttribution(
   request: FastifyRequest,
   headerNames: string[] | undefined,
+  agentHeaders = true,
 ): Record<string, string> | undefined {
-  if (!headerNames || headerNames.length === 0) return undefined;
-  const out: Record<string, string> = {};
+  // Zero-config agent tags first; a configured header mapping to the same key wins.
+  const out: Record<string, string> = agentHeaders ? (agentAttribution(request.headers) ?? {}) : {};
+  if (!headerNames || headerNames.length === 0) {
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
   for (const name of headerNames) {
     const raw = request.headers[name];
     const val = Array.isArray(raw) ? raw[0] : raw;

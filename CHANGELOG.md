@@ -48,6 +48,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   audited as `policy.substitution_pinned`. Substituting the model made the API drop that
   reasoning silently and restarted the prompt cache. Set `allow` to substitute anyway.
 
+- **Zero-config agent attribution** (`AGENT_HEADER_ATTRIBUTION`, default on). Claude
+  Code's `x-claude-code-*` headers (session, subagent, parent agent, prompt, request
+  class, agent type, compaction) and Codex's `originator` become attribution tags —
+  `session`, `cc_agent`, `cc_parent_agent`, `prompt`, `request_class`, `agent_type`,
+  `compaction`, `context_compacted` and `agent` (`claude-code` | `codex`) — on every
+  ledger, request-log and audit row, so chargeback by session / prompt / subagent /
+  agent product and per-attribution caps work without any `ATTRIBUTION_HEADERS`.
 - **Claude Code gateway-contract fixes.** `POST /v1/messages/count_tokens` (also under
   `/anthropic` and `/bedrock`) is served through the same authn / scope / policy /
   residency / input-guardrail gates as inference, with no spend, via the adapter's

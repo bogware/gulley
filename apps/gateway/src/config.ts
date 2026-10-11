@@ -554,6 +554,15 @@ const EnvShape = z.object({
   // is the header name lowercased with a leading `x-`/`x-gulley-` stripped
   // (`X-Gulley-Repo` -> `repo`). e.g. ATTRIBUTION_HEADERS=x-gulley-repo,x-gulley-dev
   ATTRIBUTION_HEADERS: z.string().optional(),
+  // Zero-config agent attribution: consume Claude Code's `x-claude-code-*` headers
+  // (session, subagent, parent agent, prompt, request class, agent type, compaction)
+  // and Codex's `originator` as attribution tags — `session`, `cc_agent`,
+  // `cc_parent_agent`, `prompt`, `request_class`, `agent_type`, `compaction`,
+  // `context_compacted` and `agent` (claude-code | codex) — so spend rolls up by
+  // session / prompt / subagent / agent product with no ATTRIBUTION_HEADERS. A
+  // configured header that maps to the same key wins. The headers still reach the
+  // upstream untouched.
+  AGENT_HEADER_ATTRIBUTION: envBool(true),
 
   // When a successful (2xx) response emits NO provider usage (some OpenAI-compatible
   // and local backends omit stream usage), the request would otherwise bill $0 and
