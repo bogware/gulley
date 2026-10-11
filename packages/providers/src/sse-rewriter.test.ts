@@ -493,3 +493,106 @@ describe('ResponsesSseRewriter', () => {
     expect(evs[0]?.obj['delta']).toBe('tail');
   });
 });
+
+describe('sequential multi-block streams (wave 0)', () => {
+  const upperT: TextTransform = { push: (t) => t.toUpperCase(), flush: () => '' };
+  const rf = (type: string, obj: Record<string, unknown>): string =>
+    `event: ${type}\ndata: ${JSON.stringify({ type, ...obj })}\n\n`;
+
+  it('Anthropic: enforces a second text block that starts after the first one stopped (text → server_tool_use → text)', () => {
+    const r = new AnthropicSseRewriter(upperT);
+    const input =
+      frame('content_block_start', { type: 'content_block_start', index: 0 }) +
+      textDelta(0, 'first ') +
+      frame('content_block_stop', { type: 'content_block_stop', index: 0 }) +
+      frame('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'server_tool_use', name: 'web_search' },
+      }) +
+      frame('content_block_delta', {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'input_json_delta', partial_json: '{"q":"x"}' },
+      }) +
+      frame('content_block_stop', { type: 'content_block_stop', index: 1 }) +
+      frame('content_block_start', { type: 'content_block_start', index: 2 }) +
+      textDelta(2, 'second') +
+      frame('content_block_stop', { type: 'content_block_stop', index: 2 }) +
+      frame('message_stop', { type: 'message_stop' });
+    const out = r.push(input) + r.flush();
+    expect(r.failClosed).toBe(false);
+    const texts = parse(out).filter(
+      (e) => e.obj.type === 'content_block_delta' && e.obj.delta?.type === 'text_delta',
+    );
+    expect(texts.map((e) => e.obj.delta?.text ?? '').join('')).toBe('FIRST SECOND');
+    expect(texts.map((e) => e.obj.index)).toEqual([0, 2]); // each block keeps its index
+    expect(parse(out).filter((e) => e.obj.type === 'content_block_stop')).toHaveLength(3);
+  });
+
+  it('Responses: enforces a second output_text part that starts after the first part ended (text → function_call → text)', () => {
+    const r = new ResponsesSseRewriter(upperT);
+    const input =
+      rf('response.output_text.delta', {
+        item_id: 'm1',
+        output_index: 0,
+        content_index: 0,
+        delta: 'a',
+      }) +
+      rf('response.output_text.done', {
+        item_id: 'm1',
+        output_index: 0,
+        content_index: 0,
+        text: 'a',
+      }) +
+      rf('response.output_item.added', {
+        output_index: 1,
+        item: { type: 'function_call', id: 'fc_1', call_id: 'c1', name: 'f', arguments: '{}' },
+      }) +
+      rf('response.output_text.delta', {
+        item_id: 'm2',
+        output_index: 2,
+        content_index: 0,
+        delta: 'b',
+      }) +
+      rf('response.output_text.done', {
+        item_id: 'm2',
+        output_index: 2,
+        content_index: 0,
+        text: 'b',
+      }) +
+      rf('response.completed', {
+        response: {
+          output: [
+            { type: 'message', content: [{ type: 'output_text', text: 'a' }] },
+            { type: 'function_call', id: 'fc_1', call_id: 'c1', name: 'f', arguments: '{}' },
+            { type: 'message', content: [{ type: 'output_text', text: 'b' }] },
+          ],
+        },
+      });
+    const out = r.push(input) + r.flush();
+    expect(r.failClosed).toBe(false);
+    const events = new SSEParser()
+      .push(out)
+      .map((e) => JSON.parse(e.data) as Record<string, unknown>);
+    const deltas = events.filter((e) => e['type'] === 'response.output_text.delta');
+    expect(deltas.map((e) => e['delta'])).toEqual(['A', 'B']);
+    const dones = events.filter((e) => e['type'] === 'response.output_text.done');
+    expect(dones.map((e) => e['text'])).toEqual(['A', 'B']);
+    const completed = events.find((e) => e['type'] === 'response.completed') as {
+      response: { output: Array<{ content?: Array<{ text: string }> }> };
+    };
+    expect(completed.response.output[0]?.content?.[0]?.text).toBe('A');
+    expect(completed.response.output[2]?.content?.[0]?.text).toBe('B');
+  });
+
+  it('Responses: still fails closed when two parts interleave before the first ended', () => {
+    const r = new ResponsesSseRewriter(upperT);
+    r.push(rf('response.output_text.delta', { output_index: 0, content_index: 0, delta: 'a' }));
+    const out = r.push(
+      rf('response.output_text.delta', { output_index: 2, content_index: 0, delta: 'b' }),
+    );
+    expect(r.failClosed).toBe(true);
+    expect(out).toBe('');
+  });
+});
