@@ -67,7 +67,8 @@ COPY --from=os-patch /patch/ /
 WORKDIR /app
 ENV NODE_ENV=production \
     GATEWAY_PORT=8080 CONTROL_API_PORT=8081 \
-    GULLEY_MIGRATIONS_DIR=/app/dist/migrations
+    GULLEY_MIGRATIONS_DIR=/app/dist/migrations \
+    GULLEY_CATALOG_SNAPSHOT=/app/dist/data/models-dev.snapshot.json
 # Each entry resolves its packages from the node_modules beside it (Node walks up from
 # the entry file's directory), so the two trees never mix.
 COPY --from=build --chown=nonroot:nonroot /app/dist ./dist

@@ -2,7 +2,9 @@ import type { NormalizedUsage } from './normalized';
 import { effectiveRate, type ModelRate, PROVIDER_PRICING } from './pricing';
 
 /** A rate supplied by an external source (e.g. the models.dev catalog). Cache
- *  multipliers are optional; they fall back to the provider seed, then neutral. */
+ *  multipliers are optional; they fall back to the provider seed, then neutral. A
+ *  `tier` is honoured as-is (the catalog carries the provider's long-context tier);
+ *  without one the seed model's tier structure is scaled to this rate's base. */
 export interface RateOverride {
   /** USD per million input tokens. */
   input: number;
@@ -10,6 +12,9 @@ export interface RateOverride {
   output: number;
   /** Cache pricing as multipliers on the base input rate. */
   cache?: { read: number; write5m: number; write1h: number };
+  /** Long-context tier: past `aboveInputTokens` total input the WHOLE request bills at
+   *  the tier rates. */
+  tier?: { aboveInputTokens: number; input: number; output: number };
 }
 
 /** Resolve a (provider, model) to a rate, or undefined to fall back to the seed. */
@@ -17,14 +22,21 @@ export type RateResolver = (provider: string, model: string) => RateOverride | u
 
 const NEUTRAL_CACHE = { read: 1, write5m: 1, write1h: 1 };
 
+const finiteTier = (t: ModelRate['tier']): t is NonNullable<ModelRate['tier']> =>
+  !!t &&
+  Number.isFinite(t.aboveInputTokens) &&
+  Number.isFinite(t.input) &&
+  Number.isFinite(t.output);
+
 /** The long-context tier to bill `rate` with: its own when it carries one (a seed
- *  model), else the seed model's tier scaled by the ratio of `rate`'s base to the
- *  seed's base — a catalog override's base keeps governing, the seed only lends the
- *  threshold and the multiplier (Haiku 5.5: ×5 above 100K; gpt-5.x: ×2 input / ×1.5
- *  output above 272K). No seed, or no tier on it ⇒ flat. */
+ *  model, or a catalog row that ships the provider's tier), else the seed model's tier
+ *  scaled by the ratio of `rate`'s base to the seed's base — a catalog override's base
+ *  keeps governing, the seed only lends the threshold and the multiplier (Haiku 5.5: ×5
+ *  above 100K; gpt-5.x: ×2 input / ×1.5 output above 272K). No seed, or no tier on it
+ *  ⇒ flat. A malformed (non-finite) tier on the rate is ignored, never billed as NaN. */
 function tierFor(rate: ModelRate | RateOverride, seed: ModelRate | undefined): ModelRate['tier'] {
-  const own = (rate as ModelRate).tier;
-  if (own) return own;
+  const own = rate.tier;
+  if (finiteTier(own)) return own;
   const t = seed?.tier;
   if (!t || !seed) return undefined;
   const inRatio = seed.input > 0 ? rate.input / seed.input : 1;
@@ -76,7 +88,11 @@ export function rankPrice(
 ): number | undefined {
   const pricing = PROVIDER_PRICING[provider];
   const rate = resolve?.(provider, model) ?? pricing?.rates[pricing.normalize(model)];
-  return rate ? rate.input + rate.output : undefined;
+  // Mirror computeCost: a malformed catalog row (NaN/Infinity) ranks as unpriced rather
+  // than as "cheapest" (NaN compares false everywhere) or "most expensive".
+  return rate && Number.isFinite(rate.input) && Number.isFinite(rate.output)
+    ? rate.input + rate.output
+    : undefined;
 }
 
 export function computeCost(
@@ -129,11 +145,12 @@ export function computeCost(
   }
 
   // Long-context tier: past the threshold the WHOLE request bills at the tier rates. A
-  // catalog override is a flat rate only because the catalog carries no tier data, not
-  // because the provider bills flat — so the seed's tier STRUCTURE (threshold + its
-  // ratio to the base price) still applies under an override, SCALED to the override's
-  // base so the operator's per-provider catalog price keeps governing (the seed's
-  // absolute tier prices would silently replace a negotiated Bedrock/Azure rate).
+  // catalog override that carries the provider's tier (models.dev `cost.tiers`) is
+  // billed with it. A FLAT override is flat only because its source had no tier data,
+  // not because the provider bills flat — so the seed's tier STRUCTURE (threshold + its
+  // ratio to the base price) still applies under it, SCALED to the override's base so
+  // the operator's per-provider catalog price keeps governing (the seed's absolute tier
+  // prices would silently replace a negotiated Bedrock/Azure rate).
   const eff = effectiveRate({ ...rate, tier: tierFor(rate, seed) }, totalInputTokens);
   const inputUsd = perMillion(u.inputTokens, eff.input);
   const cacheReadUsd = perMillion(u.cacheReadTokens, eff.input * cache.read);

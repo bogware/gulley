@@ -12,7 +12,9 @@
  *
  * Entries: the two servers, the gateway doctor, the control-api migrate + audit-verify
  * CLIs. The migration SQL + journal are copied so `migrate.mjs` and the schema-version
- * readiness probe read them from the image (GULLEY_MIGRATIONS_DIR).
+ * readiness probe read them from the image (GULLEY_MIGRATIONS_DIR), and the bundled
+ * models.dev pricing snapshot (`packages/catalog/data`) is copied to `dist/data` so the
+ * offline pricing fallback ships in the image too (GULLEY_CATALOG_SNAPSHOT).
  */
 import { build } from 'esbuild';
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -82,6 +84,11 @@ for (const [entry, target] of ENTRIES) {
 // Migrations travel with the image: the migrate entry applies them and the readiness
 // probe compares the journal with the database's applied set.
 cpSync(join(root, 'packages/storage/migrations'), join(out, 'migrations'), { recursive: true });
+// The bundled models.dev pricing snapshot travels with the image too. It lands in
+// dist/data so `@gulley/catalog`'s package-relative `../data/…` default resolves from the
+// bundled entries (dist/<app>/main.mjs) exactly as it does from the workspace source;
+// the image also points GULLEY_CATALOG_SNAPSHOT at it explicitly.
+cpSync(join(root, 'packages/catalog/data'), join(out, 'data'), { recursive: true });
 
 writeFileSync(
   join(out, 'build.json'),
