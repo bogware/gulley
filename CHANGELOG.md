@@ -6,6 +6,42 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-11
+
+Wave 2 of the October 2026 cycle — **money and identity**: every dollar an agent spends
+is capped by the right entity, and every identity that spends is a first-class
+principal. Hierarchical hard budgets with calendar windows and a typed rejection,
+workload identity federation for Kubernetes and GitHub Actions, per-agent FinOps with a
+FOCUS export and a runaway-session kill switch, operator alert channels, and SAML SSO
+with custom roles.
+
+### Upgrade notes
+
+- **Four migrations** (`0027_hierarchical_budgets`, `0028_custom_roles`,
+  `0029_finops_sessions`, `0030_workload_federation`) — apply them before rolling the
+  images (`/ready` is 503 on a schema that is behind). Existing `budget` rows become
+  `scope_kind = 'workspace'` rows with `scope_id` backfilled from the workspace id;
+  their config documents export exactly as before. The `role` table is seeded with the
+  five built-in roles (`builtin = true`, never redefinable from a row).
+- **The budget rejection is `402 quota_for_entity_exceeded`** (was `budget_exceeded`);
+  see _Changed_. Clients matching on the old type string need updating.
+- **`BUDGET_ALERT_THRESHOLDS` defaults to `0.5,0.75,1`** (was `0.8,0.9`) and alerts
+  are keyed by budget scope; the legacy webhook payload gained `scope` / `scopeKind` /
+  `entity` / `window`.
+- **`BUDGET_SCOPES` defaults to the whole hierarchy** (`org,key,user,team,project`):
+  each kind is one memoized cap lookup per request on the Redis path and a no-op when
+  no row exists. `BUDGET_SCOPES=workspace` restores the 0.6 workspace-only check.
+- **`x-user-id` is now honoured** — only from a federated service principal whose
+  federation sets `onBehalfOf` — as the `user` attribution and budget scope. Every
+  other principal ignores the header, as before.
+- **New production dependencies** in the image: `nodemailer` (email alerts) and
+  `@node-saml/node-saml` (SAML SP). Both are external in the bundle and land via the
+  control-api `pnpm deploy` step; see `docs/SUPPLY_CHAIN.md`.
+- **`ALERT_CHANNELS`** takes the same JSON on both apps: the gateway emits budget,
+  guardrail-block and breaker events, the control API the rest. Under `AIR_GAPPED`
+  no channel may point outside the allowlist.
+- Helm chart `0.4.0` (`appVersion` `v0.7.0`).
+
 ### Added
 
 - **Hierarchical hard budgets (K4).** A request must now be admitted by every budget in
