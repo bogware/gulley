@@ -76,7 +76,7 @@ pnpm --filter @gulley/control-api ssrf:check     # real DNS-rebind blocking
 ### Terraform
 
 ```bash
-bash ci/tf-check.sh              # fmt -check + validate for envs/dev and envs/prod (no cloud creds)
+bash ci/tf-check.sh              # fmt -check + validate for infra/terraform and infra/eks (no cloud creds)
 ```
 
 ## Architecture map
