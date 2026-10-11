@@ -4474,15 +4474,20 @@ function shouldLogUnpriced(key: string): boolean {
   return true;
 }
 
-/** True when the request can yield tool calls at all: it declares `tools` (Anthropic,
- *  OpenAI chat and Responses all use that field) or forces a `tool_choice`. A malformed
+/** True when the request can yield tool calls at all — every shape the extractor
+ *  governs: `tools` (Anthropic, OpenAI chat and Responses) or a forcing `tool_choice`;
+ *  the legacy OpenAI chat `functions` list or a forcing `function_call` (they yield
+ *  `delta.function_call`, which the extractor reads); and a Responses stored `prompt`
+ *  object, which can carry its own tool definitions the body never shows. A malformed
  *  (unparseable) body is treated as tool-bearing so governance stays fail-closed. */
 function requestDeclaresTools(parsed: Record<string, unknown>, parseOk: boolean): boolean {
   if (!parseOk) return true;
-  const tools = parsed['tools'];
-  if (Array.isArray(tools) && tools.length > 0) return true;
-  const choice = parsed['tool_choice'];
-  return choice !== undefined && choice !== null && choice !== 'none';
+  const nonEmptyList = (v: unknown): boolean => Array.isArray(v) && v.length > 0;
+  const forcing = (v: unknown): boolean => v !== undefined && v !== null && v !== 'none';
+  if (nonEmptyList(parsed['tools']) || nonEmptyList(parsed['functions'])) return true;
+  if (forcing(parsed['tool_choice']) || forcing(parsed['function_call'])) return true;
+  const prompt = parsed['prompt'];
+  return prompt !== null && typeof prompt === 'object';
 }
 
 function bearerToken(request: FastifyRequest): string | undefined {

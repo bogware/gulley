@@ -6663,3 +6663,75 @@ describe('wave 0 regressions (2026-10)', () => {
     await app.close();
   });
 });
+
+describe('wave 0 review follow-ups', () => {
+  it('TOOL_POLICY governs a legacy OpenAI `functions` request (no `tools` key), streamed', async () => {
+    // The gate that spares tool-less requests from buffering must recognise every shape
+    // the extractor governs: a chat.completions request declaring `functions` (legacy)
+    // yields `delta.function_call`, which the extractor reads — so it must be buffered
+    // and governed, not piped through.
+    const chunk = (obj: unknown): string => `data: ${JSON.stringify(obj)}\n\n`;
+    const CHAT_SSE =
+      chunk({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: { role: 'assistant' } }],
+      }) +
+      chunk({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [
+          {
+            index: 0,
+            delta: { function_call: { name: 'run_shell', arguments: '{"cmd":"rm -rf /"}' } },
+          },
+        ],
+      }) +
+      chunk({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: 'function_call' }],
+        usage: { prompt_tokens: 5, completion_tokens: 8 },
+      }) +
+      'data: [DONE]\n\n';
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(CHAT_SSE);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      CUSTOM_PROVIDERS: JSON.stringify([
+        { provider: 'compat', baseUrl: srvUrl, models: ['gpt-x'] },
+      ]),
+    } as NodeJS.ProcessEnv);
+    const custom = buildCustomProviders(config);
+    const { store, token } = seededStore();
+    const { ctx, audit } = buildContext(store);
+    ctx.routes = custom.routes;
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "run_shell"' }]),
+    );
+    const app = buildServer(config, ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/compat/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'gpt-x',
+        stream: true,
+        functions: [{ name: 'run_shell', parameters: { type: 'object' } }],
+        function_call: 'auto',
+        messages: [{ role: 'user', content: 'wipe it' }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.headers.get('x-gulley-tool-policy')).toBe('blocked');
+    expect(text).not.toContain('rm -rf');
+    expect(audit.rows.some((e) => e.action === 'tool_policy.blocked')).toBe(true);
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+});

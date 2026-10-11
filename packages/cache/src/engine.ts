@@ -34,6 +34,22 @@ export interface CacheLookup {
  * neighbor above threshold). The vector id IS the exact key, so a semantic match
  * resolves straight to a stored exact entry. `store` persists both tiers.
  */
+/** The semantic tier's partition — must include everything that changes the response
+ *  (provider/model/path/variant/delivery mode), NOT just the tenant scope, so a
+ *  paraphrase can never near-neighbor into a different model's, provider's or
+ *  stream-mode's entry. Joined with the ASCII unit separator (U+001F): a character no
+ *  scope, model, path or header value carries, AND one Postgres accepts in a `text`
+ *  column — the previous NUL separator was rejected by the pgvector index
+ *  (`invalid byte sequence for encoding "UTF8": 0x00`), which made every semantic
+ *  lookup reject and, since the engine awaits it after the exact miss, bypassed the
+ *  WHOLE cache on the production-default backend. */
+export const VECTOR_SCOPE_SEPARATOR = '\u001f';
+export function vectorScope(req: CacheableRequest): string {
+  return [req.scope, req.provider, req.model, req.path, req.variant ?? '', streamTag(req)].join(
+    VECTOR_SCOPE_SEPARATOR,
+  );
+}
+
 export class CacheEngine {
   constructor(private readonly opts: CacheEngineOptions) {}
 
@@ -41,16 +57,8 @@ export class CacheEngine {
     return this.opts.semantic !== undefined;
   }
 
-  /** Vector partition — must include everything that changes the response
-   *  (provider/model/path/variant), NOT just the tenant scope, so a paraphrase
-   *  can never near-neighbor into a different model's or provider's entry. */
   private vectorScope(req: CacheableRequest): string {
-    // Includes the delivery mode: a streamed and a buffered answer are different byte
-    // sequences, so a paraphrase must never near-neighbor across stream modes either.
-    // NUL-joined: a separator no scope/model/path string can contain.
-    return [req.scope, req.provider, req.model, req.path, req.variant ?? '', streamTag(req)].join(
-      '\u0000',
-    );
+    return vectorScope(req);
   }
 
   async lookup(req: CacheableRequest): Promise<CacheLookup> {

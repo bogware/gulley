@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CacheEngine } from './engine';
+import { CacheEngine, VECTOR_SCOPE_SEPARATOR, vectorScope } from './engine';
 import { InMemoryExactCache } from './exact';
 import { exactKey, semanticText } from './key';
 import type { CacheableRequest, CachedResponse, EmbeddingProvider } from './types';
@@ -198,5 +198,23 @@ describe('cache delivery-mode partition', () => {
     expect((await engine.lookup(req('ws1', paraphrase, { stream: true }))).status).toBe(
       'hit-semantic',
     );
+  });
+});
+
+describe('vector scope', () => {
+  it('is Postgres-safe (no NUL byte) and carries every partition dimension', () => {
+    const scope = vectorScope(
+      req('ws1', { model: 'm', messages: [] }, { variant: 'beta-x|2023-06-01', stream: true }),
+    );
+    expect(scope).not.toContain('\u0000');
+    const parts = scope.split(VECTOR_SCOPE_SEPARATOR);
+    expect(parts).toEqual([
+      'ws1',
+      'anthropic',
+      'claude-haiku-4-5',
+      '/v1/messages',
+      'beta-x|2023-06-01',
+      'stream',
+    ]);
   });
 });

@@ -72,10 +72,22 @@ tests; the data-plane changes went through the adversarial hot-path review.
   table with the document's provider-only single routes and never re-applied
   `CUSTOM_PROVIDERS`, the shared chat path or `ROUTE_GROUPS` — the recommended production
   mode ran with no failover, load-balance, hedge, arbitrage or OpenAI-compatible provider.
-- **`TOOL_POLICY` no longer disables streaming deployment-wide** (gated on declared tools).
-- **A quiet reasoning stream no longer opens the circuit.** A single watchdog abort was a
-  breaker fault; five long thinks on a provider without keepalives opened the breaker
-  (fleet-wide under `BREAKER_SHARED`).
+- **`TOOL_POLICY` no longer disables streaming deployment-wide** (gated on declared
+  tools: `tools` / `tool_choice`, the legacy chat `functions` / `function_call`, or a
+  Responses stored `prompt`; anything the extractor governs is still buffered).
+- **A quiet reasoning stream no longer opens the circuit, and a hung one still does.** A
+  single watchdog abort was a breaker fault; five long thinks on a provider without
+  keepalives opened the breaker (fleet-wide under `BREAKER_SHARED`). A run of
+  `STREAM_WATCHDOG_BREAKER_THRESHOLD` consecutive stalls now trips the circuit outright
+  (`CircuitBreaker.trip`): each stalled stream also records a first-byte success, so the
+  per-sample rules alone could never eject a provider that accepts every request and
+  then hangs.
+- **The semantic cache works on the pgvector default again.** The vector partition was
+  joined with a NUL byte, which Postgres rejects in a `text` column; every semantic
+  lookup threw and, because the engine awaits it after the exact-tier miss, the WHOLE
+  cache was bypassed with `CACHE_SEMANTIC_ENABLED` on pgvector (pre-existing; hidden
+  because the in-process Postgres tests strip the vector extension). The separator is
+  now the ASCII unit separator.
 - **Embeddings requests reserve input-only.** They reserved the 8k default output at the
   unknown-pricing floor (about $0.61 per call) and were refused with 402 near any real
   cap; the unpriced-model warning is throttled to once a minute per model.
