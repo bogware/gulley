@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   extractToolCalls,
   extractToolCallsFromSse,
+  extractTextFromSse,
   governToolCalls,
   parseToolPolicy,
   type ToolActivationContext,
@@ -264,5 +265,189 @@ describe('parseToolPolicy + governToolCalls', () => {
         principal: { ...CTX.principal, workspaceId: 'ws_locked' },
       }).denied?.call.name,
     ).toBe('shell');
+  });
+});
+
+describe('tool-call shapes beyond function_call (wave 0)', () => {
+  it('extracts a tool call on a SECOND choice of a streamed chat completion (n>1)', () => {
+    const calls = extractToolCallsFromSse(
+      sse([
+        {
+          data: {
+            choices: [
+              { index: 0, delta: { content: 'hi' } },
+              {
+                index: 1,
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: 'c1', function: { name: 'shell', arguments: '{"cmd":' } },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+        {
+          data: {
+            choices: [
+              {
+                index: 1,
+                delta: { tool_calls: [{ index: 0, function: { arguments: '"rm -rf /"}' } }] },
+              },
+            ],
+          },
+        },
+      ]),
+      'openai',
+    );
+    expect(calls).toEqual([{ name: 'shell', input: { cmd: 'rm -rf /' }, id: 'c1' }]);
+  });
+
+  it('reads the text of EVERY choice for output DLP (n>1)', () => {
+    const text = extractTextFromSse(
+      sse([
+        {
+          data: {
+            choices: [
+              { index: 0, delta: { content: 'first ' } },
+              { index: 1, delta: { content: 'SECRET' } },
+            ],
+          },
+        },
+      ]),
+      'openai',
+    );
+    expect(text).toContain('SECRET');
+  });
+
+  it('extracts Responses local_shell_call, custom_tool_call and mcp_call items (non-streamed)', () => {
+    const body = {
+      output: [
+        {
+          type: 'local_shell_call',
+          id: 'lsh_1',
+          call_id: 'call_1',
+          status: 'completed',
+          action: { type: 'exec', command: ['rm', '-rf', '/'] },
+        },
+        {
+          type: 'custom_tool_call',
+          id: 'ct_1',
+          call_id: 'call_2',
+          name: 'apply_patch',
+          input: '{"path":"x"}',
+        },
+        {
+          type: 'mcp_call',
+          id: 'mcp_1',
+          name: 'read_file',
+          server_label: 'fs',
+          arguments: '{"path":"/etc/passwd"}',
+        },
+        { type: 'message', role: 'assistant', content: [] },
+      ],
+    };
+    expect(extractToolCalls(body)).toEqual([
+      {
+        name: 'local_shell_call',
+        input: { type: 'exec', command: ['rm', '-rf', '/'] },
+        id: 'call_1',
+      },
+      { name: 'apply_patch', input: { path: 'x' }, id: 'call_2' },
+      { name: 'read_file', input: { path: '/etc/passwd' }, id: 'mcp_1' },
+    ]);
+  });
+
+  it('reassembles a streamed Responses local_shell_call from the output_item.done echo', () => {
+    const calls = extractToolCallsFromSse(
+      sse([
+        {
+          event: 'response.output_item.added',
+          data: {
+            type: 'response.output_item.added',
+            output_index: 0,
+            item: {
+              type: 'local_shell_call',
+              id: 'lsh_1',
+              call_id: 'call_1',
+              status: 'in_progress',
+            },
+          },
+        },
+        {
+          event: 'response.output_item.done',
+          data: {
+            type: 'response.output_item.done',
+            output_index: 0,
+            item: {
+              type: 'local_shell_call',
+              id: 'lsh_1',
+              call_id: 'call_1',
+              status: 'completed',
+              action: { type: 'exec', command: ['ls'] },
+            },
+          },
+        },
+      ]),
+      'responses',
+    );
+    expect(calls).toEqual([
+      { name: 'local_shell_call', input: { type: 'exec', command: ['ls'] }, id: 'call_1' },
+    ]);
+  });
+
+  it('reassembles a streamed custom_tool_call input from its deltas', () => {
+    const calls = extractToolCallsFromSse(
+      sse([
+        {
+          event: 'response.output_item.added',
+          data: {
+            type: 'response.output_item.added',
+            output_index: 0,
+            item: {
+              type: 'custom_tool_call',
+              id: 'ct_1',
+              call_id: 'call_2',
+              name: 'apply_patch',
+              input: '',
+            },
+          },
+        },
+        {
+          event: 'response.custom_tool_call_input.delta',
+          data: {
+            type: 'response.custom_tool_call_input.delta',
+            item_id: 'ct_1',
+            delta: '{"path":',
+          },
+        },
+        {
+          event: 'response.custom_tool_call_input.delta',
+          data: { type: 'response.custom_tool_call_input.delta', item_id: 'ct_1', delta: '"x"}' },
+        },
+      ]),
+      'responses',
+    );
+    expect(calls).toEqual([{ name: 'apply_patch', input: { path: 'x' }, id: 'call_2' }]);
+  });
+
+  it('extracts a legacy chat function_call, non-streamed and streamed', () => {
+    expect(
+      extractToolCalls({
+        choices: [{ message: { function_call: { name: 'shell', arguments: '{"cmd":"ls"}' } } }],
+      }),
+    ).toEqual([{ name: 'shell', input: { cmd: 'ls' } }]);
+    const streamed = extractToolCallsFromSse(
+      sse([
+        { data: { choices: [{ index: 0, delta: { function_call: { name: 'shell' } } }] } },
+        {
+          data: {
+            choices: [{ index: 0, delta: { function_call: { arguments: '{"cmd":"ls"}' } } }],
+          },
+        },
+      ]),
+      'openai',
+    );
+    expect(streamed).toEqual([{ name: 'shell', input: { cmd: 'ls' } }]);
   });
 });

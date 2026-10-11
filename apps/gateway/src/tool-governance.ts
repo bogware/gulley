@@ -62,7 +62,9 @@ export function extractToolCalls(body: unknown): ToolCall[] {
     }
   }
 
-  // OpenAI chat.completions: choices[].message.tool_calls[].function{name,arguments}.
+  // OpenAI chat.completions: choices[].message.tool_calls[].function{name,arguments},
+  // plus the legacy single `message.function_call` {name, arguments}. EVERY choice is
+  // read (n>1), never only the first.
   if (Array.isArray(b['choices'])) {
     for (const ch of b['choices']) {
       const msg = asRecord(asRecord(ch)?.['message']);
@@ -79,24 +81,62 @@ export function extractToolCalls(body: unknown): ToolCall[] {
           }
         }
       }
-    }
-  }
-
-  // OpenAI Responses: output[] with function_call items {name, arguments, call_id}.
-  if (Array.isArray(b['output'])) {
-    for (const item of b['output']) {
-      const r = asRecord(item);
-      if (r && r['type'] === 'function_call' && typeof r['name'] === 'string') {
-        calls.push({
-          name: r['name'],
-          input: parseArgs(r['arguments']),
-          id: strOrUndef(r['call_id']),
-        });
+      const fc = asRecord(msg?.['function_call']);
+      if (fc && typeof fc['name'] === 'string') {
+        calls.push({ name: fc['name'], input: parseArgs(fc['arguments']) });
       }
     }
   }
 
+  // OpenAI Responses: every `*_call` output item (see responsesItemCall).
+  if (Array.isArray(b['output'])) {
+    for (const item of b['output']) {
+      const call = responsesItemCall(asRecord(item));
+      if (call) calls.push(call);
+    }
+  }
+
   return calls;
+}
+
+/**
+ * Every OpenAI Responses output item that asks the client — or a built-in — to ACT is a
+ * tool call for governance, not only `function_call`: `mcp_call` (name + arguments),
+ * `custom_tool_call` (name + string `input`, what Codex's shell runs through),
+ * `local_shell_call` / `computer_call` (an `action` object), and any other `*_call`
+ * (web_search_call, file_search_call, code_interpreter_call, image_generation_call,
+ * shell_call, …) with its remaining fields as the input. An item that carries no `name`
+ * is named by its item type, so an allow-list policy denies what it does not name and a
+ * deny rule can target `tool.name == "local_shell_call"`. Previously only
+ * `function_call` was extracted, so a `local_shell_call` passed an allow-list ungoverned.
+ */
+function responsesItemCall(
+  item: Record<string, unknown> | undefined,
+  streamedArgs?: string,
+): ToolCall | undefined {
+  if (!item) return undefined;
+  const type = item['type'];
+  if (typeof type !== 'string' || !type.endsWith('_call')) return undefined;
+  const name = typeof item['name'] === 'string' ? item['name'] : type;
+  const id = strOrUndef(item['call_id']) ?? strOrUndef(item['id']);
+  const argText =
+    streamedArgs !== undefined && streamedArgs.length > 0
+      ? streamedArgs
+      : typeof item['arguments'] === 'string'
+        ? (item['arguments'] as string)
+        : typeof item['input'] === 'string'
+          ? (item['input'] as string)
+          : undefined;
+  let input: unknown;
+  if (argText !== undefined) input = parseArgs(argText.length > 0 ? argText : '{}');
+  else if (item['arguments'] !== undefined) input = item['arguments'];
+  else if (item['action'] !== undefined) input = item['action'];
+  else {
+    const rest: Record<string, unknown> = { ...item };
+    for (const k of ['type', 'id', 'call_id', 'status', 'name']) delete rest[k];
+    input = rest;
+  }
+  return { name, input, id };
 }
 
 function strOrUndef(v: unknown): string | undefined {
@@ -176,12 +216,18 @@ export function extractTextFromSse(sse: string, dialect: ToolStreamDialect): str
         push(data['delta']);
     } else {
       const choices = data['choices'];
-      const delta = Array.isArray(choices) ? asRecord(asRecord(choices[0])?.['delta']) : undefined;
-      push(delta?.['content']);
-      push(delta?.['reasoning_content']);
-      const tcs = delta?.['tool_calls'];
-      if (Array.isArray(tcs))
-        for (const raw of tcs) push(asRecord(asRecord(raw)?.['function'])?.['arguments']);
+      if (!Array.isArray(choices)) continue;
+      for (const c of choices) {
+        // Every choice (n>1), not only the first: a second choice's text is as
+        // enforceable as the first's.
+        const delta = asRecord(asRecord(c)?.['delta']);
+        push(delta?.['content']);
+        push(delta?.['reasoning_content']);
+        const tcs = delta?.['tool_calls'];
+        if (Array.isArray(tcs))
+          for (const raw of tcs) push(asRecord(asRecord(raw)?.['function'])?.['arguments']);
+        push(asRecord(delta?.['function_call'])?.['arguments']);
+      }
     }
   }
   return parts.join('');
@@ -224,69 +270,101 @@ function fromAnthropicSse(events: ParsedEvent[]): ToolCall[] {
 }
 
 function fromOpenAiChatSse(events: ParsedEvent[]): ToolCall[] {
-  const byIndex = new Map<number, { id?: string; name: string; args: string }>();
-  const order: number[] = [];
+  // Keyed by `${choiceIndex}:${toolCallIndex}` so EVERY choice (n>1) is reassembled —
+  // reading only choices[0] let a tool call on a second choice through ungoverned.
+  const byKey = new Map<string, { id?: string; name: string; args: string }>();
+  const order: string[] = [];
+  const slot = (key: string, id?: string): { id?: string; name: string; args: string } => {
+    let cur = byKey.get(key);
+    if (!cur) {
+      cur = { id, name: '', args: '' };
+      byKey.set(key, cur);
+      order.push(key);
+    }
+    if (id && !cur.id) cur.id = id;
+    return cur;
+  };
   for (const { data } of events) {
     if (!data) continue;
     const choices = data['choices'];
-    const delta = Array.isArray(choices) ? asRecord(asRecord(choices[0])?.['delta']) : undefined;
-    const tcs = delta?.['tool_calls'];
-    if (!Array.isArray(tcs)) continue;
-    for (const raw of tcs) {
-      const tc = asRecord(raw);
-      if (!tc) continue;
-      const idx = num(tc['index']) ?? 0;
-      let cur = byIndex.get(idx);
-      if (!cur) {
-        cur = { id: strOrUndef(tc['id']), name: '', args: '' };
-        byIndex.set(idx, cur);
-        order.push(idx);
+    if (!Array.isArray(choices)) continue;
+    for (const [pos, c] of choices.entries()) {
+      const choice = asRecord(c);
+      const delta = asRecord(choice?.['delta']);
+      if (!delta) continue;
+      const choiceIdx = num(choice?.['index']) ?? pos;
+      // Legacy single `delta.function_call` {name?, arguments?} fragments.
+      const fc = asRecord(delta['function_call']);
+      if (fc) {
+        const cur = slot(`${choiceIdx}:function_call`);
+        if (typeof fc['name'] === 'string') cur.name += fc['name'];
+        if (typeof fc['arguments'] === 'string') cur.args += fc['arguments'];
       }
-      if (typeof tc['id'] === 'string' && !cur.id) cur.id = tc['id'];
-      const fn = asRecord(tc['function']);
-      if (fn) {
-        if (typeof fn['name'] === 'string') cur.name += fn['name'];
-        if (typeof fn['arguments'] === 'string') cur.args += fn['arguments'];
+      const tcs = delta['tool_calls'];
+      if (!Array.isArray(tcs)) continue;
+      for (const raw of tcs) {
+        const tc = asRecord(raw);
+        if (!tc) continue;
+        const cur = slot(`${choiceIdx}:${num(tc['index']) ?? 0}`, strOrUndef(tc['id']));
+        const fn = asRecord(tc['function']);
+        if (fn) {
+          if (typeof fn['name'] === 'string') cur.name += fn['name'];
+          if (typeof fn['arguments'] === 'string') cur.args += fn['arguments'];
+        }
       }
     }
   }
   return order
-    .map((i) => {
-      const c = byIndex.get(i)!;
+    .map((k) => {
+      const c = byKey.get(k)!;
       return { name: c.name, input: parseArgs(c.args.length ? c.args : '{}'), id: c.id };
     })
     .filter((c) => c.name.length > 0);
 }
 
 function fromResponsesSse(events: ParsedEvent[]): ToolCall[] {
-  const byId = new Map<string, { callId?: string; name: string; args: string }>();
+  // Every `*_call` output item is tracked from `output_item.added`; the `output_item.done`
+  // echo (which carries the final `action` / `arguments` / `input` — how
+  // local_shell_call and computer_call arrive) replaces the snapshot; streamed argument
+  // deltas (function, custom tool input, MCP) accumulate in between.
+  const items = new Map<string, { item: Record<string, unknown>; args: string }>();
   const order: string[] = [];
   for (const { event, data } of events) {
     if (!data) continue;
     const type = typeof data['type'] === 'string' ? (data['type'] as string) : event;
-    if (type === 'response.output_item.added') {
+    if (type === 'response.output_item.added' || type === 'response.output_item.done') {
       const item = asRecord(data['item']);
-      if (item && item['type'] === 'function_call' && typeof item['name'] === 'string') {
-        const id = strOrUndef(item['id']) ?? strOrUndef(item['call_id']) ?? String(order.length);
-        byId.set(id, {
-          callId: strOrUndef(item['call_id']),
-          name: item['name'],
-          args: typeof item['arguments'] === 'string' ? (item['arguments'] as string) : '',
-        });
+      const itemType = item?.['type'];
+      if (!item || typeof itemType !== 'string' || !itemType.endsWith('_call')) continue;
+      const id =
+        strOrUndef(item['id']) ??
+        strOrUndef(item['call_id']) ??
+        `#${num(data['output_index']) ?? order.length}`;
+      const cur = items.get(id);
+      if (cur) cur.item = item;
+      else {
+        items.set(id, { item, args: '' });
         order.push(id);
       }
-    } else if (type === 'response.function_call_arguments.delta') {
+    } else if (
+      type === 'response.function_call_arguments.delta' ||
+      type === 'response.custom_tool_call_input.delta' ||
+      type === 'response.mcp_call_arguments.delta'
+    ) {
       if (typeof data['delta'] === 'string') {
         const id = strOrUndef(data['item_id']) ?? order[order.length - 1];
-        const cur = id ? byId.get(id) : undefined;
+        const cur = id ? items.get(id) : undefined;
         if (cur) cur.args += data['delta'];
       }
     }
   }
-  return order.map((id) => {
-    const c = byId.get(id)!;
-    return { name: c.name, input: parseArgs(c.args.length ? c.args : '{}'), id: c.callId };
-  });
+  const calls: ToolCall[] = [];
+  for (const id of order) {
+    const c = items.get(id)!;
+    const call = responsesItemCall(c.item, c.args);
+    if (call) calls.push(call);
+  }
+  return calls;
 }
 
 export interface ToolActivationContext {
