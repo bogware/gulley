@@ -150,3 +150,37 @@ describe('InMemoryBudgetStore — orphan reservation reclamation (audit #10)', (
     expect((await s.reserve('ws', 'big', 400))?.allowed).toBe(false); // 'long' survived
   });
 });
+
+/** Records every script invocation so the commit's key shape can be asserted. */
+class CaptureRedis implements EvalRedis {
+  readonly calls: Array<{ script: string; numKeys: number; args: (string | number)[] }> = [];
+  async eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown> {
+    this.calls.push({ script, numKeys, args });
+    return '0';
+  }
+}
+
+describe('RedisBudgetStore.commit idempotency token', () => {
+  it('uses one self-expiring key per request id, never a shared ever-growing set', async () => {
+    // The regression: a shared committed-ids SET had its TTL re-stamped on EVERY commit,
+    // so under continuous traffic it never expired and grew by one member per request
+    // on the noeviction counters store until Redis refused writes (and BUDGET_FAIL_OPEN
+    // then admitted everything). A per-request SET NX EX key expires on its own.
+    const redis = new CaptureRedis();
+    const store = new RedisBudgetStore(
+      redis,
+      async () => ({ capMicroUsd: 1_000_000, periodSeconds: 0 }),
+      600_000,
+    );
+    await store.commit('ws_1', 'req_1', 100);
+    const call = redis.calls[0];
+    expect(call).toBeDefined();
+    expect(call?.numKeys).toBe(3);
+    expect(call?.args[2]).toBe('budget:{ws_1}:cid:req_1');
+    expect(call?.args[3]).toBe('req_1');
+    expect(Number(call?.args[6])).toBe(600); // dedup TTL = reservation lifetime, seconds
+    expect(call?.script).toContain("'SET', commitIdKey, '1', 'NX', 'EX', dedupTtl");
+    expect(call?.script).not.toContain('SADD');
+    expect(call?.script).not.toContain('committed_ids');
+  });
+});
