@@ -279,6 +279,9 @@ export const maskVault = pgTable(
     direction: text('direction').notNull(), // 'input' | 'output'
     workspaceId: uuid('workspace_id').notNull(),
     orgId: uuid('org_id'),
+    // The conversation the request belonged to (K2 conversation-stable masking):
+    // a bounded printable id (`session:…` / `conv:…` / `fp:…` / `principal:…`).
+    conversationId: text('conversation_id'),
     ciphertext: jsonb('ciphertext').notNull(), // EnvelopeCiphertext (encrypted-at-rest)
     tokenCount: integer('token_count').notNull().default(0),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
@@ -288,6 +291,7 @@ export const maskVault = pgTable(
     primaryKey({ columns: [t.requestId, t.direction] }),
     index('mask_vault_workspace_idx').on(t.workspaceId),
     index('mask_vault_expires_idx').on(t.expiresAt),
+    index('mask_vault_conversation_idx').on(t.conversationId),
   ],
 );
 

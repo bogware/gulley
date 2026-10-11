@@ -34,6 +34,7 @@ import { loadConfig } from './config';
 import { buildCustomProviders } from './context';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 import { buildServer } from './server';
+import { deriveVaultMaster } from './conversation';
 import { buildSmartRouter } from './smart-router';
 import type { ClassifierCompleter, SmartRoutingPolicy } from '@gulley/routing';
 
@@ -3785,6 +3786,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       },
       get: async () => undefined,
       list: async () => [],
+      listByConversation: async () => [],
       sweepExpired: async () => 0,
     };
     ctx.maskVaultEncryptor = cipher;
@@ -3853,6 +3855,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       put: async () => {},
       get: async () => undefined,
       list: async () => [],
+      listByConversation: async () => [],
       sweepExpired: async () => 0,
     };
     ctx.maskVaultEncryptor = {
@@ -4385,7 +4388,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     expect(res.status).toBe(200);
     expect(ct).not.toContain('jane@example.com'); // raw value never reaches the client
-    const tokens = [...ct.matchAll(/<<GULLEY_EMAIL_[0-9A-F]+_\d+>>/g)].map((m) => m[0]);
+    const tokens = [...ct.matchAll(/<<GULLEY_EMAIL_[0-9A-F]+(?:_\d+)?>>/g)].map((m) => m[0]);
     expect(tokens.length).toBe(2); // both occurrences tokenized
     expect(tokens[0]).toBe(tokens[1]); // stable token (coreference preserved)
     expect(ledger.entries).toHaveLength(1);
@@ -6733,5 +6736,167 @@ describe('wave 0 review follow-ups', () => {
     expect(audit.rows.some((e) => e.action === 'tool_policy.blocked')).toBe(true);
     await app.close();
     await new Promise<void>((r) => srv.close(() => r()));
+  });
+});
+
+describe('conversation-stable masking (K2)', () => {
+  const EMAIL = 'jane@example.com';
+  const TOKEN_RE = /<<GULLEY_EMAIL_[0-9A-F]{24}>>/;
+
+  function echoUpstream(): { server: http.Server; bodies: string[] } {
+    const bodies: string[] = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        bodies.push(raw);
+        const body = JSON.parse(raw) as { messages?: Array<{ content?: unknown }> };
+        const last = body.messages?.[body.messages.length - 1]?.content;
+        const echoed = typeof last === 'string' ? last : JSON.stringify(last);
+        const sse =
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5}}}\n\n' +
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n' +
+          'event: content_block_delta\ndata: ' +
+          JSON.stringify({
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: echoed },
+          }) +
+          '\n\n' +
+          'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"output_tokens":5}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(sse);
+      });
+    });
+    return { server, bodies };
+  }
+
+  async function maskingApp(url: string) {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.maskVaultMaster = deriveVaultMaster('test-pepper-for-k2-masking');
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('mask', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    return { app, base, token };
+  }
+
+  const turn1 = (system = 'You are helpful') => ({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 50,
+    system,
+    messages: [{ role: 'user', content: `email ${EMAIL} please` }],
+  });
+
+  it('masks the same value to the same token on every turn of a session, so the provider-side prefix is byte-identical', async () => {
+    const { server, bodies } = echoUpstream();
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { app, base, token } = await maskingApp(url);
+    const headers = (session: string) => ({
+      'content-type': 'application/json',
+      'x-api-key': token,
+      'x-claude-code-session-id': session,
+    });
+
+    const r1 = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: headers('sess-k2-1'),
+      body: JSON.stringify(turn1()),
+    });
+    const t1 = await r1.text();
+    expect(r1.status).toBe(200);
+    expect(t1).toContain(EMAIL); // detokenized for the client
+    const up1 = JSON.parse(bodies[0]!) as { messages: Array<{ content: string }> };
+    const tok = TOKEN_RE.exec(up1.messages[0]!.content)?.[0];
+    expect(tok).toBeDefined();
+
+    // Turn 2: the client replays turn 1 with the REAL value (it never saw the token),
+    // plus the assistant reply it received and a new user turn mentioning it again.
+    const t2body = {
+      ...turn1(),
+      messages: [
+        turn1().messages[0],
+        { role: 'assistant', content: [{ type: 'text', text: `email ${EMAIL} please` }] },
+        { role: 'user', content: `and again ${EMAIL}` },
+      ],
+    };
+    const r2 = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: headers('sess-k2-1'),
+      body: JSON.stringify(t2body),
+    });
+    await r2.text();
+    expect(r2.status).toBe(200);
+    const up2 = JSON.parse(bodies[1]!) as {
+      messages: [{ content: string }, { content: Array<{ text: string }> }, { content: string }];
+    };
+    expect(up2.messages[0]).toEqual(up1.messages[0]); // identical prefix ⇒ prompt cache + preserved thinking hold
+    expect(up2.messages[1].content[0]!.text).toContain(tok!);
+    expect(up2.messages[2].content).toContain(tok!);
+    expect(bodies[1]).not.toContain(EMAIL);
+
+    // Another session ⇒ a different token for the same value (no cross-conversation linkability).
+    const r3 = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: headers('sess-k2-2'),
+      body: JSON.stringify(turn1()),
+    });
+    await r3.text();
+    const up3 = JSON.parse(bodies[2]!) as { messages: Array<{ content: string }> };
+    expect(up3.messages[0]!.content).toMatch(TOKEN_RE);
+    expect(up3.messages[0]!.content).not.toContain(tok!);
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('keys on the conversation fingerprint (system prompt + first user turn) when no session header is sent', async () => {
+    const { server, bodies } = echoUpstream();
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { app, base, token } = await maskingApp(url);
+    const headers = { 'content-type': 'application/json', 'x-api-key': token };
+    const post = (body: unknown) =>
+      fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(body) }).then(
+        async (r) => {
+          await r.text();
+          return r.status;
+        },
+      );
+
+    expect(await post(turn1())).toBe(200);
+    expect(
+      await post({
+        ...turn1(),
+        messages: [
+          turn1().messages[0],
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: `again ${EMAIL}` },
+        ],
+      }),
+    ).toBe(200);
+    expect(await post(turn1('A different system prompt'))).toBe(200);
+    const [a, b, c] = bodies.map((raw) => TOKEN_RE.exec(raw)?.[0]);
+    expect(a).toBeDefined();
+    expect(b).toBe(a); // same conversation prefix ⇒ same token
+    expect(c).toBeDefined();
+    expect(c).not.toBe(a); // another conversation ⇒ another token
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
   });
 });

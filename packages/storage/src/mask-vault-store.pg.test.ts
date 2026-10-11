@@ -134,4 +134,67 @@ describe('PostgresMaskVaultStore (real SQL via pglite)', () => {
     const swept = await store.sweepExpired(new Date());
     expect(swept).toBeGreaterThanOrEqual(1);
   });
+
+  it('listByConversation returns every live record of a conversation, oldest first, optionally per workspace', async () => {
+    const store = new PostgresMaskVaultStore(db);
+    const OTHER_WS = '22222222-2222-2222-2222-222222222222';
+    const base = { orgId: null, ciphertext: cipher, tokenCount: 1, ttlSeconds: 3600 };
+    await store.put({
+      ...base,
+      requestId: 'req_c1',
+      direction: 'input',
+      workspaceId: WS,
+      conversationId: 'session:s1',
+    });
+    await store.put({
+      ...base,
+      requestId: 'req_c1',
+      direction: 'output',
+      workspaceId: WS,
+      conversationId: 'session:s1',
+    });
+    await store.put({
+      ...base,
+      requestId: 'req_c2',
+      direction: 'input',
+      workspaceId: WS,
+      conversationId: 'session:s1',
+    });
+    await store.put({
+      ...base,
+      requestId: 'req_other',
+      direction: 'input',
+      workspaceId: OTHER_WS,
+      conversationId: 'session:s1',
+    });
+    await store.put({
+      ...base,
+      requestId: 'req_x',
+      direction: 'input',
+      workspaceId: WS,
+      conversationId: 'session:s2',
+    });
+    await store.put({
+      ...base,
+      requestId: 'req_expired',
+      direction: 'input',
+      workspaceId: WS,
+      conversationId: 'session:s1',
+      ttlSeconds: -1,
+    });
+    const all = await store.listByConversation('session:s1');
+    expect(all.map((r) => `${r.requestId}:${r.direction}`)).toEqual([
+      'req_c1:input',
+      'req_c1:output',
+      'req_c2:input',
+      'req_other:input',
+    ]);
+    expect(all.every((r) => r.conversationId === 'session:s1')).toBe(true);
+    const ws = await store.listByConversation('session:s1', WS);
+    expect(ws.map((r) => r.requestId)).toEqual(['req_c1', 'req_c1', 'req_c2']);
+    // A record written without a conversation id stays reachable by request id only.
+    await store.put({ ...base, requestId: 'req_nc', direction: 'input', workspaceId: WS });
+    expect((await store.get('req_nc', 'input'))?.conversationId).toBeNull();
+    expect(await store.listByConversation('undefined')).toEqual([]);
+  });
 });

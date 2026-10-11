@@ -21,6 +21,7 @@ class MemMaskVault implements MaskVaultStore {
       direction: r.direction,
       workspaceId: r.workspaceId,
       orgId: r.orgId,
+      conversationId: r.conversationId ?? null,
       ciphertext: r.ciphertext,
       tokenCount: r.tokenCount,
     };
@@ -33,6 +34,15 @@ class MemMaskVault implements MaskVaultStore {
   }
   async list(requestId: string): Promise<MaskVaultView[]> {
     return this.rows.get(requestId) ?? [];
+  }
+  async listByConversation(conversationId: string, workspaceId?: string): Promise<MaskVaultView[]> {
+    return [...this.rows.values()]
+      .flat()
+      .filter(
+        (x) =>
+          x.conversationId === conversationId &&
+          (workspaceId === undefined || x.workspaceId === workspaceId),
+      );
   }
   async sweepExpired(): Promise<number> {
     return 0;

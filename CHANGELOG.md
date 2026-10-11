@@ -6,6 +6,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Conversation-stable reversible masking (K2).** Guardrail `mask` tokens are now
+  derived by HMAC under a per-workspace × per-conversation key, so the same value masks
+  to the same `<<GULLEY_EMAIL_<24 hex>>>` on every turn, in every replica and in both
+  directions. The masked request prefix is byte-identical turn after turn, which keeps
+  the provider's prompt cache hitting and passes the Claude 5.5-generation
+  preserved-thinking prefix check; the previous per-request random token broke both
+  (every masked multi-turn conversation on Opus 5.5 / Sonnet 5.5 / Fable 5.1 was
+  rejected with "bound to a different conversation" and missed its cache prefix). The
+  conversation is identified by `x-gulley-conversation-id` or Claude Code's
+  `x-claude-code-session-id`, else a fingerprint of the system prompt + first user turn,
+  else the virtual key. A token echoed back in the history is never re-masked. Persisted
+  vault records carry the conversation id (migration `0026`) and the control plane can
+  reveal a whole conversation: `GET /admin/mask-vault/conversation/:conversationId`.
+
+### Changed
+
+- **Load-balancer session affinity defaults to the conversation identity** (the session
+  header or the prefix fingerprint) when `LB_SESSION_AFFINITY_HEADER` is unset, so a
+  multi-turn conversation stays on one provider — thinking signatures and prompt caches
+  are provider-bound. Single-turn / unparseable requests keep the least-load spread.
+- Mask token format: keyed tokens have no per-request counter
+  (`<<GULLEY_EMAIL_<24 hex>>>`); the keyless library form keeps `_<nonce>_<n>`.
+
 ## [0.5.1] — 2026-10-10
 
 A correctness patch from the October 2026 audit: eight HIGH defects (one a regression

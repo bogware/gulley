@@ -54,6 +54,7 @@ import { parseToolPolicy } from './tool-governance';
 import { modelPolicyFromEnv } from './model-policy';
 import { isEmptyResidencyPolicy, residencyPolicyFromEnv } from './residency-policy';
 import { parseCascadePolicy } from './cascade';
+import { deriveVaultMaster } from './conversation';
 import { RequestTracer } from './tracer';
 import {
   AzureContentSafetyPlugin,
@@ -1274,6 +1275,7 @@ export function createProductionContext(
     maskVault,
     maskVaultEncryptor,
     maskVaultTtlSeconds: config.MASK_VAULT_TTL_SECONDS,
+    maskVaultMaster: deriveVaultMaster(config.GULLEY_KEY_PEPPER),
     telemetry,
     guardrails,
     cache: config.CACHE_ENABLED

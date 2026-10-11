@@ -47,6 +47,7 @@ import {
   residencyAllowedRegions,
 } from '../residency-policy';
 import { type CascadePolicy, matchCascade, shouldEscalate } from '../cascade';
+import { conversationIdentity, maskVaultKey } from '../conversation';
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
@@ -360,6 +361,10 @@ export interface GatewayContext {
   maskVaultEncryptor?: Encryptor;
   /** Retention for a persisted mask-vault record. */
   maskVaultTtlSeconds?: number;
+  /** Deployment-wide mask-vault master secret (K2): every `mask` token is derived
+   *  from a per-conversation key under it, so the same value masks to the same
+   *  token on every turn. Unset ⇒ request-scoped nonce'd tokens (tests/libraries). */
+  maskVaultMaster?: Uint8Array;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -936,6 +941,16 @@ async function handleProxy(
     principal = auth.value;
   }
 
+  // --- conversation identity (K2): keys the mask vault so tokens are stable for the
+  // lifetime of a conversation (explicit id header → prefix fingerprint → principal),
+  // and pins a conversation to one provider under load balancing. Computed BEFORE any
+  // stage rewrites the body (smart routing, spotlighting, masking) so the fingerprint
+  // sees the same bytes on every turn.
+  const conversation = conversationIdentity(request.headers, parsed, parseOk, principal.id);
+  const vaultKey = ctx.maskVaultMaster
+    ? maskVaultKey(ctx.maskVaultMaster, principal.scope.workspaceId, conversation)
+    : undefined;
+
   // --- per-tenant routing override (most specific: wins over the shared route
   // and the model router) ---
   // A workspace may reroute this client path to its own strategy/provider. Applied
@@ -1058,9 +1073,16 @@ async function handleProxy(
     });
     return;
   }
+  // Session affinity: the configured header, else the conversation identity (an
+  // explicit session id or the prefix fingerprint) so a multi-turn conversation stays
+  // on ONE provider — thinking signatures and prompt caches are provider-bound. A
+  // principal-only identity (single-turn / unparseable body) keeps the old
+  // least-load / weighted spread.
   const sessionKey = ctx.sessionAffinityHeader
-    ? (headerValue(request, ctx.sessionAffinityHeader) ?? principal.id)
-    : undefined;
+    ? (headerValue(request, ctx.sessionAffinityHeader) ?? conversation.id)
+    : conversation.source === 'principal'
+      ? undefined
+      : conversation.id;
   // Data-residency / ZDR: drop any upstream that does not satisfy the deployment
   // policy BEFORE a target is chosen. Enforced inside selectCandidates so it gates the
   // single-mode return and the all-open pool fallback (never re-admitting an
@@ -1421,7 +1443,9 @@ async function handleProxy(
     // `@` as `\u0040` (or a newline as `\n`), which every detector missed while the
     // provider decoded it back into the real value — a one-escape DLP bypass. The
     // masked output stays a JSON object, so the re-parse below still applies.
-    const gr = await engine.inspectInput(parseOk ? JSON.stringify(parsed) : body.toString('utf8'));
+    const gr = await engine.inspectInput(parseOk ? JSON.stringify(parsed) : body.toString('utf8'), {
+      vaultKey,
+    });
     inputFindings = gr.summary.total;
     if (gr.blocked) {
       await auditSafe({
@@ -2839,6 +2863,7 @@ async function handleProxy(
           engine.combinedDetector(),
           engine.outputPolicy,
           ctx.streamEnforceWindowChars ?? 512,
+          { vaultKey },
         )
       : undefined;
   // The client-bound transform: detokenize masked-input values (in logical-text
@@ -3306,6 +3331,7 @@ async function handleProxy(
             direction,
             workspaceId: principal.scope.workspaceId,
             orgId: principal.scope.orgId,
+            conversationId: conversation.id,
             ciphertext: ct,
             tokenCount: v.size,
             ttlSeconds: ctx.maskVaultTtlSeconds ?? 604_800,
@@ -3887,6 +3913,7 @@ async function handleProxy(
       const inspectDetok = vault ? new StreamingReplacer(vault.entries()) : undefined;
       const out = await engine.inspectOutput(
         inspectDetok ? inspectDetok.push(logical) + inspectDetok.flush() : logical,
+        { vaultKey },
       );
       outputEnforced = out;
       const withhold = out.blocked || out.transformedText !== undefined;
@@ -3922,7 +3949,7 @@ async function handleProxy(
       // values with its own fresh tokens, with no collision.
       const raw = Buffer.concat(fullChunks).toString('utf8');
       const text = detok ? detok.push(raw) + detok.flush() : raw;
-      const out = await engine.inspectOutput(text);
+      const out = await engine.inspectOutput(text, { vaultKey });
       outputEnforced = out;
       const bodyOut = out.blocked
         ? Buffer.from(

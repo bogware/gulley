@@ -183,6 +183,13 @@
       "when": 1791690199156,
       "tag": "0025_key_allowlists",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1791725742222,
+      "tag": "0026_mask_vault_conversation",
+      "breakpoints": true
     }
   ]
 }

@@ -1,6 +1,6 @@
 import { filterByPolicy } from './engine';
 import type { Detector, Finding, GuardrailPolicy } from './types';
-import { redactText, TokenVault } from './vault';
+import { redactText, TokenVault, type TokenVaultOptions } from './vault';
 
 /**
  * Starts of a potentially-LONG match — one that can exceed the hold window, so the
@@ -210,6 +210,7 @@ export class StreamingRedactor {
     private readonly detector: Detector,
     private readonly policy: GuardrailPolicy,
     windowChars = 512,
+    options: { vaultKey?: TokenVaultOptions['key'] } = {},
   ) {
     this.window = Math.max(1, windowChars);
     // Room for a forming long match (a PEM private key) to complete and be redacted
@@ -219,7 +220,7 @@ export class StreamingRedactor {
     // `mask` tokenizes reversibly (stable per-value token, restorable via the vault);
     // `redact` (and any other action) replaces irreversibly. One vault spans the
     // whole stream so a value recurring across chunks keeps its token (coreference).
-    this._vault = policy.action === 'mask' ? new TokenVault() : undefined;
+    this._vault = policy.action === 'mask' ? new TokenVault({ key: options.vaultKey }) : undefined;
     // Only hold an anchor whose category this policy could enforce. Under a policy
     // that excludes the category (e.g. mask PII only, not secrets), a matching
     // JWT/PEM is not sensitive — holding it would add latency for nothing. The
