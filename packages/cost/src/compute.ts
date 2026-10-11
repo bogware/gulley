@@ -1,5 +1,5 @@
 import type { NormalizedUsage } from './normalized';
-import { PROVIDER_PRICING } from './pricing';
+import { effectiveRate, type ModelRate, PROVIDER_PRICING } from './pricing';
 
 /** A rate supplied by an external source (e.g. the models.dev catalog). Cache
  *  multipliers are optional; they fall back to the provider seed, then neutral. */
@@ -82,8 +82,9 @@ export function computeCost(
   // back to the in-tree seed table. Either way an unknown model still meters
   // tokens with priced: false rather than guessing.
   const pricing = PROVIDER_PRICING[provider];
+  const seed: ModelRate | undefined = pricing?.rates[pricing.normalize(model)];
   const override = resolve?.(provider, model);
-  const candidate = override ?? pricing?.rates[pricing.normalize(model)];
+  const candidate: ModelRate | RateOverride | undefined = override ?? seed;
   // A rate that is not a finite number (a malformed catalog row) must surface as
   // UNPRICED — NaN would otherwise propagate into the reservation (silently skipped)
   // and the ledger (a bigint column that rejects the row on every request).
@@ -91,7 +92,10 @@ export function computeCost(
     candidate && Number.isFinite(candidate.input) && Number.isFinite(candidate.output)
       ? candidate
       : undefined;
-  const cache = override?.cache ?? pricing?.cache ?? NEUTRAL_CACHE;
+  // Cache multipliers: a catalog override that carries them wins; otherwise the
+  // provider default with the seed model's own per-model fields layered over it
+  // (Opus 5.5 reads at 0.05×, gpt-4o at 0.5× — a flat provider rate mis-billed both).
+  const cache = override?.cache ?? { ...(pricing?.cache ?? NEUTRAL_CACHE), ...(seed?.cache ?? {}) };
   if (!rate) {
     return {
       ...base,
@@ -105,15 +109,18 @@ export function computeCost(
     };
   }
 
-  const inputUsd = perMillion(u.inputTokens, rate.input);
-  const cacheReadUsd = perMillion(u.cacheReadTokens, rate.input * cache.read);
+  // Long-context tier (seed models only; a catalog override is already a flat rate):
+  // past the threshold the WHOLE request bills at the tier rates.
+  const eff = effectiveRate(rate as ModelRate, totalInputTokens);
+  const inputUsd = perMillion(u.inputTokens, eff.input);
+  const cacheReadUsd = perMillion(u.cacheReadTokens, eff.input * cache.read);
   const cacheWriteUsd =
-    perMillion(u.cacheWrite5mTokens, rate.input * cache.write5m) +
-    perMillion(u.cacheWrite1hTokens, rate.input * cache.write1h);
-  const outputUsd = perMillion(u.outputTokens, rate.output);
+    perMillion(u.cacheWrite5mTokens, eff.input * cache.write5m) +
+    perMillion(u.cacheWrite1hTokens, eff.input * cache.write1h);
+  const outputUsd = perMillion(u.outputTokens, eff.output);
   // What cache_read tokens would have cost at the full input rate, minus what they
   // did cost at the discounted rate — the provider-prompt-cache dollars saved.
-  const cacheSavedUsd = perMillion(u.cacheReadTokens, rate.input * (1 - cache.read));
+  const cacheSavedUsd = perMillion(u.cacheReadTokens, eff.input * (1 - cache.read));
 
   return {
     ...base,

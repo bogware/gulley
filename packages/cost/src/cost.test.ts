@@ -5,6 +5,7 @@ import {
   lookupRate,
   normalizeModelId,
   toMicroUsd,
+  type NormalizedUsage,
 } from './index';
 
 describe('pricing', () => {
@@ -45,8 +46,8 @@ describe('computeAnthropicCost', () => {
   });
 
   it('applies cache read/write multipliers on the input rate', () => {
-    // Sonnet-5 input $3/MTok. read x0.1 => $0.30; write5m x1.25 => $3.75 per MTok.
-    const c = computeAnthropicCost('claude-sonnet-5', {
+    // Sonnet 4.6 input $3/MTok. read x0.1 => $0.30; write5m x1.25 => $3.75 per MTok.
+    const c = computeAnthropicCost('claude-sonnet-4-6', {
       input_tokens: 0,
       output_tokens: 0,
       cache_read_input_tokens: 1_000_000,
@@ -160,5 +161,118 @@ describe('computeCost (provider-generic)', () => {
     });
     expect(c.priced).toBe(false);
     expect(c.outputTokens).toBe(5);
+  });
+});
+
+describe('seed pricing (2026-10)', () => {
+  const usage = (over: Partial<NormalizedUsage>): NormalizedUsage => ({
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWrite5mTokens: 0,
+    cacheWrite1hTokens: 0,
+    outputTokens: 0,
+    seen: true,
+    ...over,
+  });
+  const oneM = usage({ inputTokens: 1_000_000, outputTokens: 1_000_000 });
+
+  it('prices every current Anthropic model, by API id and by Bedrock id', () => {
+    const current = [
+      'claude-fable-5-1',
+      'claude-mythos-5-1',
+      'claude-fable-5',
+      'claude-opus-5-5',
+      'claude-opus-5',
+      'claude-opus-4-8',
+      'claude-sonnet-5-5',
+      'claude-sonnet-5',
+      'claude-sonnet-4-6',
+      'claude-haiku-5-5',
+      'claude-haiku-4-5',
+    ];
+    for (const m of current) {
+      expect(computeCost('anthropic', m, oneM).priced, m).toBe(true);
+      expect(computeCost('anthropic', `${m}-20260401`, oneM).priced, `${m} dated`).toBe(true);
+      expect(
+        computeCost('bedrock', `us.anthropic.${m}-20260401-v1:0`, oneM).priced,
+        `${m} bedrock`,
+      ).toBe(true);
+    }
+  });
+
+  it('prices every current OpenAI model including embeddings', () => {
+    const current = [
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.5',
+      'gpt-5.4',
+      'gpt-5.4-mini',
+      'gpt-5.4-nano',
+      'gpt-5.2',
+      'gpt-5.1',
+      'gpt-5',
+      'gpt-5-mini',
+      'gpt-5-nano',
+      'gpt-4.1',
+      'gpt-4o',
+      'o3',
+      'o4-mini',
+      'text-embedding-3-small',
+      'text-embedding-3-large',
+    ];
+    for (const m of current) expect(computeCost('openai', m, oneM).priced, m).toBe(true);
+    const e = computeCost('openai', 'text-embedding-3-small', usage({ inputTokens: 1_000_000 }));
+    expect(e.totalUsd).toBeCloseTo(0.02, 6);
+  });
+
+  it('applies per-model cache-read multipliers', () => {
+    const read = usage({ cacheReadTokens: 1_000_000 });
+    expect(computeCost('anthropic', 'claude-opus-5-5', read).cacheReadUsd).toBeCloseTo(0.2, 6);
+    expect(computeCost('anthropic', 'claude-fable-5-1', read).cacheReadUsd).toBeCloseTo(0.25, 6);
+    expect(computeCost('anthropic', 'claude-sonnet-5-5', read).cacheReadUsd).toBeCloseTo(0.2, 6);
+    expect(computeCost('anthropic', 'claude-fable-5', read).cacheReadUsd).toBeCloseTo(1, 6);
+    expect(computeCost('openai', 'gpt-5', read).cacheReadUsd).toBeCloseTo(0.125, 6);
+    expect(computeCost('openai', 'gpt-4.1', read).cacheReadUsd).toBeCloseTo(0.5, 6);
+    expect(computeCost('openai', 'o3', read).cacheReadUsd).toBeCloseTo(0.5, 6);
+    expect(computeCost('openai', 'gpt-5-pro', read).cacheReadUsd).toBeCloseTo(15, 6);
+    // Cache writes keep the Anthropic provider default (1.25x / 2x) under a per-model read.
+    const write = usage({ cacheWrite5mTokens: 1_000_000, cacheWrite1hTokens: 1_000_000 });
+    expect(computeCost('anthropic', 'claude-opus-5-5', write).cacheWriteUsd).toBeCloseTo(13, 6);
+  });
+
+  it('bills Sonnet 5 at the $2/$10 list price (was seeded at $3/$15)', () => {
+    const c = computeCost('anthropic', 'claude-sonnet-5', oneM);
+    expect(c.inputUsd).toBeCloseTo(2, 6);
+    expect(c.outputUsd).toBeCloseTo(10, 6);
+  });
+
+  it('bills the whole request at the long-context tier past the threshold', () => {
+    // Haiku 5.5: $0.10/$0.50 up to 100K input, $0.50/$2.50 above.
+    const short = computeCost('anthropic', 'claude-haiku-5-5', usage({ inputTokens: 50_000 }));
+    expect(short.inputUsd).toBeCloseTo(0.005, 9);
+    const long = computeCost(
+      'anthropic',
+      'claude-haiku-5-5',
+      usage({ inputTokens: 150_000, outputTokens: 1_000 }),
+    );
+    expect(long.inputUsd).toBeCloseTo(0.075, 9);
+    expect(long.outputUsd).toBeCloseTo(0.0025, 9);
+    // Cache-read tokens count toward the threshold (total billable input).
+    const viaCache = computeCost(
+      'anthropic',
+      'claude-haiku-5-5',
+      usage({ inputTokens: 10_000, cacheReadTokens: 100_000 }),
+    );
+    expect(viaCache.inputUsd).toBeCloseTo(0.005, 9);
+    // gpt-5.6-sol: $4/$20 up to 272K input, $8/$30 above; cached input stays 0.1x.
+    const sol = computeCost(
+      'openai',
+      'gpt-5.6-sol',
+      usage({ inputTokens: 300_000, cacheReadTokens: 100_000, outputTokens: 1_000 }),
+    );
+    expect(sol.inputUsd).toBeCloseTo(2.4, 6);
+    expect(sol.cacheReadUsd).toBeCloseTo(0.08, 6);
+    expect(sol.outputUsd).toBeCloseTo(0.03, 6);
   });
 });
