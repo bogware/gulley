@@ -20,3 +20,6 @@ design_handoff_gulley_console/
 
 # internal development notes (local-only, not tracked)
 docs/internal/
+# Generated gateway-contract conformance report (apps/gateway conformance:report)
+docs/CONFORMANCE.md
+docs/conformance-report.json

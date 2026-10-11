@@ -1,0 +1,118 @@
+{
+  "gateway": "gulley",
+  "version": "0.0.0-dev",
+  "cases": [
+    {
+      "id": "A01-beta-open-list",
+      "source": "anthropic",
+      "requirement": "Forward the anthropic-beta header verbatim as an open list (never an allowlist), and anthropic-version unchanged",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#request-headers",
+      "status": "pass"
+    },
+    {
+      "id": "A02-no-buffering",
+      "source": "anthropic",
+      "requirement": "Relay a streamed response event by event: the client receives bytes before the upstream finishes",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#streaming",
+      "status": "pass"
+    },
+    {
+      "id": "A03-ping-relay",
+      "source": "anthropic",
+      "requirement": "Relay upstream ping events (and comment lines) — never strip or buffer them",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#streaming",
+      "status": "pass"
+    },
+    {
+      "id": "A04-event-order",
+      "source": "anthropic",
+      "requirement": "Deliver the full event sequence in order through the final message_delta and message_stop",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#streaming",
+      "status": "pass"
+    },
+    {
+      "id": "A05-bedrock-ping-synthesis",
+      "source": "anthropic",
+      "requirement": "A gateway that translates from an upstream without pings (Bedrock) emits its own ping events during a pause",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#streaming",
+      "status": "pass"
+    },
+    {
+      "id": "A06-error-body-verbatim",
+      "source": "anthropic",
+      "requirement": "Forward error response bodies unmodified, with retry-after as integer seconds, x-should-retry and anthropic-ratelimit-unified-* unchanged",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#response-headers",
+      "status": "pass"
+    },
+    {
+      "id": "A07-gateway-errors",
+      "source": "anthropic",
+      "requirement": "Gateway-generated errors use Anthropic's envelope and types and carry x-should-retry",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#response-headers",
+      "status": "pass"
+    },
+    {
+      "id": "A08-model-discovery",
+      "source": "anthropic",
+      "requirement": "Serve GET /v1/models?limit=1000 directly (no redirect) within 3 seconds, with ids Claude Code keeps (contain \"claude\")",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#model-discovery",
+      "status": "pass"
+    },
+    {
+      "id": "A09-count-tokens",
+      "source": "anthropic",
+      "requirement": "Expose POST /v1/messages/count_tokens for exact token counts",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#api-formats",
+      "status": "pass"
+    },
+    {
+      "id": "A10-system-and-body-unchanged",
+      "source": "anthropic",
+      "requirement": "Forward the system array exactly as received (attribution block first) and body fields such as cache_control, thinking and context_management unchanged — inspect without modifying",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#system-prompt-attribution-block",
+      "status": "pass"
+    },
+    {
+      "id": "A11-capability-rejected-token",
+      "source": "anthropic",
+      "requirement": "A translated route's error envelope carries a stable capability_rejected: token (prompt_too_long) where the upstream's wording differs",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#automatic-retry-and-error-forwarding",
+      "status": "pass"
+    },
+    {
+      "id": "A12-attribution-headers-consumed",
+      "source": "anthropic",
+      "requirement": "x-claude-code-* headers may be consumed for attribution and still reach the upstream",
+      "reference": "code.claude.com/docs/en/llm-gateway-protocol#request-headers",
+      "status": "pass"
+    },
+    {
+      "id": "C01-responses-sse-incremental",
+      "source": "codex",
+      "requirement": "Accept POST /v1/responses and forward server-sent events incrementally, preserving event types including the terminal response.completed",
+      "reference": "learn.chatgpt.com/docs/enterprise/gateway-compatibility",
+      "status": "pass"
+    },
+    {
+      "id": "C02-function-call-pairing",
+      "source": "codex",
+      "requirement": "Preserve function-call items and their matching function_call_output items, including the identifiers that link them",
+      "reference": "learn.chatgpt.com/docs/enterprise/gateway-compatibility",
+      "status": "pass"
+    },
+    {
+      "id": "C03-error-classes",
+      "source": "codex",
+      "requirement": "Distinguish client authentication errors, unknown model routes, rate limits and upstream failures — never a generic 500",
+      "reference": "learn.chatgpt.com/docs/enterprise/gateway-compatibility",
+      "status": "pass"
+    },
+    {
+      "id": "C04-model-routing",
+      "source": "codex",
+      "requirement": "Each Codex-facing model name routes to the intended upstream model, verifiable in gateway records",
+      "reference": "learn.chatgpt.com/docs/enterprise/gateway-compatibility",
+      "status": "pass"
+    }
+  ]
+}

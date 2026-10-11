@@ -56,6 +56,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   audited as `policy.substitution_pinned`. Substituting the model made the API drop that
   reasoning silently and restarted the prompt cache. Set `allow` to substitute anyway.
 
+- **Certified gateway-contract conformance (K6).** A black-box suite executes the rules
+  of Anthropic's Claude Code gateway compatibility guide (open-list beta forwarding, no
+  buffering, ping relay and Bedrock ping synthesis, event order, verbatim error bodies
+  with `retry-after` / `x-should-retry` / `anthropic-ratelimit-unified-*`, model
+  discovery timing, `count_tokens`, an unchanged `system` array and body fields,
+  `capability_rejected:` tokens, consumed attribution headers) and OpenAI's Codex
+  checklist (incremental Responses SSE through `response.completed`,
+  `function_call_output` pairing, distinct error classes, model routing) against the
+  assembled gateway on every CI run, and renders the committed per-release report
+  `docs/CONFORMANCE.md` (`pnpm --filter @gulley/gateway conformance:report`; CI fails
+  on drift; attached to each GitHub Release).
 - **Request-level routing preferences and per-attempt provenance (P7).** An
   OpenRouter-compatible `provider` object (`order`, `only`, `ignore`, `allow_fallbacks`,
   `sort`, `zdr`, `max_price`) or Vercel's `providerOptions.gateway` (`order`, `only`,
