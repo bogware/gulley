@@ -10,7 +10,8 @@ import { type CentroidStore, type ConfigSubscriber, SignalGate } from '@gulley/s
 import { buildModelRouterFromDocument, buildRoutesFromDocument } from './config-builder';
 import { buildModelPolicy, unionModelPolicy } from './model-policy';
 import { isEmptyResidencyPolicy, residencyAllowedRegions } from './residency-policy';
-import type { RouteHolder } from './routes/messages';
+import type { ModelRouteRule } from '@gulley/routing';
+import type { ProviderRoute, RouteHolder } from './routes/messages';
 import {
   buildEmbeddingCentroids,
   buildPersistentCentroids,
@@ -52,6 +53,14 @@ export interface ReconcileLog {
   error(err: unknown, msg: string): void;
 }
 
+/** Env-sourced route overlays re-applied on every reconcile (see
+ *  `overlayEnvRoutes` in context.ts): custom/local providers, the shared chat path,
+ *  ROUTE_GROUPS composition, plus the custom providers' model-router rules. */
+export interface RouteOverlay {
+  apply(base: ProviderRoute[]): ProviderRoute[];
+  modelRules: readonly ModelRouteRule[];
+}
+
 /**
  * Drives a live config reconcile: reads the current document from the durable
  * store, builds the new route table (resolving provider secret ARNs), and swaps
@@ -73,6 +82,7 @@ export class GatewayReconciler {
     private readonly resolver: SecretResolver,
     private readonly log?: ReconcileLog,
     private readonly smartRouting?: SmartRoutingReconcile,
+    private readonly overlay?: RouteOverlay,
   ) {}
 
   /** Trigger a reconcile; serialized behind any in-flight one. Resolves to true
@@ -96,7 +106,16 @@ export class GatewayReconciler {
       // floor), so a DB policy can only add to it — never drop its output
       // enforcement or managed DLP plugins. ctx is preserved by reference across
       // reconciles, so the floor is stable.
-      const routes = await buildRoutesFromDocument(doc, this.resolver, this.holder.ctx.guardrails);
+      const docRoutes = await buildRoutesFromDocument(
+        doc,
+        this.resolver,
+        this.holder.ctx.guardrails,
+      );
+      // Re-apply the env-only overlays (custom/local providers, ROUTE_GROUPS) on EVERY
+      // reconcile: the document carries only the four core provider kinds, so without
+      // this the first swap silently dropped failover/LB/hedge/arbitrage and every
+      // OpenAI-compatible provider in production (DB-config) mode.
+      const routes = this.overlay ? this.overlay.apply(docRoutes) : docRoutes;
       // Build the smart router BEFORE swapping anything: a malformed policy throws
       // here and the catch keeps the CURRENT routes + smart router intact (never a
       // partial swap), matching the credential-resolution failure contract.
@@ -152,7 +171,9 @@ export class GatewayReconciler {
       }
       // Build the model router from the document's aliases BEFORE swapping, so a
       // malformed alias throws here (caught → current config kept), never partial.
-      const modelRouter = buildModelRouterFromDocument(doc);
+      // The env custom-provider model rules ride along (document aliases win on a
+      // duplicate pattern) so a reconcile never un-routes a CUSTOM_PROVIDERS model.
+      const modelRouter = buildModelRouterFromDocument(doc, this.overlay?.modelRules ?? []);
       // Central model allow/deny policy from the document's `policies` entities,
       // UNIONED with the stable env floor (envModelPolicy) so a config document with
       // no model policy never drops an env-set MODEL_DENY floor.

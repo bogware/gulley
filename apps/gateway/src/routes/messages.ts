@@ -109,6 +109,15 @@ import {
 } from 'node:zlib';
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+/** Consecutive watchdog aborts on one target before the breaker is faulted (ctx override:
+ *  STREAM_WATCHDOG_BREAKER_THRESHOLD). */
+const DEFAULT_WATCHDOG_BREAKER_THRESHOLD = 3;
+/** Per-target run of consecutive inactivity-watchdog aborts (process-local; a clean
+ *  stream end on the target resets it). Bounded by the number of configured targets. */
+const watchdogRuns = new Map<string, number>();
+/** Last time an unpriced-model warning was logged per provider/model (throttle). */
+const unpricedLogAt = new Map<string, number>();
+const UNPRICED_LOG_INTERVAL_MS = 60_000;
 
 /** A client-facing surface backed by a routing strategy (single / load-balance
  *  / fallback across upstream targets). */
@@ -283,6 +292,20 @@ export interface GatewayContext {
    *  idle. Zod-validated in production; absent (tests/smoke scripts) ⇒
    *  DEFAULT_STREAM_INACTIVITY_MS. */
   streamInactivityMs?: number;
+  /** How many CONSECUTIVE inactivity-watchdog aborts on one target count as a breaker
+   *  fault. A watchdog fire is a liveness guess, not an observed upstream fault: a
+   *  reasoning model can legitimately go quiet past the idle budget on a provider that
+   *  sends no keepalives, and one such abort per request used to open the circuit —
+   *  fleet-wide with BREAKER_SHARED — after `failureThreshold` quiet streams. Absent
+   *  (tests) ⇒ DEFAULT_WATCHDOG_BREAKER_THRESHOLD; a clean stream end resets the run. */
+  watchdogBreakerThreshold?: number;
+  /** What an unpriced CONFIGURED model (an alias target, downshift model, cascade
+   *  escalation target or route-group model map) does to /ready: `fail` (503) or `warn`
+   *  (ready, with the list in the body). Absent ⇒ no check. */
+  unpricedConfig?: 'fail' | 'warn';
+  /** Provider names whose models are free to serve (local runtimes), so an unpriced
+   *  model on them is expected and never flagged by the readiness check. */
+  freeProviders?: readonly string[];
   /** Hard deadline for the whole cache lookup (config.CACHE_LOOKUP_TIMEOUT_MS). */
   cacheLookupTimeoutMs?: number;
   /** Stop every background maintenance timer this context started (SIGTERM drain). */
@@ -1515,7 +1538,10 @@ async function handleProxy(
       model: requestedModel,
       path: route.clientPaths[0] ?? '',
       body,
-      variant: headerValue(request, 'anthropic-beta'),
+      variant: cacheVariant(request),
+      // Delivery mode is part of the partition: the stored bytes are replayed verbatim
+      // on a hit, so a streamed (SSE) entry must never answer a non-streaming caller.
+      stream: parseOk && parsed['stream'] === true,
       semantic: route.semantic,
     };
     try {
@@ -1559,16 +1585,22 @@ async function handleProxy(
   // --- budget: reserve worst-case at admission (hard cap, TOCTOU-safe) ---
   // Clamped to a positive integer: a negative/zero/NaN value made the worst-case
   // estimate <= 0, which skipped the reservation (and the commit) entirely.
+  // An embeddings request produces no completion, so its output ceiling is the 1-token
+  // floor: reserving the 8k default against the unknown-pricing floor ($75/MTok) held
+  // ~$0.61 per embeddings call and spuriously 402'd workspaces near their cap.
+  const embeddingsRoute = route.clientPaths.some((p) => p.endsWith('/v1/embeddings'));
   const maxOutput = Math.max(
     1,
     Math.floor(
-      numField(parsed['max_tokens']) ??
-        numField(parsed['max_output_tokens']) ??
-        // OpenAI reasoning / o-series / gpt-5-class models take `max_completion_tokens`
-        // (and reject `max_tokens`); without this a request that sets only that field
-        // reserves against the 8k default and can breach the hard cap at scale.
-        numField(parsed['max_completion_tokens']) ??
-        DEFAULT_MAX_OUTPUT_TOKENS,
+      embeddingsRoute
+        ? 1
+        : (numField(parsed['max_tokens']) ??
+            numField(parsed['max_output_tokens']) ??
+            // OpenAI reasoning / o-series / gpt-5-class models take `max_completion_tokens`
+            // (and reject `max_tokens`); without this a request that sets only that field
+            // reserves against the 8k default and can breach the hard cap at scale.
+            numField(parsed['max_completion_tokens']) ??
+            DEFAULT_MAX_OUTPUT_TOKENS),
     ),
   );
   let worstCase = estimateWorstCaseMicroUsd(
@@ -1763,7 +1795,11 @@ async function handleProxy(
     // the model AFTER the authz gate, so an unchecked target would bypass the policy.
     // If the cheaper model is denied, skip the downshift (keep the allowed model,
     // subject to the budget it was about to breach).
-    (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, downshift.model))
+    (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, downshift.model)) &&
+    // ...and never to a model the KEY's own scope does not allow (a compliance pin to one
+    // model must not be undone by the budget): the same check the cascade and smart
+    // router apply before reassigning the model.
+    scopeAllowsModel(principal.scope, downshift.model)
   ) {
     request.log.info(
       { from: requestedModel, to: downshift.model, utilization: admittedUtilization },
@@ -2756,7 +2792,12 @@ async function handleProxy(
   // buffered and its tool calls reassembled from the SSE, so `stream:true` can't
   // bypass governance). Buffering is required so a denied call withholds the whole
   // response fail-closed before any byte reaches the client's executor.
-  const toolGovern = ctx.toolPolicy !== undefined && statusCode < 400;
+  // Only a request that DECLARED tools (or forced a tool choice) can yield tool calls, so
+  // governance — and the full buffering it needs — is gated on that. Without the gate,
+  // setting TOOL_POLICY turned streaming off deployment-wide for every plain chat request,
+  // which the Claude Code gateway contract calls a stall.
+  const toolGovern =
+    ctx.toolPolicy !== undefined && statusCode < 400 && requestDeclaresTools(parsed, parseOk);
   const bufferOutput =
     (outputEnforcing && !streamed && statusCode < 400) || holdStreamed || toolGovern;
 
@@ -2903,10 +2944,13 @@ async function handleProxy(
     // so an off-catalog model can't be used to drive real spend past the cap.
     const unpriced = n.seen && !cost.priced && statusCode < 400;
     const chargeUnpriced = unpriced && ctx.meterFailClosedOnUnpriced === true;
-    if (unpriced) {
+    // Throttled per (provider, model): one line per minute, not one per request — an
+    // unpriced embeddings or local model otherwise spammed the log on every call while
+    // the metric (gulley_unpriced_requests_total) already counts each one.
+    if (unpriced && shouldLogUnpriced(`${provider}/${meteredModel}`)) {
       request.log.warn(
         { provider, model: meteredModel, failClosed: chargeUnpriced },
-        'served a model with no catalog price — metering $0 unless fail-closed',
+        'served a model with no catalog price — metering $0 unless fail-closed (throttled: once per minute per model)',
       );
     }
     // A request the upstream accepted but never answered (headers timeout) was in all
@@ -3592,6 +3636,8 @@ async function handleProxy(
   });
 
   upstreamBody.on('end', () => {
+    // A stream that ended cleanly proves the target alive: reset its watchdog run.
+    if (abortReason === undefined) watchdogRuns.delete(servedTarget.name);
     // The buffered-output branch consults the async output plugin, so the whole
     // handler runs in an async IIFE with teardown guaranteed in `finally`.
     void (async () => {
@@ -3948,7 +3994,20 @@ async function handleProxy(
     // so a provider stalling mid-stream never looks like users pressing Ctrl-C on
     // the ledger, in metrics or in traces.
     status = abortReason === 'client' ? 'aborted' : 'error';
-    if (abortReason === 'watchdog') ctx.breaker.recordFailure(servedTarget.name);
+    // A watchdog fire is a liveness GUESS (a reasoning model can go quiet past the idle
+    // budget on a provider that sends no keepalives), so one abort is not an observed
+    // fault: only a run of consecutive watchdog aborts on the same target — with no clean
+    // stream end in between — opens the circuit. Every abort is still an `error` here.
+    if (abortReason === 'watchdog') {
+      const runs = (watchdogRuns.get(servedTarget.name) ?? 0) + 1;
+      const threshold = ctx.watchdogBreakerThreshold ?? DEFAULT_WATCHDOG_BREAKER_THRESHOLD;
+      if (runs >= threshold) {
+        watchdogRuns.delete(servedTarget.name);
+        ctx.breaker.recordFailure(servedTarget.name);
+      } else {
+        watchdogRuns.set(servedTarget.name, runs);
+      }
+    }
     if (abortReason === 'client') {
       request.log.info({ target: servedTarget.name }, 'client disconnected mid-stream');
     } else {
@@ -4387,6 +4446,38 @@ function brokeredAccessToken(
   if (bearer && bearer.startsWith('gko_at_')) return bearer;
   if (apiKey && apiKey.startsWith('gko_at_')) return apiKey;
   return undefined;
+}
+
+/** The request attributes (beyond body/model/path) that change what the upstream
+ *  returns for the same body, folded into the cache partition: the `anthropic-beta`
+ *  capability set and the `anthropic-version` API version. Either alone is enough
+ *  to make two otherwise-identical requests different responses. */
+function cacheVariant(request: FastifyRequest): string | undefined {
+  const beta = headerValue(request, 'anthropic-beta');
+  const version = headerValue(request, 'anthropic-version');
+  if (beta === undefined && version === undefined) return undefined;
+  return `${beta ?? ''}|${version ?? ''}`;
+}
+
+/** Throttle the unpriced-model warning to one line per minute per provider/model. */
+function shouldLogUnpriced(key: string): boolean {
+  const now = Date.now();
+  const prev = unpricedLogAt.get(key);
+  if (prev !== undefined && now - prev < UNPRICED_LOG_INTERVAL_MS) return false;
+  if (unpricedLogAt.size >= 1024) unpricedLogAt.clear(); // bounded; a clear just re-logs
+  unpricedLogAt.set(key, now);
+  return true;
+}
+
+/** True when the request can yield tool calls at all: it declares `tools` (Anthropic,
+ *  OpenAI chat and Responses all use that field) or forces a `tool_choice`. A malformed
+ *  (unparseable) body is treated as tool-bearing so governance stays fail-closed. */
+function requestDeclaresTools(parsed: Record<string, unknown>, parseOk: boolean): boolean {
+  if (!parseOk) return true;
+  const tools = parsed['tools'];
+  if (Array.isArray(tools) && tools.length > 0) return true;
+  const choice = parsed['tool_choice'];
+  return choice !== undefined && choice !== null && choice !== 'none';
 }
 
 function bearerToken(request: FastifyRequest): string | undefined {

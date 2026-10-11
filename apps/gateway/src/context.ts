@@ -623,11 +623,15 @@ export function buildCustomProviders(config: Config): {
   routes: ProviderRoute[];
   modelRules: ModelRouteRule[];
   models: string[];
+  /** Local-runtime presets (Ollama, vLLM, …): their models are free to serve, so the
+   *  unpriced-model readiness check never flags them. */
+  freeProviders: string[];
 } {
   const routes: ProviderRoute[] = [];
   const modelRules: ModelRouteRule[] = [];
   const models: string[] = [];
-  if (!config.CUSTOM_PROVIDERS) return { routes, modelRules, models };
+  const freeProviders: string[] = [];
+  if (!config.CUSTOM_PROVIDERS) return { routes, modelRules, models, freeProviders };
 
   let entries: CustomProviderConfig[];
   try {
@@ -643,6 +647,7 @@ export function buildCustomProviders(config: Config): {
     const r = resolveCustomProvider(entry);
     if (seen.has(r.provider)) throw new Error(`duplicate custom provider label: ${r.provider}`);
     seen.add(r.provider);
+    if (r.local) freeProviders.push(r.provider);
     const credential: UpstreamCredential = { scheme: 'bearer', value: r.apiKey };
     const adapter = new PassthroughAdapter({ name: r.provider, baseUrl: r.baseUrl });
     const target: RouteTarget = {
@@ -680,7 +685,40 @@ export function buildCustomProviders(config: Config): {
       modelRules.push({ pattern: m, strategy, provider: r.provider });
     }
   }
-  return { routes, modelRules, models };
+  return { routes, modelRules, models, freeProviders };
+}
+
+/**
+ * The env-sourced route overlays, applied over a base route table (env `buildRoutes`
+ * at boot, or the config document's routes on every DB-mode reconcile): custom/local
+ * OpenAI-compatible providers, the shared `/v1/chat/completions` default when no
+ * built-in OpenAI route claimed it, and the ROUTE_GROUPS multi-target composition
+ * (fallback/loadbalance/breaker/outlier/P2C/HRW/hedge needs >=2 targets). Pure over
+ * its inputs; `custom` may be pre-built so the boot path reuses its model rules.
+ */
+export function overlayEnvRoutes(
+  config: Config,
+  base: ProviderRoute[],
+  custom: ReturnType<typeof buildCustomProviders> = buildCustomProviders(config),
+): ProviderRoute[] {
+  const routes = [...base, ...custom.routes];
+  // If no built-in OpenAI route claimed the shared chat path but custom/local
+  // providers exist, expose /v1/chat/completions with the first as the default
+  // target; the model router dispatches per requested model to the right backend.
+  if (
+    !routes.some((r) => r.clientPaths.includes('/v1/chat/completions')) &&
+    custom.routes.length > 0
+  ) {
+    const first = custom.routes[0] as ProviderRoute;
+    routes.push({
+      clientPaths: ['/v1/chat/completions', '/openai/v1/chat/completions'],
+      createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: first.strategy,
+    });
+  }
+  // M19: fold ROUTE_GROUPS into multi-target routes so the resilience library
+  // (fallback/loadbalance/breaker/outlier/P2C/HRW/hedge) has >=2 targets to work on.
+  return applyRouteGroups(routes, parseRouteGroups(config.ROUTE_GROUPS), config.HEDGE_DELAY_MS);
 }
 
 export function createProductionContext(
@@ -724,28 +762,13 @@ export function createProductionContext(
     },
   });
 
-  let routes = buildRoutes(config);
   const custom = buildCustomProviders(config);
-  routes.push(...custom.routes);
-
-  // If no built-in OpenAI route claimed the shared chat path but custom/local
-  // providers exist, expose /v1/chat/completions with the first as the default
-  // target; the model router dispatches per requested model to the right backend.
-  if (
-    !routes.some((r) => r.clientPaths.includes('/v1/chat/completions')) &&
-    custom.routes.length > 0
-  ) {
-    const first = custom.routes[0] as ProviderRoute;
-    routes.push({
-      clientPaths: ['/v1/chat/completions', '/openai/v1/chat/completions'],
-      createExtractor: () => new OpenAIUsageExtractor(),
-      strategy: first.strategy,
-    });
-  }
-
-  // M19: fold ROUTE_GROUPS into multi-target routes so the resilience library
-  // (fallback/loadbalance/breaker/outlier/P2C/HRW/hedge) has >=2 targets to work on.
-  routes = applyRouteGroups(routes, parseRouteGroups(config.ROUTE_GROUPS), config.HEDGE_DELAY_MS);
+  // Env-only overlays (custom/local providers, the shared chat path, ROUTE_GROUPS) are
+  // applied through ONE function that the DB-mode reconcile re-runs on every swap —
+  // the first reconcile used to replace the whole table with provider-only single
+  // routes, silently dropping failover/LB/hedge/arbitrage and every OpenAI-compatible
+  // provider in exactly the mode production is meant to run in.
+  const routes = overlayEnvRoutes(config, buildRoutes(config), custom);
 
   // In DB config mode the route table is loaded from Postgres by the reload
   // watcher AFTER boot, so an empty env route set is expected — the gateway boots
@@ -1270,6 +1293,9 @@ export function createProductionContext(
     models: catalogModels,
     rateResolver,
     streamInactivityMs: config.STREAM_INACTIVITY_MS,
+    watchdogBreakerThreshold: config.STREAM_WATCHDOG_BREAKER_THRESHOLD,
+    unpricedConfig: config.METER_UNPRICED_CONFIG,
+    freeProviders: custom.freeProviders,
     cacheLookupTimeoutMs: config.CACHE_LOOKUP_TIMEOUT_MS,
     upstreamHeadersTimeoutMs: config.UPSTREAM_HEADERS_TIMEOUT_MS,
     inflightTeardowns: new Set<Promise<void>>(),

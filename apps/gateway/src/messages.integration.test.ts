@@ -56,6 +56,12 @@ const GOLDEN_SSE = [
   '',
 ].join('\n');
 
+/** A declared tool for the tool-governance tests: governance (and the buffering it
+ *  needs) only applies to requests that can yield tool calls at all. */
+const GOVERNED_TOOLS = [
+  { name: 'shell', description: 'run a command', input_schema: { type: 'object' } },
+];
+
 let upstream: http.Server;
 let upstreamUrl: string;
 let received: {
@@ -1620,6 +1626,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'delete everything' }],
       }),
@@ -1681,6 +1688,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'list files' }],
       }),
@@ -1752,6 +1760,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'clean up' }],
@@ -1806,6 +1815,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'go' }],
       }),
@@ -1874,6 +1884,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'print the key' }],
@@ -1925,6 +1936,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'go' }],
       }),
@@ -1976,6 +1988,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'go' }],
       }),
     };
@@ -2039,6 +2052,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'contact jane@example.com please' }],
       }),
     });
@@ -2078,6 +2092,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'go' }],
       }),
     }).catch(() => undefined);
@@ -2140,6 +2155,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'contact alice@corp.com please' }],
       }),
     });
@@ -2194,6 +2210,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'hi' }],
       }),
     }).catch(() => undefined);
@@ -2254,6 +2271,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     const base = await app.listen({ port: 0, host: '127.0.0.1' });
     const body = {
       model: 'claude-sonnet-4-6',
+      tools: GOVERNED_TOOLS,
       max_tokens: 100,
       messages: [{ role: 'user', content: 'read it' }],
     };
@@ -2323,6 +2341,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 50,
         messages: [{ role: 'user', content: 'why is the sky blue' }],
       }),
@@ -2386,6 +2405,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 50,
         messages: [{ role: 'user', content: 'what is my key' }],
       }),
@@ -2460,6 +2480,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 50,
         messages: [{ role: 'user', content: 'tell me the detail' }],
       }),
@@ -2752,6 +2773,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 1000,
         messages: [{ role: 'user', content: 'hi' }],
@@ -2778,6 +2800,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'hi' }],
@@ -2924,6 +2947,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -2965,6 +2989,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -3020,6 +3045,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         top_p: 0.9,
         messages: [{ role: 'user', content: 'hi' }],
@@ -3061,6 +3087,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 10,
         messages: [{ role: 'user', content: 'hi' }],
@@ -3273,6 +3300,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -3313,6 +3341,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers,
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -3440,6 +3469,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -3715,6 +3745,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'contact jane@example.com please' }],
       }),
@@ -3777,6 +3808,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token, 'request-id': requestId },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'contact jane@example.com please' }],
       }),
@@ -3847,6 +3879,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'contact jane@example.com please' }],
       }),
@@ -4487,6 +4520,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'hi' }],
       }),
     });
@@ -4523,6 +4557,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -4604,6 +4639,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'shadow me' }],
       }),
@@ -4634,6 +4670,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -4687,6 +4724,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token, traceparent: inbound },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -4719,6 +4757,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -5016,6 +5055,7 @@ describe('data residency + ZDR', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 10,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -5045,6 +5085,7 @@ describe('data residency + ZDR', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'hi' }],
@@ -5531,6 +5572,7 @@ describe('same-model arbitrage', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 10,
         messages: [{ role: 'user', content: 'hi' }],
@@ -5651,6 +5693,7 @@ describe('hot-path hardening (refine cycle 2026-09)', () => {
     ];
     ctx.streamInactivityMs = 150;
     ctx.metrics = new GatewayMetrics();
+    ctx.watchdogBreakerThreshold = 1; // this test asserts the fault on a single stall
     const app = buildServer(testConfig(), ctx);
     const base = await app.listen({ port: 0, host: '127.0.0.1' });
 
@@ -5672,6 +5715,55 @@ describe('hot-path hardening (refine cycle 2026-09)', () => {
 
     await app.close();
     await hung.close();
+  });
+
+  it('a single watchdog stall is NOT a breaker fault; three consecutive stalls are, and a clean stream end resets the run', async () => {
+    // A watchdog fire is a liveness guess: a reasoning model can go quiet past the idle
+    // budget on a provider that sends no keepalives. One such abort used to fault the
+    // breaker, so `failureThreshold` quiet streams opened the circuit fleet-wide.
+    const CLEAN_TAIL =
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+    let hang = true;
+    const srv = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START);
+      if (!hang) res.end(CLEAN_TAIL);
+    });
+    const { store, token } = seededStore();
+    const { ctx, breaker } = buildContext(store);
+    // A target name no other test shares: the consecutive-stall run is kept per target.
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic-wd', srv.url) },
+      },
+    ];
+    ctx.streamInactivityMs = 150;
+    ctx.watchdogBreakerThreshold = 3;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const call = async (): Promise<string> => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: streamBody(),
+      });
+      return res.text();
+    };
+    expect(await call()).toContain('stalled'); // stall 1
+    expect(await call()).toContain('stalled'); // stall 2
+    expect(breaker.errorRate('anthropic-wd')).toBe(0); // below the run threshold: no fault
+    hang = false;
+    expect(await call()).toContain('message_stop'); // a clean end resets the run
+    hang = true;
+    expect(await call()).toContain('stalled'); // stall 1 of a fresh run
+    expect(await call()).toContain('stalled'); // stall 2
+    expect(breaker.errorRate('anthropic-wd')).toBe(0); // the reset held
+    expect(await call()).toContain('stalled'); // stall 3: a run of three on one target
+    expect(breaker.errorRate('anthropic-wd')).toBeGreaterThan(0);
+    await app.close();
+    await srv.close();
   });
 
   it('a client disconnect mid-stream is recorded as ABORTED with reason client and frees the limiter slot without a drop', async () => {
@@ -6442,3 +6534,128 @@ describe('hot-path review fixes (refine cycle 2026-09, wave 9)', () => {
 function single(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }
+
+describe('wave 0 regressions (2026-10)', () => {
+  it('TOOL_POLICY does not buffer a request that declares no tools: the stream stays a raw pipe', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.toolPolicy = parseToolPolicy(JSON.stringify([{ effect: 'deny', expr: 'true' }]));
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    // No `tools` in the request ⇒ nothing can be governed ⇒ no buffering, no withholding:
+    // the upstream SSE reaches the client byte for byte (TOOL_POLICY used to turn streaming
+    // off deployment-wide for every plain chat request).
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-tool-policy')).toBeNull();
+    expect(text).toBe(GOLDEN_SSE);
+    await app.close();
+  });
+
+  it('an embeddings request reserves input-only: an unpriced embedding model no longer holds the 8k-output floor', async () => {
+    const emb = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          object: 'list',
+          model: 'mystery-embed',
+          data: [{ object: 'embedding', index: 0, embedding: [0.1, 0.2] }],
+          usage: { prompt_tokens: 8, total_tokens: 8 },
+        }),
+      );
+    });
+    await new Promise<void>((r) => emb.listen(0, '127.0.0.1', r));
+    const embUrl = `http://127.0.0.1:${(emb.address() as AddressInfo).port}`;
+    // A HOSTED (non-local) OpenAI-compatible provider, so the unknown-pricing floor applies.
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      CUSTOM_PROVIDERS: JSON.stringify([
+        { provider: 'embedco', baseUrl: embUrl, embeddings: true },
+      ]),
+    } as NodeJS.ProcessEnv);
+    const custom = buildCustomProviders(config);
+    const { store, token } = seededStore();
+    // $0.05 cap: the old reservation ($15/MTok floor on input + $75/MTok x 8192 default
+    // output ≈ $0.61) was refused with 402 on every embeddings call near any real cap.
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 50_000 }]]));
+    const { ctx, ledger } = buildContext(store, budgets);
+    ctx.routes = custom.routes;
+    const app = buildServer(config, ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/embedco/v1/embeddings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({ model: 'mystery-embed', input: 'hello there' }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(ledger.entries.length).toBe(1));
+    expect(ledger.entries[0]?.cost.totalInputTokens).toBe(8);
+    await app.close();
+    await new Promise<void>((r) => emb.close(() => r()));
+  });
+
+  it('never budget-downshifts to a model outside the key scope (a compliance pin survives the cap)', async () => {
+    const { store, token } = restrictedStore(['claude-opus-4-8']);
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+    await budgets.reserve('ws_1', 'seed', 8_200_000);
+    await budgets.commit('ws_1', 'seed', 8_200_000); // 82% used — above the 0.8 threshold
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    // The key may only use Opus: the downshift (to Haiku, outside its scope) is skipped.
+    expect(JSON.parse(received.body).model).toBe('claude-opus-4-8');
+    await app.close();
+  });
+
+  it('a cached streamed response is never replayed to a non-streaming request (delivery mode partitions the cache)', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = async (stream: boolean): Promise<string | null> => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'same prompt' }],
+        }),
+      });
+      await res.text();
+      return res.headers.get('x-gulley-cache');
+    };
+    expect(await send(true)).toBe('miss');
+    await vi.waitFor(async () => expect(await send(true)).toBe('hit-exact'));
+    // Same body, stream:false — the stored bytes are SSE, so this must be a miss.
+    expect(await send(false)).toBe('miss');
+    await app.close();
+  });
+});

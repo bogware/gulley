@@ -5,7 +5,7 @@ import { CircuitBreaker, LoadScoreboard } from '@gulley/routing';
 import { type ConfigSignal, InMemoryConfigBus } from '@gulley/storage';
 import { describe, expect, it, vi } from 'vitest';
 import { ConfigWatcher, GatewayReconciler } from './reconcile';
-import { type GatewayContext, RouteHolder } from './routes/messages';
+import { type GatewayContext, type ProviderRoute, RouteHolder } from './routes/messages';
 
 const ARN = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:anthropic';
 
@@ -385,5 +385,54 @@ describe('ConfigWatcher', () => {
     await vi.waitFor(() => expect(holder.routeFor('/v1/chat/completions')).toBeDefined());
 
     await watcher.stop();
+  });
+});
+
+describe('GatewayReconciler env overlay', () => {
+  it('re-applies the env overlay (custom providers, route groups) and merges its model rules on EVERY reconcile', async () => {
+    // The first DB-mode reconcile used to replace the whole table with the document's
+    // provider-only single routes, silently dropping ROUTE_GROUPS and every
+    // CUSTOM_PROVIDERS route (failover/LB/hedge/arbitrage gone in production mode).
+    const { holder } = holderWithState();
+    const overlayRoute = {
+      clientPaths: ['/ollama/v1/chat/completions'],
+      createExtractor: () => {
+        throw new Error('unused');
+      },
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'ollama',
+          provider: 'ollama',
+          adapter: undefined,
+          credential: undefined,
+          upstreamPath: '/v1/chat/completions',
+        },
+      },
+    } as unknown as ProviderRoute;
+    let applied = 0;
+    const reconciler = new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      new MapSecretResolver(new Map([[ARN, 'k']])),
+      undefined,
+      undefined,
+      {
+        apply: (base) => {
+          applied += 1;
+          return [...base, overlayRoute];
+        },
+        modelRules: [{ pattern: 'llama3', provider: 'ollama' }],
+      },
+    );
+    await reconciler.reconcile();
+    expect(applied).toBe(1);
+    expect(holder.routeFor('/v1/messages')).toBeDefined(); // the document's route
+    expect(holder.routeFor('/ollama/v1/chat/completions')).toBeDefined(); // the overlay survived
+    expect(holder.ctx.modelRouter?.resolve('llama3')?.provider).toBe('ollama');
+    await reconciler.reconcile(); // and again on the next swap
+    expect(applied).toBe(2);
+    expect(holder.routeFor('/ollama/v1/chat/completions')).toBeDefined();
+    expect(holder.ctx.modelRouter?.resolve('llama3')?.provider).toBe('ollama');
   });
 });

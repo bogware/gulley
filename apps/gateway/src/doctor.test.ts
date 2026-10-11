@@ -133,3 +133,55 @@ describe('gulley doctor: air-gapped readiness', () => {
     expect(fs.filter((f) => f.level === 'warn')).toHaveLength(0);
   });
 });
+
+describe('gulley doctor: pricing', () => {
+  it('errors (METER_UNPRICED_CONFIG=fail, the default) when a configured downshift model has no seed rate', () => {
+    const fs = runDoctor(
+      cfg({
+        ANTHROPIC_UPSTREAM_API_KEY: 'sk-x',
+        BUDGET_DOWNSHIFT_MODEL: 'claude-mystery-9',
+        BUDGET_DOWNSHIFT_THRESHOLD: '0.8',
+      }),
+    );
+    expect(find(fs, 'pricing')?.level).toBe('error');
+    expect(find(fs, 'pricing')?.detail).toContain('claude-mystery-9');
+  });
+
+  it('warns instead under METER_UNPRICED_CONFIG=warn', () => {
+    const fs = runDoctor(
+      cfg({
+        ANTHROPIC_UPSTREAM_API_KEY: 'sk-x',
+        CASCADE_POLICY: JSON.stringify([{ model: 'claude-haiku-*', escalateTo: 'gpt-99' }]),
+        METER_UNPRICED_CONFIG: 'warn',
+      }),
+    );
+    expect(find(fs, 'pricing')?.level).toBe('warn');
+    expect(find(fs, 'pricing')?.detail).toContain('gpt-99');
+  });
+
+  it('passes when every configured model has a seed rate', () => {
+    const fs = runDoctor(
+      cfg({
+        ANTHROPIC_UPSTREAM_API_KEY: 'sk-x',
+        BUDGET_DOWNSHIFT_MODEL: 'claude-haiku-5-5',
+        BUDGET_DOWNSHIFT_THRESHOLD: '0.8',
+        CASCADE_POLICY: JSON.stringify([
+          { model: 'claude-haiku-*', escalateTo: 'claude-sonnet-5-5' },
+        ]),
+      }),
+    );
+    expect(find(fs, 'pricing')?.level).toBe('ok');
+  });
+
+  it('defers to /ready when a catalog file is configured (doctor reads no files)', () => {
+    const fs = runDoctor(
+      cfg({
+        ANTHROPIC_UPSTREAM_API_KEY: 'sk-x',
+        MODELS_CATALOG_FILE: 'catalog.json',
+        BUDGET_DOWNSHIFT_MODEL: 'claude-mystery-9',
+        BUDGET_DOWNSHIFT_THRESHOLD: '0.8',
+      }),
+    );
+    expect(find(fs, 'pricing')?.level).toBe('info');
+  });
+});

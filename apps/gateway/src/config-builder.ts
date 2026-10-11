@@ -32,9 +32,14 @@ function anthropicCredential(value: string): UpstreamCredential {
  * from the CUSTOM_PROVIDERS env before, so DB-configured aliases were inert). An
  * alias entity maps a requested-model pattern (its `config.pattern`, else its name)
  * to an upstream `target` rewrite and/or a `provider` label. Single-tenant v1:
- * aliases across all workspaces are flattened into one global router.
+ * aliases across all workspaces are flattened into one global router. `extraRules`
+ * (the env CUSTOM_PROVIDERS model rules) are appended AFTER the document's, so a
+ * document alias wins on a duplicate pattern (the router keeps the first exact rule).
  */
-export function buildModelRouterFromDocument(doc: ConfigDocument): ModelRouter | undefined {
+export function buildModelRouterFromDocument(
+  doc: ConfigDocument,
+  extraRules: readonly ModelRouteRule[] = [],
+): ModelRouter | undefined {
   const rules: ModelRouteRule[] = [];
   for (const org of doc.orgs) {
     for (const ws of org.workspaces) {
@@ -49,7 +54,8 @@ export function buildModelRouterFromDocument(doc: ConfigDocument): ModelRouter |
       }
     }
   }
-  return rules.length > 0 ? new ModelRouter(rules) : undefined;
+  const all = [...rules, ...extraRules];
+  return all.length > 0 ? new ModelRouter(all) : undefined;
 }
 
 /** A workspace's resolved guardrail configuration, attached to each of its routes. */

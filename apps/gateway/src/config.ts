@@ -401,6 +401,12 @@ const EnvShape = z.object({
   // budget reservation). Also bounds a buffered cascade leg's idle. Validated (was a raw,
   // module-load-time process.env read).
   STREAM_INACTIVITY_MS: z.coerce.number().int().positive().default(120_000),
+  // How many CONSECUTIVE watchdog aborts on one upstream target count as a circuit-breaker
+  // fault. A single quiet stream (a reasoning model past the idle budget on a provider that
+  // sends no keepalive pings) is a liveness guess, not an observed fault; counting each one
+  // opened the circuit — fleet-wide under BREAKER_SHARED — after a handful of long thinks.
+  // A clean stream end on the target resets the run. 1 = every watchdog abort is a fault.
+  STREAM_WATCHDOG_BREAKER_THRESHOLD: z.coerce.number().int().min(1).default(3),
   // Graceful-drain backstop (ms): the bounded window a SIGTERM/SIGINT drain (or an
   // uncaughtException drain) is given before process.exit fires. MUST be strictly LESS than
   // the platform's stop deadline (ECS stopTimeout / k8s terminationGracePeriodSeconds*1000)
@@ -549,6 +555,12 @@ const EnvShape = z.object({
   // gulley_unpriced_requests_total + a request-log/audit attribute); opt in here to
   // ALSO fail closed by charging the worst-case reservation so it can't slip the cap.
   METER_FAIL_CLOSED_ON_UNPRICED: envBool(false),
+  // A model the OPERATOR configured (a model-alias target, BUDGET_DOWNSHIFT_MODEL, a
+  // CASCADE_POLICY escalation target, a ROUTE_GROUPS modelMap entry) with no price in the
+  // seed table or MODELS_CATALOG_FILE would meter $0 on every request it serves. `fail`
+  // (default) reports /ready 503 with the list until it is priced; `warn` stays ready and
+  // lists them in the /ready body. Local-runtime presets (Ollama, vLLM, …) are exempt.
+  METER_UNPRICED_CONFIG: z.enum(['fail', 'warn']).default('fail'),
 
   // Static request/response header set/remove applied to every proxied request
   // (the non-CEL sibling of CEL_TRANSFORM). JSON:
