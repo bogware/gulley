@@ -54,6 +54,30 @@ function invalid(reply: FastifyReply, message: string): FastifyReply {
   return reply.code(422).send({ error: { type: 'validation', message } });
 }
 
+/** A key allow-list field: absent / `*` ⇒ undefined (unrestricted); a non-empty array of
+ *  non-empty strings ⇒ the list; anything else ⇒ null (invalid). */
+function allowListField(v: unknown): readonly string[] | undefined | null {
+  if (v === undefined || v === null || v === '*') return undefined;
+  const list = stringListField(v);
+  if (list === null) return null;
+  return list && list.length > 0 ? list : null;
+}
+
+/** A string-array field: absent ⇒ undefined; an array of bounded non-empty strings ⇒ the
+ *  (de-duplicated) list; anything else ⇒ null (invalid). */
+function stringListField(v: unknown): readonly string[] | undefined | null {
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v) || v.length > 256) return null;
+  const out: string[] = [];
+  for (const x of v) {
+    if (typeof x !== 'string') return null;
+    const s = x.trim();
+    if (s.length === 0 || s.length > 256) return null;
+    if (!out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
 function paramId(request: { params: unknown }): string {
   return (request.params as { id: string }).id;
 }
@@ -507,17 +531,50 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
       const workspaceId = str(b['workspaceId']);
       const name = str(b['name']) ?? 'key';
       if (!workspaceId) return invalid(reply, 'workspaceId required');
+      // Optional per-key scope: provider/model allow-lists (the gateway enforces them on
+      // the RESOLVED model/provider), an expiry, and group tags. Absent / `*` = open.
+      const allowedProviders = allowListField(b['allowedProviders']);
+      const allowedModels = allowListField(b['allowedModels']);
+      const groups = stringListField(b['groups']);
+      if (allowedProviders === null)
+        return invalid(reply, 'allowedProviders must be a string array or "*"');
+      if (allowedModels === null)
+        return invalid(reply, 'allowedModels must be a string array or "*"');
+      if (groups === null) return invalid(reply, 'groups must be a string array');
+      const expiresAtRaw = b['expiresAt'];
+      let expiresAt: string | undefined;
+      if (expiresAtRaw !== undefined && expiresAtRaw !== null && expiresAtRaw !== '') {
+        const t = typeof expiresAtRaw === 'string' ? Date.parse(expiresAtRaw) : NaN;
+        if (!Number.isFinite(t)) return invalid(reply, 'expiresAt must be an ISO-8601 timestamp');
+        if (t <= Date.now()) return invalid(reply, 'expiresAt must be in the future');
+        expiresAt = new Date(t).toISOString();
+      }
       const ws = ctx.workspaces.get(workspaceId);
       if (!ws) return notFound(reply, 'workspace');
       const at = { orgId: ws.orgId, workspaceId };
       if (!(await ctx.access.can(admin, 'key:create', at))) return forbidden(reply);
-      const minted = await ctx.keys.mint({ workspaceId, orgId: ws.orgId, name });
+      const minted = await ctx.keys.mint({
+        workspaceId,
+        orgId: ws.orgId,
+        name,
+        ...(allowedProviders ? { allowedProviders } : {}),
+        ...(allowedModels ? { allowedModels } : {}),
+        ...(expiresAt ? { expiresAt } : {}),
+        ...(groups ? { groups } : {}),
+      });
       await ctx.audit.append({
         orgId: ws.orgId,
         actor: admin.subject,
         action: 'key.mint',
         target: minted.id,
-        payload: { name, keyPrefix: minted.keyPrefix },
+        payload: {
+          name,
+          keyPrefix: minted.keyPrefix,
+          allowedProviders: allowedProviders ?? '*',
+          allowedModels: allowedModels ?? '*',
+          expiresAt: expiresAt ?? null,
+          groups: groups ?? [],
+        },
       });
       return reply
         .code(201)

@@ -71,6 +71,12 @@ export const virtualKey = pgTable(
     groups: jsonb('groups')
       .notNull()
       .default(sql`'[]'::jsonb`),
+    // Per-key authz scope, enforced by the gateway on the RESOLVED provider/model:
+    // NULL = unrestricted (`*`), a JSON string array = the allow-list. The data-plane
+    // key store hard-coded `*` before these columns existed, so per-key scoping was
+    // silently impossible in production.
+    allowedProviders: jsonb('allowed_providers'),
+    allowedModels: jsonb('allowed_models'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

@@ -50,6 +50,8 @@ export class PostgresKeyStore implements KeyStore {
         disabled: virtualKey.disabled,
         expiresAt: virtualKey.expiresAt,
         groups: virtualKey.groups,
+        allowedProviders: virtualKey.allowedProviders,
+        allowedModels: virtualKey.allowedModels,
         orgId: workspace.orgId,
       })
       .from(virtualKey)
@@ -69,11 +71,10 @@ export class PostgresKeyStore implements KeyStore {
       epoch: r.epoch,
       disabled: r.disabled,
       expiresAt: r.expiresAt,
-      allowedProviders: '*',
-      allowedModels: '*',
-      groups: Array.isArray(r.groups)
-        ? (r.groups as string[]).filter((g) => typeof g === 'string')
-        : [],
+      // The stored allow-lists, enforced by the gateway (NULL = unrestricted).
+      allowedProviders: allowList(r.allowedProviders),
+      allowedModels: allowList(r.allowedModels),
+      groups: stringList(r.groups),
     };
   }
 
@@ -115,11 +116,28 @@ interface KeyViewRow {
   keyPrefix: string;
   disabled: boolean;
   createdAt: string;
+  expiresAt: string | null;
+  allowedProviders: readonly string[] | '*';
+  allowedModels: readonly string[] | '*';
+  groups: readonly string[];
 }
 interface MintKeyArgs {
   workspaceId: string;
   orgId: string;
   name: string;
+  allowedProviders?: readonly string[] | '*';
+  allowedModels?: readonly string[] | '*';
+  /** ISO timestamp; the gateway refuses the key once it has passed. */
+  expiresAt?: string;
+  groups?: readonly string[];
+}
+
+/** A jsonb allow-list column: NULL / non-array = unrestricted, else its string entries. */
+function allowList(v: unknown): readonly string[] | '*' {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : '*';
+}
+function stringList(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
 }
 
 /**
@@ -142,6 +160,10 @@ export class PostgresKeyAdminStore {
       keyPrefix: r.keyPrefix,
       disabled: r.disabled,
       createdAt: r.createdAt.toISOString(),
+      expiresAt: r.expiresAt ? r.expiresAt.toISOString() : null,
+      allowedProviders: allowList(r.allowedProviders),
+      allowedModels: allowList(r.allowedModels),
+      groups: stringList(r.groups),
     };
   }
 
@@ -154,6 +176,15 @@ export class PostgresKeyAdminStore {
         name: args.name,
         keyPrefix: gen.keyPrefix,
         keyHash: gen.keyHash,
+        // `*` (or absent) stays NULL = unrestricted; a list is stored as-is.
+        allowedProviders:
+          args.allowedProviders && args.allowedProviders !== '*'
+            ? [...args.allowedProviders]
+            : null,
+        allowedModels:
+          args.allowedModels && args.allowedModels !== '*' ? [...args.allowedModels] : null,
+        expiresAt: args.expiresAt ? new Date(args.expiresAt) : null,
+        groups: args.groups ? [...args.groups] : [],
       })
       .returning({ id: virtualKey.id });
     return { id: row?.id ?? '', token: gen.token, keyPrefix: gen.keyPrefix };

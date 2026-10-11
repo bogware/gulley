@@ -75,6 +75,13 @@ export interface KeyView {
   keyPrefix: string;
   disabled: boolean;
   createdAt: string;
+  /** ISO timestamp after which the gateway refuses the key; null = never. */
+  expiresAt: string | null;
+  /** The gateway enforces these on the RESOLVED provider/model; `*` = unrestricted. */
+  allowedProviders: readonly string[] | '*';
+  allowedModels: readonly string[] | '*';
+  /** Group/team tags carried onto the principal's scope (per-group config). */
+  groups: readonly string[];
 }
 
 export interface MintKeyArgs {
@@ -83,6 +90,9 @@ export interface MintKeyArgs {
   name: string;
   allowedProviders?: readonly string[] | '*';
   allowedModels?: readonly string[] | '*';
+  /** ISO timestamp; must be in the future. */
+  expiresAt?: string;
+  groups?: readonly string[];
 }
 export interface MintedKey {
   id: string;
