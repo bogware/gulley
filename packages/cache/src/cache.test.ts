@@ -163,3 +163,40 @@ describe('CacheEngine semantic tier', () => {
     expect((await engine.lookup(otherScope)).status).toBe('miss');
   });
 });
+
+describe('cache delivery-mode partition', () => {
+  const body = { model: 'm', messages: [{ role: 'user', content: 'Hello there!' }] };
+
+  it('keys a streamed and a buffered request differently; absent means buffered', () => {
+    const streamed = exactKey(req('ws1', body, { stream: true }));
+    const buffered = exactKey(req('ws1', body, { stream: false }));
+    const absent = exactKey(req('ws1', body));
+    expect(streamed).not.toBe(buffered);
+    expect(absent).toBe(buffered);
+  });
+
+  it('never replays a streamed body to a buffered request on the exact tier', async () => {
+    const engine = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    const streamed = req('ws1', body, { stream: true });
+    const miss = await engine.lookup(streamed);
+    await engine.store(streamed, resp('data: {"type":"message_start"}'), miss);
+    expect((await engine.lookup(streamed)).status).toBe('hit-exact');
+    expect((await engine.lookup(req('ws1', body, { stream: false }))).status).toBe('miss');
+  });
+
+  it('never crosses delivery modes on the semantic tier either', async () => {
+    const engine = new CacheEngine({
+      exact: new InMemoryExactCache(),
+      semantic: { embed: new FakeEmbed(), index: new InMemoryVectorIndex(), threshold: 0.9 },
+      ttlSeconds: 60,
+    });
+    const streamed = req('ws1', body, { stream: true });
+    const miss = await engine.lookup(streamed);
+    await engine.store(streamed, resp('data: {"type":"message_start"}'), miss);
+    const paraphrase = { model: 'm', messages: [{ role: 'user', content: 'hello there' }] };
+    expect((await engine.lookup(req('ws1', paraphrase, { stream: false }))).status).toBe('miss');
+    expect((await engine.lookup(req('ws1', paraphrase, { stream: true }))).status).toBe(
+      'hit-semantic',
+    );
+  });
+});
