@@ -1294,6 +1294,7 @@ export function createProductionContext(
     // Cascade routing policies (env-config). Empty = off. Parse THROWS on bad JSON so a
     // malformed policy fails boot rather than silently disabling escalation.
     cascade,
+    signedThinkingSubstitution: config.SIGNED_THINKING_SUBSTITUTION,
     models: catalogModels,
     rateResolver,
     streamInactivityMs: config.STREAM_INACTIVITY_MS,

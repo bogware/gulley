@@ -6900,3 +6900,135 @@ describe('conversation-stable masking (K2)', () => {
     await new Promise<void>((r) => server.close(() => r()));
   });
 });
+
+describe('signed reasoning pins the model (SIGNED_THINKING_SUBSTITUTION=pin)', () => {
+  const SIGNED_HISTORY = [
+    { role: 'user', content: 'hi' },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'hmm', signature: 'EqoBCkgIARABGAIiQfakethinkingsig' },
+        { type: 'text', text: 'hello' },
+      ],
+    },
+    { role: 'user', content: 'hard question' },
+  ];
+  const pinnedAudit = (rows: Array<{ action: string; payload?: unknown }>, stage: string) =>
+    rows.find(
+      (r) =>
+        r.action === 'policy.substitution_pinned' &&
+        (r.payload as { stage?: string })?.stage === stage,
+    );
+
+  it('does NOT budget-downshift a conversation that carries signed thinking (audited), but still does under `allow`', async () => {
+    for (const mode of ['pin', 'allow'] as const) {
+      const { store, token } = seededStore();
+      const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+      await budgets.reserve('ws_1', 'seed', 8_200_000);
+      await budgets.commit('ws_1', 'seed', 8_200_000);
+      const { ctx, audit } = buildContext(store);
+      ctx.budgets = budgets;
+      ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+      ctx.signedThinkingSubstitution = mode;
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          max_tokens: 100,
+          messages: SIGNED_HISTORY,
+        }),
+      }).then((r) => r.text());
+      if (mode === 'pin') {
+        expect(JSON.parse(received.body).model).toBe('claude-opus-4-8'); // pinned
+        expect(pinnedAudit(audit.rows, 'budget_downshift')).toBeDefined();
+      } else {
+        expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5'); // substituted
+        expect(pinnedAudit(audit.rows, 'budget_downshift')).toBeUndefined();
+      }
+      await app.close();
+    }
+  });
+
+  it('does NOT smart-reroute a conversation that carries signed thinking (audited)', async () => {
+    const { store, token } = seededStore();
+    const { ctx, audit } = buildContext(store);
+    const policy: SmartRoutingPolicy = {
+      name: 'cost',
+      objective: 'cost-tier',
+      classifier: { mode: 'rules-then-llm', rules: [{ category: 'cheap', maxChars: 20 }] },
+      categoryRoutes: { cheap: 'claude-haiku-4-5' },
+      selector: {},
+    };
+    ctx.smartRouter = buildSmartRouter([policy], ctx.routes);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = (messages: unknown) =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 10, messages }),
+      }).then((r) => r.text());
+    await send([{ role: 'user', content: 'hi' }]);
+    expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5'); // the rule fires without history
+    await send(SIGNED_HISTORY);
+    expect(JSON.parse(received.body).model).toBe('claude-sonnet-4-6'); // pinned
+    expect(pinnedAudit(audit.rows, 'smart_routing')).toBeDefined();
+    await app.close();
+  });
+
+  it('does NOT arm the cascade for a conversation that carries signed thinking (tier-0 served as is, audited)', async () => {
+    const REFUSAL =
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5}}}\n\n' +
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CHEAP-REFUSAL"}}\n\n' +
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}\n\n' +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    const models: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        models.push(String((JSON.parse(b) as { model?: string }).model ?? ''));
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(REFUSAL);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, audit } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', url) },
+      },
+    ];
+    ctx.cascade = [
+      { model: 'claude-haiku-*', escalateTo: 'claude-sonnet-4-6', stopReasons: ['refusal'] },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: SIGNED_HISTORY,
+      }),
+    });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).toContain('CHEAP-REFUSAL'); // tier-0 served untouched, streamed
+    expect(models).toEqual(['claude-haiku-4-5']); // no tier-1 dispatch
+    expect(pinnedAudit(audit.rows, 'cascade')).toBeDefined();
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+});

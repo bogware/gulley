@@ -48,6 +48,7 @@ import {
 } from '../residency-policy';
 import { type CascadePolicy, matchCascade, shouldEscalate } from '../cascade';
 import { conversationIdentity, maskVaultKey } from '../conversation';
+import { hasSignedThinking, type SignedThinkingSubstitution } from '../thinking';
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
@@ -192,6 +193,10 @@ export interface GatewayContext {
    *  the request is re-dispatched once to the stronger `escalateTo` model before any
    *  client byte. Empty/absent = no cascade. */
   cascade?: CascadePolicy[];
+  /** `pin` (default): a request whose history carries signed reasoning keeps its
+   *  requested model — smart re-route, budget downshift and cascade are skipped for
+   *  it (audited). `allow`: substitute regardless. See ../thinking.ts. */
+  signedThinkingSubstitution?: SignedThinkingSubstitution;
   budgets: BudgetStore;
   /** Behavior when the budget counter store is unreachable at admission: true/undefined
    *  = fail-open (serve without a reservation + audit; the ledger self-heals the
@@ -802,6 +807,11 @@ async function handleProxy(
     parseOk = false; /* malformed body still gets forwarded verbatim */
   }
   let requestedModel = typeof parsed['model'] === 'string' ? parsed['model'] : 'unknown';
+  // Signed reasoning in the history is bound to the model that produced it: under the
+  // default `pin`, every stage that would substitute the model (smart re-route, budget
+  // downshift, cascade) is skipped for this request, each skip audited.
+  const pinnedByThinking =
+    parseOk && (ctx.signedThinkingSubstitution ?? 'pin') === 'pin' && hasSignedThinking(parsed);
 
   // --- model routing + request shaping (only when the body parsed cleanly) ---
   // Resolve the requested model through the router (alias/pin the upstream model,
@@ -964,6 +974,16 @@ async function handleProxy(
   if (tenantRoute) {
     strategy = tenantRoute.strategy;
     if (tenantRoute.createExtractor) createExtractor = tenantRoute.createExtractor;
+  } else if (ctx.smartRouter && parseOk && pinnedByThinking) {
+    // Signed reasoning pins the model: a smart re-route (possibly to another provider)
+    // would make the API drop that reasoning. Skip it, audibly.
+    await auditSafe({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'policy.substitution_pinned',
+      target: requestedModel,
+      payload: { stage: 'smart_routing', reason: 'signed_thinking' },
+    });
   } else if (ctx.smartRouter && parseOk) {
     // --- smart routing (M15): classify the prompt, reroute by category ---
     // Runs ONLY when no residency pin applies (the tenant override wins outright,
@@ -1169,10 +1189,26 @@ async function handleProxy(
         provider: string;
       }
     | undefined;
-  const cascadePolicy =
+  const cascadeMatch =
     parseOk && ctx.cascade && ctx.cascade.length > 0
       ? matchCascade(ctx.cascade, requestedModel)
       : undefined;
+  if (cascadeMatch && pinnedByThinking) {
+    // An escalation re-dispatches the history to another model, which drops the
+    // signed reasoning the cheap model produced so far. Serve tier-0 as is, audibly.
+    await auditSafe({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'policy.substitution_pinned',
+      target: requestedModel,
+      payload: {
+        stage: 'cascade',
+        reason: 'signed_thinking',
+        to: cascadeMatch.escalateTo,
+      },
+    });
+  }
+  const cascadePolicy = pinnedByThinking ? undefined : cascadeMatch;
   if (cascadePolicy) {
     const t1res = ctx.modelRouter?.resolve(cascadePolicy.escalateTo);
     const t1Model = t1res?.resolved ?? cascadePolicy.escalateTo;
@@ -1401,7 +1437,7 @@ async function handleProxy(
   // structure-preserving, so cache hits are preserved — no `inputMasked` gate.
   if (parseOk && ctx.spotlightUntrusted) {
     const sl = spotlightUntrusted(parsed, { directive: ctx.spotlightDirective });
-    if (sl.marked > 0) {
+    if (sl.marked > 0 || sl.directive) {
       parsed = sl.body as Record<string, unknown>;
       body = Buffer.from(JSON.stringify(parsed), 'utf8');
     }
@@ -1813,6 +1849,28 @@ async function handleProxy(
   let downshiftedFrom: string | undefined;
   if (
     downshift &&
+    pinnedByThinking &&
+    admittedUtilization >= downshift.threshold &&
+    requestedModel !== downshift.model
+  ) {
+    // The downshift would have applied, but the history carries signed reasoning bound
+    // to the requested model — keep it (the budget it was about to breach still applies).
+    await auditSafe({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'policy.substitution_pinned',
+      target: requestedModel,
+      payload: {
+        stage: 'budget_downshift',
+        reason: 'signed_thinking',
+        to: downshift.model,
+        utilization: admittedUtilization,
+      },
+    });
+  }
+  if (
+    downshift &&
+    !pinnedByThinking &&
     admittedUtilization >= downshift.threshold &&
     requestedModel !== downshift.model &&
     // Never downshift TO a model the central policy denies — the downshift reassigns

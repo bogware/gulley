@@ -159,6 +159,14 @@ const EnvShape = z.object({
   // decision is made BEFORE any client byte; both legs are billed. Empty = off.
   // e.g. CASCADE_POLICY=[{"model":"claude-haiku-*","escalateTo":"claude-sonnet-4-6"}]
   CASCADE_POLICY: z.string().optional(),
+  // Signed reasoning in the request history (Anthropic `thinking` signatures /
+  // `redacted_thinking`, OpenAI Responses `reasoning.encrypted_content`) is bound to the
+  // model that produced it: a substitution makes the API drop it silently and restarts
+  // the prompt cache. `pin` (default) keeps the requested model whenever the history
+  // carries signed reasoning — the budget downshift, cascade escalation and smart
+  // re-route are skipped (and audited as `policy.substitution_pinned`) for that
+  // request. `allow` restores substitution.
+  SIGNED_THINKING_SUBSTITUTION: z.enum(['pin', 'allow']).default('pin'),
   // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
   // Deny-first, then allow-list; expressions run over { request, principal }.
   // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]
@@ -315,8 +323,9 @@ const EnvShape = z.object({
   // output, the classic indirect-injection vector) — in trust-tag delimiters so the
   // model can tell external data from instructions. Deterministic + structure-
   // preserving (cache-safe), off by default. GUARDRAILS_SPOTLIGHT_DIRECTIVE also
-  // prepends a system directive explaining the tags (maximizes efficacy, but the
-  // added system prefix shifts Anthropic prompt-cache breakpoints — opt in).
+  // APPENDS a system directive explaining the tags — on every request and after the
+  // client's own system content, so the system prompt is identical turn after turn
+  // (prompt cache + preserved thinking safe) and a client attribution block stays first.
   GUARDRAILS_SPOTLIGHT: envBool(false),
   GUARDRAILS_SPOTLIGHT_DIRECTIVE: envBool(false),
   // M17: windowed in-stream enforcement of the output policy on Anthropic-canonical

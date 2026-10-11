@@ -22,8 +22,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   vault records carry the conversation id (migration `0026`) and the control plane can
   reveal a whole conversation: `GET /admin/mask-vault/conversation/:conversationId`.
 
+- **Signed reasoning pins the model** (`SIGNED_THINKING_SUBSTITUTION`, default `pin`).
+  A request whose history carries Anthropic `thinking` signatures / `redacted_thinking`
+  or OpenAI Responses `reasoning.encrypted_content` keeps its requested model: the
+  budget downshift, the cascade escalation and the smart re-route are skipped for it and
+  audited as `policy.substitution_pinned`. Substituting the model made the API drop that
+  reasoning silently and restarted the prompt cache. Set `allow` to substitute anyway.
+
 ### Changed
 
+- **The spotlight directive is appended, not prepended, and on every request**
+  (`GUARDRAILS_SPOTLIGHT_DIRECTIVE`): it follows the client's own system content so a
+  Claude Code attribution block stays first (Anthropic's strip is positional) and the
+  system prompt is identical turn after turn (prompt cache + preserved thinking). It
+  used to be prepended only on turns that carried a tool result, which changed the
+  system prompt mid-conversation. OpenAI-shaped bodies get it on their leading system
+  message instead of an invalid top-level `system` field.
 - **Load-balancer session affinity defaults to the conversation identity** (the session
   header or the prefix fingerprint) when `LB_SESSION_AFFINITY_HEADER` is unset, so a
   multi-turn conversation stays on one provider — thinking signatures and prompt caches
