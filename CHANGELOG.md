@@ -56,6 +56,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   audited as `policy.substitution_pinned`. Substituting the model made the API drop that
   reasoning silently and restarted the prompt cache. Set `allow` to substitute anyway.
 
+- **Request-level routing preferences and per-attempt provenance (P7).** An
+  OpenRouter-compatible `provider` object (`order`, `only`, `ignore`, `allow_fallbacks`,
+  `sort`, `zdr`, `max_price`) or Vercel's `providerOptions.gateway` (`order`, `only`,
+  `sort`) in the request narrows or re-orders the route's candidates after scope, model
+  policy, residency and the breaker have applied; an unsatisfiable preference is a 404.
+  The fields are stripped before the cache key and the upstream see the body
+  (`CLIENT_ROUTING_PREFERENCES`). Every response carries `x-gulley-attempts`
+  (`<target>:<outcome>[:<status>][:<ms>]`) and a request that touched more than one
+  attempt records it as the request-log `attempts` attribute.
 - **Live pricing catalog (P8).** A models.dev snapshot ships in the image
   (`packages/catalog/data`, refreshed by a manual script) and is the default catalog;
   `MODELS_CATALOG_FILE` accepts the raw models.dev `api.json` as well as the entry-array

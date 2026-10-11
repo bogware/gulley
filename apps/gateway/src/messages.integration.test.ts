@@ -7437,3 +7437,128 @@ describe('fail-closed metering of unpriced models (0.6 default) spares free prov
     await new Promise<void>((r) => up.close(() => r()));
   });
 });
+
+describe('request-level routing preferences + attempt provenance (P7)', () => {
+  const GOLDEN_FROM = (name: string) => (req: http.IncomingMessage, res: http.ServerResponse) => {
+    req.resume();
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-upstream': name });
+    res.end(GOLDEN_SSE);
+  };
+  async function serve(
+    handler: http.RequestListener,
+  ): Promise<{ url: string; close: () => Promise<void>; hits: () => number; bodies: string[] }> {
+    let hits = 0;
+    const bodies: string[] = [];
+    const srv = http.createServer((req, res) => {
+      hits++;
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => bodies.push(b));
+      handler(req, res);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+      hits: () => hits,
+      bodies,
+    };
+  }
+  const post = (base: string, token: string, body: unknown) =>
+    fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify(body),
+    });
+  const req = (over: Record<string, unknown>) => ({
+    model: 'claude-sonnet-4-6',
+    stream: true,
+    max_tokens: 10,
+    messages: [{ role: 'user', content: 'hi' }],
+    ...over,
+  });
+
+  it('`order` promotes a provider, `only` restricts, the fields are stripped upstream, and x-gulley-attempts names the served target', async () => {
+    const a = await serve(GOLDEN_FROM('a'));
+    const b = await serve(GOLDEN_FROM('b'));
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: {
+          mode: 'fallback',
+          targets: [
+            anthropicTarget('alpha', a.url),
+            { ...anthropicTarget('bravo', b.url), provider: 'bedrock' },
+          ],
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const r1 = await post(base, token, req({ provider: { order: ['bedrock'] } }));
+    await r1.text();
+    expect(r1.headers.get('x-gulley-target')).toBe('bravo');
+    expect(r1.headers.get('x-gulley-attempts')).toMatch(/^bravo:served:200:\d+ms$/);
+    expect(JSON.parse(b.bodies[0] ?? '{}')).not.toHaveProperty('provider');
+
+    const r2 = await post(base, token, req({ providerOptions: { gateway: { only: ['alpha'] } } }));
+    await r2.text();
+    expect(r2.headers.get('x-gulley-target')).toBe('alpha');
+
+    const r3 = await post(base, token, req({ provider: { only: ['vertex'] } }));
+    expect(r3.status).toBe(404);
+    const err = (await r3.json()) as { error: { type: string; message: string } };
+    expect(err.error.type).toBe('not_found_error');
+    expect(err.error.message).toMatch(/only=\[vertex\].*available: anthropic, bedrock/);
+
+    // The knob off: stripped (upstream never sees it) but ignored (declared order).
+    ctx.clientRoutingPreferences = false;
+    const r4 = await post(base, token, req({ provider: { only: ['vertex'] } }));
+    await r4.text();
+    expect(r4.status).toBe(200);
+    expect(r4.headers.get('x-gulley-target')).toBe('alpha');
+
+    await app.close();
+    await a.close();
+    await b.close();
+  });
+
+  it('records every attempt of a failover in x-gulley-attempts and the request-log `attempts` attribute', async () => {
+    const bad = await serve((req, res) => {
+      req.resume();
+      res.writeHead(529, { 'content-type': 'application/json' });
+      res.end('{"type":"error","error":{"type":"overloaded_error","message":"busy"}}');
+    });
+    const good = await serve(GOLDEN_FROM('good'));
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: {
+          mode: 'fallback',
+          targets: [anthropicTarget('bad', bad.url), anthropicTarget('good', good.url)],
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await post(base, token, req({}));
+    await res.text();
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-attempts')).toMatch(
+      /^bad:failover:529:\d+ms;good:served:200:\d+ms$/,
+    );
+    expect(requestLog.entries[0]?.attributes?.['attempts']).toMatch(
+      /^bad:failover:529:\d+ms;good:served:200:\d+ms$/,
+    );
+    await app.close();
+    await bad.close();
+    await good.close();
+  });
+});

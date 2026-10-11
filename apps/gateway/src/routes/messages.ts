@@ -20,7 +20,15 @@ import {
   type CacheLookup,
   semanticText,
 } from '@gulley/cache';
-import { computeCost, emptyUsage, rankPrice, type RateResolver, toMicroUsd, PROVIDER_PRICING } from '@gulley/cost';
+import {
+  computeCost,
+  emptyUsage,
+  rankPrice,
+  type RateResolver,
+  toMicroUsd,
+  PROVIDER_PRICING,
+  resolveRate,
+} from '@gulley/cost';
 import { isErr, type Result } from '@gulley/core';
 import {
   filterByPolicy,
@@ -91,6 +99,9 @@ import {
   residencyCompliant,
   selectCandidates,
   shapeRequestBody,
+  applyRoutingPreferences,
+  extractRoutingPreferences,
+  type RoutingPreferences,
 } from '@gulley/routing';
 import {
   type AccessLogFieldEngine,
@@ -337,6 +348,9 @@ export interface GatewayContext {
    *  attribution tags (session / cc_agent / prompt / request_class / … / agent) with
    *  no configuration. Default true. See ../agent-attribution.ts. */
   agentHeaderAttribution?: boolean;
+  /** Honour request-level routing preferences (OpenRouter `provider`, Vercel
+   *  `providerOptions.gateway`). Default true; the fields are stripped either way. */
+  clientRoutingPreferences?: boolean;
   /** Indirect-injection spotlighting: wrap untrusted request spans (tool_result /
    *  role:"tool" output) in trust-tag delimiters before forwarding. Absent = off. */
   spotlightUntrusted?: boolean;
@@ -665,14 +679,17 @@ async function handleModels(
   };
   const query = (request.query ?? {}) as Record<string, unknown>;
   const limitRaw = Number(query['limit']);
-  const limit = Number.isFinite(limitRaw) && limitRaw >= 1 ? Math.min(1000, Math.floor(limitRaw)) : 1000;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw >= 1 ? Math.min(1000, Math.floor(limitRaw)) : 1000;
 
   const listed = new Map<string, ModelListing>();
   // Priced models of every configured provider (bundled snapshot / catalog, else the
   // seed table for the first-party providers), each with its pricing so a client can
   // discover cost as well as availability (Vercel-style, Anthropic list shape). Region-
   // prefixed Bedrock ids are folded into the base id.
-  const providers = new Set(ctx.routes.flatMap((r) => allTargets(r.strategy).map((t) => t.provider)));
+  const providers = new Set(
+    ctx.routes.flatMap((r) => allTargets(r.strategy).map((t) => t.provider)),
+  );
   for (const provider of providers) {
     const entries = ctx.catalog?.entriesFor(provider) ?? [];
     for (const e of entries) {
@@ -689,7 +706,12 @@ async function handleModels(
             type: 'model',
             display_name: id,
             owned_by: provider,
-            pricing: pricingOf(rate.input, rate.output, rate.cache?.read ?? seed?.cache.read, rate.cache?.write5m ?? seed?.cache.write5m),
+            pricing: pricingOf(
+              rate.input,
+              rate.output,
+              rate.cache?.read ?? seed?.cache.read,
+              rate.cache?.write5m ?? seed?.cache.write5m,
+            ),
           });
         }
       }
@@ -702,7 +724,9 @@ async function handleModels(
       listed.set(id, { id, object: 'model', type: 'model', display_name: id, owned_by: 'gulley' });
     }
   }
-  const all = [...listed.values()].filter((m) => permitted(m.id)).sort((a, b) => (a.id < b.id ? -1 : 1));
+  const all = [...listed.values()]
+    .filter((m) => permitted(m.id))
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
   const data = all.slice(0, limit);
   await reply.send({
     object: 'list',
@@ -725,7 +749,12 @@ interface ModelListing {
   created_at?: string;
   context_window?: number;
   max_tokens?: number;
-  pricing?: { input: string; output: string; input_cache_read?: string; input_cache_write?: string };
+  pricing?: {
+    input: string;
+    output: string;
+    input_cache_read?: string;
+    input_cache_write?: string;
+  };
 }
 
 const REGION_PREFIX_RE = /^(us|eu|apac|global|jp|au|ca|sa)\./;
@@ -940,6 +969,26 @@ async function handleProxy(
   // downshift, cascade) is skipped for this request, each skip audited.
   const pinnedByThinking =
     parseOk && (ctx.signedThinkingSubstitution ?? 'pin') === 'pin' && hasSignedThinking(parsed);
+  // Request-level routing preferences (OpenRouter `provider` / Vercel
+  // `providerOptions.gateway`): read, then STRIPPED before anything else sees the body
+  // — no upstream accepts the fields, and the cache key must not vary on them.
+  let routingPrefs: RoutingPreferences | undefined;
+  if (parseOk) {
+    const extracted = extractRoutingPreferences(parsed);
+    if (extracted.stripped) body = Buffer.from(JSON.stringify(parsed), 'utf8');
+    if ((ctx.clientRoutingPreferences ?? true) && extracted.prefs) routingPrefs = extracted.prefs;
+  }
+  // Per-attempt routing provenance (`x-gulley-attempts`, request-log `attempts`):
+  // every target this request touched and how it ended. Bounded.
+  const attempts: RoutingAttempt[] = [];
+  const noteAttempt = (
+    target: string,
+    outcome: RoutingAttempt['outcome'],
+    status?: number,
+    ms?: number,
+  ): void => {
+    if (attempts.length < MAX_ROUTING_ATTEMPTS) attempts.push({ target, outcome, status, ms });
+  };
 
   // --- model routing + request shaping (only when the body parsed cleanly) ---
   // Resolve the requested model through the router (alias/pin the upstream model,
@@ -1248,6 +1297,31 @@ async function handleProxy(
     allowedRegions,
     requireZdr,
   }).filter((t) => scopeAllowsProvider(principal.scope, t.provider));
+  // Request-level preferences narrow / re-order what the policies above left — they
+  // can never widen it. An unsatisfiable preference is a 404 (OpenRouter's semantics),
+  // never a fall-through to a provider the client excluded.
+  if (routingPrefs && candidates.length > 0) {
+    const applied = applyRoutingPreferences(candidates, routingPrefs, {
+      rateOf: (t) =>
+        resolveRate(t.provider, t.modelMap?.[requestedModel] ?? requestedModel, ctx.rateResolver),
+      ...(ctx.outlier ? { latencyOf: (t) => ctx.outlier!.latency(t.name) } : {}),
+    });
+    if (applied.candidates.length === 0) {
+      request.log.info(
+        { prefs: routingPrefs, reason: applied.reason },
+        'routing preferences unsatisfied',
+      );
+      await reply.code(404).send({
+        type: 'error',
+        error: {
+          type: 'not_found_error',
+          message: applied.reason ?? 'no provider satisfies the routing preferences',
+        },
+      });
+      return;
+    }
+    candidates = applied.candidates;
+  }
   // A stream-only upstream (alwaysStream, e.g. Bedrock) can't serve a NON-streamed
   // request without flipping the client-visible response to SSE. In a multi-target
   // (arbitrage/failover) group, drop such targets for a non-streamed request — but keep
@@ -1490,6 +1564,12 @@ async function handleProxy(
       (h as Record<string, string | string[]>)['x-gulley-served-region'] === undefined
     ) {
       (h as Record<string, string | string[]>)['x-gulley-served-region'] = servedRegion;
+    }
+    if (
+      attempts.length > 0 &&
+      (h as Record<string, string | string[]>)['x-gulley-attempts'] === undefined
+    ) {
+      (h as Record<string, string | string[]>)['x-gulley-attempts'] = formatAttempts(attempts);
     }
     return h;
   };
@@ -2229,6 +2309,7 @@ async function handleProxy(
     servedRegion = target.region;
     dispatchMs = fwdStart;
     firstByteMs = Date.now();
+    noteAttempt(target.name, 'served', resp.statusCode, firstByteMs - fwdStart);
     ctx.outlier?.recordLatency(
       target.name,
       firstByteMs - fwdStart,
@@ -2299,6 +2380,7 @@ async function handleProxy(
     if (ctx.limiter) {
       if (!ctx.limiter.tryAcquire(target.name)) {
         anySaturation = true;
+        noteAttempt(target.name, 'shed');
         return { kind: 'saturated', target };
       }
       limiterAcquired = true;
@@ -2308,6 +2390,7 @@ async function handleProxy(
     if (!ctx.breaker.tryProbe(target.name)) {
       if (limiterAcquired) ctx.limiter?.release(target.name);
       anySaturation = true;
+      noteAttempt(target.name, 'shed');
       return { kind: 'saturated', target };
     }
     // Resolve the tenant credential OUTSIDE the attempt: a Postgres/Secrets Manager
@@ -2322,6 +2405,7 @@ async function handleProxy(
       credentialUnavailable = true;
       if (limiterAcquired) ctx.limiter?.release(target.name);
       ctx.breaker.releaseProbe(target.name);
+      noteAttempt(target.name, 'error');
       return { kind: 'failed', target };
     }
     anyRealAttempt = true;
@@ -2339,6 +2423,7 @@ async function handleProxy(
         ctx.breaker.recordFailure(target.name, parseRetryAfterMs(resp.headers));
         if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
         resp.body.resume();
+        noteAttempt(target.name, 'failover', resp.statusCode, Date.now() - forwardStart);
         return { kind: 'failed', target };
       }
       return { kind: 'usable', target, resp, forwardStart, limiterAcquired };
@@ -2540,6 +2625,7 @@ async function handleProxy(
         if (!ctx.limiter.tryAcquire(target.name)) {
           anySaturation = true;
           ctx.metrics?.recordShed('adaptive_limit');
+          noteAttempt(target.name, 'shed');
           request.log.warn({ target: target.name }, 'target at capacity — skipping');
           continue;
         }
@@ -2557,6 +2643,7 @@ async function handleProxy(
         if (limiterAcquired) ctx.limiter?.release(target.name);
         anySaturation = true;
         ctx.metrics?.recordShed('half_open_probe');
+        noteAttempt(target.name, 'shed');
         request.log.warn({ target: target.name }, 'half-open probe in flight — shedding');
         continue;
       }
@@ -2573,6 +2660,7 @@ async function handleProxy(
         credentialUnavailable = true;
         if (limiterAcquired) ctx.limiter?.release(target.name);
         ctx.breaker.releaseProbe(target.name);
+        noteAttempt(target.name, 'error');
         continue;
       }
       anyRealAttempt = true;
@@ -2608,6 +2696,7 @@ async function handleProxy(
           ) {
             ctx.breaker.recordFailure(target.name, retryAfterMs);
             r.body.resume();
+            noteAttempt(target.name, 'retry', r.statusCode, Date.now() - forwardStart);
             request.log.warn({ target: target.name, status: r.statusCode, attempt }, 'retrying');
             continue;
           }
@@ -2663,6 +2752,12 @@ async function handleProxy(
         ctx.breaker.recordFailure(target.name);
         if (limiterAcquired)
           ctx.limiter?.record(target.name, forwardStart ? Date.now() - forwardStart : 0, true);
+        noteAttempt(
+          target.name,
+          'error',
+          undefined,
+          forwardStart ? Date.now() - forwardStart : undefined,
+        );
         continue; // fail over to the next candidate
       }
 
@@ -2671,6 +2766,7 @@ async function handleProxy(
         if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
         ctx.metrics?.recordFailover(target.name);
         resp.body.resume(); // discard the failed body, then try the next target
+        noteAttempt(target.name, 'failover', resp.statusCode, Date.now() - forwardStart);
         request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
         continue;
       }
@@ -3355,6 +3451,9 @@ async function handleProxy(
           ...(rateLimitDegraded ? { rateLimitUnenforced: true } : {}),
           ...(downshiftedFrom ? { downshiftedFrom } : {}),
           ...(cascadeEscalatedFrom ? { cascadeEscalatedFrom } : {}),
+          // Routing provenance only when the request touched more than one attempt
+          // (a shed, retry or failover) — a single served attempt is already `target`.
+          ...(attempts.length > 1 ? { attempts: formatAttempts(attempts) } : {}),
         },
       });
     } catch (err) {
@@ -4643,6 +4742,27 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 
 function numField(v: unknown): number | undefined {
   return typeof v === 'number' ? v : undefined;
+}
+
+/** One routing attempt of a request, for the `x-gulley-attempts` header and the
+ *  request-log `attempts` attribute: `<target>:<outcome>[:<status>][:<ms>]`. */
+interface RoutingAttempt {
+  target: string;
+  outcome: 'served' | 'failover' | 'retry' | 'shed' | 'error';
+  status?: number;
+  ms?: number;
+}
+const MAX_ROUTING_ATTEMPTS = 32;
+
+function formatAttempts(attempts: readonly RoutingAttempt[]): string {
+  return attempts
+    .map((a) => {
+      let s = `${a.target}:${a.outcome}`;
+      if (a.status !== undefined) s += `:${a.status}`;
+      if (a.ms !== undefined) s += `:${a.ms}ms`;
+      return s;
+    })
+    .join(';');
 }
 
 function headerValue(request: FastifyRequest, name: string): string | undefined {

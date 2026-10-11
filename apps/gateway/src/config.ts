@@ -571,6 +571,13 @@ const EnvShape = z.object({
   // configured header that maps to the same key wins. The headers still reach the
   // upstream untouched.
   AGENT_HEADER_ATTRIBUTION: envBool(true),
+  // Request-level routing preferences: an OpenRouter-compatible `provider` object
+  // ({order, only, ignore, allow_fallbacks, sort: price|latency|throughput, zdr,
+  // max_price}) or Vercel's `providerOptions.gateway` ({order, only, sort: cost|ttft|tps})
+  // in the body narrows / re-orders the route's candidates AFTER scope, model policy,
+  // residency and the breaker have applied (a request can tighten ZDR, never relax it).
+  // The fields are always stripped before forwarding; off = stripped and ignored.
+  CLIENT_ROUTING_PREFERENCES: envBool(true),
 
   // When a successful (2xx) response emits NO provider usage (some OpenAI-compatible
   // and local backends omit stream usage), the request would otherwise bill $0 and

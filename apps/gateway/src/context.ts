@@ -808,11 +808,15 @@ export function createProductionContext(
   if (config.MODELS_CATALOG_FILE && config.PRICING_RELOAD_INTERVAL_SECONDS > 0) {
     const path = config.MODELS_CATALOG_FILE;
     maintenanceStops.push(
-      watchCatalogFile(path, (c) => log.info({ path, models: c.size }, 'pricing catalog reloaded'), {
-        intervalMs: config.PRICING_RELOAD_INTERVAL_SECONDS * 1000,
-        into: catalog,
-        log: (msg, err) => log.warn({ path, err }, msg),
-      }),
+      watchCatalogFile(
+        path,
+        (c) => log.info({ path, models: c.size }, 'pricing catalog reloaded'),
+        {
+          intervalMs: config.PRICING_RELOAD_INTERVAL_SECONDS * 1000,
+          into: catalog,
+          log: (msg, err) => log.warn({ path, err }, msg),
+        },
+      ),
     );
   }
 
@@ -1358,6 +1362,7 @@ export function createProductionContext(
     meterFailClosedOnUnpriced: config.METER_FAIL_CLOSED_ON_UNPRICED,
     requestDeadlineMs: config.REQUEST_DEADLINE_MS > 0 ? config.REQUEST_DEADLINE_MS : undefined,
     agentHeaderAttribution: config.AGENT_HEADER_ATTRIBUTION,
+    clientRoutingPreferences: config.CLIENT_ROUTING_PREFERENCES,
     attributionHeaders: config.ATTRIBUTION_HEADERS
       ? config.ATTRIBUTION_HEADERS.split(',')
           .map((h) => h.trim().toLowerCase())

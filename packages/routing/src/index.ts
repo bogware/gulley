@@ -5,6 +5,7 @@ export * from './breaker-sync';
 export * from './circuit-breaker';
 export * from './outlier';
 export * from './select';
+export * from './preferences';
 export * from './model-router';
 export * from './shaping';
 export * from './smart-router';

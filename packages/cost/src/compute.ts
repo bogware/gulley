@@ -95,6 +95,21 @@ export function rankPrice(
     : undefined;
 }
 
+/** The per-MTok input/output rate a (provider, model) would be billed at (catalog
+ *  resolver first, then the seed), or undefined when unpriced. For routing
+ *  preferences (`max_price`, `sort: price`) that need the two sides separately. */
+export function resolveRate(
+  provider: string,
+  model: string,
+  resolve?: RateResolver,
+): { input: number; output: number } | undefined {
+  const pricing = PROVIDER_PRICING[provider];
+  const rate = resolve?.(provider, model) ?? pricing?.rates[pricing.normalize(model)];
+  return rate && Number.isFinite(rate.input) && Number.isFinite(rate.output)
+    ? { input: rate.input, output: rate.output }
+    : undefined;
+}
+
 export function computeCost(
   provider: string,
   model: string,
