@@ -11,6 +11,7 @@ import {
   buildModelRouterFromDocument,
   buildRouteGroupsFromDocument,
   buildRoutesFromDocument,
+  type ProviderBuildOptions,
 } from './config-builder';
 import { buildModelPolicy, unionModelPolicy } from './model-policy';
 import { isEmptyResidencyPolicy, residencyAllowedRegions } from './residency-policy';
@@ -96,6 +97,9 @@ export class GatewayReconciler {
     /** Global `HEDGE_DELAY_MS` — the default hedge for a document route group that
      *  sets none (the same value the env overlay uses). 0 = no hedging. */
     private readonly hedgeDelayMs = 0,
+    /** Env-derived adapter options (Bedrock ping synthesis / beta deny-list) that the
+     *  document cannot express; applied to every document-built Bedrock route. */
+    private readonly providerOptions: ProviderBuildOptions = {},
   ) {}
 
   private warn(msg: string): void {
@@ -129,6 +133,7 @@ export class GatewayReconciler {
         doc,
         this.resolver,
         this.holder.ctx.guardrails,
+        this.providerOptions,
       );
       // Re-apply the env-only overlays (custom/local providers, ROUTE_GROUPS) on EVERY
       // reconcile: the document carries only the four core provider kinds, so without

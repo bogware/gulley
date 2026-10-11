@@ -230,7 +230,7 @@ describe('seed pricing (2026-10)', () => {
     const read = usage({ cacheReadTokens: 1_000_000 });
     expect(computeCost('anthropic', 'claude-opus-5-5', read).cacheReadUsd).toBeCloseTo(0.2, 6);
     expect(computeCost('anthropic', 'claude-fable-5-1', read).cacheReadUsd).toBeCloseTo(0.25, 6);
-    expect(computeCost('anthropic', 'claude-sonnet-5-5', read).cacheReadUsd).toBeCloseTo(0.2, 6);
+    expect(computeCost('anthropic', 'claude-sonnet-5-5', read).cacheReadUsd).toBeCloseTo(0.1, 6); // 0.05x on Sonnet 5.5
     expect(computeCost('anthropic', 'claude-fable-5', read).cacheReadUsd).toBeCloseTo(1, 6);
     expect(computeCost('openai', 'gpt-5', read).cacheReadUsd).toBeCloseTo(0.125, 6);
     expect(computeCost('openai', 'gpt-4.1', read).cacheReadUsd).toBeCloseTo(0.5, 6);

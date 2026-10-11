@@ -53,10 +53,12 @@ describe('isFailoverStatus', () => {
     expect(isFailoverStatus(fb, 404)).toBe(false);
   });
 
-  it('honors custom onStatusCodes', () => {
-    const fb: RoutingStrategy = { mode: 'fallback', targets: [], onStatusCodes: [418] };
-    expect(isFailoverStatus(fb, 418)).toBe(true);
-    expect(isFailoverStatus(fb, 429)).toBe(false);
+  it('honors custom onStatusCodes, but a terminal client error never fails over even if configured', () => {
+    const fb: RoutingStrategy = { mode: 'fallback', targets: [], onStatusCodes: [529, 418, 404] };
+    expect(isFailoverStatus(fb, 529)).toBe(true);
+    expect(isFailoverStatus(fb, 429)).toBe(false); // not in the custom list
+    expect(isFailoverStatus(fb, 418)).toBe(false); // configured, but a 4xx that is not 408/409/429
+    expect(isFailoverStatus(fb, 404)).toBe(false);
   });
 });
 

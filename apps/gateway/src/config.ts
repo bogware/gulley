@@ -81,8 +81,9 @@ const EnvShape = z.object({
   // Bedrock streams carry no `ping` events; a client idle watchdog (Claude Code's
   // streaming idle timeout) trips during a long thinking pause. The gateway emits an
   // Anthropic `ping` after this many ms without an upstream frame, once the stream has
-  // started (15 s = Anthropic's own cadence; 0 = off). Synthesis stops after 5 min of
-  // silence so a real hang still reaches STREAM_INACTIVITY_MS.
+  // started (15 s = Anthropic's own cadence; 0 = off). Synthetic pings are NOT upstream
+  // liveness: the gateway's inactivity watchdog ignores them, so a hung Bedrock stream
+  // still aborts at STREAM_INACTIVITY_MS, and synthesis stops at that bound too.
   BEDROCK_PING_INTERVAL_MS: z.coerce.number().int().min(0).default(15_000),
   // `anthropic-beta` values are forwarded to Bedrock as the body's `anthropic_beta`
   // list (an OPEN list, per Anthropic's gateway contract). Comma-separated values to

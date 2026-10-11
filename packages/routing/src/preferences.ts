@@ -71,17 +71,32 @@ export function extractRoutingPreferences(body: Record<string, unknown>): Extrac
     const order = asStringList(src['order']);
     const only = asStringList(src['only']);
     const ignore = asStringList(src['ignore']);
-    if (order) ((merged.order = order), (any = true));
-    if (only) ((merged.only = only), (any = true));
-    if (ignore) ((merged.ignore = ignore), (any = true));
+    if (order) {
+      merged.order = order;
+      any = true;
+    }
+    if (only) {
+      merged.only = only;
+      any = true;
+    }
+    if (ignore) {
+      merged.ignore = ignore;
+      any = true;
+    }
     if (typeof src['allow_fallbacks'] === 'boolean') {
       merged.allowFallbacks = src['allow_fallbacks'];
       any = true;
     }
     const sort = asSort(src['sort']);
-    if (sort) ((merged.sort = sort), (any = true));
+    if (sort) {
+      merged.sort = sort;
+      any = true;
+    }
     if (!vercel) {
-      if (src['zdr'] === true) ((merged.zdr = true), (any = true));
+      if (src['zdr'] === true) {
+        merged.zdr = true;
+        any = true;
+      }
       const mp = src['max_price'];
       if (mp && typeof mp === 'object') {
         const prompt = asPrice((mp as Record<string, unknown>)['prompt']);

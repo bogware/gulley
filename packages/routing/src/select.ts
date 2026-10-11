@@ -6,12 +6,21 @@ import type { RouteTarget, RoutingStrategy } from './types';
  *  4xx (e.g. 400/401/403/404) are NOT here — they don't fail over. */
 export const DEFAULT_FAILOVER_STATUS = [408, 409, 429, 500, 502, 503, 504, 529];
 
+/** A status that MAY be configured as a failover trigger: request timeout, conflict,
+ *  throttling, or any server error. A terminal client error never qualifies — it is the
+ *  caller's fault, so it must not record a breaker fault, retry, or fail over (that
+ *  would let one bad request eject a healthy upstream fleet-wide). */
+export function isFailoverEligibleStatus(code: number): boolean {
+  return code === 408 || code === 409 || code === 429 || (code >= 500 && code <= 599);
+}
+
 export function isFailoverStatus(strategy: RoutingStrategy, code: number): boolean {
   const codes =
     strategy.mode === 'fallback' && strategy.onStatusCodes
       ? strategy.onStatusCodes
       : DEFAULT_FAILOVER_STATUS;
-  return codes.includes(code);
+  // Defense in depth over the schema bound: a configured terminal 4xx is ignored.
+  return isFailoverEligibleStatus(code) && codes.includes(code);
 }
 
 /** Tracks in-flight request counts per target, for power-of-two-choices

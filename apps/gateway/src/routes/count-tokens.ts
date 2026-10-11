@@ -6,7 +6,7 @@ import type { Readable } from 'node:stream';
 import { conversationIdentity, maskVaultKey } from '../conversation';
 import { modelAllowedByPolicy } from '../model-policy';
 import { residencyAllowedRegions } from '../residency-policy';
-import type { GatewayContext, RouteHolder } from './messages';
+import type { GatewayContext, RouteHolder, safeRecord } from './messages';
 
 /**
  * `POST /v1/messages/count_tokens` (Anthropic's optional gateway endpoint: without it
@@ -29,6 +29,8 @@ const COUNT_TOKENS_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export interface CountTokensDeps {
+  /** The proxy's request-record emitter (metrics + span), for denials. */
+  record: typeof safeRecord;
   resolvePrincipal(
     ctx: GatewayContext,
     request: FastifyRequest,
@@ -48,6 +50,7 @@ export async function handleCountTokens(
   deps: CountTokensDeps,
 ): Promise<void> {
   const ctx = holder.ctx;
+  const startedAtMs = Date.now();
   const path = (request.url.split('?')[0] ?? request.url) || '/';
   const route = holder.routeFor(path.replace(/\/count_tokens$/, ''));
   if (!route) {
@@ -114,7 +117,47 @@ export async function handleCountTokens(
       ? maskVaultKey(ctx.maskVaultMaster, principal.scope.workspaceId, conversation)
       : undefined;
     const gr = await engine.inspectInput(body.toString('utf8'), { vaultKey });
+    // The same outcomes as the inference path are audited and recorded the same way:
+    // a blocked or unforwardable count is a guardrail event, not a silent 4xx.
+    const denied = async (
+      status: 403 | 422,
+      action: 'guardrail.blocked' | 'guardrail.transform_unforwardable',
+      guardrailAction: 'block' | 'mask' | 'redact',
+    ): Promise<void> => {
+      try {
+        await ctx.audit.append({
+          orgId: principal.scope.orgId,
+          actor: principal.id,
+          action,
+          target: route.strategy.mode === 'single' ? route.strategy.target.provider : path,
+          payload: {
+            direction: 'input',
+            surface: 'count_tokens',
+            ...(gr.blockedReason ? { reason: gr.blockedReason } : {}),
+            categories: gr.summary.categories,
+          },
+        });
+      } catch (err) {
+        request.log.error({ err, sink: 'audit' }, 'audit append failed');
+      }
+      deps.record(ctx, request.log, {
+        provider: route.strategy.mode === 'single' ? route.strategy.target.provider : 'unknown',
+        requestModel: model,
+        responseModel: model,
+        route: `${path}`,
+        statusCode: status,
+        status: 'error',
+        inputTokens: 0,
+        outputTokens: 0,
+        costMicroUsd: 0,
+        streamed: false,
+        startedAtMs,
+        guardrailInputFindings: gr.summary.total,
+        guardrailAction,
+      });
+    };
     if (gr.blocked) {
+      await denied(403, 'guardrail.blocked', 'block');
       await error(reply, 403, 'guardrail_blocked', gr.blockedReason ?? 'blocked by guardrail');
       return;
     }
@@ -124,6 +167,7 @@ export async function handleCountTokens(
         if (!t || typeof t !== 'object' || Array.isArray(t)) throw new Error('not an object');
         body = Buffer.from(gr.transformedText, 'utf8');
       } catch {
+        await denied(422, 'guardrail.transform_unforwardable', gr.vault ? 'mask' : 'redact');
         await error(reply, 422, 'guardrail_transform_error', 'masked request is not forwardable');
         return;
       }

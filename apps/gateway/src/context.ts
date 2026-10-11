@@ -571,6 +571,9 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           adapter: new BedrockAdapter({
             region: config.BEDROCK_REGION,
             pingIntervalMs: config.BEDROCK_PING_INTERVAL_MS,
+            // Synthesis never outlives the gateway's own inactivity bound (and the
+            // gateway ignores synthetic pings for that watchdog anyway).
+            pingMaxIdleMs: config.STREAM_INACTIVITY_MS,
             betaDeny: config.BEDROCK_BETA_DENY.split(',')
               .map((b) => b.trim())
               .filter(Boolean),

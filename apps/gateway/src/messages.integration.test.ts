@@ -24,6 +24,7 @@ import {
   OpenAIUsageExtractor,
   ProviderRequestError,
   SSEParser,
+  BedrockAdapter,
 } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { AdaptiveLimiter, CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
@@ -7560,5 +7561,229 @@ describe('request-level routing preferences + attempt provenance (P7)', () => {
     await app.close();
     await bad.close();
     await good.close();
+  });
+});
+
+describe('hot-path review follow-ups (Wave 1)', () => {
+  function bedrockFrame(headers: Record<string, string>, payload: Buffer): Buffer {
+    const headerBufs: Buffer[] = [];
+    for (const [name, value] of Object.entries(headers)) {
+      const n = Buffer.from(name, 'utf8');
+      const v = Buffer.from(value, 'utf8');
+      const b = Buffer.alloc(1 + n.length + 1 + 2 + v.length);
+      let o = 0;
+      b.writeUInt8(n.length, o);
+      o += 1;
+      n.copy(b, o);
+      o += n.length;
+      b.writeUInt8(7, o);
+      o += 1;
+      b.writeUInt16BE(v.length, o);
+      o += 2;
+      v.copy(b, o);
+      headerBufs.push(b);
+    }
+    const headersBuf = Buffer.concat(headerBufs);
+    const total = 4 + 4 + 4 + headersBuf.length + payload.length + 4;
+    const frame = Buffer.alloc(total);
+    let o = 0;
+    frame.writeUInt32BE(total, o);
+    o += 4;
+    frame.writeUInt32BE(headersBuf.length, o);
+    o += 4;
+    frame.writeUInt32BE(0, o);
+    o += 4;
+    headersBuf.copy(frame, o);
+    o += headersBuf.length;
+    payload.copy(frame, o);
+    o += payload.length;
+    frame.writeUInt32BE(0, o);
+    return frame;
+  }
+  const bedrockChunk = (event: object) =>
+    bedrockFrame(
+      { ':message-type': 'event', ':event-type': 'chunk' },
+      Buffer.from(JSON.stringify({ bytes: Buffer.from(JSON.stringify(event)).toString('base64') })),
+    );
+
+  it('synthetic Bedrock pings keep the client alive but never reset the gateway inactivity watchdog', async () => {
+    // Bedrock answers message_start, then the connection hangs (half-open) forever.
+    const sockets = new Set<import('node:net').Socket>();
+    const up = http.createServer((req, res) => {
+      req.resume();
+      sockets.add(req.socket);
+      res.writeHead(200, { 'content-type': 'application/vnd.amazon.eventstream' });
+      res.write(
+        bedrockChunk({ type: 'message_start', message: { id: 'm', usage: { input_tokens: 3 } } }),
+      );
+      // never ends
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    ctx.streamInactivityMs = 150;
+    ctx.routes = [
+      {
+        clientPaths: ['/bedrock/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: {
+          mode: 'single',
+          target: {
+            name: 'bedrock',
+            provider: 'bedrock',
+            adapter: new BedrockAdapter({
+              baseUrl: url,
+              pingIntervalMs: 20,
+              pingMaxIdleMs: 10_000,
+            }),
+            credential: { scheme: 'bearer', value: 'k' },
+            upstreamPath: '/v1/messages',
+          },
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const started = Date.now();
+    const res = await fetch(`${base}/bedrock/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'anthropic.claude-sonnet-5-5',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+    const elapsed = Date.now() - started;
+    expect(text).toContain('event: ping'); // the client saw liveness
+    expect(text).toContain('event: error'); // …and then the gateway's own watchdog verdict
+    expect(elapsed).toBeLessThan(1500); // ≈ STREAM_INACTIVITY_MS, not pingMaxIdle + it
+    expect(requestLog.entries).toHaveLength(1); // teardown ran: the reservation is released
+    expect(requestLog.entries[0]?.attributes?.['abortReason']).toBe('watchdog');
+    await app.close();
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((r) => up.close(() => r()));
+  });
+
+  it('an unsatisfiable routing preference is recorded (request log + audit) like every other denial', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog, audit } = buildContext(store);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+        provider: { only: ['vertex'] },
+      }),
+    });
+    expect(res.status).toBe(404);
+    // Pre-dispatch denials record through the telemetry/metrics emitter (like the scope
+    // and policy 403s) and leave an audit row; the durable request log is a teardown
+    // artifact of dispatched requests.
+    expect(requestLog.entries).toHaveLength(0);
+    expect(audit.rows.some((r) => r.action === 'policy.routing_preferences_unsatisfied')).toBe(
+      true,
+    );
+    await app.close();
+  });
+
+  it('a blocked count_tokens prompt is audited and recorded like a blocked inference prompt', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog, audit } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', upstreamUrl) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'block', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'mail jane@example.com' }],
+      }),
+    });
+    expect(res.status).toBe(403);
+    const row = audit.rows.find((r) => r.action === 'guardrail.blocked');
+    expect(row).toBeDefined();
+    expect((row?.payload as { surface?: string })?.surface).toBe('count_tokens');
+    expect((row?.payload as { direction?: string })?.direction).toBe('input');
+    expect(requestLog.entries).toHaveLength(0); // no dispatch, no teardown row (as for the proxy's block)
+    await app.close();
+  });
+
+  it('a buffered response that echoes an opaque secret-looking token is never cached (raw findings gate the store)', async () => {
+    const TOKEN = 'opaque-9F3kQ2mZ8pL1vX7cR4tB6nW0yH5jD2sA-session';
+    const up = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id: 'msg_1',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-sonnet-4-6',
+          content: [{ type: 'text', text: `your token is ${TOKEN}` }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 5, output_tokens: 12 },
+        }),
+      );
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', url) },
+        cacheable: true,
+        // A buffered path with an enforcing output policy whose floor (0.5) hides the
+        // entropy detector's 0.4 finding from the policy-filtered set.
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action: 'block', minConfidence: 0.5 },
+        }),
+      },
+    ];
+    const storeSpy = vi.spyOn(ctx.cache, 'store');
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'token?' }],
+        }),
+      });
+    const r1 = await send();
+    await r1.text();
+    const r2 = await send();
+    await r2.text();
+    expect(r1.headers.get('x-gulley-cache')).toBe('miss');
+    expect(r2.headers.get('x-gulley-cache')).toBe('miss'); // never stored, never a hit
+    expect(storeSpy).not.toHaveBeenCalled();
+    await app.close();
+    await new Promise<void>((r) => up.close(() => r()));
   });
 });

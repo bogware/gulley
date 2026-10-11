@@ -110,6 +110,15 @@ export function buildConfigWatcher(
     overlay,
     // The document's route groups default to the same global hedge as the env overlay.
     config.HEDGE_DELAY_MS,
+    {
+      bedrock: {
+        pingIntervalMs: config.BEDROCK_PING_INTERVAL_MS,
+        pingMaxIdleMs: config.STREAM_INACTIVITY_MS,
+        betaDeny: config.BEDROCK_BETA_DENY.split(',')
+          .map((b) => b.trim())
+          .filter(Boolean),
+      },
+    },
   );
 
   const listen = createListenConnection(config.DATABASE_URL);

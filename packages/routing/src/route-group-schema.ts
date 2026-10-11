@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isFailoverEligibleStatus } from './select';
 
 /**
  * A declarative multi-target route group (M19). The route builders only ever emit
@@ -27,7 +28,19 @@ export const routeGroupSchema = z.object({
   /** Optional per-provider weight for `loadbalance` (defaults to 1). */
   weights: z.record(z.string(), z.number().positive()).optional(),
   /** Fallback only: upstream status codes that trigger failover to the next target. */
-  onStatusCodes: z.array(z.number().int()).optional(),
+  /** Statuses that fail over to the next target. Only transient / overload classes
+   *  may be listed: a terminal client error (400/401/403/404/413/422/…) must never
+   *  record a breaker fault or eject an upstream. */
+  onStatusCodes: z
+    .array(
+      z
+        .number()
+        .int()
+        .refine((c) => isFailoverEligibleStatus(c), {
+          message: 'only 408, 409, 429 or a 5xx status may trigger failover',
+        }),
+    )
+    .optional(),
   /** Per-group hedge delay (ms); 0/absent falls back to the global `HEDGE_DELAY_MS`. */
   hedgeDelayMs: z.number().int().nonnegative().optional(),
   /** Same-model ARBITRAGE across providers whose model ids differ: per-provider map of

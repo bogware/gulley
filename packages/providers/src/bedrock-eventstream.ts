@@ -132,6 +132,22 @@ export interface BedrockSseOptions {
 }
 
 const PING_FRAME = 'event: ping\ndata: {"type":"ping"}\n\n';
+/** The exact bytes of one synthesized ping. A gateway consuming the translated
+ *  stream must NOT count these as upstream liveness: they are produced here, not by
+ *  the provider, so a hung upstream would otherwise look alive to an inactivity
+ *  watchdog for as long as synthesis runs. */
+export const SYNTHETIC_PING_FRAME: Buffer = Buffer.from(PING_FRAME, 'utf8');
+
+/** True when `chunk` consists solely of synthesized ping frames (one, or a few that
+ *  coalesced in the stream buffer) — i.e. carries no upstream bytes. */
+export function isSyntheticPingChunk(chunk: Buffer): boolean {
+  const n = SYNTHETIC_PING_FRAME.length;
+  if (chunk.length === 0 || chunk.length % n !== 0 || chunk.length > n * 8) return false;
+  for (let off = 0; off < chunk.length; off += n) {
+    if (!chunk.subarray(off, off + n).equals(SYNTHETIC_PING_FRAME)) return false;
+  }
+  return true;
+}
 const DEFAULT_PING_MAX_IDLE_MS = 300_000;
 
 /** Wrap a Bedrock eventstream response body into an Anthropic-SSE Readable. */

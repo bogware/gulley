@@ -36,7 +36,7 @@ control, and audit over every request.
 
 ## Why Gulley
 
-- **Multi-provider, one surface** — Anthropic (API + Enterprise), OpenAI, AWS Bedrock, Azure AI Foundry, Google Gemini/Vertex, any OpenAI-compatible backend (Groq, Mistral, Together, …), and local runtimes (Ollama, vLLM, LM Studio). Native full-fidelity passthrough _and_ a cross-provider layer for routing, load-balancing, failover, and same-model arbitrage.
+- **Multi-provider, one surface** — Anthropic (API + Enterprise), OpenAI, AWS Bedrock, Azure AI Foundry, any OpenAI-compatible backend (Groq, Mistral, Together, …), and local runtimes (Ollama, vLLM, LM Studio); a Google Gemini/Vertex native adapter ships but is not yet configurable. Native full-fidelity passthrough _and_ a cross-provider layer for routing, load-balancing, failover, and same-model arbitrage.
 - **Governance, all open** — RBAC, virtual keys, budgets with hard caps, PII/secret masking, guardrails, and a tamper-evident (hash-chained + S3 Object Lock WORM, KMS-signed, externally anchored) audit trail. Every governance feature is in the Apache-2.0 core — not paywalled behind an "enterprise" edition.
 - **Coding-agent aware** — governs and _attributes_ the traffic Claude Code and Codex actually generate; in-stream (not buffered) source-code / secret DLP; the prompt cache the big cacheable prefixes depend on is metered, so you can see the dollars it saves.
 - **Enterprise identity** — Microsoft **Entra (Azure AD) SSO** for the console, JWT auth for the data plane, App-Role / group → RBAC, SCIM provisioning, and Graph-backed revoke-on-deprovision. See [`docs/ENTRA_SETUP.md`](docs/ENTRA_SETUP.md).

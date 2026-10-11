@@ -44,7 +44,8 @@ export const ANTHROPIC_PRICING: Readonly<Record<string, ModelRate>> = {
   'claude-opus-4-7': { input: 5, output: 25 },
   'claude-opus-4-6': { input: 5, output: 25 },
   // Sonnet: 5 and 5.5 list at $2/$10 (the 4.6 generation was $3/$15).
-  'claude-sonnet-5-5': { input: 2, output: 10 },
+  // Cache hits are 0.05x base on Sonnet 5.5 (as on Opus 5.5) — $0.10/MTok.
+  'claude-sonnet-5-5': { input: 2, output: 10, cache: { read: 0.05 } },
   'claude-sonnet-5': { input: 2, output: 10 },
   'claude-sonnet-4-6': { input: 3, output: 15 },
   // Haiku 5.5 has a long-prompt tier above 100K input tokens.

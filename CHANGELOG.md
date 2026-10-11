@@ -6,12 +6,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-11
+
+Wave 1 of the October 2026 cycle — **agent trust**: the changes that make Gulley safe
+to put in front of Claude Code and Codex on the Claude 5.5 generation and provable as
+such. Conversation-stable masking (the per-request mask token that broke preserved
+thinking and prompt caching is gone), signed reasoning pins the model, the Claude Code
+gateway contract is executed as a published conformance report, zero-config agent
+attribution, a live pricing catalog with `/v1/models` pricing, request-level routing
+preferences with per-attempt provenance, and route groups as first-class DB config.
+
 ### Upgrade notes
 
 - **`METER_FAIL_CLOSED_ON_UNPRICED` now defaults to `true`:** a served model with no
   price in the catalog or the seeds is charged its worst-case reservation instead of
   metering $0. Models of a `local` custom provider (Ollama, vLLM, …) are free and are
   never charged. Set it to `false` to restore the 0.5 behaviour.
+- **`onStatusCodes` on a route group may list only 408, 409, 429 or a 5xx** (env
+  `ROUTE_GROUPS` and DB route groups alike); a configured terminal 4xx is now rejected
+  by validation and ignored by the failover check, so one bad request can never record
+  a breaker fault or eject a healthy upstream.
+- **Sonnet 5.5 cache reads are billed at 0.05× base ($0.10/MTok)**, matching Anthropic's
+  list price; the 0.5.1 seed billed 0.1×. A drift test now holds the bundled snapshot
+  and the seed tables to the same prices.
 - The bundled models.dev snapshot becomes the default pricing catalog; prices for
   Claude on Bedrock and Vertex now come from the catalog (partner list prices) rather
   than the Anthropic seed table. Pin `MODELS_CATALOG_FILE` or `PRICING_OVERRIDES` for
@@ -658,7 +675,8 @@ _Resolved during pre-release hardening (these never shipped in a public release)
   token on `x-api-key` as well as the bearer; IPv6 loopback (`[::1]`) PKCE redirects
   are accepted; and `gulley init` merges into an existing settings file.
 
-[Unreleased]: https://github.com/bogware/gulley/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/bogware/gulley/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/bogware/gulley/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/bogware/gulley/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/bogware/gulley/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bogware/gulley/compare/v0.3.0...v0.4.0

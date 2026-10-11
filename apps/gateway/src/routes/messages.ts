@@ -39,6 +39,7 @@ import {
   StreamingReplacer,
   StreamingScanner,
   type TokenVault,
+  type Finding,
 } from '@gulley/guardrails';
 import type { CelAuthorizer, CelTransformer, ExternalAuthorizer, HeaderChanges } from '@gulley/cel';
 import {
@@ -78,6 +79,7 @@ import {
   SSEParser,
   type TextTransform,
   type UsageExtractor,
+  isSyntheticPingChunk,
 } from '@gulley/providers';
 import type { Encryptor } from '@gulley/crypto';
 import type { MaskDirection, MaskVaultStore, SchemaStatus } from '@gulley/storage';
@@ -543,6 +545,7 @@ export function registerRoutes(app: FastifyInstance, holder: RouteHolder): void 
   const countTokensDeps: CountTokensDeps = {
     resolvePrincipal: resolveAnyPrincipal,
     filterResponseHeaders,
+    record: safeRecord,
   };
   for (const path of COUNT_TOKENS_PATHS) {
     app.post(path, (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
@@ -877,7 +880,7 @@ function decodeForEval(buf: Buffer, encoding: string | string[] | undefined): Bu
 /** Emit a request metric without ever letting a telemetry fault escape into the
  *  request/teardown path (a throw here must not turn a clean 4xx into a 500, nor
  *  reject the fire-and-forget teardown promise and skip the tracer/span close). */
-function safeRecord(
+export function safeRecord(
   ctx: GatewayContext,
   log: { error: (obj: object, msg?: string) => void },
   args: Parameters<Telemetry['recordRequest']>[0],
@@ -1311,6 +1314,16 @@ async function handleProxy(
         { prefs: routingPrefs, reason: applied.reason },
         'routing preferences unsatisfied',
       );
+      // Like every other pre-dispatch denial: a request-log / metrics record and an
+      // audit row, so a client-excluded provider is never an invisible failure.
+      recordDenied(404, candidates[0]?.provider ?? 'unknown');
+      await auditSafe({
+        orgId: principal.scope.orgId,
+        actor: principal.id,
+        action: 'policy.routing_preferences_unsatisfied',
+        target: requestedModel,
+        payload: { preferences: routingPrefs, reason: applied.reason },
+      });
       await reply.code(404).send({
         type: 'error',
         error: {
@@ -3181,6 +3194,10 @@ async function handleProxy(
   let fullBytes = 0;
   let captureOverflow = false;
   let outputEnforced: OutputInspection | undefined;
+  // RAW (unfiltered) detector findings over a buffered body, for the cache gate: the
+  // output policy's confidence floor drops the unkeyed-secret detectors (entropy 0.4),
+  // and a response echoing an opaque token must never be cached and replayed.
+  let rawBufferedOutFindings: Finding[] | undefined;
   // Tool-call governance state (set in onUpstreamEnd, read in teardown for the
   // cache-store gate + telemetry): whether the response carried any tool call, and
   // the first policy-denied call if governance withheld the response.
@@ -3293,7 +3310,9 @@ async function handleProxy(
     //     findings and treat ANY secret/entropy-source finding as sensitive, else a response
     //     echoing an opaque token is cached and replayed to another caller in the same scope.
     const cacheGateFindings =
-      outScanner && !redactor && !bufferOutput ? outScanner.findings() : outFindings;
+      outScanner && !redactor && !bufferOutput
+        ? outScanner.findings()
+        : (rawBufferedOutFindings ?? outFindings);
     const outputSensitive =
       outputScanFailed ||
       cacheGateFindings.some(
@@ -3840,7 +3859,9 @@ async function handleProxy(
   resetWatchdog();
 
   upstreamBody.on('data', (chunk: Buffer) => {
-    resetWatchdog();
+    // A synthesized Bedrock ping is gateway-made, not upstream liveness: it keeps the
+    // CLIENT's idle watchdog happy but must not keep OURS from catching a hung upstream.
+    if (!isSyntheticPingChunk(chunk)) resetWatchdog();
     if (reply.raw.destroyed) {
       // The client socket is gone: stop pulling (and paying for) bytes nobody reads.
       abortWith('client');
@@ -3979,7 +4000,7 @@ async function handleProxy(
                   'content-type': streamed ? 'text/event-stream' : 'application/json',
                   'x-gulley-request-id': requestId,
                   'x-gulley-target': servedTarget.name,
-                  'x-gulley-cache': 'bypass',
+                  'x-gulley-cache': cacheLookup?.status ?? 'bypass',
                 }),
               );
               reply.raw.write(
@@ -4138,7 +4159,7 @@ async function handleProxy(
             'content-type': streamed ? 'text/event-stream' : 'application/json',
             'x-gulley-request-id': requestId,
             'x-gulley-target': servedTarget.name,
-            'x-gulley-cache': 'bypass',
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             'x-gulley-tool-policy': 'blocked',
           }),
         );
@@ -4174,7 +4195,7 @@ async function handleProxy(
             'content-type': sse ? 'text/event-stream' : 'application/json',
             'x-gulley-request-id': requestId,
             'x-gulley-target': servedTarget.name,
-            'x-gulley-cache': 'bypass',
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             'x-gulley-guardrail': bufferFailClosed
               ? 'output-blocked-overflow'
               : 'overflow-unenforced',
@@ -4201,11 +4222,10 @@ async function handleProxy(
       // Fail safe on an unrecognised framing: nothing extractable → scan the raw text.
       const logical = extractTextFromSse(text, clientDialect) || text;
       const inspectDetok = vault ? new StreamingReplacer(vault.entries()) : undefined;
-      const out = await engine.inspectOutput(
-        inspectDetok ? inspectDetok.push(logical) + inspectDetok.flush() : logical,
-        { vaultKey },
-      );
+      const inspected = inspectDetok ? inspectDetok.push(logical) + inspectDetok.flush() : logical;
+      const out = await engine.inspectOutput(inspected, { vaultKey });
       outputEnforced = out;
+      rawBufferedOutFindings = engine.combinedDetector().detect(inspected);
       const withhold = out.blocked || out.transformedText !== undefined;
       const bodyOut = withhold
         ? providerErrorFrame(clientDialect, 'response withheld by guardrail')
@@ -4221,7 +4241,7 @@ async function handleProxy(
             'content-type': 'text/event-stream',
             'x-gulley-request-id': requestId,
             'x-gulley-target': servedTarget.name,
-            'x-gulley-cache': 'bypass',
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             'x-gulley-guardrail': withhold ? 'output-blocked' : 'audit',
           }),
         );
@@ -4241,6 +4261,7 @@ async function handleProxy(
       const text = detok ? detok.push(raw) + detok.flush() : raw;
       const out = await engine.inspectOutput(text, { vaultKey });
       outputEnforced = out;
+      rawBufferedOutFindings = engine.combinedDetector().detect(text);
       const bodyOut = out.blocked
         ? Buffer.from(
             JSON.stringify({
@@ -4258,7 +4279,7 @@ async function handleProxy(
             'content-type': 'application/json',
             'x-gulley-request-id': requestId,
             'x-gulley-target': servedTarget.name,
-            'x-gulley-cache': 'bypass',
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             'x-gulley-guardrail': out.blocked
               ? 'output-blocked'
               : out.transformedText
@@ -4350,7 +4371,7 @@ async function handleProxy(
               'content-type': streamed ? 'text/event-stream' : 'application/json',
               'x-gulley-request-id': requestId,
               'x-gulley-target': servedTarget.name,
-              'x-gulley-cache': 'bypass',
+              'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             }),
           );
           reply.raw.write(

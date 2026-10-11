@@ -1,4 +1,5 @@
 import { existsSync, statSync } from 'node:fs';
+import { PROVIDER_PRICING } from '@gulley/cost';
 import { computeCost } from '@gulley/cost';
 import { describe, expect, it } from 'vitest';
 import { BUNDLED_SNAPSHOT_PATH, bundledSnapshotPath, loadBundledSnapshot } from './bundled';
@@ -74,5 +75,32 @@ describe('bundled models.dev snapshot', () => {
       if (prev === undefined) delete process.env['GULLEY_CATALOG_SNAPSHOT'];
       else process.env['GULLEY_CATALOG_SNAPSHOT'] = prev;
     }
+  });
+});
+
+describe('bundled snapshot vs in-tree seeds (drift guard)', () => {
+  it('agrees with the Anthropic and OpenAI seed tables on input, output and cache-read for every shared model', () => {
+    const catalog = loadBundledSnapshot();
+    const mismatches: string[] = [];
+    for (const provider of ['anthropic', 'openai'] as const) {
+      const seed = PROVIDER_PRICING[provider]!;
+      for (const [id, rate] of Object.entries(seed.rates)) {
+        const entry = catalog.entry(provider, id);
+        if (!entry) continue; // a seed-only model (not in the snapshot) is fine
+        const seedRead = rate.cache?.read ?? seed.cache.read;
+        const snapRead = entry.cache?.read;
+        const close = (a: number, b: number) => Math.abs(a - b) < 1e-9;
+        if (!close(entry.input, rate.input) || !close(entry.output, rate.output)) {
+          mismatches.push(
+            `${provider}/${id}: base ${entry.input}/${entry.output} vs seed ${rate.input}/${rate.output}`,
+          );
+        } else if (snapRead !== undefined && !close(snapRead, seedRead)) {
+          mismatches.push(`${provider}/${id}: cache read ${snapRead} vs seed ${seedRead}`);
+        }
+      }
+    }
+    // A refreshed snapshot that disagrees with the seeds is a PRICING CHANGE: update the
+    // seed (and its golden test) deliberately rather than letting the two sources diverge.
+    expect(mismatches).toEqual([]);
   });
 });

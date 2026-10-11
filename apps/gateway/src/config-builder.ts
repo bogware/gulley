@@ -12,6 +12,7 @@ import {
   AnthropicUsageExtractor,
   AzureAdapter,
   BedrockAdapter,
+  type BedrockAdapterOptions,
   OpenAIAdapter,
   OpenAIUsageExtractor,
   type UpstreamCredential,
@@ -205,10 +206,16 @@ export function buildWorkspaceGuardrails(
  * been resolved from its ARN; this only maps a provider kind → adapter + paths.
  * An unknown kind yields no routes (skipped, not an error).
  */
+/** Env-derived adapter options DB-config mode cannot express in the document. */
+export interface ProviderBuildOptions {
+  bedrock?: BedrockAdapterOptions;
+}
+
 export function routesForProvider(
   kind: string,
   baseUrl: string | null,
   value: string,
+  opts: ProviderBuildOptions = {},
 ): ProviderRoute[] {
   switch (kind) {
     case 'anthropic':
@@ -267,7 +274,7 @@ export function routesForProvider(
             target: {
               name: 'bedrock',
               provider: 'bedrock',
-              adapter: new BedrockAdapter({ region: baseUrl ?? 'us-east-1' }),
+              adapter: new BedrockAdapter({ ...opts.bedrock, region: baseUrl ?? 'us-east-1' }),
               credential: { scheme: 'bearer', value },
               upstreamPath: '/v1/messages',
               // DB-config mode overloads the Bedrock baseUrl column as the region, so
@@ -321,6 +328,7 @@ export async function buildRoutesFromDocument(
   doc: ConfigDocument,
   resolver: SecretResolver,
   baseGuardrails?: GuardrailEngine,
+  opts: ProviderBuildOptions = {},
 ): Promise<ProviderRoute[]> {
   const routes: ProviderRoute[] = [];
   for (const org of doc.orgs) {
@@ -336,7 +344,7 @@ export async function buildRoutesFromDocument(
       for (const p of ws.providers as ConfigProvider[]) {
         if (!p.enabled || !p.credential) continue;
         const value = await resolver.resolve(p.credential);
-        for (const route of routesForProvider(p.kind, p.baseUrl ?? null, value)) {
+        for (const route of routesForProvider(p.kind, p.baseUrl ?? null, value, opts)) {
           // Stamp the provider's data-residency posture onto its target so DB-config-mode
           // routes can satisfy an active residency/ZDR policy (the env path stamps from
           // ANTHROPIC_REGION/ZDR etc.). Explicit region wins; otherwise any adapter-derived

@@ -321,14 +321,20 @@ describe('BedrockAdapter — gateway contract (Wave 1)', () => {
 
   it('stops synthesizing pings after pingMaxIdleMs of silence so a hang reaches the watchdog', async () => {
     const up = new (await import('node:stream')).PassThrough();
-    const out = bedrockToSse(up, { pingIntervalMs: 10, pingMaxIdleMs: 35 });
+    const out = bedrockToSse(up, { pingIntervalMs: 20, pingMaxIdleMs: 120 });
     const seen: string[] = [];
     out.on('data', (c: Buffer) => seen.push(c.toString('utf8')));
     up.write(chunkFrame({ type: 'message_start', message: { id: 'm' } }));
-    await new Promise((r) => setTimeout(r, 120));
-    const pings = seen.join('').split('event: ping').length - 1;
-    expect(pings).toBeGreaterThanOrEqual(1);
-    expect(pings).toBeLessThanOrEqual(4); // ~3 intervals fit before the idle cap
+    const count = () => seen.join('').split('event: ping').length - 1;
+    // Generous bounds (timers slip under a loaded test runner): some pings during the
+    // idle budget, never more than fit in it…
+    await new Promise((r) => setTimeout(r, 300));
+    const afterBudget = count();
+    expect(afterBudget).toBeGreaterThanOrEqual(1);
+    expect(afterBudget).toBeLessThanOrEqual(7);
+    // …and NONE once the idle budget is spent: the hang is now visible upstream.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(count()).toBe(afterBudget);
     up.destroy();
   });
 });

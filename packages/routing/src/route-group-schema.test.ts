@@ -46,3 +46,20 @@ describe('routeGroupSchema', () => {
     expect(routeGroupListSchema.safeParse(base).success).toBe(false); // must be an array
   });
 });
+
+describe('routeGroupSchema — onStatusCodes bound', () => {
+  it('accepts 408/409/429/5xx and rejects a terminal client error', () => {
+    const base = {
+      clientPath: '/v1/messages',
+      mode: 'fallback',
+      providers: ['anthropic', 'bedrock'],
+    };
+    expect(
+      routeGroupSchema.safeParse({ ...base, onStatusCodes: [408, 409, 429, 500, 529] }).success,
+    ).toBe(true);
+    const bad = routeGroupSchema.safeParse({ ...base, onStatusCodes: [418] });
+    expect(bad.success).toBe(false);
+    if (!bad.success) expect(JSON.stringify(bad.error.issues)).toMatch(/408, 409, 429 or a 5xx/);
+    expect(routeGroupSchema.safeParse({ ...base, onStatusCodes: [404] }).success).toBe(false);
+  });
+});
