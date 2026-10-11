@@ -25,7 +25,9 @@ tests; the data-plane changes went through the adversarial hot-path review.
   cached input is 0.1× on the GPT-5.x generation (older families keep their own
   multiplier) and the GPT-5.x, o-series and `text-embedding-*` models are priced
   (embeddings metered $0). Per-model cache-read multipliers (Opus 5.5 0.05×, Fable 5.1
-  0.025×) and long-context tiers (Haiku 5.5 above 100K, GPT-5.x above 272K) apply.
+  0.025×) and long-context tiers (Haiku 5.5 above 100K, GPT-5.x above 272K) apply —
+  under a `MODELS_CATALOG_FILE` override the tier is scaled to the catalog's base
+  price, so a negotiated Bedrock/Azure rate keeps governing above the threshold.
 - **`METER_UNPRICED_CONFIG`** (new, default `fail`): `/ready` reports 503 while an
   operator-configured model (a model-alias target, `BUDGET_DOWNSHIFT_MODEL`, a cascade
   escalation target, a `ROUTE_GROUPS` model map entry) has no price in the seed or the

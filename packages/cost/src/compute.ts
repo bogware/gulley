@@ -17,6 +17,25 @@ export type RateResolver = (provider: string, model: string) => RateOverride | u
 
 const NEUTRAL_CACHE = { read: 1, write5m: 1, write1h: 1 };
 
+/** The long-context tier to bill `rate` with: its own when it carries one (a seed
+ *  model), else the seed model's tier scaled by the ratio of `rate`'s base to the
+ *  seed's base — a catalog override's base keeps governing, the seed only lends the
+ *  threshold and the multiplier (Haiku 5.5: ×5 above 100K; gpt-5.x: ×2 input / ×1.5
+ *  output above 272K). No seed, or no tier on it ⇒ flat. */
+function tierFor(rate: ModelRate | RateOverride, seed: ModelRate | undefined): ModelRate['tier'] {
+  const own = (rate as ModelRate).tier;
+  if (own) return own;
+  const t = seed?.tier;
+  if (!t || !seed) return undefined;
+  const inRatio = seed.input > 0 ? rate.input / seed.input : 1;
+  const outRatio = seed.output > 0 ? rate.output / seed.output : 1;
+  return {
+    aboveInputTokens: t.aboveInputTokens,
+    input: t.input * inRatio,
+    output: t.output * outRatio,
+  };
+}
+
 export interface CostBreakdown {
   provider: string;
   model: string;
@@ -111,10 +130,11 @@ export function computeCost(
 
   // Long-context tier: past the threshold the WHOLE request bills at the tier rates. A
   // catalog override is a flat rate only because the catalog carries no tier data, not
-  // because the provider bills flat — so the seed's tier for the same model still
-  // applies under an override (the documented production setup is MODELS_CATALOG_FILE).
-  const tier = (rate as ModelRate).tier ?? seed?.tier;
-  const eff = effectiveRate({ ...rate, tier }, totalInputTokens);
+  // because the provider bills flat — so the seed's tier STRUCTURE (threshold + its
+  // ratio to the base price) still applies under an override, SCALED to the override's
+  // base so the operator's per-provider catalog price keeps governing (the seed's
+  // absolute tier prices would silently replace a negotiated Bedrock/Azure rate).
+  const eff = effectiveRate({ ...rate, tier: tierFor(rate, seed) }, totalInputTokens);
   const inputUsd = perMillion(u.inputTokens, eff.input);
   const cacheReadUsd = perMillion(u.cacheReadTokens, eff.input * cache.read);
   const cacheWriteUsd =

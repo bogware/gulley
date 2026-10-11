@@ -307,3 +307,48 @@ describe('long-context tier under a catalog override', () => {
     expect(short.inputUsd).toBeCloseTo(0.005, 9);
   });
 });
+
+describe('long-context tier scaled to a divergent catalog base', () => {
+  const usage = (inputTokens: number) => ({
+    inputTokens,
+    cacheReadTokens: 0,
+    cacheWrite5mTokens: 0,
+    cacheWrite1hTokens: 0,
+    outputTokens: 1_000,
+    seen: true,
+  });
+
+  it('keeps the operator catalog price governing: the seed lends only the threshold and multiplier', () => {
+    // A negotiated Bedrock rate below list: Haiku 5.5 seed is $0.10/$0.50 with ×5 above
+    // 100K; the catalog says $0.08/$0.40 — so above 100K the request bills at $0.40/$2.00
+    // (the catalog base ×5), never at the seed's absolute $0.50/$2.50.
+    const below = (p: string, m: string) =>
+      p === 'bedrock' && m.includes('claude-haiku-5-5') ? { input: 0.08, output: 0.4 } : undefined;
+    const long = computeCost(
+      'bedrock',
+      'us.anthropic.claude-haiku-5-5-20251001-v1:0',
+      usage(150_000),
+      below,
+    );
+    expect(long.inputUsd).toBeCloseTo(0.06, 9);
+    expect(long.outputUsd).toBeCloseTo(0.002, 9);
+    const short = computeCost(
+      'bedrock',
+      'us.anthropic.claude-haiku-5-5-20251001-v1:0',
+      usage(99_000),
+      below,
+    );
+    expect(short.inputUsd).toBeCloseTo(0.00792, 9);
+    // A chargeback markup above list must not invert the tier (the per-token rate can
+    // never DROP past the threshold).
+    const above = () => ({ input: 0.6, output: 3 });
+    const marked = computeCost('anthropic', 'claude-haiku-5-5', usage(150_000), above);
+    expect(marked.inputUsd).toBeCloseTo(0.45, 9); // 150K × $3.00/MTok (0.6 × 5)
+    const markedShort = computeCost('anthropic', 'claude-haiku-5-5', usage(99_000), above);
+    expect(marked.inputUsd / 150_000).toBeGreaterThan(markedShort.inputUsd / 99_000);
+    // Azure reuses the OpenAI seed: a gpt-5.4 catalog row of $2/$12 bills $4/MTok input
+    // past 272K (seed ×2), not the OpenAI list $5.
+    const azure = computeCost('azure', 'gpt-5.4', usage(300_000), () => ({ input: 2, output: 12 }));
+    expect(azure.inputUsd).toBeCloseTo(1.2, 9);
+  });
+});
