@@ -217,13 +217,19 @@ describe('path ids and scope sentinels (F8/F14)', () => {
 
 describe('collection update audit diff (F16) and fixed egress errors', () => {
   it('records whether the name and/or config changed, with content hashes', async () => {
-    const created = await post('/routes', { workspaceId, name: 'r', config: { a: 1 } });
+    // A `routes` entity's config is a route group (schema-validated on write).
+    const group = {
+      clientPath: '/v1/messages',
+      mode: 'fallback',
+      providers: ['anthropic', 'bedrock'],
+    };
+    const created = await post('/routes', { workspaceId, name: 'r', config: group });
     const id = (created.json() as { entity: { id: string } }).entity.id;
     const upd = await app.inject({
       method: 'PUT',
       url: `/routes/${id}`,
       headers: auth(),
-      payload: JSON.stringify({ config: { a: 2 } }),
+      payload: JSON.stringify({ config: { ...group, hedgeDelayMs: 250 } }),
     });
     expect(upd.statusCode).toBe(200);
     const events = (await get('/audit/events?limit=3')).json() as {

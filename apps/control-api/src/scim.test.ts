@@ -120,11 +120,13 @@ describe('SCIM 2.0 Users provisioning', () => {
     // 4) The user's session (NO token memberships) can now do editor work — the
     //    grant is loaded from the durable store at auth time.
     const session = devSession('dev@corp');
-    const before = await post(
-      '/routes',
-      { workspaceId: wsId, name: 'r1', config: { target: 'anthropic' } },
-      session,
-    );
+    // A `routes` entity's config is a route group (schema-validated before authz).
+    const group = {
+      clientPath: '/v1/messages',
+      mode: 'fallback',
+      providers: ['anthropic', 'bedrock'],
+    };
+    const before = await post('/routes', { workspaceId: wsId, name: 'r1', config: group }, session);
     expect(before.statusCode).toBe(201);
 
     // 5) IdP deprovisions (SCIM DELETE) — cascades to the membership grant.
@@ -137,11 +139,7 @@ describe('SCIM 2.0 Users provisioning', () => {
 
     // 6) The SAME session immediately loses access — the grant was cascaded away, so
     //    the membership loader now returns nothing for this subject.
-    const after = await post(
-      '/routes',
-      { workspaceId: wsId, name: 'r2', config: { target: 'anthropic' } },
-      session,
-    );
+    const after = await post('/routes', { workspaceId: wsId, name: 'r2', config: group }, session);
     expect(after.statusCode).toBe(403);
   });
 

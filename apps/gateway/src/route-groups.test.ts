@@ -1,6 +1,6 @@
 import type { RouteTarget } from '@gulley/routing';
 import { describe, expect, it } from 'vitest';
-import { applyRouteGroups, parseRouteGroups } from './route-groups';
+import { applyRouteGroups, parseRouteGroups, routeGroupSchema } from './route-groups';
 import type { ProviderRoute } from './routes/messages';
 
 const target = (provider: string): RouteTarget => ({
@@ -107,6 +107,20 @@ describe('applyRouteGroups', () => {
     expect(group.hedgeDelayMs).toBe(400);
     expect(targetsOf(group).find((t) => t.provider === 'anthropic')?.weight).toBe(3);
     expect(targetsOf(group).find((t) => t.provider === 'bedrock')?.weight).toBe(1);
+  });
+
+  it('accepts and ignores a group name (a DB `routes` entity carries one)', () => {
+    const named = {
+      name: 'messages-ha',
+      clientPath: '/v1/messages',
+      mode: 'fallback' as const,
+      providers: ['anthropic', 'bedrock'],
+    };
+    expect(routeGroupSchema.safeParse(named).success).toBe(true); // re-exported shared schema
+    const out = applyRouteGroups(routes(), [named], 0);
+    expect(out).toHaveLength(3);
+    expect(out[2]?.strategy.mode).toBe('fallback');
+    expect(out[2]).not.toHaveProperty('name'); // descriptive only — not a route field
   });
 
   it('skips a group resolving to <2 configured targets, and one matching no path', () => {

@@ -1,6 +1,12 @@
-import type { ConfigDocument, ConfigEntity, ConfigProvider } from '@gulley/config';
+import {
+  type ConfigDocument,
+  type ConfigEntity,
+  type ConfigProvider,
+  routeGroupsFromDocument,
+  skippedRouteEntities,
+} from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
-import { type ModelRouteRule, ModelRouter } from '@gulley/routing';
+import { type ModelRouteRule, ModelRouter, type RouteGroup } from '@gulley/routing';
 import {
   AnthropicAdapter,
   AnthropicUsageExtractor,
@@ -56,6 +62,30 @@ export function buildModelRouterFromDocument(
   }
   const all = [...rules, ...extraRules];
   return all.length > 0 ? new ModelRouter(all) : undefined;
+}
+
+/** The config document's route groups plus what the gateway skips. */
+export interface DocumentRouteGroups {
+  /** Valid `routes` entities as route groups, in document order, named per entity. */
+  groups: RouteGroup[];
+  /** `org/workspace/name: reason` for each entity NOT applied — a legacy console-shape
+   *  row (no clientPath) or, defensively, one failing the schema (plan/apply and the
+   *  console reject those up front). Logged once per reconcile. */
+  skipped: string[];
+}
+
+/**
+ * Route groups from the config document's `routes` entities (single-tenant v1:
+ * every workspace's groups are flattened). The reconciler folds them with
+ * `applyRouteGroups` AFTER the env overlay, so a DB group shadows an env
+ * `ROUTE_GROUPS` entry on the same clientPath and a later entity wins among
+ * document groups. Pure over the document — no secrets, no I/O.
+ */
+export function buildRouteGroupsFromDocument(doc: ConfigDocument): DocumentRouteGroups {
+  return {
+    groups: routeGroupsFromDocument(doc),
+    skipped: skippedRouteEntities(doc).map((s) => `${s.name}: ${s.reason}`),
+  };
 }
 
 /** A workspace's resolved guardrail configuration, attached to each of its routes. */

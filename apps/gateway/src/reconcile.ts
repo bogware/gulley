@@ -7,9 +7,14 @@ import type {
   ClassifierOutcome,
 } from '@gulley/routing';
 import { type CentroidStore, type ConfigSubscriber, SignalGate } from '@gulley/storage';
-import { buildModelRouterFromDocument, buildRoutesFromDocument } from './config-builder';
+import {
+  buildModelRouterFromDocument,
+  buildRouteGroupsFromDocument,
+  buildRoutesFromDocument,
+} from './config-builder';
 import { buildModelPolicy, unionModelPolicy } from './model-policy';
 import { isEmptyResidencyPolicy, residencyAllowedRegions } from './residency-policy';
+import { applyRouteGroups } from './route-groups';
 import type { ModelRouteRule } from '@gulley/routing';
 import type { ProviderRoute, RouteHolder } from './routes/messages';
 import {
@@ -50,12 +55,17 @@ export interface SmartRoutingReconcile {
 
 export interface ReconcileLog {
   info(msg: string): void;
+  /** A non-fatal condition worth an operator's attention (e.g. `routes` entities the
+   *  gateway skipped); optional — falls back to `info`. */
+  warn?(msg: string): void;
   error(err: unknown, msg: string): void;
 }
 
 /** Env-sourced route overlays re-applied on every reconcile (see
  *  `overlayEnvRoutes` in context.ts): custom/local providers, the shared chat path,
- *  ROUTE_GROUPS composition, plus the custom providers' model-router rules. */
+ *  ROUTE_GROUPS composition, plus the custom providers' model-router rules. The
+ *  document's own route groups are folded AFTER this overlay (they shadow an env
+ *  group on the same clientPath). */
 export interface RouteOverlay {
   apply(base: ProviderRoute[]): ProviderRoute[];
   modelRules: readonly ModelRouteRule[];
@@ -83,7 +93,16 @@ export class GatewayReconciler {
     private readonly log?: ReconcileLog,
     private readonly smartRouting?: SmartRoutingReconcile,
     private readonly overlay?: RouteOverlay,
+    /** Global `HEDGE_DELAY_MS` — the default hedge for a document route group that
+     *  sets none (the same value the env overlay uses). 0 = no hedging. */
+    private readonly hedgeDelayMs = 0,
   ) {}
+
+  private warn(msg: string): void {
+    if (!this.log) return;
+    if (this.log.warn) this.log.warn(msg);
+    else this.log.info(msg);
+  }
 
   /** Trigger a reconcile; serialized behind any in-flight one. Resolves to true
    *  if the swap succeeded, false if it failed (old config kept). */
@@ -115,7 +134,20 @@ export class GatewayReconciler {
       // reconcile: the document carries only the four core provider kinds, so without
       // this the first swap silently dropped failover/LB/hedge/arbitrage and every
       // OpenAI-compatible provider in production (DB-config) mode.
-      const routes = this.overlay ? this.overlay.apply(docRoutes) : docRoutes;
+      const overlaid = this.overlay ? this.overlay.apply(docRoutes) : docRoutes;
+      // The document's own route groups (its `routes` entities) are folded LAST, so a
+      // DB group shadows an env ROUTE_GROUPS entry on the same clientPath. Entities the
+      // gateway cannot apply (legacy console shape / invalid) are named once per run
+      // rather than silently dropped — an operator who edited one expects it to route.
+      const docGroups = buildRouteGroupsFromDocument(doc);
+      if (docGroups.skipped.length > 0) {
+        this.warn(
+          `config reconcile: ${docGroups.skipped.length} route entit${
+            docGroups.skipped.length === 1 ? 'y' : 'ies'
+          } skipped (not route groups) — ${docGroups.skipped.join('; ')}`,
+        );
+      }
+      const routes = applyRouteGroups(overlaid, docGroups.groups, this.hedgeDelayMs);
       // Build the smart router BEFORE swapping anything: a malformed policy throws
       // here and the catch keeps the CURRENT routes + smart router intact (never a
       // partial swap), matching the credential-resolution failure contract.

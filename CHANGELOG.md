@@ -6,7 +6,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Console `routes` entities change shape.** Entities written by the previous Routes
+  page (`{ strategy | mode, targets[] }`, no `clientPath`) were never applied by the
+  gateway; they still export/apply unchanged but are now listed as "legacy (ignored by
+  the gateway)" and logged once per reconcile. Convert each in place on the Route groups
+  page (fill in the client path and two or more providers) or delete it. New writes must
+  be the route-group shape; `ROUTE_GROUPS` env entries are unchanged.
+
 ### Added
+
+- **Route groups are first-class in DB-config mode.** A config document's `routes`
+  entity is now a route group — the same shape as an env `ROUTE_GROUPS` entry
+  (`clientPath`, `mode`, `providers`, `select`, `weights`, `onStatusCodes`,
+  `hedgeDelayMs`, `modelMap`; the entity `name` is the group name; schema
+  `routeGroupSchema` in `@gulley/routing`). The gateway folds document groups on every
+  reconcile after the env overlay, so a DB group shadows an env group on the same client
+  path (the `routes` collection used to be stored and never read). GitOps plan/apply and
+  the console's `POST`/`PUT /routes` reject a malformed group (400 with the schema
+  `issues`). The console's Route groups page lists, creates, edits and deletes them.
 
 - **Conversation-stable reversible masking (K2).** Guardrail `mask` tokens are now
   derived by HMAC under a per-workspace × per-conversation key, so the same value masks

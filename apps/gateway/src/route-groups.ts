@@ -1,47 +1,32 @@
-import { allTargets, type RouteTarget, type RoutingStrategy } from '@gulley/routing';
-import { z } from 'zod';
+import {
+  allTargets,
+  type RouteGroup,
+  routeGroupListSchema,
+  routeGroupSchema,
+  type RouteTarget,
+  type RoutingStrategy,
+} from '@gulley/routing';
 import type { ProviderRoute } from './routes/messages';
 
 /**
  * Declarative multi-target routing overlay (M19). The routing library already
  * implements fallback / weighted load-balance / circuit-breaker / outlier ejection
  * / P2C / HRW affinity / hedging — but the route builders only ever emit
- * single-target strategies, so none of it can operate in a real deployment. A
- * `ROUTE_GROUPS` entry combines the single-target routes the builders produced (by
- * provider name, for one client-path family) into ONE multi-target route, turning
- * the whole resilience surface on.
+ * single-target strategies, so none of it can operate in a real deployment. A route
+ * group combines the single-target routes the builders produced (by provider name,
+ * for one client-path family) into ONE multi-target route, turning the whole
+ * resilience surface on. The shape (`routeGroupSchema`) lives in `@gulley/routing`
+ * because it is shared with the DB config document's `routes` entities
+ * (`@gulley/config`); it is re-exported here so existing imports keep working.
  */
-export const routeGroupSchema = z.object({
-  /** Client path (or suffix) this group serves, e.g. `/v1/messages`. */
-  clientPath: z.string().min(1),
-  mode: z.enum(['fallback', 'loadbalance']),
-  /** Provider names to combine, in preference order (fallback) — each must be a
-   *  configured provider that already serves `clientPath`. */
-  providers: z.array(z.string().min(1)).min(2),
-  /** loadbalance primary-pick policy: least-load (default) | cheapest | fastest. */
-  select: z.enum(['least-load', 'cheapest', 'fastest']).optional(),
-  /** Optional per-provider weight for `loadbalance` (defaults to 1). */
-  weights: z.record(z.string(), z.number().positive()).optional(),
-  /** Fallback only: upstream status codes that trigger failover to the next target. */
-  onStatusCodes: z.array(z.number().int()).optional(),
-  /** Per-group hedge delay (ms); 0/absent falls back to the global `HEDGE_DELAY_MS`. */
-  hedgeDelayMs: z.number().int().nonnegative().optional(),
-  /** Same-model ARBITRAGE across providers whose model ids differ: per-provider map of
-   *  the client (canonical) model → the id THAT provider expects. e.g.
-   *  `{ "bedrock": { "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6-v1:0" } }`.
-   *  A provider with no entry forwards the client model verbatim (correct for the
-   *  native provider). */
-  modelMap: z.record(z.string(), z.record(z.string(), z.string())).optional(),
-});
-export type RouteGroup = z.infer<typeof routeGroupSchema>;
-
-const routeGroupsSchema = z.array(routeGroupSchema);
+export { routeGroupSchema };
+export type { RouteGroup };
 
 /** Parse + validate the `ROUTE_GROUPS` JSON env value (throws on malformed input,
  *  so a bad config fails fast at boot rather than silently routing single-target). */
 export function parseRouteGroups(json: string | undefined): RouteGroup[] {
   if (!json || json.trim() === '') return [];
-  const parsed = routeGroupsSchema.safeParse(JSON.parse(json));
+  const parsed = routeGroupListSchema.safeParse(JSON.parse(json));
   if (!parsed.success) throw new Error(`ROUTE_GROUPS is invalid: ${parsed.error.message}`);
   return parsed.data;
 }

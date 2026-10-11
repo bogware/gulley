@@ -108,6 +108,8 @@ export function buildConfigWatcher(
       annIndex: annEligible ? new PostgresCentroidIndex(db, config.EMBEDDINGS_MODEL) : undefined,
     },
     overlay,
+    // The document's route groups default to the same global hedge as the env overlay.
+    config.HEDGE_DELAY_MS,
   );
 
   const listen = createListenConnection(config.DATABASE_URL);

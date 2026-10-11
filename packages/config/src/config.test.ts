@@ -4,6 +4,11 @@ import { describe, expect, it } from 'vitest';
 import { applyConfig } from './apply';
 import { contentHash, diffDocuments } from './canonical';
 import { type ConfigDocument, emptyDocument, validateConfigDocument } from './document';
+import {
+  routeGroupsFromDocument,
+  skippedRouteEntities,
+  validateRouteEntities,
+} from './route-groups';
 import { type ConfigStore, InMemoryConfigVersionStore, type ReconcileContext } from './store';
 import { fromYaml, toYaml } from './yaml';
 
@@ -113,6 +118,54 @@ describe('validateConfigDocument — smartRoutingPolicies (M15)', () => {
     expect(
       validateConfigDocument(baseWs({ smartRoutingPolicies: [{ name: 'p', config: 'x' }] })),
     ).toContain('smartRoutingPolicies[0]');
+  });
+});
+
+describe('routes entities are route groups', () => {
+  const group = {
+    clientPath: '/v1/messages',
+    mode: 'fallback',
+    providers: ['anthropic', 'bedrock'],
+  };
+
+  it('accepts a valid route group and exposes it named after its entity', () => {
+    const d = doc(group);
+    expect(validateConfigDocument(d)).toBeNull();
+    expect(validateRouteEntities(d)).toEqual([]);
+    expect(routeGroupsFromDocument(d)).toEqual([{ name: 'default', ...group }]);
+    expect(skippedRouteEntities(d)).toEqual([]);
+    // The entity name is the group name — it wins over a `name` inside the config.
+    expect(routeGroupsFromDocument(doc({ ...group, name: 'inner' }))[0]?.name).toBe('default');
+  });
+
+  it('rejects a malformed group with a message naming the entity and the field', async () => {
+    const d = doc({ ...group, providers: ['anthropic'] });
+    const message = validateConfigDocument(d);
+    expect(message).toContain('routes[0] ("default")');
+    expect(message).toContain('providers');
+    expect(routeGroupsFromDocument(d)).toEqual([]); // never applied
+    expect(skippedRouteEntities(d)[0]).toMatchObject({ name: 'Acme/Default/default' });
+    // An unknown key is a typo, not an extension (strict for DB entities).
+    expect(validateConfigDocument(doc({ ...group, hedgeDelay: 100 }))).toContain('hedgeDelay');
+    expect(validateConfigDocument(doc({ ...group, mode: 'conditional' }))).toContain('mode');
+    // applyConfig refuses it up front — no version consumed.
+    const versions = new InMemoryConfigVersionStore();
+    const r = await applyConfig(d, 0, OWNER, deps(new TestStore(), versions));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.kind).toBe('validation');
+    expect(await versions.currentVersion()).toBe(0);
+  });
+
+  it('tolerates a legacy console-shape entity (no clientPath): valid, skipped, never applied', async () => {
+    const legacy = { strategy: { mode: 'loadbalance', targets: [{ name: 'a', weight: 50 }] } };
+    const d = doc(legacy);
+    expect(validateConfigDocument(d)).toBeNull(); // an existing document keeps applying
+    expect(validateRouteEntities(d)).toEqual([]);
+    expect(routeGroupsFromDocument(d)).toEqual([]);
+    expect(skippedRouteEntities(d)).toEqual([
+      { name: 'Acme/Default/default', reason: expect.stringMatching(/legacy/) },
+    ]);
+    expect((await applyConfig(d, 0, OWNER, deps(new TestStore()))).ok).toBe(true);
   });
 });
 

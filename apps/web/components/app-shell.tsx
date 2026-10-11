@@ -49,7 +49,7 @@ const NAV_GROUPS: Array<{ group: string; items: NavItem[] }> = [
     group: 'Configure',
     items: [
       { href: '/config', label: 'Config console' },
-      { href: '/routes', label: 'Routes & aliases' },
+      { href: '/routes', label: 'Route groups' },
       { href: '/providers', label: 'Providers' },
       { href: '/prompts', label: 'Prompts' },
       { href: '/orgs', label: 'Orgs & workspaces' },

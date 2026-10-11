@@ -13,6 +13,7 @@ import {
   publicKeyOf,
   signOnboardingPack,
 } from '@gulley/cli';
+import { routeGroupEntitySchema } from '@gulley/config';
 import { GULLEY_VERSION, secretRef } from '@gulley/core';
 import { assertEgressAllowed, EgressError } from '@gulley/egress';
 import {
@@ -49,9 +50,28 @@ import type { ControlContext } from './context';
 import { publicOrigin } from './oauth-routes';
 import type { CollectionKind } from './domain';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { ZodIssue } from 'zod';
 
 function invalid(reply: FastifyReply, message: string): FastifyReply {
   return reply.code(422).send({ error: { type: 'validation', message } });
+}
+
+/** A `routes` entity's config must be a route group — the shape the gateway applies
+ *  (`routeGroupEntitySchema`: clientPath, mode, ≥2 providers, …). A malformed one is
+ *  a 400 that carries the schema issues (`error.issues`) so the console can point at
+ *  the field; the legacy console shape (no clientPath) is a new write too, so it is
+ *  rejected the same way. */
+function invalidRouteGroup(reply: FastifyReply, issues: ZodIssue[]): FastifyReply {
+  const detail = issues
+    .map((i) => (i.path.length > 0 ? `${i.path.join('.')}: ${i.message}` : i.message))
+    .join('; ');
+  return reply.code(400).send({
+    error: {
+      type: 'validation',
+      message: `route config is not a valid route group: ${detail}`,
+      issues,
+    },
+  });
 }
 
 /** A key allow-list field: absent / `*` ⇒ undefined (unrestricted); a non-empty array of
@@ -777,6 +797,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         if (!workspaceId || !name) return invalid(reply, 'workspaceId and name required');
         const at = scopeForWorkspace(ctx, workspaceId);
         if (!at) return notFound(reply, 'workspace');
+        if (c.kind === 'route') {
+          const parsed = routeGroupEntitySchema.safeParse(config);
+          if (!parsed.success) return invalidRouteGroup(reply, parsed.error.issues);
+        }
         try {
           assertNoInlineSecret(config);
         } catch (e) {
@@ -833,6 +857,10 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: ControlContext): 
         if (name) patch.name = name;
         if (b['config'] && typeof b['config'] === 'object') {
           const config = b['config'] as Record<string, unknown>;
+          if (c.kind === 'route') {
+            const parsed = routeGroupEntitySchema.safeParse(config);
+            if (!parsed.success) return invalidRouteGroup(reply, parsed.error.issues);
+          }
           try {
             assertNoInlineSecret(config);
           } catch (e) {

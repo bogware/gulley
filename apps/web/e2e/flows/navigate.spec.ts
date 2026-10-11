@@ -32,7 +32,7 @@ test.describe('authenticated console navigation', () => {
     ['/identity', /Identity/],
     ['/keys', /Virtual keys/],
     ['/config', /Config console/],
-    ['/routes', /Routes & aliases/],
+    ['/routes', /Route groups/],
     ['/providers', /Providers/],
     ['/prompts', /Prompts/],
     ['/orgs', /Orgs & workspaces/],

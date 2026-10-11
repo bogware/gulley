@@ -1,7 +1,9 @@
 import type { SecretRef } from '@gulley/core';
+import { validateRouteEntities } from './route-groups';
 
 /** A workspace-scoped config entity (route / policy / budget / rate-limit /
- *  guardrail / model-alias). Keyed by `name` in the document (GitOps-friendly). */
+ *  guardrail / model-alias). Keyed by `name` in the document (GitOps-friendly).
+ *  A `routes` entity's `config` is a route group — see `./route-groups`. */
 export interface ConfigEntity {
   name: string;
   config: Record<string, unknown>;
@@ -133,5 +135,11 @@ export function validateConfigDocument(v: unknown): string | null {
       }
     }
   }
+  // Entity-level shape, once the structure is known-good: a `routes` entity's config
+  // must be a route group (a legacy console-shape entity without a clientPath is
+  // tolerated — the gateway skips it with a warning — so an existing document never
+  // stops applying).
+  const routeIssues = validateRouteEntities(v);
+  if (routeIssues.length > 0) return routeIssues.join('; ');
   return null;
 }

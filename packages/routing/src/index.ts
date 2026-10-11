@@ -1,4 +1,5 @@
 export * from './types';
+export * from './route-group-schema';
 export * from './adaptive-limit';
 export * from './breaker-sync';
 export * from './circuit-breaker';

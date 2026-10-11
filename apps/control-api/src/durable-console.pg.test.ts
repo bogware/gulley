@@ -113,11 +113,13 @@ describe('console CRUD is durable in DB mode (F2)', () => {
       secretVersion: 'v1',
     });
     expect(cred.statusCode).toBe(201);
-    const route = await post('/routes', {
-      workspaceId,
-      name: 'primary',
-      config: { strategy: 'single', target: 'anthropic' },
-    });
+    // A `routes` entity's config is a route group (schema-validated on write).
+    const group = {
+      clientPath: '/v1/messages',
+      mode: 'fallback',
+      providers: ['anthropic', 'bedrock'],
+    };
+    const route = await post('/routes', { workspaceId, name: 'primary', config: group });
     expect(route.statusCode).toBe(201);
     const routeId = (route.json() as { entity: { id: string } }).entity.id;
 
@@ -145,13 +147,14 @@ describe('console CRUD is durable in DB mode (F2)', () => {
     expect((await get('/config/drift')).json()).toMatchObject({ drifted: false });
 
     // Update + delete follow the same path (ids are the Postgres ids).
-    const upd = await put(`/routes/${routeId}`, { name: 'primary-v2', config: { a: 1 } });
+    const next = { ...group, mode: 'loadbalance', hedgeDelayMs: 250 };
+    const upd = await put(`/routes/${routeId}`, { name: 'primary-v2', config: next });
     expect(upd.statusCode).toBe(200);
     expect(await ctx.configVersions.currentVersion()).toBe(v0 + 4);
     const doc2 = await new PostgresConfigStore(db).exportDocument('*');
     expect(doc2.orgs[0]!.workspaces[0]!.routes[0]).toEqual({
       name: 'primary-v2',
-      config: { a: 1 },
+      config: next,
     });
     expect((await del(`/routes/${routeId}`)).statusCode).toBe(200);
     expect((await get('/routes')).json()).toMatchObject({ entities: [] });

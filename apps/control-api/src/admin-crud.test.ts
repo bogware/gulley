@@ -44,22 +44,27 @@ afterEach(async () => {
 
 describe('admin CRUD — update + delete on config collections', () => {
   it('updates a collection entity (name + config) and deletes it', async () => {
+    // A `routes` entity's config is a route group (validated on write).
     const created = await post('/routes', {
       workspaceId,
       name: 'primary',
-      config: { target: 'anthropic' },
+      config: { clientPath: '/v1/messages', mode: 'fallback', providers: ['anthropic', 'bedrock'] },
     });
     expect(created.statusCode).toBe(201);
     const id = (created.json() as { entity: { id: string } }).entity.id;
 
     const updated = await put(`/routes/${id}`, {
       name: 'primary-v2',
-      config: { target: 'openai' },
+      config: {
+        clientPath: '/v1/messages',
+        mode: 'loadbalance',
+        providers: ['anthropic', 'bedrock'],
+      },
     });
     expect(updated.statusCode).toBe(200);
     expect((updated.json() as { entity: { name: string; config: unknown } }).entity).toMatchObject({
       name: 'primary-v2',
-      config: { target: 'openai' },
+      config: { mode: 'loadbalance' },
     });
 
     const removed = await del(`/routes/${id}`);
@@ -82,9 +87,11 @@ describe('admin CRUD — update + delete on config collections', () => {
   });
 
   it('rejects an inline secret in an updated config', async () => {
-    const created = await post('/routes', { workspaceId, name: 'r', config: {} });
+    // A free-form collection (routes are schema-validated, so a bare apiKey would be
+    // a 400 there before the guard runs).
+    const created = await post('/policies', { workspaceId, name: 'r', config: {} });
     const id = (created.json() as { entity: { id: string } }).entity.id;
-    const res = await put(`/routes/${id}`, { config: { apiKey: 'sk-should-be-an-arn' } });
+    const res = await put(`/policies/${id}`, { config: { apiKey: 'sk-should-be-an-arn' } });
     // Guard fires only for secret-resolving fields; a plain key is accepted, an
     // inline secret field is a 422. Either way the route enforces the guard path.
     expect([200, 422]).toContain(res.statusCode);
@@ -96,6 +103,66 @@ describe('admin CRUD — update + delete on config collections', () => {
     expect((await del(`/providers/${provId}`)).statusCode).toBe(200);
 
     expect((await del(`/workspaces/${workspaceId}`)).statusCode).toBe(200);
+  });
+});
+
+describe('routes collection — a route entity is a route group (the shape the gateway applies)', () => {
+  const group = {
+    clientPath: '/v1/messages',
+    mode: 'fallback',
+    providers: ['anthropic', 'bedrock'],
+  };
+
+  it('accepts a valid route group on create and update', async () => {
+    const created = await post('/routes', { workspaceId, name: 'messages-ha', config: group });
+    expect(created.statusCode).toBe(201);
+    const id = (created.json() as { entity: { id: string } }).entity.id;
+    const next = {
+      ...group,
+      mode: 'loadbalance',
+      select: 'cheapest',
+      weights: { anthropic: 3 },
+      onStatusCodes: [429, 503],
+      hedgeDelayMs: 250,
+      modelMap: { bedrock: { 'claude-sonnet-4-6': 'us.anthropic.claude-sonnet-4-6-v1:0' } },
+    };
+    const updated = await put(`/routes/${id}`, { config: next });
+    expect(updated.statusCode).toBe(200);
+    expect((updated.json() as { entity: { config: unknown } }).entity.config).toEqual(next);
+    // A name-only update never re-validates an untouched config.
+    expect((await put(`/routes/${id}`, { name: 'messages-ha-2' })).statusCode).toBe(200);
+  });
+
+  it('400s a malformed route group with the schema issues, on create and update', async () => {
+    const solo = await post('/routes', {
+      workspaceId,
+      name: 'solo',
+      config: { ...group, providers: ['anthropic'] },
+    });
+    expect(solo.statusCode).toBe(400);
+    const body = solo.json() as {
+      error: { type: string; message: string; issues: Array<{ path: unknown[] }> };
+    };
+    expect(body.error.type).toBe('validation');
+    expect(body.error.message).toMatch(/route group/);
+    expect(body.error.issues[0]?.path).toEqual(['providers']);
+    // The legacy console shape (no clientPath) is not accepted for a NEW write.
+    const legacy = await post('/routes', {
+      workspaceId,
+      name: 'legacy',
+      config: { strategy: 'single', target: 'anthropic' },
+    });
+    expect(legacy.statusCode).toBe(400);
+    // An unknown key is a typo, not an extension.
+    const created = await post('/routes', { workspaceId, name: 'ok', config: group });
+    expect(created.statusCode).toBe(201);
+    const id = (created.json() as { entity: { id: string } }).entity.id;
+    const typo = await put(`/routes/${id}`, { config: { ...group, hedgeDelay: 100 } });
+    expect(typo.statusCode).toBe(400);
+    expect((typo.json() as { error: { message: string } }).error.message).toMatch(/hedgeDelay/);
+    // Other collections stay free-form.
+    const policy = await post('/policies', { workspaceId, name: 'p', config: { allow: ['x'] } });
+    expect(policy.statusCode).toBe(201);
   });
 });
 
