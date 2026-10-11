@@ -99,6 +99,14 @@ const EnvShape = z.object({
   // manually from models.dev with `pnpm --filter @gulley/gateway catalog:refresh`
   // (per the manual-updates rule; there is no runtime auto-fetch).
   MODELS_CATALOG_FILE: z.string().optional(),
+  // Contracted / negotiated rates layered OVER the catalog and the seeds: a JSON array of
+  // catalog entries ({provider, model, input, output, cache?, tier?, …}, USD per MTok),
+  // from a file and/or inline. A listed (provider, model) is priced from here first.
+  PRICING_OVERRIDES_FILE: z.string().optional(),
+  PRICING_OVERRIDES: z.string().optional(),
+  // Reload MODELS_CATALOG_FILE in place when it changes on disk (polled every N seconds;
+  // 0 = load once at boot). A bad write keeps the previous catalog and logs. No network.
+  PRICING_RELOAD_INTERVAL_SECONDS: z.coerce.number().int().min(0).default(0),
   MODELS_DEV_URL: z.string().url().default('https://models.dev/api.json'),
 
   // Inbound JWT/JWKS auth mode (data plane) — clients authenticate with their
@@ -582,7 +590,9 @@ const EnvShape = z.object({
   // bypassing the budget. Off-catalog requests are always observed (a warn log +
   // gulley_unpriced_requests_total + a request-log/audit attribute); opt in here to
   // ALSO fail closed by charging the worst-case reservation so it can't slip the cap.
-  METER_FAIL_CLOSED_ON_UNPRICED: envBool(false),
+  // Default ON since 0.6.0: an unpriced paid model is charged its worst case; models of
+  // a `local` custom provider (Ollama, vLLM, …) are free and never charged.
+  METER_FAIL_CLOSED_ON_UNPRICED: envBool(true),
   // A model the OPERATOR configured (a model-alias target, BUDGET_DOWNSHIFT_MODEL, a
   // CASCADE_POLICY escalation target, a ROUTE_GROUPS modelMap entry) with no price in the
   // seed table or MODELS_CATALOG_FILE would meter $0 on every request it serves. `fail`

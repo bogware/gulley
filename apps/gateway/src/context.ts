@@ -26,7 +26,13 @@ import {
   OpenAIEmbeddingProvider,
   type VectorIndex,
 } from '@gulley/cache';
-import { loadCatalogFromFile } from '@gulley/catalog';
+import {
+  loadBundledSnapshot,
+  loadCatalogFromFile,
+  ModelCatalog,
+  parsePricingOverrides,
+  watchCatalogFile,
+} from '@gulley/catalog';
 import {
   type AuthzRuleConfig,
   CelAuthorizer,
@@ -791,15 +797,23 @@ export function createProductionContext(
   const modelRouter = custom.modelRules.length > 0 ? new ModelRouter(custom.modelRules) : undefined;
   const catalogModels = custom.models.length > 0 ? [...new Set(custom.models)] : undefined;
 
-  // Optional models.dev-derived pricing catalog (operator-maintained file loaded
-  // on boot); absent = seed rate tables only.
-  let rateResolver: RateResolver | undefined;
-  if (config.MODELS_CATALOG_FILE) {
-    try {
-      rateResolver = loadCatalogFromFile(config.MODELS_CATALOG_FILE).resolver();
-    } catch (err) {
-      throw new Error(`failed to load MODELS_CATALOG_FILE: ${(err as Error).message}`);
-    }
+  // Pricing catalog: the operator's MODELS_CATALOG_FILE (raw models.dev api.json or
+  // the entry-array format) when set, else the models.dev snapshot bundled with this
+  // release; the in-tree seeds remain the fallback for anything the catalog lacks.
+  // Contracted rates (PRICING_OVERRIDES[_FILE]) layer over both. The catalog INSTANCE
+  // is kept so a file reload (PRICING_RELOAD_INTERVAL_SECONDS) swaps rates in place
+  // for new requests without a restart.
+  const catalog = loadPricingCatalog(config, log);
+  const rateResolver: RateResolver = catalog.resolver();
+  if (config.MODELS_CATALOG_FILE && config.PRICING_RELOAD_INTERVAL_SECONDS > 0) {
+    const path = config.MODELS_CATALOG_FILE;
+    maintenanceStops.push(
+      watchCatalogFile(path, (c) => log.info({ path, models: c.size }, 'pricing catalog reloaded'), {
+        intervalMs: config.PRICING_RELOAD_INTERVAL_SECONDS * 1000,
+        into: catalog,
+        log: (msg, err) => log.warn({ path, err }, msg),
+      }),
+    );
   }
 
   // Optional CEL authorization rules (strict-compiled against the known surface).
@@ -1218,7 +1232,10 @@ export function createProductionContext(
   log.info(
     {
       pricingAsOf: PRICING_AS_OF,
-      catalog: config.MODELS_CATALOG_FILE ?? 'seed',
+      catalog: config.MODELS_CATALOG_FILE ?? 'bundled models.dev snapshot',
+      catalogModels: catalog.size,
+      pricingOverrides: catalog.overrideCount,
+      reloadIntervalSeconds: config.PRICING_RELOAD_INTERVAL_SECONDS,
       version: GULLEY_VERSION,
     },
     'pricing tables loaded',
@@ -1303,6 +1320,7 @@ export function createProductionContext(
     signedThinkingSubstitution: config.SIGNED_THINKING_SUBSTITUTION,
     models: catalogModels,
     rateResolver,
+    catalog,
     streamInactivityMs: config.STREAM_INACTIVITY_MS,
     watchdogBreakerThreshold: config.STREAM_WATCHDOG_BREAKER_THRESHOLD,
     unpricedConfig: config.METER_UNPRICED_CONFIG,
@@ -1429,4 +1447,47 @@ export function buildBasicAuth(config: Config): BasicAuthConfig | undefined {
     defaultAllowedProviders: defaultList(config.BASIC_AUTH_DEFAULT_ALLOWED_PROVIDERS),
     defaultAllowedModels: defaultList(config.BASIC_AUTH_DEFAULT_ALLOWED_MODELS),
   };
+}
+
+/** Load the pricing catalog per the boot rules above. Throws on an unreadable
+ *  operator file or malformed overrides (loud, at boot); a missing bundled snapshot
+ *  degrades to the seeds with a warning (a build without the data file). */
+export function loadPricingCatalog(
+  config: Pick<Config, 'MODELS_CATALOG_FILE' | 'PRICING_OVERRIDES_FILE' | 'PRICING_OVERRIDES'>,
+  log: BootLogger,
+): ModelCatalog {
+  let catalog: ModelCatalog;
+  if (config.MODELS_CATALOG_FILE) {
+    try {
+      catalog = loadCatalogFromFile(config.MODELS_CATALOG_FILE);
+    } catch (err) {
+      throw new Error(`failed to load MODELS_CATALOG_FILE: ${(err as Error).message}`);
+    }
+  } else {
+    try {
+      catalog = loadBundledSnapshot();
+    } catch (err) {
+      log.warn({ err }, 'bundled pricing snapshot unavailable — seed prices only');
+      catalog = new ModelCatalog([]);
+    }
+  }
+  const overrides = [];
+  if (config.PRICING_OVERRIDES_FILE) {
+    try {
+      overrides.push(
+        ...parsePricingOverrides(JSON.parse(readFileSync(config.PRICING_OVERRIDES_FILE, 'utf8'))),
+      );
+    } catch (err) {
+      throw new Error(`failed to load PRICING_OVERRIDES_FILE: ${(err as Error).message}`);
+    }
+  }
+  if (config.PRICING_OVERRIDES) {
+    try {
+      overrides.push(...parsePricingOverrides(JSON.parse(config.PRICING_OVERRIDES)));
+    } catch (err) {
+      throw new Error(`invalid PRICING_OVERRIDES: ${(err as Error).message}`);
+    }
+  }
+  if (overrides.length > 0) catalog.setOverrides(overrides);
+  return catalog;
 }

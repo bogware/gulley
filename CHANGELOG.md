@@ -8,6 +8,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrade notes
 
+- **`METER_FAIL_CLOSED_ON_UNPRICED` now defaults to `true`:** a served model with no
+  price in the catalog or the seeds is charged its worst-case reservation instead of
+  metering $0. Models of a `local` custom provider (Ollama, vLLM, …) are free and are
+  never charged. Set it to `false` to restore the 0.5 behaviour.
+- The bundled models.dev snapshot becomes the default pricing catalog; prices for
+  Claude on Bedrock and Vertex now come from the catalog (partner list prices) rather
+  than the Anthropic seed table. Pin `MODELS_CATALOG_FILE` or `PRICING_OVERRIDES` for
+  contracted rates.
 - **Console `routes` entities change shape.** Entities written by the previous Routes
   page (`{ strategy | mode, targets[] }`, no `clientPath`) were never applied by the
   gateway; they still export/apply unchanged but are now listed as "legacy (ignored by
@@ -48,6 +56,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   audited as `policy.substitution_pinned`. Substituting the model made the API drop that
   reasoning silently and restarted the prompt cache. Set `allow` to substitute anyway.
 
+- **Live pricing catalog (P8).** A models.dev snapshot ships in the image
+  (`packages/catalog/data`, refreshed by a manual script) and is the default catalog;
+  `MODELS_CATALOG_FILE` accepts the raw models.dev `api.json` as well as the entry-array
+  format and can be reloaded in place when it changes (`PRICING_RELOAD_INTERVAL_SECONDS`);
+  catalog long-context tiers, cache multipliers, context windows and output limits are
+  honoured; contracted rates layer over everything (`PRICING_OVERRIDES[_FILE]`);
+  `GET /v1/models` lists every priced model of a configured provider with per-token
+  pricing, context window and max output in Anthropic's list shape; unpriced requests
+  carry the `gulley.pricing.unpriced` span attribute.
 - **Zero-config agent attribution** (`AGENT_HEADER_ATTRIBUTION`, default on). Claude
   Code's `x-claude-code-*` headers (session, subagent, parent agent, prompt, request
   class, agent type, compaction) and Codex's `originator` become attribution tags —

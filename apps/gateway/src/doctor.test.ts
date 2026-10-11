@@ -91,12 +91,15 @@ describe('gulley doctor: air-gapped readiness', () => {
     expect(airFindings(runDoctor(cfg({ ANTHROPIC_UPSTREAM_API_KEY: 'sk-x' })))).toHaveLength(0);
   });
 
-  it('reports the posture (info) and warns without a pinned catalog', () => {
+  it('reports the posture (info) and notes the bundled snapshot without a pinned catalog', () => {
     const fs = airFindings(
       runDoctor(cfg({ ANTHROPIC_UPSTREAM_API_KEY: 'sk-x', AIR_GAPPED: 'true' })),
     );
     expect(fs.some((f) => f.level === 'info')).toBe(true);
-    expect(fs.some((f) => f.level === 'warn' && /MODELS_CATALOG_FILE/.test(f.detail))).toBe(true);
+    // Since 0.6 the image carries a models.dev snapshot, so a missing catalog file is
+    // informational (prices work offline), not a warning.
+    expect(fs.some((f) => f.level === 'info' && /bundled/.test(f.detail))).toBe(true);
+    expect(fs.some((f) => f.level === 'warn' && /MODELS_CATALOG_FILE/.test(f.detail))).toBe(false);
   });
 
   it('warns about a public-reaching DLP webhook and managed guardrail plugins', () => {

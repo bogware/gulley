@@ -34,6 +34,7 @@ import { loadConfig } from './config';
 import { buildCustomProviders } from './context';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 import { buildServer } from './server';
+import { ModelCatalog } from '@gulley/catalog';
 import { deriveVaultMaster } from './conversation';
 import { buildSmartRouter } from './smart-router';
 import type { ClassifierCompleter, SmartRoutingPolicy } from '@gulley/routing';
@@ -7281,5 +7282,158 @@ describe('zero-config agent attribution (x-claude-code-*, originator)', () => {
     await send();
     expect(ledger.entries[1]?.attributes).toEqual({ session: 'operator-session' });
     await app.close();
+  });
+});
+
+describe('GET /v1/models with pricing (P8)', () => {
+  it('lists catalog models of configured providers with per-token pricing, context and limits, Anthropic list shape', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.catalog = new ModelCatalog([
+      {
+        provider: 'anthropic',
+        model: 'claude-sonnet-5-5',
+        input: 2,
+        output: 10,
+        cache: { read: 0.1, write5m: 1.25, write1h: 2 },
+        contextLength: 1_000_000,
+        maxOutputTokens: 128_000,
+        displayName: 'Claude Sonnet 5.5',
+        releaseDate: '2026-06-01',
+      },
+      { provider: 'anthropic', model: 'claude-haiku-5-5', input: 0.1, output: 0.5 },
+      { provider: 'openai', model: 'gpt-5.4', input: 2.5, output: 15 }, // no openai route ⇒ not listed
+    ]);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/models?limit=1000`, { headers: { 'x-api-key': token } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      object: string;
+      has_more: boolean;
+      first_id: string;
+      last_id: string;
+      data: Array<Record<string, unknown>>;
+    };
+    expect(body.object).toBe('list');
+    expect(body.has_more).toBe(false);
+    expect(body.data.map((m) => m['id'])).toEqual(['claude-haiku-5-5', 'claude-sonnet-5-5']);
+    expect(body.first_id).toBe('claude-haiku-5-5');
+    expect(body.last_id).toBe('claude-sonnet-5-5');
+    expect(body.data[1]).toEqual({
+      id: 'claude-sonnet-5-5',
+      object: 'model',
+      type: 'model',
+      display_name: 'Claude Sonnet 5.5',
+      owned_by: 'anthropic',
+      created_at: '2026-06-01T00:00:00Z',
+      context_window: 1_000_000,
+      max_tokens: 128_000,
+      pricing: {
+        input: '0.000002',
+        output: '0.00001',
+        input_cache_read: '0.0000002',
+        input_cache_write: '0.0000025',
+      },
+    });
+    // Pagination: a limit below the total sets has_more.
+    const page = (await fetch(`${base}/v1/models?limit=1`, {
+      headers: { 'x-api-key': token },
+    }).then((r) => r.json())) as {
+      has_more: boolean;
+      data: unknown[];
+    };
+    expect(page.data).toHaveLength(1);
+    expect(page.has_more).toBe(true);
+    await app.close();
+  });
+
+  it('hides a catalog model the key may not use (scope is enforced on the listing)', async () => {
+    const store = new InMemoryKeyStore();
+    const gen = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_models',
+      keyPrefix: gen.keyPrefix,
+      keyHash: gen.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_1',
+      displayName: 'scoped',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: '*',
+      allowedModels: ['claude-haiku-5-5'],
+    });
+    const { ctx } = buildContext(store);
+    ctx.catalog = new ModelCatalog([
+      { provider: 'anthropic', model: 'claude-sonnet-5-5', input: 2, output: 10 },
+      { provider: 'anthropic', model: 'claude-haiku-5-5', input: 0.1, output: 0.5 },
+    ]);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const body = (await fetch(`${base}/v1/models`, { headers: { 'x-api-key': gen.token } }).then(
+      (r) => r.json(),
+    )) as {
+      data: Array<{ id: string }>;
+    };
+    expect(body.data.map((m) => m.id)).toEqual(['claude-haiku-5-5']);
+    await app.close();
+  });
+});
+
+describe('fail-closed metering of unpriced models (0.6 default) spares free providers', () => {
+  it('charges the worst case for an unpriced PAID model but $0 for a model of a free (local) provider', async () => {
+    // The metered model is the one the upstream REPORTS (message_start.message.model).
+    const UNPRICED_SSE = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_u","model":"mystery-model-9","usage":{"input_tokens":50,"output_tokens":1}}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+      '',
+    ].join('\n');
+    const up = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(UNPRICED_SSE);
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const upUrl = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+    for (const free of [false, true]) {
+      const { store, token } = seededStore();
+      const { ctx, ledger, requestLog } = buildContext(store);
+      ctx.meterFailClosedOnUnpriced = true;
+      ctx.freeProviders = free ? ['anthropic'] : [];
+      ctx.routes = [
+        {
+          clientPaths: ['/v1/messages'],
+          createExtractor: () => new AnthropicUsageExtractor(),
+          strategy: { mode: 'single', target: anthropicTarget('anthropic', upUrl) },
+        },
+      ];
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'mystery-model-9',
+          stream: true,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      }).then((r) => r.text());
+      expect(requestLog.entries[0]?.attributes?.['unpriced']).toBe(true);
+      if (free) expect(ledger.entries[0]?.costMicroUsd).toBe(0);
+      else expect(ledger.entries[0]?.costMicroUsd ?? 0).toBeGreaterThan(0);
+      await app.close();
+    }
+    await new Promise<void>((r) => up.close(() => r()));
   });
 });

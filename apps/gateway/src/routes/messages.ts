@@ -20,7 +20,7 @@ import {
   type CacheLookup,
   semanticText,
 } from '@gulley/cache';
-import { computeCost, emptyUsage, rankPrice, type RateResolver, toMicroUsd } from '@gulley/cost';
+import { computeCost, emptyUsage, rankPrice, type RateResolver, toMicroUsd, PROVIDER_PRICING } from '@gulley/cost';
 import { isErr, type Result } from '@gulley/core';
 import {
   filterByPolicy,
@@ -47,6 +47,7 @@ import {
   residencyAllowedRegions,
 } from '../residency-policy';
 import { type CascadePolicy, matchCascade, shouldEscalate } from '../cascade';
+import type { CatalogEntry, ModelCatalog } from '@gulley/catalog';
 import { agentAttribution } from '../agent-attribution';
 import { conversationIdentity, maskVaultKey } from '../conversation';
 import { COUNT_TOKENS_PATHS, type CountTokensDeps, handleCountTokens } from './count-tokens';
@@ -325,6 +326,10 @@ export interface GatewayContext {
   inflightTeardowns?: Set<Promise<void>>;
   /** Upstream time-to-headers budget (config.UPSTREAM_HEADERS_TIMEOUT_MS). */
   upstreamHeadersTimeoutMs?: number;
+  /** The pricing catalog instance behind `rateResolver` (bundled models.dev snapshot
+   *  or MODELS_CATALOG_FILE, with contracted overrides). `/v1/models` lists its
+   *  entries with pricing; a file reload swaps its rates in place. */
+  catalog?: ModelCatalog;
   /** Request header names whose values are captured as cost-attribution tags on the
    *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
   attributionHeaders?: string[];
@@ -646,23 +651,117 @@ async function handleModels(
     return;
   }
   const principal = resolved.principal;
-  const ids = new Set<string>([...(ctx.models ?? []), ...(ctx.modelRouter?.knownModels() ?? [])]);
-  const data = [...ids]
+  const permitted = (id: string): boolean => {
     // Advertise an id only if a request for it would actually be permitted. Both the
     // per-key scope and the central policy are enforced on the RESOLVED model (after
     // alias/pin rewrite), so resolve the advertised id the same way here — otherwise
     // an alias whose target is denied would be advertised (then 403), or one whose
     // target is allowed would be hidden.
-    .filter((id) => {
-      const resolved = ctx.modelRouter?.resolve(id)?.resolved ?? id;
-      return (
-        scopeAllowsModel(principal.scope, resolved) &&
-        (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, resolved))
-      );
-    })
-    .sort()
-    .map((id) => ({ id, object: 'model', owned_by: 'gulley' }));
-  await reply.send({ object: 'list', data });
+    const resolvedId = ctx.modelRouter?.resolve(id)?.resolved ?? id;
+    return (
+      scopeAllowsModel(principal.scope, resolvedId) &&
+      (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, resolvedId))
+    );
+  };
+  const query = (request.query ?? {}) as Record<string, unknown>;
+  const limitRaw = Number(query['limit']);
+  const limit = Number.isFinite(limitRaw) && limitRaw >= 1 ? Math.min(1000, Math.floor(limitRaw)) : 1000;
+
+  const listed = new Map<string, ModelListing>();
+  // Priced models of every configured provider (bundled snapshot / catalog, else the
+  // seed table for the first-party providers), each with its pricing so a client can
+  // discover cost as well as availability (Vercel-style, Anthropic list shape). Region-
+  // prefixed Bedrock ids are folded into the base id.
+  const providers = new Set(ctx.routes.flatMap((r) => allTargets(r.strategy).map((t) => t.provider)));
+  for (const provider of providers) {
+    const entries = ctx.catalog?.entriesFor(provider) ?? [];
+    for (const e of entries) {
+      if (REGION_PREFIX_RE.test(e.model)) continue;
+      if (!listed.has(e.model)) listed.set(e.model, catalogListing(e));
+    }
+    if (entries.length === 0 && provider !== 'bedrock' && provider !== 'azure') {
+      const seed = PROVIDER_PRICING[provider];
+      for (const [id, rate] of Object.entries(seed?.rates ?? {})) {
+        if (!listed.has(id)) {
+          listed.set(id, {
+            id,
+            object: 'model',
+            type: 'model',
+            display_name: id,
+            owned_by: provider,
+            pricing: pricingOf(rate.input, rate.output, rate.cache?.read ?? seed?.cache.read, rate.cache?.write5m ?? seed?.cache.write5m),
+          });
+        }
+      }
+    }
+  }
+  // Declared custom-provider models and exact aliases — what this deployment serves
+  // beyond the catalog.
+  for (const id of [...(ctx.models ?? []), ...(ctx.modelRouter?.knownModels() ?? [])]) {
+    if (!listed.has(id)) {
+      listed.set(id, { id, object: 'model', type: 'model', display_name: id, owned_by: 'gulley' });
+    }
+  }
+  const all = [...listed.values()].filter((m) => permitted(m.id)).sort((a, b) => (a.id < b.id ? -1 : 1));
+  const data = all.slice(0, limit);
+  await reply.send({
+    object: 'list',
+    data,
+    has_more: all.length > data.length,
+    first_id: data[0]?.id ?? null,
+    last_id: data[data.length - 1]?.id ?? null,
+  });
+}
+
+/** One `/v1/models` entry: Anthropic's shape (`type`, `display_name`, `created_at`)
+ *  plus OpenAI's (`object`, `owned_by`) plus Vercel-style discovery fields. Prices are
+ *  USD per TOKEN as decimal strings (never floats). */
+interface ModelListing {
+  id: string;
+  object: 'model';
+  type: 'model';
+  display_name: string;
+  owned_by: string;
+  created_at?: string;
+  context_window?: number;
+  max_tokens?: number;
+  pricing?: { input: string; output: string; input_cache_read?: string; input_cache_write?: string };
+}
+
+const REGION_PREFIX_RE = /^(us|eu|apac|global|jp|au|ca|sa)\./;
+
+function catalogListing(e: CatalogEntry): ModelListing {
+  return {
+    id: e.model,
+    object: 'model',
+    type: 'model',
+    display_name: e.displayName ?? e.model,
+    owned_by: e.provider,
+    ...(e.releaseDate ? { created_at: `${e.releaseDate}T00:00:00Z` } : {}),
+    ...(e.contextLength ? { context_window: e.contextLength } : {}),
+    ...(e.maxOutputTokens ? { max_tokens: e.maxOutputTokens } : {}),
+    pricing: pricingOf(e.input, e.output, e.cache?.read, e.cache?.write5m),
+  };
+}
+
+function pricingOf(
+  inputPerMTok: number,
+  outputPerMTok: number,
+  cacheRead?: number,
+  cacheWrite?: number,
+): ModelListing['pricing'] {
+  return {
+    input: perToken(inputPerMTok),
+    output: perToken(outputPerMTok),
+    ...(cacheRead !== undefined ? { input_cache_read: perToken(inputPerMTok * cacheRead) } : {}),
+    ...(cacheWrite !== undefined ? { input_cache_write: perToken(inputPerMTok * cacheWrite) } : {}),
+  };
+}
+
+/** USD per million tokens → USD per token, as a decimal string with no float noise. */
+function perToken(usdPerMTok: number): string {
+  const s = (usdPerMTok / 1_000_000).toFixed(12);
+  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
 }
 
 /** Drain a Readable fully into buffered chunks, capped at `limit` bytes. On overflow it
@@ -3055,7 +3154,12 @@ async function handleProxy(
     // durable attribute); optionally fail closed by charging the worst-case reserve
     // so an off-catalog model can't be used to drive real spend past the cap.
     const unpriced = n.seen && !cost.priced && statusCode < 400;
-    const chargeUnpriced = unpriced && ctx.meterFailClosedOnUnpriced === true;
+    // Fail closed on an unpriced PAID model only: a `local` custom provider (Ollama,
+    // vLLM, …) is free, so its models meter $0 by design, never the worst case.
+    const chargeUnpriced =
+      unpriced &&
+      ctx.meterFailClosedOnUnpriced === true &&
+      !(ctx.freeProviders?.includes(provider) ?? false);
     // Throttled per (provider, model): one line per minute, not one per request — an
     // unpriced embeddings or local model otherwise spammed the log on every call while
     // the metric (gulley_unpriced_requests_total) already counts each one.

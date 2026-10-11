@@ -117,6 +117,7 @@ export function spanAttributes(data: RequestSpanData): Attributes {
     ...(data.traceId ? { 'gulley.trace_id': data.traceId } : {}),
     ...(data.abortReason ? { 'gulley.abort.reason': data.abortReason } : {}),
     ...(data.budgetEnforced === false ? { 'gulley.budget.enforced': false } : {}),
+    ...(data.unpriced === true ? { 'gulley.pricing.unpriced': true } : {}),
     ...(data.rateLimitEnforced === false ? { 'gulley.ratelimit.enforced': false } : {}),
   };
 }

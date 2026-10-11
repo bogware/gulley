@@ -155,10 +155,10 @@ export function runDoctor(config: Config): DoctorFinding[] {
     });
     if (!config.MODELS_CATALOG_FILE) {
       f.push({
-        level: 'warn',
+        level: 'info',
         check: 'air-gapped',
         detail:
-          'AIR_GAPPED without MODELS_CATALOG_FILE — pricing falls back to in-tree seeds and no models.dev refresh is possible offline. Pin a catalog file.',
+          'AIR_GAPPED without MODELS_CATALOG_FILE — pricing uses the models.dev snapshot bundled with this release (no refresh offline). Pin a newer catalog file to update prices.',
       });
     }
     if (config.GUARDRAILS_WEBHOOK_URL && !config.GUARDRAILS_WEBHOOK_ALLOW_INTERNAL) {
