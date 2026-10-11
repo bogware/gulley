@@ -25,11 +25,22 @@ interface ParsedRoute {
   raw: Record<string, unknown>;
 }
 
+// The three strategies the gateway actually implements (packages/routing): the page used
+// to offer `latency` / `cost` / `conditional`, which a hot-reload persisted and the
+// gateway then rejected. Least-load, cheapest and fastest are `select` options of
+// loadbalance; classifier routing is smart routing, configured separately.
 const STRATEGIES = [
-  { mode: 'loadbalance', title: 'Weighted', desc: 'weight-split load balance across targets' },
-  { mode: 'latency', title: 'Latency-aware', desc: 'power-of-two-choices least-load' },
-  { mode: 'cost', title: 'Cost-optimal', desc: 'cheapest healthy target by catalog price' },
-  { mode: 'conditional', title: 'Classified', desc: 'route by task classifier (smart routing)' },
+  { mode: 'single', title: 'Single', desc: 'one upstream target (the per-provider default)' },
+  {
+    mode: 'loadbalance',
+    title: 'Load-balance',
+    desc: 'weighted targets; select least-load (P2C), cheapest or fastest',
+  },
+  {
+    mode: 'fallback',
+    title: 'Fallback',
+    desc: 'ordered failover on upstream status codes, pre-first-byte only',
+  },
 ] as const;
 
 function parseRoute(e: CollectionEntity): ParsedRoute {
@@ -168,7 +179,7 @@ function RouteBuilder({ route, onApplied }: { route: ParsedRoute; onApplied: () 
   function runDryRun(): void {
     const total = sum || 1;
     const lines = [
-      '$ gulley routes dry-run --n 1000',
+      '# local projection of the configured weights — no requests are sent',
       '',
       ...targets.map((t) => {
         const pct = Math.round((t.weight / total) * 100);

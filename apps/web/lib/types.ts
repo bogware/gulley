@@ -74,8 +74,21 @@ export interface VirtualKeyView {
   id: string;
   keyPrefix: string;
   workspaceId: string;
-  displayName: string;
+  /** The key's name as the control API returns it (the console read a non-existent
+   *  `displayName` before and showed an empty column). */
+  name: string;
   disabled: boolean;
+  createdAt?: string;
+  expiresAt?: string | null;
+  allowedProviders?: readonly string[] | '*';
+  allowedModels?: readonly string[] | '*';
+  groups?: readonly string[];
+}
+export interface MintKeyOptions {
+  allowedProviders?: readonly string[];
+  allowedModels?: readonly string[];
+  expiresAt?: string;
+  groups?: readonly string[];
 }
 export interface Provider {
   id: string;
@@ -193,7 +206,9 @@ export interface ShadowSpendRow {
   gatewayMicroUsd: number;
   providerMicroUsd: number;
   shadowMicroUsd: number;
-  shadowRatioBps: number;
+  /** shadow / provider spend, 0..1 (the console divided a non-existent bps field
+   *  before and rendered NaN%). */
+  shadowRatio: number;
   flagged: boolean;
 }
 export interface ShadowSpendReport {
@@ -250,6 +265,8 @@ export interface AdminUser {
 export interface Membership {
   id?: string;
   subject?: string;
+  /** Durable (DB-mode) grants carry the admin_user id instead of a subject. */
+  userId?: string;
   role: string;
   orgId: string;
   workspaceId?: string | null;

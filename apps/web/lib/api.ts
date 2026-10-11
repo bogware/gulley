@@ -30,6 +30,7 @@ import type {
   RequestLog,
   ReuseAlert,
   Rollout,
+  MintKeyOptions,
   ShadowSpendReport,
   UsageBucket,
   UsageQuery,
@@ -273,8 +274,9 @@ export class GulleyAdminApi {
   createKey(
     workspaceId: string,
     name: string,
+    opts: MintKeyOptions = {},
   ): Promise<{ id: string; token: string; keyPrefix: string }> {
-    return this.req('POST', '/keys', { workspaceId, name });
+    return this.req('POST', '/keys', { workspaceId, name, ...opts });
   }
   key(id: string): Promise<{ key: VirtualKeyView }> {
     return this.req<{ key: VirtualKeyView }>('GET', `/keys/${encodeURIComponent(id)}`);

@@ -23,13 +23,35 @@ import { useAdminQuery } from '../../lib/hooks';
 import type { VirtualKeyView } from '../../lib/types';
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-const COLS = 'minmax(0,1fr) 130px 90px 150px';
+const COLS = 'minmax(0,1fr) 120px minmax(0,1.2fr) 80px 150px';
+
+/** The key's enforced scope, for the list: allow-lists and expiry, else unrestricted. */
+function scopeLabel(k: VirtualKeyView): string {
+  const parts: string[] = [];
+  if (Array.isArray(k.allowedModels)) parts.push(`models: ${k.allowedModels.join(', ')}`);
+  if (Array.isArray(k.allowedProviders)) parts.push(`providers: ${k.allowedProviders.join(', ')}`);
+  if (k.expiresAt) parts.push(`expires ${k.expiresAt.slice(0, 10)}`);
+  return parts.length > 0 ? parts.join(' · ') : 'unrestricted';
+}
+
+/** A comma-separated form field as a list (undefined when blank). */
+function listField(s: string): string[] | undefined {
+  const xs = s
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  return xs.length > 0 ? xs : undefined;
+}
 
 export default function KeysPage() {
   const { api } = useAdmin();
   const workspaces = useAdminQuery((a) => a.workspaces(), []);
   const [ws, setWs] = useState('');
   const [name, setName] = useState('');
+  const [models, setModels] = useState('');
+  const [providers, setProviders] = useState('');
+  const [expires, setExpires] = useState('');
+  const [groups, setGroups] = useState('');
   const [minted, setMinted] = useState<{ id: string; token: string; keyPrefix: string } | null>(
     null,
   );
@@ -42,9 +64,18 @@ export default function KeysPage() {
     setError(undefined);
     setBusy(true);
     try {
-      const r = await api.createKey(ws, name.trim());
+      const r = await api.createKey(ws, name.trim(), {
+        allowedModels: listField(models),
+        allowedProviders: listField(providers),
+        groups: listField(groups),
+        expiresAt: expires ? new Date(expires).toISOString() : undefined,
+      });
       setMinted(r);
       setName('');
+      setModels('');
+      setProviders('');
+      setExpires('');
+      setGroups('');
       keys.refetch();
     } catch (e) {
       setError(msg(e));
@@ -115,19 +146,21 @@ export default function KeysPage() {
             <EmptyState message="No keys in this workspace yet." />
           ) : (
             <div className="overflow-x-auto">
-              <div style={{ minWidth: '500px' }}>
+              <div style={{ minWidth: '720px' }}>
                 <GridRow cols={COLS} header>
                   <Cell>Name</Cell>
                   <Cell>Prefix</Cell>
+                  <Cell>Scope</Cell>
                   <Cell>State</Cell>
                   <Cell align="right">Actions</Cell>
                 </GridRow>
                 {list.map((k: VirtualKeyView) => (
                   <GridRow key={k.id} cols={COLS}>
-                    <Cell tone="ink">{k.displayName}</Cell>
+                    <Cell tone="ink">{k.name}</Cell>
                     <Cell mono tone="secondary">
                       {k.keyPrefix}
                     </Cell>
+                    <Cell tone="secondary">{scopeLabel(k)}</Cell>
                     <Cell>
                       <StatusChip tone={k.disabled ? 'red' : 'green'}>
                         {k.disabled ? 'disabled' : 'active'}
@@ -168,6 +201,34 @@ export default function KeysPage() {
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="claude-code · platform-eng"
+              />
+            </Field>
+            <Field label="Allowed models (comma-separated; blank = any)">
+              <Input
+                value={models}
+                onChange={(e) => setModels(e.target.value)}
+                placeholder="claude-sonnet-5-5, claude-haiku-5-5"
+              />
+            </Field>
+            <Field label="Allowed providers (blank = any)">
+              <Input
+                value={providers}
+                onChange={(e) => setProviders(e.target.value)}
+                placeholder="anthropic, bedrock"
+              />
+            </Field>
+            <Field label="Expires (blank = never)">
+              <Input
+                type="datetime-local"
+                value={expires}
+                onChange={(e) => setExpires(e.target.value)}
+              />
+            </Field>
+            <Field label="Groups (comma-separated tags)">
+              <Input
+                value={groups}
+                onChange={(e) => setGroups(e.target.value)}
+                placeholder="platform-eng"
               />
             </Field>
             <Button
