@@ -562,7 +562,13 @@ export function buildRoutes(config: Config): ProviderRoute[] {
         target: {
           name: 'bedrock',
           provider: 'bedrock',
-          adapter: new BedrockAdapter({ region: config.BEDROCK_REGION }),
+          adapter: new BedrockAdapter({
+            region: config.BEDROCK_REGION,
+            pingIntervalMs: config.BEDROCK_PING_INTERVAL_MS,
+            betaDeny: config.BEDROCK_BETA_DENY.split(',')
+              .map((b) => b.trim())
+              .filter(Boolean),
+          }),
           credential: { scheme: 'bearer', value: config.BEDROCK_UPSTREAM_API_KEY },
           upstreamPath: '/v1/messages',
           // Not alwaysStream any more: the adapter answers a `stream:false` request

@@ -7032,3 +7032,173 @@ describe('signed reasoning pins the model (SIGNED_THINKING_SUBSTITUTION=pin)', (
     await new Promise<void>((r) => srv.close(() => r()));
   });
 });
+
+describe('POST /v1/messages/count_tokens (gateway contract)', () => {
+  const scopedStore = (scope: {
+    allowedProviders: readonly string[] | '*';
+    allowedModels: readonly string[] | '*';
+  }): { store: InMemoryKeyStore; token: string } => {
+    const store = new InMemoryKeyStore();
+    const gen = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_ct',
+      keyPrefix: gen.keyPrefix,
+      keyHash: gen.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_1',
+      displayName: 'scoped',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: scope.allowedProviders,
+      allowedModels: scope.allowedModels,
+    });
+    return { store, token: gen.token };
+  };
+  async function countingUpstream(): Promise<{
+    url: string;
+    bodies: string[];
+    close: () => Promise<void>;
+  }> {
+    const bodies: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        if (req.url === '/v1/messages/count_tokens') {
+          bodies.push(b);
+          res.writeHead(200, { 'content-type': 'application/json', 'request-id': 'req_up_1' });
+          res.end(JSON.stringify({ input_tokens: 42 }));
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      bodies,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+    };
+  }
+
+  it('counts through the route (authn, scope, no spend) and relays the Anthropic reply', async () => {
+    const up = await countingUpstream();
+    const { store, token } = seededStore();
+    const { ctx, ledger, requestLog } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', up.url) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ input_tokens: 42 });
+    expect(res.headers.get('x-gulley-target')).toBe('anthropic');
+    expect(res.headers.get('request-id')).toBe('req_up_1'); // upstream headers relayed
+    expect(up.bodies).toHaveLength(1);
+    expect(ledger.entries).toHaveLength(0); // free: no reservation, no ledger row
+    expect(requestLog.entries).toHaveLength(0);
+
+    // Unauthenticated ⇒ 401 with the contract's x-should-retry: false.
+    const anon = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"model":"claude-sonnet-4-6","messages":[]}',
+    });
+    expect(anon.status).toBe(401);
+    expect(anon.headers.get('x-should-retry')).toBe('false');
+    await app.close();
+    await up.close();
+  });
+
+  it('is gated like inference: out-of-scope model ⇒ 403, masked prompt reaches the upstream masked', async () => {
+    const up = await countingUpstream();
+    const { store, token } = scopedStore({
+      allowedProviders: '*',
+      allowedModels: ['claude-haiku-4-5'],
+    });
+    const { ctx } = buildContext(store);
+    ctx.maskVaultMaster = deriveVaultMaster('test-pepper-for-count-tokens');
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', up.url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const post = (body: unknown) =>
+      fetch(`${base}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify(body),
+      });
+    const denied = await post({
+      model: 'claude-opus-4-8',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(denied.status).toBe(403);
+    expect(up.bodies).toHaveLength(0);
+    const ok = await post({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'mail jane@example.com' }],
+    });
+    expect(ok.status).toBe(200);
+    expect(up.bodies[0]).not.toContain('jane@example.com');
+    expect(up.bodies[0]).toMatch(/<<GULLEY_EMAIL_[0-9A-F]{24}>>/);
+    await app.close();
+    await up.close();
+  });
+
+  it('answers 404 not_found_error when the upstream has no token-counting API, and for an unknown path', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    const target = anthropicTarget('nocount', 'http://127.0.0.1:9');
+    target.adapter = { name: 'nocount', forward: target.adapter.forward.bind(target.adapter) };
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: '{"model":"claude-sonnet-4-6","messages":[]}',
+    });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe('not_found_error');
+    const unknown = await fetch(`${base}/v1/nope`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: '{}',
+    });
+    expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as { error: { type: string } }).error.type).toBe(
+      'not_found_error',
+    );
+    expect(unknown.headers.get('x-should-retry')).toBe('false');
+    await app.close();
+  });
+});

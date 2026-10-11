@@ -48,6 +48,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   audited as `policy.substitution_pinned`. Substituting the model made the API drop that
   reasoning silently and restarted the prompt cache. Set `allow` to substitute anyway.
 
+- **Claude Code gateway-contract fixes.** `POST /v1/messages/count_tokens` (also under
+  `/anthropic` and `/bedrock`) is served through the same authn / scope / policy /
+  residency / input-guardrail gates as inference, with no spend, via the adapter's
+  `countTokens` (Anthropic passthrough; Bedrock `CountTokens`). The Bedrock translation
+  synthesizes `ping` events during pauses (`BEDROCK_PING_INTERVAL_MS`, default 15 s)
+  so Claude Code's streaming idle watchdog survives a long thinking pause, forwards the
+  client's `anthropic-beta` header as the body's `anthropic_beta` list (an open list;
+  `BEDROCK_BETA_DENY` strips values a region rejects), and reshapes Bedrock errors —
+  HTTP and mid-stream — into Anthropic's envelope with the status kept, the message
+  verbatim and `capability_rejected: prompt_too_long` for a prompt that does not fit.
+  Gateway-generated errors carry `x-should-retry` (`true` for 429/502/503/504, `false`
+  for other 4xx) and the 404 type is Anthropic's `not_found_error`. `GET /v1/models` is
+  also served under `/anthropic` and `/bedrock`.
+
 ### Changed
 
 - **The spotlight directive is appended, not prepended, and on every request**

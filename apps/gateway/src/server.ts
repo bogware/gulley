@@ -80,6 +80,18 @@ export function buildServer(
   // onSend and set the header themselves at writeHead.
   app.addHook('onSend', (request, reply, payload, done) => {
     if (!reply.hasHeader('x-gulley-request-id')) reply.header('x-gulley-request-id', request.id);
+    // Anthropic's gateway contract: `x-should-retry` is one input to Claude Code's
+    // retry decision. Upstream replies carry the upstream's value (hijacked, never
+    // through this hook); a gateway-generated error says whether retrying can help —
+    // a throttle / overload / timeout can clear, a denial or a bad request cannot.
+    if (!reply.hasHeader('x-should-retry')) {
+      const status = reply.statusCode;
+      if (status === 429 || status === 502 || status === 503 || status === 504) {
+        reply.header('x-should-retry', 'true');
+      } else if (status >= 400 && status < 500) {
+        reply.header('x-should-retry', 'false');
+      }
+    }
     done(null, payload);
   });
 

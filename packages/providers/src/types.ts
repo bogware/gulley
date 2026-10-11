@@ -41,6 +41,11 @@ export interface ProviderAdapter {
    *  a `stream:false` client, instead of trying to JSON-parse SSE ($0 metered). */
   readonly alwaysStream?: boolean;
   forward(req: ForwardRequest): Promise<ForwardResponse>;
+  /** Anthropic `POST /v1/messages/count_tokens` for this upstream: `req.path` is the
+   *  inference path (the adapter derives its own count endpoint) and the reply is the
+   *  Anthropic `{ input_tokens }` JSON (or an Anthropic error envelope). Absent when
+   *  the upstream has no token-counting API (the gateway answers 404). */
+  countTokens?(req: ForwardRequest): Promise<ForwardResponse>;
 }
 
 /**

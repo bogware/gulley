@@ -78,6 +78,16 @@ const EnvShape = z.object({
   BEDROCK_UPSTREAM_API_KEY: z.string().min(1).optional(),
   BEDROCK_REGION: z.string().default('us-east-1'),
   BEDROCK_ZDR: envBool(false),
+  // Bedrock streams carry no `ping` events; a client idle watchdog (Claude Code's
+  // streaming idle timeout) trips during a long thinking pause. The gateway emits an
+  // Anthropic `ping` after this many ms without an upstream frame, once the stream has
+  // started (15 s = Anthropic's own cadence; 0 = off). Synthesis stops after 5 min of
+  // silence so a real hang still reaches STREAM_INACTIVITY_MS.
+  BEDROCK_PING_INTERVAL_MS: z.coerce.number().int().min(0).default(15_000),
+  // `anthropic-beta` values are forwarded to Bedrock as the body's `anthropic_beta`
+  // list (an OPEN list, per Anthropic's gateway contract). Comma-separated values to
+  // strip for a region/model that rejects them. Empty = forward everything.
+  BEDROCK_BETA_DENY: z.string().default(''),
   // Azure AI Foundry / Azure OpenAI: resource endpoint + api-key (Entra later).
   AZURE_ENDPOINT: z.string().url().optional(),
   AZURE_UPSTREAM_API_KEY: z.string().min(1).optional(),

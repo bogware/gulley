@@ -48,6 +48,7 @@ import {
 } from '../residency-policy';
 import { type CascadePolicy, matchCascade, shouldEscalate } from '../cascade';
 import { conversationIdentity, maskVaultKey } from '../conversation';
+import { COUNT_TOKENS_PATHS, type CountTokensDeps, handleCountTokens } from './count-tokens';
 import { hasSignedThinking, type SignedThinkingSubstitution } from '../thinking';
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
@@ -467,7 +468,7 @@ export function registerRoutes(app: FastifyInstance, holder: RouteHolder): void 
     if (!route) {
       return reply.code(404).send({
         type: 'error',
-        error: { type: 'not_found', message: 'no route for path' },
+        error: { type: 'not_found_error', message: 'no route for path' },
       }) as unknown as void;
     }
     const startedAtMs = Date.now();
@@ -501,10 +502,29 @@ export function registerRoutes(app: FastifyInstance, holder: RouteHolder): void 
       }) as unknown as void;
     });
   });
-  // Model discovery (OpenAI-shaped list), filtered to the caller's allowed models.
+  // Model discovery, filtered to the caller's allowed models. Served under every
+  // provider prefix so a client pointed at `/anthropic` or `/bedrock` discovers too.
   const modelsHandler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
     handleModels(holder.ctx, req, reply);
-  for (const path of ['/v1/models', '/openai/v1/models']) app.get(path, modelsHandler);
+  for (const path of [
+    '/v1/models',
+    '/openai/v1/models',
+    '/anthropic/v1/models',
+    '/bedrock/v1/models',
+  ])
+    app.get(path, modelsHandler);
+
+  // Token counting (Anthropic's optional gateway endpoint) — static routes win over
+  // the `/*` dispatcher; each resolves its parent inference route from the holder.
+  const countTokensDeps: CountTokensDeps = {
+    resolvePrincipal: resolveAnyPrincipal,
+    filterResponseHeaders,
+  };
+  for (const path of COUNT_TOKENS_PATHS) {
+    app.post(path, (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
+      handleCountTokens(holder, req, reply, countTokensDeps),
+    );
+  }
 
   // Playground preflight — a static POST route, so it wins over the `/*` proxy
   // dispatcher. Reuses the real pipeline components but never proxies or spends.
@@ -527,7 +547,7 @@ function handleDebugTrace(ctx: GatewayContext, request: FastifyRequest, reply: F
   }
   const tracer = ctx.tracer;
   if (!tracer) {
-    void reply.code(404).send({ type: 'error', error: { type: 'not_found' } });
+    void reply.code(404).send({ type: 'error', error: { type: 'not_found_error' } });
     return;
   }
   reply.hijack();
@@ -566,7 +586,7 @@ function handleDebugTrace(ctx: GatewayContext, request: FastifyRequest, reply: F
  * Used by the read-only endpoints (model discovery) so a harness authenticating with
  * a broker token or a JWT is not 401'd on discovery while its POSTs succeed.
  */
-async function resolveAnyPrincipal(
+export async function resolveAnyPrincipal(
   ctx: GatewayContext,
   request: FastifyRequest,
 ): Promise<{ kind: 'ok'; principal: Principal } | { kind: 'unauthorized' | 'unavailable' }> {
@@ -4586,7 +4606,7 @@ function cacheControlHas(request: FastifyRequest, directive: string): boolean {
   return cc !== undefined && cc.toLowerCase().includes(directive);
 }
 
-function filterResponseHeaders(
+export function filterResponseHeaders(
   headers: Record<string, string | string[] | undefined>,
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};

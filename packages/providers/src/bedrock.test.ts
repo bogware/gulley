@@ -145,3 +145,190 @@ describe('BedrockAdapter delivery modes', () => {
     await new Promise<void>((r) => srv.close(() => r()));
   });
 });
+
+describe('BedrockAdapter — gateway contract (Wave 1)', () => {
+  type Captured = { path: string; body: string; headers: http.IncomingHttpHeaders };
+  async function mock(
+    handler: (c: Captured, res: http.ServerResponse) => void,
+  ): Promise<{ url: string; captured: Captured[]; close: () => Promise<void> }> {
+    const captured: Captured[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        const c = { path: req.url ?? '', body: b, headers: req.headers };
+        captured.push(c);
+        handler(c, res);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      captured,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+    };
+  }
+  const req = (body: unknown, headers: Record<string, string> = {}) => ({
+    path: '/v1/messages',
+    body: Buffer.from(JSON.stringify(body)),
+    headers,
+    credential: { scheme: 'bearer' as const, value: 'k' },
+    signal: new AbortController().signal,
+  });
+  const drain = async (body: Readable) => {
+    const chunks: Buffer[] = [];
+    for await (const c of body) chunks.push(c as Buffer);
+    return Buffer.concat(chunks).toString('utf8');
+  };
+
+  it('forwards the anthropic-beta header as the body anthropic_beta list (open list, deny-filtered)', async () => {
+    const up = await mock((_c, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"id":"m"}');
+    });
+    const adapter = new BedrockAdapter({
+      baseUrl: up.url,
+      betaDeny: ['context-management-2025-06-27'],
+    });
+    await adapter.forward(
+      req(
+        { model: 'anthropic.claude-sonnet-5-5', max_tokens: 5, messages: [] },
+        {
+          'anthropic-beta':
+            'interleaved-thinking-2025-05-14, context-management-2025-06-27,output-128k-2025-02-19',
+        },
+      ),
+    );
+    const sent = JSON.parse(up.captured[0]!.body) as { anthropic_beta?: string[]; model?: unknown };
+    expect(sent.anthropic_beta).toEqual([
+      'interleaved-thinking-2025-05-14',
+      'output-128k-2025-02-19',
+    ]);
+    expect(sent.model).toBeUndefined();
+    // A body that already carries anthropic_beta wins over the header.
+    await adapter.forward(
+      req(
+        { model: 'anthropic.claude-sonnet-5-5', anthropic_beta: ['x'], messages: [] },
+        { 'anthropic-beta': 'y' },
+      ),
+    );
+    expect(
+      (JSON.parse(up.captured[1]!.body) as { anthropic_beta: string[] }).anthropic_beta,
+    ).toEqual(['x']);
+    await up.close();
+  });
+
+  it('reshapes HTTP errors into the Anthropic envelope: status kept, prompt-too-long gets the capability_rejected token', async () => {
+    const up = await mock((c, res) => {
+      if (c.path.includes('too-long')) {
+        res.writeHead(400, {
+          'content-type': 'application/json',
+          'x-amzn-errortype': 'ValidationException:http://internal',
+        });
+        res.end('{"message":"Input is too long for requested model."}');
+      } else if (c.path.includes('throttle')) {
+        res.writeHead(429, {
+          'content-type': 'application/json',
+          'x-amzn-errortype': 'ThrottlingException',
+          'retry-after': '3',
+        });
+        res.end('{"message":"Too many requests, please wait before trying again."}');
+      } else {
+        res.writeHead(400, {
+          'content-type': 'application/json',
+          'x-amzn-errortype': 'ValidationException',
+        });
+        res.end('{"message":"extra_field: Extra inputs are not permitted"}');
+      }
+    });
+    const adapter = new BedrockAdapter({ baseUrl: up.url });
+    const r1 = await adapter.forward(req({ model: 'too-long', messages: [] }));
+    expect(r1.statusCode).toBe(400);
+    expect(r1.headers['x-amzn-errortype']).toBe('ValidationException:http://internal');
+    expect(JSON.parse(await drain(r1.body))).toEqual({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'capability_rejected: prompt_too_long' },
+    });
+    const r2 = await adapter.forward(req({ model: 'throttle', messages: [] }));
+    expect(r2.statusCode).toBe(429);
+    expect(r2.headers['retry-after']).toBe('3');
+    expect(JSON.parse(await drain(r2.body))).toMatchObject({ error: { type: 'rate_limit_error' } });
+    // Other wording stays verbatim so Claude Code's own matches (e.g. "Extra inputs are
+    // not permitted") keep working.
+    const r3 = await adapter.forward(req({ model: 'other', messages: [] }));
+    expect(JSON.parse(await drain(r3.body))).toEqual({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: 'extra_field: Extra inputs are not permitted',
+      },
+    });
+    await up.close();
+  });
+
+  it('count_tokens goes to CountTokens with the InvokeModel body and answers { input_tokens }', async () => {
+    const up = await mock((c, res) => {
+      if (c.path.endsWith('/count-tokens')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"inputTokens":42}');
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    const adapter = new BedrockAdapter({ baseUrl: up.url });
+    const r = await adapter.countTokens(
+      req(
+        { model: 'anthropic.claude-sonnet-5-5', messages: [{ role: 'user', content: 'hi' }] },
+        { 'anthropic-beta': 'b1' },
+      ),
+    );
+    expect(r.statusCode).toBe(200);
+    expect(JSON.parse(await drain(r.body))).toEqual({ input_tokens: 42 });
+    expect(up.captured[0]!.path).toBe('/model/anthropic.claude-sonnet-5-5/count-tokens');
+    const sent = JSON.parse(up.captured[0]!.body) as { input: { invokeModel: { body: string } } };
+    const inner = JSON.parse(sent.input.invokeModel.body) as Record<string, unknown>;
+    expect(inner['model']).toBeUndefined();
+    expect(inner['anthropic_version']).toBe('bedrock-2023-05-31');
+    expect(inner['anthropic_beta']).toEqual(['b1']);
+    await up.close();
+  });
+
+  it('synthesizes ping events during a pause once the stream has started, and stops at the end', async () => {
+    const up = new (await import('node:stream')).PassThrough();
+    const out = bedrockToSse(up, { pingIntervalMs: 15 });
+    const seen: string[] = [];
+    out.on('data', (c: Buffer) => seen.push(c.toString('utf8')));
+    // Silence BEFORE the first frame: no pings (pre-first-byte is the headers timeout's job).
+    await new Promise((r) => setTimeout(r, 50));
+    expect(seen.join('')).not.toContain('event: ping');
+    up.write(
+      chunkFrame({ type: 'message_start', message: { id: 'm', usage: { input_tokens: 1 } } }),
+    );
+    await new Promise((r) => setTimeout(r, 70)); // a pause: ≥3 ping intervals
+    const pingsDuringPause = seen.join('').split('event: ping').length - 1;
+    expect(pingsDuringPause).toBeGreaterThanOrEqual(2);
+    expect(seen.join('')).toContain('data: {"type":"ping"}');
+    up.write(chunkFrame({ type: 'message_stop' }));
+    up.end();
+    await new Promise<void>((r) => out.on('end', () => r()));
+    const total = seen.join('');
+    const afterStop = total.slice(total.indexOf('event: message_stop'));
+    expect(afterStop).not.toContain('event: ping');
+    await new Promise((r) => setTimeout(r, 40)); // nothing after the end either
+    expect(seen.join('')).toBe(total);
+  });
+
+  it('stops synthesizing pings after pingMaxIdleMs of silence so a hang reaches the watchdog', async () => {
+    const up = new (await import('node:stream')).PassThrough();
+    const out = bedrockToSse(up, { pingIntervalMs: 10, pingMaxIdleMs: 35 });
+    const seen: string[] = [];
+    out.on('data', (c: Buffer) => seen.push(c.toString('utf8')));
+    up.write(chunkFrame({ type: 'message_start', message: { id: 'm' } }));
+    await new Promise((r) => setTimeout(r, 120));
+    const pings = seen.join('').split('event: ping').length - 1;
+    expect(pings).toBeGreaterThanOrEqual(1);
+    expect(pings).toBeLessThanOrEqual(4); // ~3 intervals fit before the idle cap
+    up.destroy();
+  });
+});

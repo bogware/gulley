@@ -233,9 +233,10 @@ describe('Bedrock', () => {
       up.write(frame);
       const r = await done;
       expect(r.text).toContain('event: error');
-      expect(r.text).toMatch(
-        /"type":"error","error":\{"type":"(throttlingException|InternalError)"/,
-      );
+      // Bedrock's exception name is mapped to the Anthropic error type the client SDKs
+      // and Claude Code's recovery understand (message kept verbatim).
+      expect(r.text).toMatch(/"type":"error","error":\{"type":"(rate_limit_error|api_error)"/);
+      expect(r.text).toMatch(/"message":"(Too many requests|boom)"/);
       // The frame IS the failure signal (like Anthropic's own `event: error`): no
       // stream error behind it, so the gateway never appends a second generic frame.
       expect(r.error).toBeUndefined();
@@ -267,7 +268,7 @@ describe('Bedrock', () => {
     await new Promise((r) => setTimeout(r, 20)); // nobody is reading `out` yet (backpressure)
     expect(up.destroyed).toBe(true);
     const r = await collect(out); // the slow client finally drains
-    expect(r.text).toContain('"type":"modelStreamErrorException"');
+    expect(r.text).toContain('"type":"api_error"');
     expect(r.text).toContain('"message":"stream broke"');
     expect(r.error).toBeUndefined();
     expect(error).toBeUndefined();
