@@ -109,9 +109,12 @@ export function computeCost(
     };
   }
 
-  // Long-context tier (seed models only; a catalog override is already a flat rate):
-  // past the threshold the WHOLE request bills at the tier rates.
-  const eff = effectiveRate(rate as ModelRate, totalInputTokens);
+  // Long-context tier: past the threshold the WHOLE request bills at the tier rates. A
+  // catalog override is a flat rate only because the catalog carries no tier data, not
+  // because the provider bills flat — so the seed's tier for the same model still
+  // applies under an override (the documented production setup is MODELS_CATALOG_FILE).
+  const tier = (rate as ModelRate).tier ?? seed?.tier;
+  const eff = effectiveRate({ ...rate, tier }, totalInputTokens);
   const inputUsd = perMillion(u.inputTokens, eff.input);
   const cacheReadUsd = perMillion(u.cacheReadTokens, eff.input * cache.read);
   const cacheWriteUsd =

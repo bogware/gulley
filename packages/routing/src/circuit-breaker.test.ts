@@ -199,3 +199,37 @@ describe('CircuitBreaker (graded)', () => {
     });
   });
 });
+
+describe('CircuitBreaker.trip', () => {
+  it('opens the circuit outright with backoff, the peer broadcast and the onOpen hook', () => {
+    // The per-sample rules cannot express "a run of stalls": every stalled stream also
+    // records a first-byte success, which resets the consecutive counter and holds the
+    // EWMA under 0.5 — S,S,S,F forever never opens. trip() is the ejection-grade verdict.
+    const c = clock(1_000);
+    const sync = new FakeSync();
+    const opened: string[] = [];
+    const b = new CircuitBreaker({
+      now: c.now,
+      sync,
+      cooldownMs: 1_000,
+      onOpen: (k) => opened.push(k),
+    });
+    for (let i = 0; i < 50; i++) {
+      b.recordSuccess('t');
+      b.recordSuccess('t');
+      b.recordSuccess('t');
+      b.recordFailure('t');
+    }
+    expect(b.isOpen('t')).toBe(false); // the S,S,S,F pattern never trips on its own
+    b.trip('t');
+    expect(b.isOpen('t')).toBe(true);
+    expect(sync.map.get('t')).toBe(2_000); // broadcast with the base cooldown
+    expect(opened).toEqual(['t']);
+    // Honors a Retry-After floor and backs off on a repeat ejection like a threshold trip.
+    c.advance(1_001);
+    expect(b.isOpen('t')).toBe(false);
+    b.trip('t', 5_000);
+    expect(sync.map.get('t')).toBe(c.now() + 5_000);
+    expect(opened).toEqual(['t', 't']);
+  });
+});

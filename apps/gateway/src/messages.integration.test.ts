@@ -5760,7 +5760,11 @@ describe('hot-path hardening (refine cycle 2026-09)', () => {
     expect(await call()).toContain('stalled'); // stall 1 of a fresh run
     expect(await call()).toContain('stalled'); // stall 2
     expect(breaker.errorRate('anthropic-wd')).toBe(0); // the reset held
+    expect(breaker.isOpen('anthropic-wd')).toBe(false);
     expect(await call()).toContain('stalled'); // stall 3: a run of three on one target
+    // The run TRIPS the circuit (not just one more sample): every stalled stream also
+    // recorded a first-byte success, so the per-sample rules alone could never open it.
+    expect(breaker.isOpen('anthropic-wd')).toBe(true);
     expect(breaker.errorRate('anthropic-wd')).toBeGreaterThan(0);
     await app.close();
     await srv.close();

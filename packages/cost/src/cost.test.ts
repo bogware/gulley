@@ -276,3 +276,34 @@ describe('seed pricing (2026-10)', () => {
     expect(sol.outputUsd).toBeCloseTo(0.03, 6);
   });
 });
+
+describe('long-context tier under a catalog override', () => {
+  it('applies the seed tier when the catalog resolves a flat rate for the same model', () => {
+    // models.dev carries no tier data, so a catalog row is flat; the provider still bills
+    // the whole request at the tier rate past the threshold.
+    const resolve = (provider: string, model: string) =>
+      provider === 'anthropic' && model === 'claude-haiku-5-5'
+        ? { input: 0.1, output: 0.5 }
+        : undefined;
+    const usage = {
+      inputTokens: 150_000,
+      cacheReadTokens: 0,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      outputTokens: 1_000,
+      seen: true,
+    };
+    const c = computeCost('anthropic', 'claude-haiku-5-5', usage, resolve);
+    expect(c.priced).toBe(true);
+    expect(c.inputUsd).toBeCloseTo(0.075, 9); // 150K x $0.50/MTok, not $0.10
+    expect(c.outputUsd).toBeCloseTo(0.0025, 9); // 1K x $2.50/MTok, not $0.50
+    // Below the threshold the override's flat rate applies as-is.
+    const short = computeCost(
+      'anthropic',
+      'claude-haiku-5-5',
+      { ...usage, inputTokens: 50_000 },
+      resolve,
+    );
+    expect(short.inputUsd).toBeCloseTo(0.005, 9);
+  });
+});

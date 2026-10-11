@@ -3997,13 +3997,18 @@ async function handleProxy(
     // A watchdog fire is a liveness GUESS (a reasoning model can go quiet past the idle
     // budget on a provider that sends no keepalives), so one abort is not an observed
     // fault: only a run of consecutive watchdog aborts on the same target — with no clean
-    // stream end in between — opens the circuit. Every abort is still an `error` here.
+    // stream end in between — ejects it. Every abort is still an `error` here. The run
+    // TRIPS the breaker outright: each stalled stream already recorded a first-byte
+    // success (commitServed, to resolve a half-open probe), which resets the consecutive
+    // counter and keeps the EWMA under its threshold, so booking the run as one more
+    // ordinary failure could never open the circuit — a headers-then-hang provider was
+    // never ejected and every request paid the full idle budget before failing.
     if (abortReason === 'watchdog') {
       const runs = (watchdogRuns.get(servedTarget.name) ?? 0) + 1;
       const threshold = ctx.watchdogBreakerThreshold ?? DEFAULT_WATCHDOG_BREAKER_THRESHOLD;
       if (runs >= threshold) {
         watchdogRuns.delete(servedTarget.name);
-        ctx.breaker.recordFailure(servedTarget.name);
+        ctx.breaker.trip(servedTarget.name);
       } else {
         watchdogRuns.set(servedTarget.name, runs);
       }
