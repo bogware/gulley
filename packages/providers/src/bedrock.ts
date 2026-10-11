@@ -17,10 +17,13 @@ export interface BedrockAdapterOptions {
 
 /**
  * Claude-on-Bedrock adapter. The client sends a native Anthropic Messages body
- * (with `model`); this rewrites it for Bedrock's invoke-with-response-stream
- * (model → URL path, drop `model`/`stream`, add `anthropic_version`), then
- * decodes the eventstream response back into Anthropic SSE. Auth is a Bedrock
- * API key (bearer). SigV4 and the Converse API are later additions.
+ * (with `model`); this rewrites it for Bedrock (model → URL path, drop
+ * `model`/`stream`, add `anthropic_version`). A `stream: true` request goes to
+ * invoke-with-response-stream and the eventstream reply is decoded back into Anthropic
+ * SSE; any other request goes to `invoke`, whose JSON reply (the Anthropic message
+ * object) passes through as-is — so a non-streaming SDK call is answered with JSON
+ * instead of an SSE body it cannot parse. Auth is a Bedrock API key (bearer). SigV4
+ * and the Converse API are later additions.
  */
 export class BedrockAdapter implements ProviderAdapter {
   readonly name = 'bedrock';
@@ -42,6 +45,7 @@ export class BedrockAdapter implements ProviderAdapter {
       /* leave {} — model will be empty and Bedrock will 400, forwarded as-is */
     }
     const model = typeof parsed['model'] === 'string' ? parsed['model'] : '';
+    const streaming = parsed['stream'] === true;
 
     const rest: Record<string, unknown> = { ...parsed };
     delete rest['model'];
@@ -68,13 +72,15 @@ export class BedrockAdapter implements ProviderAdapter {
         }
       }
     }
-    const path = `/model/${encodeURIComponent(model)}/invoke-with-response-stream`;
+    const path = `/model/${encodeURIComponent(model)}/${
+      streaming ? 'invoke-with-response-stream' : 'invoke'
+    }`;
     const res = await request(`${this.baseUrl}${path}`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${req.credential.value}`,
         'content-type': 'application/json',
-        accept: 'application/vnd.amazon.eventstream',
+        accept: streaming ? 'application/vnd.amazon.eventstream' : 'application/json',
       },
       body: JSON.stringify(rest),
       signal: req.signal,
@@ -82,8 +88,9 @@ export class BedrockAdapter implements ProviderAdapter {
       headersTimeout: req.headersTimeoutMs ?? 60_000,
     });
 
-    // Error responses are plain JSON, not an eventstream — pass them through.
-    if (res.statusCode >= 400) {
+    // Error responses are plain JSON, not an eventstream — pass them through; so is a
+    // non-streaming `invoke` reply (the Anthropic message object, metered as JSON).
+    if (res.statusCode >= 400 || !streaming) {
       return {
         statusCode: res.statusCode,
         headers: res.headers,

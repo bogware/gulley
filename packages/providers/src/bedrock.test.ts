@@ -1,5 +1,8 @@
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
+import { BedrockAdapter } from './bedrock';
 import { bedrockToSse } from './bedrock-eventstream';
 import { AnthropicUsageExtractor } from './extractors';
 import { SSEParser } from './sse';
@@ -86,5 +89,59 @@ describe('bedrockToSse', () => {
     expect(u.inputTokens).toBe(15);
     expect(u.outputTokens).toBe(3); // from message_delta, not the 1 in message_start
     expect(u.model).toBe('claude-3-haiku');
+  });
+});
+
+describe('BedrockAdapter delivery modes', () => {
+  it('routes stream:false to /invoke (JSON passthrough) and stream:true to the eventstream path', async () => {
+    const seen: Array<{ path: string; accept: string | undefined; body: string }> = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        seen.push({ path: req.url ?? '', accept: req.headers['accept'], body: b });
+        if (req.url?.endsWith('/invoke')) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              id: 'msg_1',
+              type: 'message',
+              content: [{ type: 'text', text: 'hi' }],
+              usage: { input_tokens: 3, output_tokens: 1 },
+            }),
+          );
+        } else {
+          res.writeHead(200, { 'content-type': 'application/vnd.amazon.eventstream' });
+          res.end(chunkFrame({ type: 'message_stop' }));
+        }
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const baseUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    const adapter = new BedrockAdapter({ baseUrl });
+    const fwd = (stream: boolean) =>
+      adapter.forward({
+        path: '/v1/messages',
+        body: Buffer.from(
+          JSON.stringify({ model: 'claude-x', stream, max_tokens: 5, messages: [] }),
+        ),
+        headers: {},
+        credential: { scheme: 'bearer', value: 'k' },
+        signal: new AbortController().signal,
+      });
+
+    const json = await fwd(false);
+    expect(seen[0]?.path).toBe('/model/claude-x/invoke');
+    expect(seen[0]?.accept).toBe('application/json');
+    expect(JSON.parse(seen[0]?.body ?? '{}')).not.toHaveProperty('stream');
+    expect(json.headers['content-type']).toBe('application/json');
+    expect(JSON.parse(await collect(json.body))).toMatchObject({ type: 'message' });
+
+    const sse = await fwd(true);
+    expect(seen[1]?.path).toBe('/model/claude-x/invoke-with-response-stream');
+    expect(sse.headers['content-type']).toBe('text/event-stream');
+    expect(await collect(sse.body)).toContain('message_stop');
+
+    await new Promise<void>((r) => srv.close(() => r()));
   });
 });

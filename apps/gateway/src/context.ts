@@ -564,7 +564,9 @@ export function buildRoutes(config: Config): ProviderRoute[] {
           adapter: new BedrockAdapter({ region: config.BEDROCK_REGION }),
           credential: { scheme: 'bearer', value: config.BEDROCK_UPSTREAM_API_KEY },
           upstreamPath: '/v1/messages',
-          alwaysStream: true,
+          // Not alwaysStream any more: the adapter answers a `stream:false` request
+          // through `invoke` with the JSON message, so the client's delivery mode is
+          // honoured (and a non-streamed request is no longer excluded from groups).
           ...stamp(config.BEDROCK_REGION, config.BEDROCK_ZDR),
         },
       },
