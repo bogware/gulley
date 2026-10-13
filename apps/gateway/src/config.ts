@@ -267,11 +267,12 @@ const EnvShape = z.object({
   SECRETS_REGION: z.string().optional(),
   // Redis counters (budget reserve/commit). Absent = budgets disabled.
   REDIS_COUNTERS_URL: z.string().url().optional(),
-  // Soft-threshold budget alerts: fire a webhook + gulley_budget_alerts_total metric
-  // as a workspace's utilization crosses each level (once per level per period),
-  // before the hard 402. Absent webhook = metric only.
+  // Budget alerts: fire a webhook + gulley_budget_alerts_total metric as a budget
+  // scope's utilization crosses each level (once per level per window), and once more
+  // for the hard 402 itself (threshold 1, always reported). Absent webhook = metric
+  // only; ALERT_CHANNELS (Slack/Teams/PagerDuty/email/webhook) also receive them.
   BUDGET_ALERT_WEBHOOK_URL: z.string().url().optional(),
-  BUDGET_ALERT_THRESHOLDS: z.string().default('0.8,0.9'),
+  BUDGET_ALERT_THRESHOLDS: z.string().default('0.5,0.75,1'),
   // Budget-aware routing downshift: at/above this utilization (0..1, 0 = off) the
   // request model is rewritten to BUDGET_DOWNSHIFT_MODEL (a cheaper model the route
   // can still serve) so the workspace degrades gracefully instead of hitting the 402.
@@ -291,6 +292,20 @@ const EnvShape = z.object({
   // value is client-supplied, so every attr-cap counter must expire to keep the
   // (noeviction) counters store bounded. Enforced on the counter-less path too.
   BUDGET_ATTR_CAPS: z.string().optional(),
+  // Hierarchical hard budgets (K4): which scopes beyond the workspace a request must be
+  // admitted by, each resolved to its own `budget` row or the kind's default ('*'):
+  // org (workspace_id NULL rows), key (the credential), user (the bound or asserted end
+  // user), team (the principal's groups), project (the `project` attribution). Default:
+  // all of them; e.g. BUDGET_SCOPES=org,key to skip the user/team/project lookups.
+  BUDGET_SCOPES: z.string().optional(),
+  // Operator alert channels — the same JSON array as the control API (docs/ALERTING.md):
+  // budget rejections, guardrail blocks and breaker transitions are delivered to
+  // Slack / Teams / PagerDuty / email / signed webhooks. Unset = metrics + audit only.
+  ALERT_CHANNELS: z.string().optional(),
+  // Session kill switch (K5): how often the gateway refreshes its snapshot of blocked
+  // sessions (runaway detector + operator blocks) from Postgres. A block takes effect
+  // fleet-wide within this interval; the lookup itself is in-memory on the hot path.
+  SESSION_BLOCK_REFRESH_MS: z.coerce.number().int().min(1_000).default(10_000),
   // Behavior when the budget counter store (counters-Redis) is UNREACHABLE at admission.
   // true (default) = fail OPEN: serve the request without a reservation and record a
   // loud audit (`budget.store_unavailable`) — the durable Postgres ledger is the source

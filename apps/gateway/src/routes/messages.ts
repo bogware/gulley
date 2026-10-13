@@ -8,12 +8,16 @@ import {
   scopeAllowsProvider,
   scopeGroups,
 } from '@gulley/auth';
+import { type AlertSink, makeAlert } from '@gulley/alerts';
 import {
   type BudgetDecision,
+  type BudgetScopeKind,
   type BudgetStore,
   estimateInputTokens,
   estimateWorstCaseMicroUsd,
+  periodLabel,
 } from '@gulley/budget';
+import { type SessionBlockSnapshot } from '@gulley/storage';
 import {
   type CacheableRequest,
   type CacheEngine,
@@ -58,6 +62,12 @@ import {
 import { type CascadePolicy, matchCascade, shouldEscalate } from '../cascade';
 import type { CatalogEntry, ModelCatalog } from '@gulley/catalog';
 import { agentAttribution } from '../agent-attribution';
+import {
+  budgetExceededResponse,
+  DEFAULT_BUDGET_SCOPE_KINDS,
+  endUserIdFor,
+  hierarchyBudgetScopes,
+} from '../budget-scopes';
 import { conversationIdentity, maskVaultKey } from '../conversation';
 import { COUNT_TOKENS_PATHS, type CountTokensDeps, handleCountTokens } from './count-tokens';
 import { hasSignedThinking, type SignedThinkingSubstitution } from '../thinking';
@@ -222,8 +232,30 @@ export interface GatewayContext {
    *  orphan-sweep can't reap it mid-flight. Absent = no refresh (in-memory store, or a
    *  store without an expiry sweep). */
   budgetReserveRefreshMs?: number;
-  /** Soft-threshold budget alerter (metric + webhook); absent = no alerts. */
-  budgetAlerter?: { check(workspaceId: string, usedMicroUsd: number, capMicroUsd: number): void };
+  /** Budget alerter: soft thresholds per scope + the hard rejection; absent = no alerts. */
+  budgetAlerter?: {
+    check(
+      scope: string,
+      usedMicroUsd: number,
+      capMicroUsd: number,
+      window?: BudgetDecision['window'],
+    ): void;
+    exceeded?(
+      scope: string,
+      usedMicroUsd: number,
+      capMicroUsd: number,
+      window?: BudgetDecision['window'],
+    ): void;
+  };
+  /** Hierarchy scope kinds checked beyond the workspace (`BUDGET_SCOPES`): org, key,
+   *  user, team, project. Absent = all of them. Each resolves to its own budget row or
+   *  the kind's default; a scope without a cap is a no-op. */
+  budgetScopes?: ReadonlySet<BudgetScopeKind>;
+  /** Operator alert channels (`ALERT_CHANNELS`): budget rejections, guardrail blocks,
+   *  breaker transitions. Absent = no channels (metrics/audit only). */
+  alerts?: AlertSink;
+  /** Flush queued alert deliveries on the SIGTERM drain (bounded). */
+  drainAlerts?: () => Promise<void>;
   /** Budget-aware downshift: at/above `threshold` utilization, rewrite the request
    *  model to the cheaper `model` (must be servable by the route's candidates). */
   budgetDownshift?: { threshold: number; model: string };
@@ -388,6 +420,10 @@ export interface GatewayContext {
    *  token↔original map is envelope-encrypted and persisted in teardown so an
    *  authorized admin can de-tokenize a masked response later. */
   maskVault?: MaskVaultStore;
+  /** Session kill switch (K5): a periodically refreshed snapshot of `session_block`
+   *  (runaway detector + operator blocks). `isBlocked` is a synchronous Map lookup,
+   *  never I/O. Absent = no kill switch. */
+  sessionBlocks?: SessionBlockSnapshot;
   /** Envelope encryptor for the mask vault; REQUIRED whenever `maskVault` is set —
    *  the store never receives plaintext. */
   maskVaultEncryptor?: Encryptor;
@@ -952,7 +988,7 @@ async function handleProxy(
   // Cost-attribution tags from configured request headers (repo/branch/PR/session/
   // developer/…), captured once and threaded onto the ledger, request-log, and audit
   // so spend rolls up by any SDLC dimension for chargeback.
-  const attribution = buildAttribution(
+  let attribution = buildAttribution(
     request,
     ctx.attributionHeaders,
     ctx.agentHeaderAttribution ?? true,
@@ -1131,6 +1167,16 @@ async function handleProxy(
     principal = auth.value;
   }
 
+  // The end user this request is for (K7): a federated service principal may assert
+  // one per request (`x-user-id`, honoured only when its federation permits
+  // on-behalf-of); otherwise it is the user the credential is bound to, if any. It keys
+  // the `user` budget scope and lands on the ledger as the `user` attribution (an
+  // operator-mapped `user` header, when present, wins).
+  const endUserId = endUserIdFor(principal, request.headers);
+  if (endUserId && !attribution?.['user']) {
+    attribution = { ...(attribution ?? {}), user: endUserId };
+  }
+
   // --- conversation identity (K2): keys the mask vault so tokens are stable for the
   // lifetime of a conversation (explicit id header → prefix fingerprint → principal),
   // and pins a conversation to one provider under load balancing. Computed BEFORE any
@@ -1245,6 +1291,34 @@ async function handleProxy(
         }
       }
     }
+  }
+
+  // --- session kill switch (K5): a session blocked by the runaway detector or an
+  // operator is refused before any authz / guardrail / budget / upstream work. The
+  // `session` attribution is zero-config for Claude Code (`x-claude-code-session-id`)
+  // and operator-mapped otherwise. Snapshot read: synchronous, never I/O. ---
+  const blockedSession = attribution?.['session'];
+  if (
+    blockedSession !== undefined &&
+    ctx.sessionBlocks?.isBlocked(principal.scope.workspaceId, blockedSession)
+  ) {
+    await auditSafe({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'policy.session_blocked',
+      target: blockedSession,
+      payload: {
+        session: blockedSession,
+        workspaceId: principal.scope.workspaceId,
+        model: requestedModel,
+      },
+    });
+    recordDenied(403);
+    await reply.code(403).send({
+      type: 'error',
+      error: { type: 'session_blocked', message: 'this session is blocked by policy' },
+    });
+    return;
   }
 
   // --- authz: model + provider scope (candidates filtered to allowed providers) ---
@@ -1716,6 +1790,17 @@ async function handleProxy(
           categories: gr.summary.categories,
         },
       });
+      ctx.alerts?.emit(
+        makeAlert({
+          kind: 'guardrail.blocked',
+          direction: 'input',
+          surface: 'messages',
+          workspaceId: principal.scope.workspaceId,
+          principalId: principal.id,
+          categories: Object.keys(gr.summary.categories),
+          ...(gr.blockedReason ? { reason: gr.blockedReason } : {}),
+        }),
+      );
       safeRecord(ctx, request.log, {
         provider: provider0,
         requestModel: requestedModel,
@@ -1912,10 +1997,11 @@ async function handleProxy(
       )
     : 0;
   worstCase += cascadeReserveMicroUsd;
-  // Every budget scope reserved for THIS request (workspace + any per-model cap),
-  // so teardown commits the actual spend to each and a rejection rolls the rest back.
+  // Every budget scope reserved for THIS request (the hierarchy + any per-model /
+  // per-attribution cap), so teardown commits the actual spend to each and a rejection
+  // rolls the rest back.
   const reservedScopes: string[] = [];
-  let admittedUtilization = 0; // used/cap from the workspace reserve (drives downshift)
+  let admittedUtilization = 0; // max used/cap across the hierarchy (drives downshift)
 
   // Reject: release any scopes already reserved for this request, then 402.
   const rejectBudget = async (scope: string, decision: BudgetDecision): Promise<void> => {
@@ -1929,10 +2015,25 @@ async function handleProxy(
       }
     }
     reservedScopes.length = 0;
+    // The typed 402: names the binding entity + window, current spend / limit / what
+    // this request needed, and when a calendar window resets (`retry-after`).
+    const exceeded = budgetExceededResponse(scope, decision, worstCase);
+    const { scope: scopeInfo, window } = exceeded.body.error;
     request.log.info(
-      { scope, cap: decision.capMicroUsd, used: decision.usedMicroUsd },
+      { scope, cap: decision.capMicroUsd, used: decision.usedMicroUsd, window },
       'budget exceeded',
     );
+    ctx.metrics?.recordBudgetRejection(scopeInfo.kind);
+    try {
+      ctx.budgetAlerter?.exceeded?.(
+        scope,
+        decision.usedMicroUsd,
+        decision.capMicroUsd,
+        decision.window,
+      );
+    } catch {
+      /* never let an alert affect a request */
+    }
     await auditSafe({
       orgId: principal.scope.orgId,
       actor: principal.id,
@@ -1940,12 +2041,29 @@ async function handleProxy(
       target: provider0,
       payload: {
         scope,
+        scopeKind: scopeInfo.kind,
+        entity: scopeInfo.id,
         model: requestedModel,
         capMicroUsd: decision.capMicroUsd,
         usedMicroUsd: decision.usedMicroUsd,
         worstCaseMicroUsd: worstCase,
+        window,
       },
     });
+    ctx.alerts?.emit(
+      makeAlert({
+        kind: 'budget.exceeded',
+        scope,
+        scopeKind: scopeInfo.kind,
+        entity: scopeInfo.id,
+        window: decision.window ? periodLabel(decision.window.period) : 'lifetime',
+        usedMicroUsd: decision.usedMicroUsd,
+        capMicroUsd: decision.capMicroUsd,
+        ...(scopeInfo.workspace_id ? { workspaceId: scopeInfo.workspace_id } : {}),
+        orgId: principal.scope.orgId,
+        requestId,
+      }),
+    );
     safeRecord(ctx, request.log, {
       provider: provider0,
       requestModel: requestedModel,
@@ -1960,9 +2078,7 @@ async function handleProxy(
       startedAtMs: started,
       guardrailInputFindings: engine ? inputFindings : undefined,
     });
-    await reply
-      .code(402)
-      .send({ type: 'error', error: { type: 'budget_exceeded', message: 'budget exceeded' } });
+    await reply.code(402).headers(exceeded.headers).send(exceeded.body);
   };
 
   // Reserve against a scope, tolerating a counter-STORE outage per BUDGET_FAIL_OPEN.
@@ -2036,31 +2152,52 @@ async function handleProxy(
       });
   };
 
-  // Workspace budget: reserve worst-case at admission (hard cap, TOCTOU-safe).
+  // Hierarchical hard budgets (K4): every scope in the hierarchy that carries a cap
+  // must admit — workspace → org → key → user → team(s) → project (BUDGET_SCOPES) —
+  // then the per-model and per-attribution caps below. Each admitting scope holds a
+  // worst-case reservation (TOCTOU-safe); a rejection rolls every one back and names
+  // the binding entity + window in a typed 402. A scope with no cap is a no-op.
   if (worstCase > 0) {
-    const { decision, storeError } = await reserveSafe(principal.scope.workspaceId);
-    if (storeError && ctx.budgetFailOpen === false) {
-      await failBudgetStore();
-      return;
-    }
-    if (decision && !decision.allowed) {
-      await rejectBudget(principal.scope.workspaceId, decision);
-      return;
-    }
-    if (decision?.allowed) reservedScopes.push(principal.scope.workspaceId);
-    if (decision && decision.capMicroUsd > 0) {
-      admittedUtilization = decision.usedMicroUsd / decision.capMicroUsd;
-      ctx.metrics?.recordBudgetUtilization(admittedUtilization); // headroom trend (bucketed)
-      try {
-        ctx.budgetAlerter?.check(
-          principal.scope.workspaceId,
-          decision.usedMicroUsd,
-          decision.capMicroUsd,
+    let capped = false;
+    for (const scope of hierarchyBudgetScopes({
+      principal,
+      endUserId,
+      attribution,
+      kinds: ctx.budgetScopes ?? DEFAULT_BUDGET_SCOPE_KINDS,
+    })) {
+      const { decision, storeError } = await reserveSafe(scope);
+      if (storeError) {
+        if (ctx.budgetFailOpen === false) {
+          await failBudgetStore();
+          return;
+        }
+        break; // fail-open: one outage is one outage, not one per scope
+      }
+      if (decision && !decision.allowed) {
+        await rejectBudget(scope, decision);
+        return;
+      }
+      if (decision?.allowed) reservedScopes.push(scope);
+      if (decision && decision.capMicroUsd > 0) {
+        capped = true;
+        // The tightest scope drives the downshift (max utilization across the hierarchy).
+        admittedUtilization = Math.max(
+          admittedUtilization,
+          decision.usedMicroUsd / decision.capMicroUsd,
         );
-      } catch {
-        /* never let an alert affect a request */
+        try {
+          ctx.budgetAlerter?.check(
+            scope,
+            decision.usedMicroUsd,
+            decision.capMicroUsd,
+            decision.window,
+          );
+        } catch {
+          /* never let an alert affect a request */
+        }
       }
     }
+    if (capped) ctx.metrics?.recordBudgetUtilization(admittedUtilization); // headroom trend (bucketed)
   }
 
   // Budget-aware downshift: near the cap, switch to the cheaper configured model
@@ -3858,10 +3995,16 @@ async function handleProxy(
   };
   resetWatchdog();
 
+  // A synthesized Bedrock ping is gateway-made (bedrockToSse), not upstream liveness: it
+  // keeps the CLIENT's idle watchdog happy but must not keep OURS from catching a hung
+  // upstream. Only the Bedrock adapter synthesizes pings. On every other provider a
+  // byte-identical frame IS the upstream's own keepalive (an Anthropic-compatible proxy,
+  // a chained gateway) and resets the watchdog like any other byte — discarding it tore
+  // down healthy streams and, three in a row, tripped the breaker on a target that
+  // never faulted.
+  const synthesizesPings = servedTarget.provider === 'bedrock';
   upstreamBody.on('data', (chunk: Buffer) => {
-    // A synthesized Bedrock ping is gateway-made, not upstream liveness: it keeps the
-    // CLIENT's idle watchdog happy but must not keep OURS from catching a hung upstream.
-    if (!isSyntheticPingChunk(chunk)) resetWatchdog();
+    if (!(synthesizesPings && isSyntheticPingChunk(chunk))) resetWatchdog();
     if (reply.raw.destroyed) {
       // The client socket is gone: stop pulling (and paying for) bytes nobody reads.
       abortWith('client');
@@ -3973,8 +4116,13 @@ async function handleProxy(
   });
 
   upstreamBody.on('end', () => {
-    // A stream that ended cleanly proves the target alive: reset its watchdog run.
-    if (abortReason === undefined) watchdogRuns.delete(servedTarget.name);
+    // A stream that ended cleanly proves the target alive: reset its watchdog run and
+    // — for a target the watchdog had tripped — let the breaker close on THIS evidence
+    // (its first-byte success proved nothing: a hung provider answers headers too).
+    if (abortReason === undefined) {
+      watchdogRuns.delete(servedTarget.name);
+      ctx.breaker.recordRecovered(servedTarget.name);
+    }
     // The buffered-output branch consults the async output plugin, so the whole
     // handler runs in an async IIFE with teardown guaranteed in `finally`.
     void (async () => {

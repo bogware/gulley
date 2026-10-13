@@ -10,7 +10,8 @@ import {
   type ConfigVersionStore,
 } from '@gulley/config';
 import type { ConfigKeyMeta } from '@gulley/config';
-import { eq, sql } from 'drizzle-orm';
+import { eq, isNotNull, sql } from 'drizzle-orm';
+import { budgetConfigToColumns, budgetRowToConfig } from './budget-store';
 import type { Database } from './db';
 import {
   budget,
@@ -169,23 +170,8 @@ export class PostgresConfigBackend implements ConfigBackend {
 
   async listEntities(kind: ConfigCollectionKind, workspaceId: string): Promise<BackendEntity[]> {
     if (kind === 'budget') {
-      const rows = await this.db
-        .select({
-          id: budget.id,
-          name: budget.name,
-          cap: budget.capMicroUsd,
-          period: budget.periodSeconds,
-        })
-        .from(budget)
-        .where(eq(budget.workspaceId, workspaceId));
-      return rows.map((r) => ({
-        id: r.id,
-        name: r.name,
-        config:
-          r.period == null
-            ? { capMicroUsd: r.cap }
-            : { capMicroUsd: r.cap, periodSeconds: r.period },
-      }));
+      const rows = await this.db.select().from(budget).where(eq(budget.workspaceId, workspaceId));
+      return rows.map((r) => ({ id: r.id, name: r.name, config: budgetRowToConfig(r) }));
     }
     const t = jsonbTable(kind);
     const rows = await this.db
@@ -205,22 +191,22 @@ export class PostgresConfigBackend implements ConfigBackend {
     config: Record<string, unknown>,
   ): Promise<void> {
     if (kind === 'budget') {
-      // Budget is singular per workspace — upsert so a (structurally-valid but
-      // unusual) second budget in the doc overwrites rather than crashing the tx.
+      // One row per (workspace, scope kind, scope id) — upsert so a second entity for
+      // the same scope in the doc overwrites rather than crashing the tx.
+      const parsed = budgetConfigToColumns(config, workspaceId);
+      if (parsed.columns === undefined) throw new Error(`budget "${name}": ${parsed.problem}`);
+      const c = parsed.columns;
       await this.db
         .insert(budget)
-        .values({
-          workspaceId,
-          name,
-          capMicroUsd: Number(config['capMicroUsd'] ?? 0),
-          periodSeconds: config['periodSeconds'] == null ? null : Number(config['periodSeconds']),
-        })
+        .values({ workspaceId, name, ...c })
         .onConflictDoUpdate({
-          target: budget.workspaceId,
+          target: [budget.workspaceId, budget.scopeKind, budget.scopeId],
+          targetWhere: sql`${budget.workspaceId} is not null`,
           set: {
             name,
-            capMicroUsd: Number(config['capMicroUsd'] ?? 0),
-            periodSeconds: config['periodSeconds'] == null ? null : Number(config['periodSeconds']),
+            capMicroUsd: c.capMicroUsd,
+            periodSeconds: c.periodSeconds,
+            windows: c.windows,
           },
         });
       return;
@@ -233,11 +219,22 @@ export class PostgresConfigBackend implements ConfigBackend {
     config: Record<string, unknown>,
   ): Promise<void> {
     if (kind === 'budget') {
+      const current = await this.db
+        .select({ workspaceId: budget.workspaceId })
+        .from(budget)
+        .where(eq(budget.id, id))
+        .limit(1);
+      const parsed = budgetConfigToColumns(config, current[0]?.workspaceId ?? '');
+      if (parsed.columns === undefined) throw new Error(`budget ${id}: ${parsed.problem}`);
+      const c = parsed.columns;
       await this.db
         .update(budget)
         .set({
-          capMicroUsd: Number(config['capMicroUsd'] ?? 0),
-          periodSeconds: config['periodSeconds'] == null ? null : Number(config['periodSeconds']),
+          scopeKind: c.scopeKind,
+          scopeId: c.scopeId,
+          capMicroUsd: c.capMicroUsd,
+          periodSeconds: c.periodSeconds,
+          windows: c.windows,
         })
         .where(eq(budget.id, id));
       // Note: name is not updated here — reconcile only calls updateEntity when
@@ -308,23 +305,13 @@ export class PostgresConfigBackend implements ConfigBackend {
     kind: ConfigCollectionKind,
   ): Promise<Array<BackendEntity & { workspaceId: string }>> {
     if (kind === 'budget') {
-      const rows = await this.db
-        .select({
-          id: budget.id,
-          workspaceId: budget.workspaceId,
-          name: budget.name,
-          cap: budget.capMicroUsd,
-          period: budget.periodSeconds,
-        })
-        .from(budget);
+      // Org-scoped rows (workspace_id NULL) are not workspace entities.
+      const rows = await this.db.select().from(budget).where(isNotNull(budget.workspaceId));
       return rows.map((r) => ({
         id: r.id,
-        workspaceId: r.workspaceId,
+        workspaceId: r.workspaceId as string,
         name: r.name,
-        config:
-          r.period == null
-            ? { capMicroUsd: r.cap }
-            : { capMicroUsd: r.cap, periodSeconds: r.period },
+        config: budgetRowToConfig(r),
       }));
     }
     const t = jsonbTable(kind);
@@ -348,7 +335,8 @@ export class PostgresConfigBackend implements ConfigBackend {
   ): Promise<string> {
     await this.createEntity(kind, workspaceId, name, config);
     const rows = await this.listEntities(kind, workspaceId);
-    const row = kind === 'budget' ? rows[0] : rows.find((r) => r.name === name);
+    const row =
+      rows.find((r) => r.name === name) ?? (kind === 'budget' ? rows[rows.length - 1] : undefined);
     return row?.id ?? '';
   }
 
@@ -362,9 +350,18 @@ export class PostgresConfigBackend implements ConfigBackend {
       const set: Record<string, unknown> = {};
       if (patch.name !== undefined) set['name'] = patch.name;
       if (patch.config) {
-        set['capMicroUsd'] = Number(patch.config['capMicroUsd'] ?? 0);
-        set['periodSeconds'] =
-          patch.config['periodSeconds'] == null ? null : Number(patch.config['periodSeconds']);
+        const current = await this.db
+          .select({ workspaceId: budget.workspaceId })
+          .from(budget)
+          .where(eq(budget.id, id))
+          .limit(1);
+        const parsed = budgetConfigToColumns(patch.config, current[0]?.workspaceId ?? '');
+        if (parsed.columns === undefined) throw new Error(`budget ${id}: ${parsed.problem}`);
+        set['scopeKind'] = parsed.columns.scopeKind;
+        set['scopeId'] = parsed.columns.scopeId;
+        set['capMicroUsd'] = parsed.columns.capMicroUsd;
+        set['periodSeconds'] = parsed.columns.periodSeconds;
+        set['windows'] = parsed.columns.windows;
       }
       if (Object.keys(set).length === 0) return true;
       const rows = await this.db

@@ -25,6 +25,11 @@ describe('resolveJwtPrincipal groups', () => {
     expect(p).not.toBeNull();
     expect(p?.scope.groups).toEqual(['eng', 'beta']);
     expect(p?.id).toBe('u1');
+    // An IdP JWT is its end user: the subject propagates as userId; it is never a
+    // service principal and may not assert another user.
+    expect(p?.userId).toBe('u1');
+    expect(p?.serviceAccount).toBeUndefined();
+    expect(p?.onBehalfOf).toBeUndefined();
   });
 
   it('parses a space/comma-delimited groups claim string', async () => {

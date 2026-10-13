@@ -1,5 +1,7 @@
 import { generateVirtualKey, type InMemoryKeyStore, type StoredKey } from '@gulley/auth';
 import type { SecretRef } from '@gulley/core';
+import { BUILTIN_ROLES, type RoleDefinition } from '@gulley/rbac';
+import { BuiltinRoleError, type RoleRow, type RoleWrite } from '@gulley/storage';
 import { randomUUID } from 'node:crypto';
 import type {
   KeyAdmin,
@@ -157,6 +159,72 @@ export class MembershipStore {
   }
 }
 
+/** In-memory role catalogue (tests, no-DB dev): the built-ins seeded from code
+ *  (immutable, like the Postgres store) plus custom roles. */
+export class InMemoryRoleStore {
+  private readonly byId = new Map<string, RoleRow>();
+  constructor(seed: readonly RoleDefinition[] = BUILTIN_ROLES) {
+    for (const d of seed) {
+      this.byId.set(d.id, {
+        id: d.id,
+        name: d.name,
+        description: d.description ?? null,
+        permissions: [...d.permissions],
+        builtin: true,
+        orgId: null,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      });
+    }
+  }
+  async list(): Promise<RoleRow[]> {
+    return [...this.byId.values()].map((r) => ({ ...r, permissions: [...r.permissions] }));
+  }
+  async get(id: string): Promise<RoleRow | undefined> {
+    const r = this.byId.get(id);
+    return r ? { ...r, permissions: [...r.permissions] } : undefined;
+  }
+  async create(id: string, input: RoleWrite): Promise<RoleRow> {
+    if (this.byId.has(id)) {
+      const err = new Error(`role "${id}" already exists`) as Error & { code?: string };
+      err.code = '23505';
+      throw err;
+    }
+    const row: RoleRow = {
+      id,
+      name: input.name,
+      description: input.description ?? null,
+      permissions: [...input.permissions],
+      builtin: false,
+      orgId: null,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    this.byId.set(id, row);
+    return { ...row, permissions: [...row.permissions] };
+  }
+  async update(id: string, patch: Partial<RoleWrite>): Promise<RoleRow | undefined> {
+    const r = this.byId.get(id);
+    if (!r) return undefined;
+    if (r.builtin) throw new BuiltinRoleError(id);
+    const next: RoleRow = {
+      ...r,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.description !== undefined ? { description: patch.description } : {}),
+      ...(patch.permissions !== undefined ? { permissions: [...patch.permissions] } : {}),
+      updatedAt: nowIso(),
+    };
+    this.byId.set(id, next);
+    return { ...next, permissions: [...next.permissions] };
+  }
+  async delete(id: string): Promise<boolean> {
+    const r = this.byId.get(id);
+    if (!r) return false;
+    if (r.builtin) throw new BuiltinRoleError(id);
+    return this.byId.delete(id);
+  }
+}
+
 export class ProviderStore {
   private readonly byId = new Map<string, Provider>();
   create(p: Omit<Provider, 'id'>): Provider {
@@ -299,6 +367,13 @@ export class KeyAdminStore implements KeyAdmin {
     this.keyStore.disableByPrefix(v.keyPrefix);
     v.disabled = true;
     return v;
+  }
+
+  async listExpiring(before: Date): Promise<KeyView[]> {
+    const cutoff = before.getTime();
+    return [...this.views.values()]
+      .filter((v) => !v.disabled && v.expiresAt !== null && Date.parse(v.expiresAt) <= cutoff)
+      .sort((a, b) => Date.parse(a.expiresAt as string) - Date.parse(b.expiresAt as string));
   }
 
   async rotate(id: string): Promise<MintedKey | undefined> {

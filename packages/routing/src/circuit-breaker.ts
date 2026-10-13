@@ -45,6 +45,11 @@ interface CircuitState {
    *  so a cooldown expiry does not stampede the whole fleet onto a just-recovered
    *  upstream. Cleared on the next record{Success,Failure}. */
   probeUntil: number;
+  /** The current ejection came from {@link CircuitBreaker.trip} (a run of stalls): a
+   *  first-byte success is NOT recovery for that failure class — a provider that accepts
+   *  every request and then hangs passes it on every probe — so the half-open verdict
+   *  waits for {@link CircuitBreaker.recordRecovered} (a clean stream end). */
+  tripped: boolean;
 }
 
 /**
@@ -144,7 +149,8 @@ export class CircuitBreaker {
    * hard fail" — never block your last upstream). The token self-heals after
    * `probeTimeoutMs` so a probe that is granted-but-never-dispatched (ordered behind a
    * healthier primary) or that hangs cannot wedge the target half-open forever, and it
-   * is cleared as soon as the probe resolves via record{Success,Failure}.
+   * is cleared as soon as the probe resolves via record{Success,Failure} — or, for a
+   * target ejected by {@link trip}, via {@link recordRecovered} at the probe's clean end.
    *
    * The probe token is per-replica: with cross-replica sharing this admits up to one
    * probe PER REPLICA at recovery (not one fleet-wide), which still collapses each
@@ -180,6 +186,7 @@ export class CircuitBreaker {
         ejections: 0,
         openUntil: 0,
         probeUntil: 0,
+        tripped: false,
       };
       this.state.set(key, s);
     }
@@ -191,14 +198,37 @@ export class CircuitBreaker {
     s.consecutiveFailures = 0;
     s.ewmaError = s.ewmaError * (1 - this.alpha);
     s.samples += 1;
+    if (s.tripped && s.openUntil <= this.now() && s.ejections > 0) {
+      // A tripped target's probe is only "resolved" by a clean stream END
+      // (recordRecovered) or another trip: headers prove nothing about a provider that
+      // answers and then hangs. Keep the probe token held so the fleet does not pile
+      // onto the target behind the probe; it still self-heals after probeTimeoutMs.
+      return;
+    }
     s.probeUntil = 0; // probe resolved → release the half-open token
     // Recovered on a half-open probe → clear the backoff so the next fault
     // starts from the base cooldown again.
-    if (s.openUntil <= this.now() && s.ejections > 0) {
-      s.ejections = 0;
-      s.openUntil = 0;
-      this.notify(this.onClose, key);
-    }
+    if (s.openUntil <= this.now() && s.ejections > 0) this.close(key, s);
+  }
+
+  /**
+   * A stream from `key` ended cleanly (every byte delivered, no watchdog, no fault) —
+   * the recovery evidence a {@link trip}-ejected target needs. Closes the circuit when
+   * the target is half-open; a no-op otherwise (never seen, never ejected, or still in
+   * its cooldown). Called from the pipeline's stream-end path; cheap.
+   */
+  recordRecovered(key: string): void {
+    const s = this.state.get(key);
+    if (!s || s.ejections === 0 || s.openUntil > this.now()) return;
+    this.close(key, s);
+  }
+
+  private close(key: string, s: CircuitState): void {
+    s.ejections = 0;
+    s.openUntil = 0;
+    s.probeUntil = 0;
+    s.tripped = false;
+    this.notify(this.onClose, key);
   }
 
   /** Record a failure. `retryAfterMs` (parsed from an upstream Retry-After / rate
@@ -209,6 +239,9 @@ export class CircuitBreaker {
     s.ewmaError = s.ewmaError * (1 - this.alpha) + this.alpha;
     s.samples += 1;
     s.probeUntil = 0; // probe resolved (faulted) → release the token; a re-trip re-opens below
+    // A faulting probe on a tripped target is not the stall class any more: the
+    // per-sample rules own it from here (an ordinary success may then close it).
+    if (s.tripped && s.openUntil <= this.now()) s.tripped = false;
 
     const tripConsecutive = s.consecutiveFailures >= this.threshold;
     const tripRate = s.samples >= this.minSamples && s.ewmaError >= this.errorRateThreshold;
@@ -232,6 +265,7 @@ export class CircuitBreaker {
     s.ewmaError = s.ewmaError * (1 - this.alpha) + this.alpha;
     s.samples += 1;
     s.probeUntil = 0;
+    s.tripped = true;
     this.open(key, s, retryAfterMs);
   }
 

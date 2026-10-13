@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@gulley/auth": "workspace:*",
+    "@gulley/budget": "workspace:*",
     "@gulley/cache": "workspace:*",
     "@gulley/config": "workspace:*",
     "@gulley/core": "workspace:*",

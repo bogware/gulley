@@ -1,5 +1,5 @@
-import { resolveAdmin, signAdminSession, verifyAdminSession } from '@gulley/auth';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { resolveAdmin, verifyAdminSession } from '@gulley/auth';
+import { randomBytes } from 'node:crypto';
 import { sessionToken } from './admin';
 import type { ControlContext } from './context';
 import {
@@ -9,13 +9,13 @@ import {
   extractGroups,
   FLOW_COOKIE,
   hasGroupOverage,
-  mapMemberships,
   parseCookies,
   serializeCookie,
   SESSION_COOKIE,
   signFlow,
   verifyFlow,
 } from './oidc-gate';
+import { completeSsoLogin, mapMemberships, safeReturnTo } from './sso';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 function oidcError(reply: FastifyReply, code: number, message: string): FastifyReply {
@@ -25,24 +25,23 @@ function oidcError(reply: FastifyReply, code: number, message: string): FastifyR
 /**
  * Browser OIDC session gate: /auth/login → the IdP (auth-code + PKCE); /auth/callback
  * verifies the id_token and mints an admin-session cookie; /auth/me reports the
- * current identity; /auth/logout clears it. Enabled only when ctx.oidc is set.
+ * current identity; /auth/logout clears it. The login/callback pair answers 404 unless
+ * ctx.oidc is set; /auth/config, /auth/me and /auth/logout are shared with the SAML
+ * gate (saml-routes.ts) and always mounted.
  */
 export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): void {
   const now = (): number => ctx.resolverDeps.now ?? Date.now();
 
+  // Which browser SSO gates are on. `enabled`/`loginUrl` keep the pre-SAML shape (any
+  // SSO; the OIDC login URL when both are on) so an older console still shows one button.
   app.get('/auth/config', async (_req, reply) =>
-    reply.send({ enabled: Boolean(ctx.oidc), loginUrl: '/auth/login' }),
+    reply.send({
+      enabled: Boolean(ctx.oidc || ctx.saml),
+      loginUrl: ctx.oidc ? '/auth/login' : '/auth/saml/login',
+      oidc: { enabled: Boolean(ctx.oidc), loginUrl: '/auth/login' },
+      saml: { enabled: Boolean(ctx.saml), loginUrl: '/auth/saml/login' },
+    }),
   );
-
-  /** A post-login destination is honoured only as a same-origin path (`/x?y`), never
-   *  an absolute or scheme-relative URL — the console passes its current page so a deep
-   *  link (e.g. the device-consent page with its code) survives the SSO round trip. */
-  const safeReturnTo = (raw: unknown, fallback: string): string => {
-    if (typeof raw !== 'string' || raw.length === 0 || raw.length > 2_048) return fallback;
-    if (!raw.startsWith('/') || raw.startsWith('//') || raw.startsWith('/\\')) return fallback;
-    if (/[\r\n]/.test(raw)) return fallback;
-    return raw;
-  };
 
   app.get('/auth/login', async (_req: FastifyRequest, reply: FastifyReply) => {
     const oidc = ctx.oidc;
@@ -141,9 +140,6 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
       );
     }
 
-    const ttlSec = Math.floor(ctx.resolverDeps.maxSessionTtlMs / 1000);
-    const iat = Math.floor(now() / 1000);
-    const jti = randomUUID();
     // The admin subject is the configured claim (default `sub`); an IdP whose SCIM
     // userName is the UPN/email sets OIDC_SUBJECT_CLAIM so SSO + SCIM + RBAC grants +
     // session revocation all key on ONE identity. Fail closed on a missing claim.
@@ -155,55 +151,20 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
       request.log.warn({ claim: subjectClaim }, 'OIDC login: subject claim missing from id_token');
       return oidcError(reply, 401, 'id_token has no usable subject claim');
     }
-    const token = signAdminSession(secret, {
-      sub: subject,
-      name: claims.name ?? claims.preferred_username ?? claims.email ?? subject,
-      jti,
-      memberships,
-      iat,
-      exp: iat + ttlSec,
-      typ: 'admin-session',
-      ver: 1,
-      src: 'oidc',
-    });
-    await ctx.sessions.record?.({
-      jti,
+    return completeSsoLogin(ctx, reply, {
       subject,
+      name: claims.name ?? claims.preferred_username ?? claims.email ?? subject,
+      email: claims.email ?? null,
+      memberships,
       source: 'oidc',
-      createdAt: new Date(iat * 1000).toISOString(),
-      expiresAt: new Date((iat + ttlSec) * 1000).toISOString(),
+      cookieSecure: oidc.cookieSecure,
+      returnTo: flow.returnTo,
+      fallbackRedirect: oidc.postLoginRedirect,
+      auditAction: 'admin.session.oidc',
+      auditPayload: { groups: groups.length, overage },
+      clearCookies: [FLOW_COOKIE],
+      log: request.log,
     });
-
-    // Persist the SSO principal into the durable admin-user directory so it is one
-    // identity across SSO, RBAC, SCIM, and the console — and so a SCIM/admin grant
-    // (unioned in by membershipLoader) applies, and a SCIM/Graph deprovision can
-    // deactivate it. Best-effort: a directory hiccup must not block login.
-    if (ctx.adminUsers) {
-      try {
-        await ctx.adminUsers.upsertBySubject(
-          subject,
-          claims.name ?? claims.preferred_username ?? claims.email ?? subject,
-          claims.email ?? null,
-        );
-      } catch (e) {
-        request.log.warn({ err: (e as Error).message }, 'OIDC login: admin-user upsert failed');
-      }
-    }
-
-    await ctx.audit.append({
-      orgId: null,
-      actor: subject,
-      action: 'admin.session.oidc',
-      target: subject,
-      payload: { jti, memberships: memberships.length, groups: groups.length, overage },
-    });
-
-    reply.header('set-cookie', [
-      serializeCookie(SESSION_COOKIE, token, { secure: oidc.cookieSecure, maxAge: ttlSec }),
-      clearCookie(FLOW_COOKIE, { secure: oidc.cookieSecure }),
-    ]);
-    // Re-validated on the way out too (the cookie is signed, but defence in depth).
-    return reply.redirect(safeReturnTo(flow.returnTo, oidc.postLoginRedirect));
   });
 
   app.get('/auth/me', async (request: FastifyRequest, reply: FastifyReply) => {
@@ -241,7 +202,12 @@ export function registerOidcRoutes(app: FastifyInstance, ctx: ControlContext): v
         });
       }
     }
-    reply.header('set-cookie', clearCookie(SESSION_COOKIE, { secure: ctx.oidc?.cookieSecure }));
+    reply.header(
+      'set-cookie',
+      clearCookie(SESSION_COOKIE, {
+        secure: ctx.oidc?.cookieSecure ?? ctx.saml?.cookieSecure ?? false,
+      }),
+    );
     return reply.code(204).send();
   });
 }

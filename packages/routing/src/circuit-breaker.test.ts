@@ -233,3 +233,78 @@ describe('CircuitBreaker.trip', () => {
     expect(opened).toEqual(['t', 't']);
   });
 });
+
+describe('CircuitBreaker.trip — recovery waits for a clean stream end', () => {
+  it("a tripped target's probe is not recovered at its first byte; recordRecovered closes it", () => {
+    const c = clock(1_000);
+    const sync = new FakeSync();
+    const events: string[] = [];
+    const b = new CircuitBreaker({
+      now: c.now,
+      sync,
+      cooldownMs: 1_000,
+      probeTimeoutMs: 3_000,
+      onOpen: (k) => events.push(`open:${k}`),
+      onHalfOpen: (k) => events.push(`half:${k}`),
+      onClose: (k) => events.push(`close:${k}`),
+    });
+    b.trip('t');
+    c.advance(1_001); // cooldown over → half-open
+    expect(b.isOpen('t')).toBe(false);
+    expect(b.tryProbe('t')).toBe(true); // the one probe
+    b.recordSuccess('t'); // the probe's HEADERS arrived — a hung provider passes this too
+    expect(events).toEqual(['open:t', 'half:t']); // NOT closed
+    expect(b.tryProbe('t')).toBe(false); // the probe token is still held: no stampede
+    b.recordRecovered('t'); // the probe stream ended cleanly
+    expect(events).toEqual(['open:t', 'half:t', 'close:t']);
+    expect(b.tryProbe('t')).toBe(true);
+    b.recordRecovered('t'); // idempotent / no-op when healthy
+    expect(events).toHaveLength(3);
+  });
+
+  it('a probe that hangs again escalates the backoff instead of flapping open/closed', () => {
+    const c = clock(1_000);
+    const sync = new FakeSync();
+    const closes: string[] = [];
+    const b = new CircuitBreaker({
+      now: c.now,
+      sync,
+      cooldownMs: 1_000,
+      onClose: (k) => closes.push(k),
+    });
+    b.trip('t');
+    expect(sync.map.get('t')).toBe(2_000); // base cooldown
+    c.advance(1_001);
+    expect(b.tryProbe('t')).toBe(true);
+    b.recordSuccess('t'); // headers, then the probe stalls…
+    b.trip('t'); // …and the watchdog trips again
+    expect(closes).toEqual([]); // never declared recovered in between
+    expect(sync.map.get('t')).toBe(c.now() + 2_000); // 2× backoff: ejections were kept
+    c.advance(2_001);
+    expect(b.tryProbe('t')).toBe(true);
+    b.recordSuccess('t');
+    b.recordRecovered('t'); // this time the stream completes
+    expect(closes).toEqual(['t']);
+    b.trip('t');
+    expect(sync.map.get('t')).toBe(c.now() + 1_000); // backoff reset by the real recovery
+  });
+
+  it('an ordinary (threshold) ejection still recovers at the first-byte success', () => {
+    const c = clock(1_000);
+    const closes: string[] = [];
+    const b = new CircuitBreaker({
+      now: c.now,
+      sync: new FakeSync(),
+      cooldownMs: 1_000,
+      failureThreshold: 2,
+      onClose: (k) => closes.push(k),
+    });
+    b.recordFailure('t');
+    b.recordFailure('t');
+    expect(b.isOpen('t')).toBe(true);
+    c.advance(1_001);
+    expect(b.tryProbe('t')).toBe(true);
+    b.recordSuccess('t');
+    expect(closes).toEqual(['t']); // unchanged semantics for upstream-fault ejections
+  });
+});

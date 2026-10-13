@@ -1,43 +1,19 @@
 import { pkceChallengeS256 } from '@gulley/oauth';
 import type { OidcMetadata } from '@gulley/oidc';
-import { isRole, type Membership, type Role } from '@gulley/rbac';
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { mapMemberships, parseRoleMap, type SsoRoleRule } from './sso';
 
-export const SESSION_COOKIE = 'gulley_admin_session';
 export const FLOW_COOKIE = 'gulley_oidc_flow';
 
-// --- cookies (no dependency; manual parse/serialize) ---
-
-export function parseCookies(header: string | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!header) return out;
-  for (const part of header.split(';')) {
-    const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return out;
-}
-
-export interface CookieOptions {
-  maxAge?: number;
-  secure?: boolean;
-  httpOnly?: boolean;
-  path?: string;
-  sameSite?: 'Lax' | 'Strict' | 'None';
-}
-
-export function serializeCookie(name: string, value: string, opts: CookieOptions = {}): string {
-  const parts = [`${name}=${encodeURIComponent(value)}`, `Path=${opts.path ?? '/'}`];
-  if (opts.httpOnly !== false) parts.push('HttpOnly');
-  parts.push(`SameSite=${opts.sameSite ?? 'Lax'}`);
-  if (opts.secure) parts.push('Secure');
-  if (opts.maxAge !== undefined) parts.push(`Max-Age=${opts.maxAge}`);
-  return parts.join('; ');
-}
-
-export function clearCookie(name: string, opts: CookieOptions = {}): string {
-  return serializeCookie(name, '', { ...opts, maxAge: 0 });
-}
+// Cookie helpers live in cookies.ts (shared with the SAML gate); re-exported here so
+// existing imports keep working.
+export {
+  clearCookie,
+  type CookieOptions,
+  parseCookies,
+  serializeCookie,
+  SESSION_COOKIE,
+} from './cookies';
 
 // --- the login flow state, carried in a signed cookie (stateless across replicas) ---
 
@@ -49,26 +25,33 @@ export interface FlowState {
   exp: number;
 }
 
-export function signFlow(secret: string, flow: FlowState): string {
+/** Sign any flow record that carries an `exp` (ms since epoch): the OIDC
+ *  {@link FlowState} and the SAML flow share this HMAC envelope. */
+export function signFlow<T extends { exp: number }>(secret: string, flow: T): string {
   const body = Buffer.from(JSON.stringify(flow), 'utf8').toString('base64url');
   const sig = createHmac('sha256', secret).update(body).digest('base64url');
   return `${body}.${sig}`;
 }
 
-export function verifyFlow(secret: string, token: string, nowMs: number): FlowState | null {
+export function verifyFlow<T extends { exp: number } = FlowState>(
+  secret: string,
+  token: string,
+  nowMs: number,
+): T | null {
   const dot = token.indexOf('.');
   if (dot <= 0) return null;
   const body = token.slice(0, dot);
   const sig = Buffer.from(token.slice(dot + 1), 'base64url');
   const expected = createHmac('sha256', secret).update(body).digest();
   if (expected.length !== sig.length || !timingSafeEqual(expected, sig)) return null;
-  let flow: FlowState;
+  let flow: T;
   try {
-    flow = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as FlowState;
+    flow = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as T;
   } catch {
     return null;
   }
-  if (typeof flow.exp !== 'number' || nowMs >= flow.exp) return null;
+  if (!flow || typeof flow !== 'object' || typeof flow.exp !== 'number' || nowMs >= flow.exp)
+    return null;
   return flow;
 }
 
@@ -132,31 +115,11 @@ export async function exchangeCode(
   return (await res.json()) as { id_token?: string; access_token?: string };
 }
 
-// --- group → role mapping ---
+// --- group → role mapping (shared with the SAML gate; see sso.ts) ---
 
-export interface OidcRoleRule {
-  group: string;
-  role: Role;
-  /** Org to grant the role in; "*" expands to every existing org. */
-  orgId: string;
-}
-
-export function parseRoleMap(json: string): OidcRoleRule[] {
-  let arr: unknown;
-  try {
-    arr = JSON.parse(json);
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(arr)) return [];
-  return arr.filter(
-    (r): r is OidcRoleRule =>
-      !!r &&
-      typeof (r as OidcRoleRule).group === 'string' &&
-      isRole((r as OidcRoleRule).role) &&
-      typeof (r as OidcRoleRule).orgId === 'string',
-  );
-}
+/** @deprecated Use {@link SsoRoleRule} — kept as an alias for existing imports. */
+export type OidcRoleRule = SsoRoleRule;
+export { mapMemberships, parseRoleMap };
 
 /**
  * Collect the identity values used for role mapping, UNION-ing three sources so an
@@ -195,26 +158,4 @@ export function hasGroupOverage(claims: Record<string, unknown>): boolean {
     !Array.isArray(cn) &&
     'groups' in (cn as Record<string, unknown>)
   );
-}
-
-export function mapMemberships(
-  groups: string[],
-  rules: OidcRoleRule[],
-  allOrgIds: string[],
-): Membership[] {
-  const out: Membership[] = [];
-  const seen = new Set<string>();
-  const add = (role: Role, orgId: string): void => {
-    const k = `${role}:${orgId}`;
-    if (!seen.has(k)) {
-      seen.add(k);
-      out.push({ role, orgId, workspaceId: null });
-    }
-  };
-  for (const rule of rules) {
-    if (!groups.includes(rule.group)) continue;
-    if (rule.orgId === '*') for (const o of allOrgIds) add(rule.role, o);
-    else add(rule.role, rule.orgId);
-  }
-  return out;
 }

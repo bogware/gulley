@@ -39,8 +39,8 @@ control, and audit over every request.
 - **Multi-provider, one surface** — Anthropic (API + Enterprise), OpenAI, AWS Bedrock, Azure AI Foundry, any OpenAI-compatible backend (Groq, Mistral, Together, …), and local runtimes (Ollama, vLLM, LM Studio); a Google Gemini/Vertex native adapter ships but is not yet configurable. Native full-fidelity passthrough _and_ a cross-provider layer for routing, load-balancing, failover, and same-model arbitrage.
 - **Governance, all open** — RBAC, virtual keys, budgets with hard caps, PII/secret masking, guardrails, and a tamper-evident (hash-chained + S3 Object Lock WORM, KMS-signed, externally anchored) audit trail. Every governance feature is in the Apache-2.0 core — not paywalled behind an "enterprise" edition.
 - **Coding-agent aware** — governs and _attributes_ the traffic Claude Code and Codex actually generate; in-stream (not buffered) source-code / secret DLP; the prompt cache the big cacheable prefixes depend on is metered, so you can see the dollars it saves.
-- **Enterprise identity** — Microsoft **Entra (Azure AD) SSO** for the console, JWT auth for the data plane, App-Role / group → RBAC, SCIM provisioning, and Graph-backed revoke-on-deprovision. See [`docs/ENTRA_SETUP.md`](docs/ENTRA_SETUP.md).
-- **Observability without lock-in** — emits OpenTelemetry (GenAI semantic conventions) to _your_ backend; enforces cost/rate limits locally; a Prometheus endpoint and a batteries-included admin console.
+- **Enterprise identity** — console SSO over **OIDC (Microsoft Entra) or SAML 2.0**, JWT auth for the data plane, App-Role / group → RBAC with **custom roles**, SCIM provisioning, Graph-backed revoke-on-deprovision, and **workload identity** (a Kubernetes service account or GitHub Actions job exchanges its platform token for a scoped, short-lived gateway token — RFC 7523). See [`docs/ENTRA_SETUP.md`](docs/ENTRA_SETUP.md), [`docs/SAML_SETUP.md`](docs/SAML_SETUP.md) and [`docs/WORKLOAD_IDENTITY.md`](docs/WORKLOAD_IDENTITY.md).
+- **Observability without lock-in** — emits OpenTelemetry (GenAI semantic conventions) to _your_ backend; enforces cost/rate limits locally; a Prometheus endpoint and a batteries-included admin console. Operational alerts (budgets, key expiry, breakers, guardrail blocks, config applies, break-glass) go to Slack, Teams, PagerDuty, email or a signed webhook — see [`docs/ALERTING.md`](docs/ALERTING.md).
 - **Runs where you run** — one distroless container for AWS ECS Fargate (a single adaptable [Terraform module](infra/terraform)), Kubernetes ([Helm](deploy/helm), with an [EKS Terraform module](infra/eks)), or a [docker-compose](deploy/docker-compose.prod.yml) self-host.
 
 ## The console
@@ -56,7 +56,7 @@ as GitOps.
   </tr>
   <tr>
     <td width="50%"><img src="docs/images/console-analytics.jpg" alt="Analytics"><br><sub><b>Analytics</b> — cost / tokens / requests by provider, model, or workspace.</sub></td>
-    <td width="50%" valign="top"><br><b>Also in the console:</b> FinOps chargeback &amp; shadow-spend, guardrails, budgets &amp; rate limits, virtual keys &amp; onboarding, OAuth/Entra identity, providers, prompts, eval rollouts, and a live config editor.</td>
+    <td width="50%" valign="top"><br><b>Also in the console:</b> FinOps chargeback, per-agent cost tree, FOCUS 1.2 export &amp; runaway-session kill switch, shadow-spend, guardrails, budgets &amp; rate limits, virtual keys &amp; onboarding, OAuth/Entra identity, providers, prompts, eval rollouts, and a live config editor.</td>
   </tr>
 </table>
 
@@ -136,7 +136,7 @@ gateway or the control-api) and **`ghcr.io/bogware/gulley-web`** (the console) �
 - **Kubernetes** — [`deploy/helm/gulley`](deploy/helm/gulley); see [`deploy/README.md`](deploy/README.md).
 - **Single host** — [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml)
   (`up` migrates the database first, then starts both planes).
-- **Identity** — wire Microsoft Entra SSO + SCIM: [`docs/ENTRA_SETUP.md`](docs/ENTRA_SETUP.md).
+- **Identity** — wire Microsoft Entra SSO + SCIM: [`docs/ENTRA_SETUP.md`](docs/ENTRA_SETUP.md); SAML 2.0 SSO: [`docs/SAML_SETUP.md`](docs/SAML_SETUP.md).
 - **Air-gapped** — a no-egress posture: [`docs/AIR_GAPPED.md`](docs/AIR_GAPPED.md).
 
 ## Common tasks

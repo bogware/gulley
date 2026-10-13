@@ -121,6 +121,7 @@ export const controlApiOpenApi: OpenApiDocument = {
   tags: [
     { name: 'system', description: 'health/readiness' },
     { name: 'tenancy', description: 'orgs, workspaces, memberships' },
+    { name: 'roles', description: 'the role catalogue: built-in + custom roles' },
     { name: 'providers', description: 'upstream providers + secret-ref credentials' },
     { name: 'keys', description: 'virtual key lifecycle' },
     { name: 'config', description: 'workspace-scoped config collections' },
@@ -167,9 +168,48 @@ export const controlApiOpenApi: OpenApiDocument = {
       }),
     },
     '/memberships': {
-      post: op('create_membership', 'Grant a membership', ['tenancy'], {
+      get: op('list_memberships', 'List role grants visible to the caller', ['tenancy']),
+      post: op('create_membership', 'Grant a membership (built-in or custom role)', ['tenancy'], {
         body: true,
-        responses: { '201': 'created', '403': 'no amplification' },
+        responses: {
+          '201': 'created',
+          '403': 'no amplification: the role’s permissions exceed the caller’s at that scope',
+          '422': 'unknown role or invalid scope',
+        },
+      }),
+    },
+    '/memberships/{id}': {
+      delete: op('delete_membership', 'Revoke a durable role grant', ['tenancy'], {
+        params: idParam,
+        responses: { '200': 'deleted', '404': 'not found', '501': 'needs a database' },
+      }),
+    },
+    '/roles': {
+      get: op('list_roles', 'List roles and the permission catalogue', ['roles']),
+      post: op('create_role', 'Create a custom role', ['roles'], {
+        body: true,
+        responses: {
+          '201': 'created',
+          '403': 'a role may not grant permissions the caller does not hold',
+          '409': 'id is built-in or already exists',
+          '422': 'invalid id, name or permission name',
+        },
+      }),
+    },
+    '/roles/{id}': {
+      put: op('update_role', 'Update a custom role', ['roles'], {
+        params: idParam,
+        body: true,
+        responses: {
+          '200': 'updated',
+          '404': 'not found',
+          '409': 'built-in roles are immutable',
+          '422': 'validation error',
+        },
+      }),
+      delete: op('delete_role', 'Delete a custom role', ['roles'], {
+        params: idParam,
+        responses: { '200': 'deleted', '404': 'not found', '409': 'built-in roles are immutable' },
       }),
     },
     '/providers': {

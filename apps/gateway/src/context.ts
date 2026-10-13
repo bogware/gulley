@@ -16,6 +16,7 @@ import {
   type BudgetStore,
   InMemoryBudgetStore,
   RedisBudgetStore,
+  type BudgetScopeKind,
 } from '@gulley/budget';
 import {
   CacheEngine,
@@ -51,7 +52,15 @@ import { PRICING_AS_OF, type RateResolver } from '@gulley/cost';
 import { type BasicAuthConfig, type BasicUserScope, parseHtpasswd } from '@gulley/auth';
 import { OidcProvider } from '@gulley/oidc';
 import { readFileSync } from 'node:fs';
+import {
+  AlertDispatcher,
+  type AlertSink,
+  makeAlert,
+  noopAlertSink,
+  parseAlertChannels,
+} from '@gulley/alerts';
 import { BudgetAlerter } from './budget-alerts';
+import { parseBudgetScopeKinds } from './budget-scopes';
 import { type JwtAuthConfig, parseGroupScopeMap } from './jwt-auth';
 import { applyRouteGroups, parseRouteGroups } from './route-groups';
 import { buildSecretResolver } from './secrets';
@@ -117,6 +126,8 @@ import {
   RedisVectorIndex,
   type BatchSweepResult,
   schemaStatusProbe,
+  loadActiveSessionBlocks,
+  SessionBlockSnapshot,
 } from '@gulley/storage';
 import { resolveBrokerAccessToken } from '@gulley/oauth';
 import {
@@ -987,6 +998,16 @@ export function createProductionContext(
     );
   }
 
+  // Session kill switch (K5): a snapshot of `session_block` refreshed every
+  // SESSION_BLOCK_REFRESH_MS. The first load is awaited in main.ts before listen (a
+  // replica never serves with an empty snapshot it could have filled); a failed refresh
+  // keeps the last one. Stopped with the maintenance timers on drain.
+  const sessionBlocks = new SessionBlockSnapshot(
+    () => loadActiveSessionBlocks(db),
+    config.SESSION_BLOCK_REFRESH_MS,
+  );
+  maintenanceStops.push(() => sessionBlocks.stop());
+
   // Request-log retention: bounded batched DELETE of request_log rows past the retention
   // horizon, off the hot path on an unref'd timer (0 days = keep forever). spend_ledger
   // (the durable budget/chargeback source of truth) is deliberately NOT swept.
@@ -1106,7 +1127,7 @@ export function createProductionContext(
     maintenance('budget_heal', async () => {
       let healed = 0;
       for (const d of await loadBudgetHealData(db)) {
-        const r = await budgets.healCommitted?.(d.workspaceId, d.ledgerMicroUsd, d.periodSeconds);
+        const r = await budgets.healCommitted?.(d.scope, d.ledgerMicroUsd, d.period);
         if (r?.healed) healed += 1;
       }
       return healed;
@@ -1143,33 +1164,47 @@ export function createProductionContext(
       }
     : otel;
 
-  // Soft-threshold budget alerts (metric + optional webhook), fired fire-and-forget
-  // off the hot path so a slow/failing alert never affects a request.
+  // Budget alerts (metric + optional webhook), fired fire-and-forget off the hot path
+  // so a slow/failing alert never affects a request: soft thresholds per scope as
+  // utilization climbs, and the hard rejection itself (threshold 1) once per window.
   const alertThresholds = config.BUDGET_ALERT_THRESHOLDS.split(',')
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isFinite(n) && n > 0 && n <= 1);
   const alertUrl = config.BUDGET_ALERT_WEBHOOK_URL;
-  const budgetAlerter =
-    alertThresholds.length > 0
-      ? new BudgetAlerter(alertThresholds, (e) => {
-          metrics?.recordBudgetAlert(e.threshold);
-          if (alertUrl) {
-            const ctrl = new AbortController();
-            const t = setTimeout(() => ctrl.abort(), 3000);
-            t.unref?.();
-            void fetch(alertUrl, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ type: 'budget.threshold', ...e }),
-              signal: ctrl.signal,
-              redirect: 'error',
-              ...({ dispatcher: pinnedEgressAgent() } as object),
-            })
-              .catch(() => {})
-              .finally(() => clearTimeout(t));
-          }
+  // Operator alert channels (Slack / Teams / PagerDuty / email / signed webhooks), shared
+  // with the control API. A malformed ALERT_CHANNELS fails boot with a readable error;
+  // delivery is queued, retried and bounded off the hot path (see packages/alerts).
+  const alerts: AlertSink = buildAlertSink(config, log);
+  const budgetAlerter = new BudgetAlerter(alertThresholds, {
+    sink: alerts,
+    onEvent: (e) => {
+      metrics?.recordBudgetAlert(e.threshold);
+      if (alertUrl) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 3000);
+        t.unref?.();
+        void fetch(alertUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ type: e.exceeded ? 'budget.exceeded' : 'budget.threshold', ...e }),
+          signal: ctrl.signal,
+          redirect: 'error',
+          ...({ dispatcher: pinnedEgressAgent() } as object),
         })
-      : undefined;
+          .catch(() => {})
+          .finally(() => clearTimeout(t));
+      }
+    },
+  });
+  // Which hierarchy scopes (beyond the workspace) a request must be admitted by.
+  const budgetScopeKinds = parseBudgetScopeKinds(config.BUDGET_SCOPES);
+  if (budgetScopeKinds.unknown.length > 0) {
+    log.warn(
+      { unknown: budgetScopeKinds.unknown },
+      'BUDGET_SCOPES: ignoring unknown scope kinds (valid: org, key, user, team, project)',
+    );
+  }
+  const budgetScopes: ReadonlySet<BudgetScopeKind> = budgetScopeKinds.kinds;
 
   // Rate limiting shares the counters Redis with budgets (global, cross-replica);
   // without it, limits fall back to per-replica in-memory counters.
@@ -1264,13 +1299,19 @@ export function createProductionContext(
       probeTimeoutMs: config.BREAKER_HALF_OPEN_PROBE_TIMEOUT_MS,
       // Surface every breaker transition (open / half_open / closed) as a metric — the
       // key resiliency events. Previously only CLOSED → OPEN was emitted.
-      ...(metrics
-        ? {
-            onOpen: (target: string) => metrics.recordBreakerState(target, 'open'),
-            onHalfOpen: (target: string) => metrics.recordBreakerState(target, 'half_open'),
-            onClose: (target: string) => metrics.recordBreakerState(target, 'closed'),
-          }
-        : {}),
+      onOpen: (target: string) => {
+        metrics?.recordBreakerState(target, 'open');
+        alerts.emit(
+          makeAlert({ kind: 'breaker.open', target, provider: providerOfTarget(target) }),
+        );
+      },
+      onHalfOpen: (target: string) => metrics?.recordBreakerState(target, 'half_open'),
+      onClose: (target: string) => {
+        metrics?.recordBreakerState(target, 'closed');
+        alerts.emit(
+          makeAlert({ kind: 'breaker.closed', target, provider: providerOfTarget(target) }),
+        );
+      },
     }),
     breakerSync,
     limiter: config.ADAPTIVE_CONCURRENCY_ENABLED
@@ -1295,6 +1336,11 @@ export function createProductionContext(
     budgetFailOpen: config.BUDGET_FAIL_OPEN,
     budgetReserveRefreshMs,
     budgetAlerter,
+    budgetScopes,
+    alerts,
+    sessionBlocks,
+    drainAlerts: () =>
+      alerts instanceof AlertDispatcher ? alerts.drain(2_000) : Promise.resolve(),
     budgetDownshift:
       config.BUDGET_DOWNSHIFT_MODEL && config.BUDGET_DOWNSHIFT_THRESHOLD > 0
         ? { threshold: config.BUDGET_DOWNSHIFT_THRESHOLD, model: config.BUDGET_DOWNSHIFT_MODEL }
@@ -1498,4 +1544,26 @@ export function loadPricingCatalog(
   }
   if (overrides.length > 0) catalog.setOverrides(overrides);
   return catalog;
+}
+
+/** The provider kind of a breaker target (`anthropic`, `bedrock:us-east-1`, …). */
+function providerOfTarget(target: string): string {
+  return target.split(':')[0] ?? target;
+}
+
+/** `ALERT_CHANNELS` → a dispatcher (or the no-op sink when unset). Egress rules match
+ *  the control API: https outside development, nothing at all under AIR_GAPPED. */
+function buildAlertSink(config: Config, log: BootLogger): AlertSink {
+  if (!config.ALERT_CHANNELS) return noopAlertSink;
+  const channels = parseAlertChannels(config.ALERT_CHANNELS);
+  if (channels.length === 0) return noopAlertSink;
+  const dispatcher = new AlertDispatcher({
+    channels,
+    egress: { requireHttps: config.NODE_ENV !== 'development', airGapped: config.AIR_GAPPED },
+    fetchImpl: pinnedFetch(),
+    source: 'gulley-gateway',
+    log,
+  });
+  log.info({ channels: dispatcher.describe() }, 'alert channels configured');
+  return dispatcher;
 }

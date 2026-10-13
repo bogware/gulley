@@ -1,7 +1,13 @@
 import { GULLEY_VERSION } from '@gulley/core';
 import { randomUUID } from 'node:crypto';
-import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
+import Fastify, {
+  type FastifyBaseLogger,
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+} from 'fastify';
 import type { Config } from './config';
+import { registerAlertRoutes } from './alert-routes';
 import { registerConfigRoutes } from './config-routes';
 import { AuditUnavailableError, type ControlContext } from './context';
 import { registerCryptoShredRoutes } from './crypto-shred-routes';
@@ -12,9 +18,12 @@ import { registerParityRoutes } from './parity-routes';
 import { registerOAuthAdminRoutes } from './oauth-admin-routes';
 import { registerOAuthRoutes } from './oauth-routes';
 import { registerHttpEdge } from './http-edge';
+import { registerFinopsRoutes } from './finops-routes';
 import { registerLogRoutes } from './log-routes';
 import { registerMaskVaultRoutes } from './mask-vault-routes';
 import { registerOidcRoutes } from './oidc-routes';
+import { registerRoleRoutes } from './role-routes';
+import { registerSamlRoutes } from './saml-routes';
 import { registerScimRoutes } from './scim';
 import { registerAdminRoutes } from './routes';
 
@@ -38,6 +47,8 @@ function makeAuthThrottle(maxPerWindow: number, windowMs: number) {
 
 // The unauthenticated OAuth/OIDC protocol surface — the highest-value brute-force target.
 const AUTH_SURFACE = /^\/(oauth|auth)\//;
+const TOKEN_ENDPOINT = '/oauth/token';
+const JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
 
 /** Header paths pino must never emit (credentials). Shared with main.ts's logger. */
 export const LOG_REDACT_PATHS = [
@@ -142,17 +153,45 @@ export function buildServer(
 
   // Brute-force / flood guard on the unauthenticated OAuth/OIDC endpoints (token
   // exchange, device authorization, OIDC callback). Registered before the routes so it
-  // sheds excess volume with a 429 + Retry-After before any handler runs.
-  if (config.CONTROL_API_AUTH_RATE_LIMIT_PER_MIN > 0) {
-    const throttle = makeAuthThrottle(config.CONTROL_API_AUTH_RATE_LIMIT_PER_MIN, 60_000);
+  // sheds excess volume with a 429 + Retry-After before any handler runs. POST
+  // /oauth/token is the one path judged AFTER body parsing (preHandler): the RFC 7523
+  // JWT-bearer grant (workload identity — a NAT'd cluster or CI fleet shares one IP)
+  // draws on its own, larger budget so it never starves human logins, and vice versa.
+  const authLimit = config.CONTROL_API_AUTH_RATE_LIMIT_PER_MIN;
+  const exchangeLimit = config.CONTROL_API_TOKEN_EXCHANGE_RATE_LIMIT_PER_MIN;
+  if (authLimit > 0 || exchangeLimit > 0) {
+    const authThrottle = authLimit > 0 ? makeAuthThrottle(authLimit, 60_000) : undefined;
+    const exchangeThrottle =
+      exchangeLimit > 0 ? makeAuthThrottle(exchangeLimit, 60_000) : undefined;
+    const shed = (reply: FastifyReply): void => {
+      void reply
+        .code(429)
+        .header('retry-after', '60')
+        .send({ error: 'rate_limited', error_description: 'too many requests' });
+    };
+    const isTokenPost = (req: FastifyRequest): boolean =>
+      req.method === 'POST' && (req.url.split('?')[0] ?? req.url) === TOKEN_ENDPOINT;
     app.addHook('onRequest', (req, reply, done) => {
       const path = req.url.split('?')[0] ?? req.url;
-      if (AUTH_SURFACE.test(path) && !throttle(req.ip, Date.now())) {
-        void reply
-          .code(429)
-          .header('retry-after', '60')
-          .send({ error: 'rate_limited', error_description: 'too many requests' });
+      if (
+        authThrottle &&
+        AUTH_SURFACE.test(path) &&
+        !isTokenPost(req) &&
+        !authThrottle(req.ip, Date.now())
+      ) {
+        shed(reply);
         return; // do not call done() — the request is shed
+      }
+      done();
+    });
+    app.addHook('preHandler', (req, reply, done) => {
+      if (isTokenPost(req)) {
+        const grantType = (req.body as Record<string, unknown> | null | undefined)?.['grant_type'];
+        const throttle = grantType === JWT_BEARER ? exchangeThrottle : authThrottle;
+        if (throttle && !throttle(req.ip, Date.now())) {
+          shed(reply);
+          return;
+        }
       }
       done();
     });
@@ -186,15 +225,20 @@ export function buildServer(
     registerAdminRoutes(app, ctx);
     registerConfigRoutes(app, ctx);
     registerLogRoutes(app, ctx);
+    registerFinopsRoutes(app, ctx);
     registerMaskVaultRoutes(app, ctx);
     registerCryptoShredRoutes(app, ctx);
     registerEvalRolloutRoutes(app, ctx);
     registerObservabilityRoutes(app, ctx);
+    registerAlertRoutes(app, ctx);
     registerParityRoutes(app, ctx);
     registerOAuthAdminRoutes(app, ctx);
     // Mount the broker's own /oauth/* protocol surface only when it is enabled.
     if (ctx.oauthBroker) registerOAuthRoutes(app, ctx.oauthBroker, ctx);
     registerOidcRoutes(app, ctx);
+    // Mounted only when ctx.saml is set (the SAML gate beside the OIDC one).
+    registerSamlRoutes(app, ctx);
+    registerRoleRoutes(app, ctx);
     registerScimRoutes(app, ctx);
     registerDebugRoutes(app, ctx, config);
   }

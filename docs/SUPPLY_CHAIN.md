@@ -58,13 +58,13 @@ section, with the API image's SBOM attached best-effort — or by a manual
 stray manual run can never move it):
 
 ```bash
-docker pull ghcr.io/bogware/gulley:v0.6.0     # or :latest
+docker pull ghcr.io/bogware/gulley:v0.7.0     # or :latest
 ```
 
 Verify the signature and inspect the attestations by digest before running it:
 
 ```bash
-IMAGE=ghcr.io/bogware/gulley:v0.6.0
+IMAGE=ghcr.io/bogware/gulley:v0.7.0
 DIGEST="ghcr.io/bogware/gulley@$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')"
 
 # 1) Signature: assert it was signed by THIS repo's release workflow via GitHub OIDC.
@@ -135,3 +135,11 @@ Never deploy an unsigned image to production.
 Dependency bumps are **manual and grouped** (`workflow_dispatch` only — no
 scheduled Dependabot/renovate), by policy. Each bump is a normal reviewed PR that
 passes the full gate, keeping the SBOM's provenance auditable.
+
+**Production dependencies added deliberately** (each a reviewed decision, recorded here
+so the SBOM delta has a reason):
+
+- `nodemailer` (`^10`, zero transitive dependencies, ships its own types) — the SMTP
+  transport behind the `email` alert channel in `@gulley/alerts` (`docs/ALERTING.md`). It
+  is bundled as an external of both app entries and lands in each app's `pnpm deploy`
+  production tree like any other third-party package.

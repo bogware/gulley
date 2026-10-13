@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useAdmin } from '../lib/admin-context';
 import { controlApiUrl, GulleyAdminApi } from '../lib/api';
+import type { AuthConfig } from '../lib/types';
 import { Button, Card, ErrorNote, Input } from './ui';
 
 /** The page to return to after SSO: a same-origin path only (never an absolute URL). */
@@ -14,7 +15,7 @@ export function returnToPath(): string {
 
 export function TokenGate() {
   const { setToken, refreshAuth, authNotice } = useAdmin();
-  const [oidc, setOidc] = useState<{ enabled: boolean } | null>(null);
+  const [sso, setSso] = useState<AuthConfig | null>(null);
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | undefined>(undefined);
   const [busy, setBusy] = useState(false);
@@ -22,9 +23,13 @@ export function TokenGate() {
   useEffect(() => {
     new GulleyAdminApi(controlApiUrl())
       .authConfig()
-      .then((c) => setOidc(c))
-      .catch(() => setOidc({ enabled: false }));
+      .then((c) => setSso(c))
+      .catch(() => setSso({ enabled: false, loginUrl: '/auth/login' }));
   }, []);
+
+  // `oidc`/`saml` are absent from an older control-api; fall back to the legacy flag.
+  const oidcOn = sso?.oidc ? sso.oidc.enabled : Boolean(sso?.enabled);
+  const samlOn = Boolean(sso?.saml?.enabled);
 
   async function connect(): Promise<void> {
     const t = value.trim();
@@ -56,25 +61,44 @@ export function TokenGate() {
 
       {authNotice ? <ErrorNote error={authNotice} /> : null}
 
-      {oidc?.enabled ? (
-        <Card className="p-3.5">
-          <Button
-            variant="primary"
-            className="w-full justify-center"
-            onClick={() => {
-              // Deep links (e.g. /oauth/device?user_code=…) survive the SSO round trip.
-              window.location.href = `${controlApiUrl()}/auth/login?return_to=${encodeURIComponent(returnToPath())}`;
-            }}
-          >
-            Sign in with SSO
-          </Button>
-          <p className="mt-2 text-center text-[10.5px] text-micro">OpenID Connect single sign-on</p>
+      {oidcOn || samlOn ? (
+        <Card className="space-y-2 p-3.5">
+          {oidcOn ? (
+            <Button
+              variant="primary"
+              className="w-full justify-center"
+              onClick={() => {
+                // Deep links (e.g. /oauth/device?user_code=…) survive the SSO round trip.
+                window.location.href = `${controlApiUrl()}${sso?.oidc?.loginUrl ?? '/auth/login'}?return_to=${encodeURIComponent(returnToPath())}`;
+              }}
+            >
+              {samlOn ? 'Sign in with SSO (OpenID Connect)' : 'Sign in with SSO'}
+            </Button>
+          ) : null}
+          {samlOn ? (
+            <Button
+              variant={oidcOn ? 'secondary' : 'primary'}
+              className="w-full justify-center"
+              onClick={() => {
+                window.location.href = `${controlApiUrl()}${sso?.saml?.loginUrl ?? '/auth/saml/login'}?return_to=${encodeURIComponent(returnToPath())}`;
+              }}
+            >
+              {oidcOn ? 'Sign in with SSO (SAML)' : 'Sign in with SSO'}
+            </Button>
+          ) : null}
+          <p className="mt-2 text-center text-[10.5px] text-micro">
+            {oidcOn && samlOn
+              ? 'OpenID Connect or SAML 2.0 single sign-on'
+              : samlOn
+                ? 'SAML 2.0 single sign-on'
+                : 'OpenID Connect single sign-on'}
+          </p>
         </Card>
       ) : null}
 
       <Card className="space-y-3 p-3.5">
         <div className="text-[12px] font-medium text-ink">
-          {oidc?.enabled ? 'Or use an admin token' : 'Admin token'}
+          {oidcOn || samlOn ? 'Or use an admin token' : 'Admin token'}
         </div>
         <Input
           type="password"

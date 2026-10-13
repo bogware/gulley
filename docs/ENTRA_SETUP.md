@@ -122,6 +122,30 @@ live admin session for that subject (and its email) in the same transaction.
 
 ## Roles
 
-Gulley RBAC roles: `owner`, `admin`, `editor`, `billing`, `viewer` (deny-by-default;
-see `packages/rbac`). Map the least privilege each App Role/group needs; a mapping
-whose role is not one of these is rejected.
+Gulley RBAC is deny-by-default (`packages/rbac`). A role is a **permission set**
+referenced by id:
+
+- **Built-in roles** — `viewer` ⊂ `billing` ⊂ `editor` ⊂ `admin` ⊂ `owner` (immutable).
+  `editor` and above may mint, disable and rotate keys (`key:create`, `key:disable`,
+  `key:rotate` are distinct permissions); `admin` and above manage memberships and
+  custom roles; `owner` alone grants `owner`, applies config and reveals masked values.
+- **Custom roles** — created on the console's **Identity → Roles** tab (or
+  `POST /roles` with `{ id, name, description?, permissions[] }`): any subset of the
+  permission catalogue `GET /roles` returns, e.g. a `key-operator` that holds
+  `key:read` + `key:disable` + `key:rotate` and nothing else. Creating or editing a role
+  needs `role:create` / `role:update` at the platform scope (a `"*"` grant), and a role
+  may only carry permissions its author holds.
+
+Anywhere a role is named — `OIDC_ROLE_MAP`, `SAML_ROLE_MAP`, `SCIM_GROUP_ROLE_MAP`,
+`POST /memberships`, delegated sessions — the value is a role id: a built-in name or a
+custom role id. Granting a role is allowed only when its permissions are a **subset** of
+the granter's own at that scope (no amplification); an id that does not resolve grants
+nothing (never an error), so a deleted custom role leaves its grants inert. Map the
+least privilege each App Role/group needs.
+
+## SAML instead of OIDC
+
+Tenants that federate the console through SAML 2.0 (Entra's Enterprise-application SAML
+SSO, Okta, ADFS…) configure the SAML gate beside — or instead of — the OIDC one; the
+role map has the same format and the resulting session is identical. See
+[SAML_SETUP.md](SAML_SETUP.md).

@@ -4,7 +4,12 @@ import { PGlite } from '@electric-sql/pglite';
 import { drizzle } from 'drizzle-orm/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Database } from './db';
-import { purgeExpiredOAuthCodes, purgeRequestLogsOlderThan, retentionCutoff } from './retention';
+import {
+  purgeExpiredGrants,
+  purgeExpiredOAuthCodes,
+  purgeRequestLogsOlderThan,
+  retentionCutoff,
+} from './retention';
 import * as schema from './schema';
 
 let client: PGlite;
@@ -143,6 +148,40 @@ describe('retention sweeps (real SQL via pglite)', () => {
 
     expect((await db.select().from(schema.deviceCode)).length).toBe(1); // dc_live survives
     expect((await db.select().from(schema.authCode)).length).toBe(1); // ac_live survives
+  });
+
+  it('purges grants past BOTH their absolute and access expiry, keeping live families', async () => {
+    const now = new Date('2026-06-01T00:00:00Z');
+    const past = new Date(now.getTime() - 60_000);
+    const future = new Date(now.getTime() + 60 * 60_000);
+    const row = (handle: string, absolute: Date, access: Date | null, status = 'active') => ({
+      handle,
+      clientId: 'workload',
+      principalId: 'svc:f:s',
+      displayName: 's',
+      orgId: UUID,
+      workspaceId: UUID,
+      status,
+      accessTokenHash: 'a',
+      accessTokenExpiresAt: access,
+      refreshTokenHash: null,
+      prevRefreshTokenHash: null,
+      refreshGeneration: 0,
+      absoluteExpiresAt: absolute,
+      kind: 'service',
+    });
+    await db.insert(schema.oauthGrant).values([
+      row('g_dead', past, past), // expired service grant
+      row('g_dead_revoked', past, past, 'revoked'),
+      row('g_dead_noaccess', past, null),
+      row('g_live', future, future),
+      // Absolute passed but a refresh minted an access token that outlives it: keep.
+      row('g_straddle', past, future),
+    ]);
+    expect(await purgeExpiredGrants(db, now)).toBe(3);
+    const left = (await db.select().from(schema.oauthGrant)).map((r) => r.handle).sort();
+    expect(left).toEqual(['g_live', 'g_straddle']);
+    expect(await purgeExpiredGrants(db, now)).toBe(0);
   });
 
   it('retentionCutoff subtracts the day window from now', () => {

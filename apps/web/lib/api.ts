@@ -2,8 +2,11 @@ import type {
   AdminSessionInfo,
   AdminStatus,
   AdminUser,
+  AgentTreeQuery,
+  AgentTreeResponse,
   Attestation,
   AuditEvent,
+  AuthConfig,
   ChargebackQuery,
   ChargebackRow,
   CollectionEntity,
@@ -17,6 +20,7 @@ import type {
   OAuthMetadata,
   DriftReport,
   EvalSuite,
+  FocusExportQuery,
   GatewayMetricsSummary,
   LogFilter,
   LogPage,
@@ -29,8 +33,10 @@ import type {
   Provider,
   RequestLog,
   ReuseAlert,
+  RoleDefinition,
   Rollout,
   MintKeyOptions,
+  SessionBlock,
   ShadowSpendReport,
   UsageBucket,
   UsageQuery,
@@ -204,9 +210,9 @@ export class GulleyAdminApi {
     return this.req('GET', '/health');
   }
 
-  // --- auth (OIDC session gate) ---
-  authConfig(): Promise<{ enabled: boolean; loginUrl: string }> {
-    return this.req<{ enabled: boolean; loginUrl: string }>('GET', '/auth/config');
+  // --- auth (OIDC / SAML session gates) ---
+  authConfig(): Promise<AuthConfig> {
+    return this.req<AuthConfig>('GET', '/auth/config');
   }
   me(): Promise<{ subject: string; name: string; memberships: unknown[] }> {
     return this.req<{ subject: string; name: string; memberships: unknown[] }>('GET', '/auth/me');
@@ -474,6 +480,38 @@ export class GulleyAdminApi {
   shadowSpend(query: { workspaceId?: string; from?: string; to?: string } = {}) {
     return this.req<ShadowSpendReport>('GET', `/admin/analytics/shadow-spend${this.qs(query)}`);
   }
+  agentTree(query: AgentTreeQuery = {}) {
+    return this.req<AgentTreeResponse>('GET', `/admin/analytics/agent-tree${this.qs(query)}`);
+  }
+  /** One streamed page of the FOCUS 1.2 CSV export (the server pages at 50k rows);
+   *  `nextCursor` continues it. The body is text, not JSON. */
+  async focusCsv(query: FocusExportQuery = {}): Promise<{ csv: string; nextCursor?: string }> {
+    const res = await this.raw(
+      'GET',
+      `/admin/analytics/focus${this.qs({ ...query, format: 'csv' })}`,
+    );
+    const next = res.headers.get('x-next-cursor');
+    return { csv: await res.text(), ...(next ? { nextCursor: next } : {}) };
+  }
+  blockedSessions(query: { workspaceId?: string } = {}) {
+    return this.req<{ blocks: SessionBlock[] }>('GET', `/admin/sessions/blocked${this.qs(query)}`);
+  }
+  blockSession(
+    session: string,
+    body: { workspaceId: string; reason: string; ttlSeconds?: number },
+  ) {
+    return this.req<{ block: SessionBlock }>(
+      'POST',
+      `/admin/sessions/${encodeURIComponent(session)}/block`,
+      body,
+    );
+  }
+  unblockSession(session: string, workspaceId: string) {
+    return this.req<{ unblocked: boolean }>(
+      'DELETE',
+      `/admin/sessions/${encodeURIComponent(session)}/block${this.qs({ workspaceId })}`,
+    );
+  }
 
   // --- eval rollouts ---
   evalSuites() {
@@ -540,6 +578,22 @@ export class GulleyAdminApi {
   }
   deleteMembership(id: string) {
     return this.req<{ deleted: boolean }>('DELETE', `/memberships/${encodeURIComponent(id)}`);
+  }
+  /** The role catalogue (built-ins + custom) and the permission names a role may hold. */
+  roles() {
+    return this.req<{ roles: RoleDefinition[]; permissions: string[] }>('GET', '/roles');
+  }
+  createRole(input: { id: string; name: string; description?: string; permissions: string[] }) {
+    return this.req<{ role: RoleDefinition }>('POST', '/roles', input);
+  }
+  updateRole(
+    id: string,
+    patch: { name?: string; description?: string | null; permissions?: string[] },
+  ) {
+    return this.req<{ role: RoleDefinition }>('PUT', `/roles/${encodeURIComponent(id)}`, patch);
+  }
+  deleteRole(id: string) {
+    return this.req<{ deleted: boolean }>('DELETE', `/roles/${encodeURIComponent(id)}`);
   }
   sessions() {
     return this.req<{ enumerable: boolean; sessions: AdminSessionInfo[] }>(

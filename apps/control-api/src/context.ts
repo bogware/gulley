@@ -11,11 +11,19 @@ import {
 } from '@gulley/config';
 import {
   type ConfigNotifier,
+  agentCostTree,
+  type AgentCostTree,
+  type AgentCostTreeQuery,
   chargebackReport,
   type ChargebackRow,
   createDatabase,
   type Database,
+  type FocusPageStream,
+  type FocusPageStreamQuery,
   ledgerSpendTotals,
+  openFocusPage,
+  PostgresSessionBlockStore,
+  type SessionBlockStore,
   newOriginId,
   PostgresAdminUserStore,
   PostgresAuditSink,
@@ -35,6 +43,7 @@ import {
   PostgresTenancyStore,
   PostgresConfigBackend,
   PostgresPromptRegistry,
+  PostgresRoleStore,
   type SchemaStatus,
   schemaStatusProbe,
   auditHeadSeq,
@@ -46,6 +55,7 @@ import {
 } from '@gulley/storage';
 import {
   BrokerService,
+  type FederationVerifierPort,
   type IdentityProvider,
   InMemoryAuthCodeStore,
   InMemoryDeviceCodeStore,
@@ -63,6 +73,7 @@ import {
 import type { AuditMirror } from '@gulley/worm';
 import type { Anchor } from './anchor';
 import { type SiemConnector, SiemExporter } from './siem';
+import { type AlertSink, noopAlertSink } from '@gulley/alerts';
 import { type EvalStore, InMemoryEvalStore } from './eval-store';
 import type { EvalRunner } from './eval-runner';
 import type { RolloutPromoter } from './eval-rollout-routes';
@@ -76,7 +87,8 @@ import {
   runShadowSpendReconciliation,
   type ShadowSpendReport,
 } from './shadow-spend';
-import type { OidcRoleRule } from './oidc-gate';
+import type { SsoRoleRule } from './sso';
+import { CachedRoleResolver, roleLoader, type RoleStore } from './roles';
 import {
   AuditChainWalker,
   type AuditEventInput,
@@ -89,10 +101,16 @@ import {
   verifyAuditChain,
 } from '@gulley/pipeline';
 import { InMemoryPromptRegistry, type PromptRegistry } from '@gulley/prompts';
-import { type AccessControl, InMemoryAccessControl, isRole, type Membership } from '@gulley/rbac';
+import {
+  type AccessControl,
+  isRoleId,
+  type Membership,
+  RoleAwareAccessControl,
+} from '@gulley/rbac';
 import type { CollectionKind, KeyAdmin } from './domain';
 import { COLLECTION_KINDS } from './domain';
 import {
+  InMemoryRoleStore,
   KeyAdminStore,
   MembershipStore,
   OrgStore,
@@ -179,7 +197,12 @@ export interface ControlContext {
   keys: KeyAdmin;
   keyStore: InMemoryKeyStore;
   audit: AuditSink;
+  /** Permission port: resolves custom role ids through {@link roleResolver}. */
   access: AccessControl;
+  /** Role catalogue (built-ins + custom roles); Postgres in DB mode. */
+  roles: RoleStore;
+  /** Memoized role snapshot the permission engine consults (10 s TTL, stale-on-error). */
+  roleResolver: CachedRoleResolver;
   sessionStore: AdminSessionStore;
   configVersions: ConfigVersionStore;
   /** Durable config store (Postgres); absent = in-memory ControlConfigStore. */
@@ -204,6 +227,15 @@ export interface ControlContext {
     to?: Date;
     workspaceIds?: string[];
   }) => Promise<ShadowSpendReport>;
+  /** K5 per-agent FinOps over the durable ledger: the session → prompt → subagent cost
+   *  tree and the streamed FOCUS 1.2 export. Absent when no DB is wired (501). */
+  finops?: {
+    agentTree: (q: AgentCostTreeQuery) => Promise<AgentCostTree>;
+    focusPage: (q: FocusPageStreamQuery) => Promise<FocusPageStream>;
+  };
+  /** Session kill switch store (the gateway honours a snapshot of it): written by the
+   *  runaway detector and the console. Absent when no DB is wired (501). */
+  sessionBlocks?: SessionBlockStore;
   /** Live gateway observability: fetch + parse the gateway's Prometheus /metrics.
    *  Absent ⇒ /admin/observability/* returns 501. */
   gatewayMetrics?: GatewayMetricsProvider;
@@ -259,6 +291,9 @@ export interface ControlContext {
   /** SIEM exporter: tails new audit-trail events to Splunk/Sentinel/webhook. Absent =
    *  SIEM export off (endpoints 501). */
   siemExporter?: SiemExporter;
+  /** Operational alert sink (Slack / Teams / PagerDuty / email / signed webhook).
+   *  Fire-and-forget, never throws; a no-op when ALERT_CHANNELS is unset. */
+  alerts: AlertSink;
   /** Durable mask-reversal store (M22 D); present (with an encryptor) ⇒ the reveal
    *  endpoint is served. */
   maskVault?: MaskVaultStore;
@@ -293,8 +328,11 @@ export interface ControlContext {
   /** Ed25519 private key (PEM) that signs onboarding packs; absent ⇒ the
    *  onboarding-pack + public-key endpoints are not served. */
   onboardingSigningKey?: string;
-  /** OIDC session gate config; absent = OIDC login disabled (token-paste only). */
+  /** OIDC session gate config; absent = OIDC login disabled. */
   oidc?: OidcSessionConfig;
+  /** SAML 2.0 session gate config; absent = SAML login disabled. With neither gate the
+   *  console is token-paste only. */
+  saml?: SamlSessionConfig;
   /** Broadcasts a post-commit config signal to gateway replicas; absent = no
    *  hot-reload propagation (single-process / v1 default). */
   notifier?: ConfigNotifier;
@@ -314,7 +352,7 @@ export interface OidcSessionConfig {
   redirectUri: string;
   scopes: string;
   groupsClaim: string;
-  roleRules: OidcRoleRule[];
+  roleRules: SsoRoleRule[];
   postLoginRedirect: string;
   cookieSecure: boolean;
   /** Injected HTTP for the token exchange (tests); defaults to global fetch. */
@@ -325,6 +363,37 @@ export interface OidcSessionConfig {
   exchangeTimeoutMs?: number;
   /** Egress guard for the token_endpoint the discovery document advertises. */
   assertEgress?: (url: string) => void;
+}
+
+/** SAML 2.0 SP configuration for the admin-console session gate (saml-routes.ts). */
+export interface SamlSessionConfig {
+  /** IdP single-sign-on URL (HTTP-Redirect binding) the AuthnRequest is sent to. */
+  entryPoint: string;
+  /** The IdP entityID every assertion's <Issuer> must equal. */
+  idpIssuer: string;
+  /** IdP signing certificate(s) / public key(s), PEM. Several during a key rollover. */
+  idpCert: string | string[];
+  /** This SP's entityID — also the required assertion Audience. */
+  spEntityId: string;
+  /** The public ACS URL (`…/auth/saml/acs`) — the required Response Destination. */
+  callbackUrl: string;
+  /** Optional SP signing key + certificate (PEM): AuthnRequests are signed when set. */
+  spPrivateKey?: string;
+  spCert?: string;
+  /** Attribute whose values are the groups fed to the role map (default `groups`). */
+  groupsAttribute: string;
+  /** `NameID` (default) or an attribute name that becomes the admin subject. */
+  subjectAttribute: string;
+  roleRules: SsoRoleRule[];
+  postLoginRedirect: string;
+  cookieSecure: boolean;
+  /** Accept a Response with no InResponseTo (IdP-initiated SSO). Off by default. */
+  allowIdpInitiated: boolean;
+  /** Require the Assertion (default true) / the Response (default false) to be signed. */
+  wantAssertionsSigned: boolean;
+  wantResponseSigned: boolean;
+  /** Tolerated clock skew for NotBefore/NotOnOrAfter (ms). */
+  acceptedClockSkewMs: number;
 }
 
 export interface InMemoryContextOptions {
@@ -346,6 +415,11 @@ export interface InMemoryContextOptions {
   /** Inject a pre-seeded query backend (tests); defaults to a fresh in-memory log. */
   requestLogQuery?: RequestLogQuery;
   oidc?: OidcSessionConfig;
+  saml?: SamlSessionConfig;
+  /** Inject a role store (tests); default in-memory, Postgres in DB mode. */
+  roles?: RoleStore;
+  /** Structured hook for a failing role-catalogue load (the stale snapshot stays). */
+  onRoleLoadError?: (err: unknown) => void;
   /** Config-change broadcaster (composite PG+Redis bus in prod); absent = none. */
   notifier?: ConfigNotifier;
   /** Postgres URL; when set, the config path is durable (persists to the tables
@@ -382,6 +456,9 @@ export interface InMemoryContextOptions {
   /** SIEM connector (prod: Splunk/Sentinel/webhook; tests inject a fake). Wrapped in a
    *  SiemExporter over the durable audit chain. */
   siem?: { connector: SiemConnector; batchMax?: number };
+  /** Alert sink (prod: an AlertDispatcher from ALERT_CHANNELS; tests inject a
+   *  collector). Absent = no-op. */
+  alerts?: AlertSink;
   /** Durable mask-reversal store (tests inject one). */
   maskVault?: MaskVaultStore;
   /** Envelope decryptor for the mask vault (tests inject a shared cipher). */
@@ -407,6 +484,10 @@ export interface InMemoryContextOptions {
   /** Inject the shadow-spend port directly (tests / a custom backend); overrides
    *  the DB-derived default. */
   shadowSpend?: ControlContext['shadowSpend'];
+  /** Inject the FinOps ports / session-block store directly (tests); override the
+   *  DB-derived defaults. */
+  finops?: ControlContext['finops'];
+  sessionBlocks?: SessionBlockStore;
   /** Live gateway metrics provider (prod: built from GATEWAY_METRICS_URL; tests inject
    *  a fake). Absent ⇒ /admin/observability/* returns 501. */
   gatewayMetrics?: GatewayMetricsProvider;
@@ -423,6 +504,9 @@ export interface InMemoryContextOptions {
     /** Upstream identity provider for revoke-on-deprovision. When omitted the broker
      *  treats every principal as active (dev/simulated) — wire an EntraGraphIdp in prod. */
     idp?: IdentityProvider;
+    /** Workload identity federation verifier (RFC 7523 JWT-bearer). Absent ⇒ the
+     *  grant type is unsupported and not advertised. */
+    federation?: FederationVerifierPort;
   };
   /** SCIM Groups → role mapping (group displayName → { role, orgId }; orgId "*" =
    *  platform-wide). Drives role provisioning on /scim/v2/Groups member changes. */
@@ -469,7 +553,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   const scimGroups = db
     ? new PostgresScimGroupStore(db, (displayName) => {
         const e = opts.scimGroupRoleMap?.[displayName];
-        return e && isRole(e.role)
+        return e && isRoleId(e.role)
           ? { role: e.role, orgId: e.orgId === '*' ? null : e.orgId }
           : null;
       })
@@ -477,10 +561,12 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   const membershipLoader = durableMemberships
     ? async (subject: string): Promise<Membership[]> => {
         const rows = await durableMemberships.membershipsForSubject(subject);
+        // A role is an id (built-in or custom); an id that no longer resolves grants
+        // nothing at check time, so it is carried rather than dropped.
         return rows
-          .filter((r) => isRole(r.role))
+          .filter((r) => isRoleId(r.role))
           .map((r) => ({
-            role: r.role as Membership['role'],
+            role: r.role,
             // A persisted NULL org is a platform grant (covers all orgs).
             orgId: r.orgId ?? '*',
             workspaceId: r.workspaceId,
@@ -607,6 +693,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
                 codes: new PostgresAuthCodeStore(db!),
                 clients: oauthAdmin.clients,
                 idp: prodIdp,
+                federation: brokerCfg.federation,
               }
             : {
                 grants: new InMemoryGrantStore(),
@@ -614,6 +701,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
                 codes: new InMemoryAuthCodeStore(),
                 clients: new InMemoryOAuthClientStore(),
                 idp: prodIdp,
+                federation: brokerCfg.federation,
               },
         )
       : undefined;
@@ -663,8 +751,19 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
   const tenancy = opts.tenancy ?? (db ? new PostgresTenancyStore(db) : undefined);
   const orgs = new OrgStore(tenancy);
   const workspaces = new WorkspaceStore(tenancy);
+
+  // Role catalogue: durable in DB mode (seeded by migration 0028, built-ins re-synced
+  // from code at first load), in-memory otherwise. The resolver is the memoized
+  // snapshot the permission engine reads; `access` resolves custom role ids through it.
+  const roles: RoleStore = opts.roles ?? (db ? new PostgresRoleStore(db) : new InMemoryRoleStore());
+  const roleResolver = new CachedRoleResolver(roleLoader(roles), {
+    onError: opts.onRoleLoadError,
+  });
   const hydrateTenancy = tenancy
-    ? async () => ({ orgs: await orgs.hydrate(), workspaces: await workspaces.hydrate() })
+    ? async () => {
+        await roleResolver.refresh();
+        return { orgs: await orgs.hydrate(), workspaces: await workspaces.hydrate() };
+      }
     : undefined;
 
   // DB mode: providers / credentials / collections are a READ MODEL of the Postgres
@@ -737,7 +836,9 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
       : new KeyAdminStore(keyStore, opts.pepper),
     keyStore,
     audit,
-    access: new InMemoryAccessControl(),
+    access: new RoleAwareAccessControl(roleResolver),
+    roles,
+    roleResolver,
     sessionStore,
     configVersions,
     configStore,
@@ -765,6 +866,12 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
             );
           }
         : undefined),
+    finops:
+      opts.finops ??
+      (db
+        ? { agentTree: (q) => agentCostTree(db, q), focusPage: (q) => openFocusPage(db, q) }
+        : undefined),
+    sessionBlocks: opts.sessionBlocks ?? (db ? new PostgresSessionBlockStore(db) : undefined),
     gatewayMetrics: opts.gatewayMetrics,
     oauthBroker,
     oauthAdmin,
@@ -809,6 +916,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     wormShipper,
     anchor: opts.anchor,
     siemExporter,
+    alerts: opts.alerts ?? noopAlertSink,
     // Only served when an encryptor is present (the store never sees plaintext, and
     // reveal must decrypt) — so a DB alone doesn't turn the reveal endpoint on.
     maskVault:
@@ -828,6 +936,7 @@ export function createInMemoryControlContext(opts: InMemoryContextOptions): Cont
     consolePublicUrl: opts.consolePublicUrl,
     onboardingSigningKey: opts.onboardingSigningKey,
     oidc: opts.oidc,
+    saml: opts.saml,
     notifier: opts.notifier,
     originId,
     db,

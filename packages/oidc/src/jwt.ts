@@ -67,6 +67,22 @@ export function decodeJwtHeader(jwt: string): JwtHeader | null {
 }
 
 /**
+ * Decode a JWT's payload WITHOUT verifying it. Only for routing a token to the
+ * right verifier (e.g. picking the trust configuration by its `iss`) — nothing read
+ * here may be trusted until {@link verifyJwtWithJwks} + {@link validateClaims} pass.
+ */
+export function decodeJwtPayload(jwt: string): JwtClaims | null {
+  const parts = jwt.split('.');
+  if (parts.length !== 3 || !parts[1]) return null;
+  try {
+    const p = decode(parts[1]);
+    return p && typeof p === 'object' && !Array.isArray(p) ? (p as JwtClaims) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Verify a compact JWS against a JWKS. The algorithm comes from the token header
  * but is constrained to the asymmetric set above (no `none`, no HS*). The key is
  * selected by `kid`, falling back to a single key of the matching type. Returns

@@ -43,6 +43,11 @@ const EnvShape = z.object({
   // surface (/oauth/*, /auth/*) — brute-force / flood protection on the highest-value
   // control-plane paths. In-memory per instance; 0 disables. Default 60/min.
   CONTROL_API_AUTH_RATE_LIMIT_PER_MIN: z.coerce.number().int().min(0).default(60),
+  // Separate per-IP budget (per minute) for the RFC 7523 JWT-bearer token exchange on
+  // POST /oauth/token (workload identity). A NAT'd cluster or CI fleet shares one
+  // source IP, so it must not compete with the 60/min human-login budget. In-memory
+  // per instance; 0 disables. Default 600/min.
+  CONTROL_API_TOKEN_EXCHANGE_RATE_LIMIT_PER_MIN: z.coerce.number().int().min(0).default(600),
   // Explicit request body cap (bytes). Sized generously for the largest GitOps
   // config-apply document (Fastify's 1 MB default would reject a big-fleet apply), while
   // still bounding an abusive payload. Default 8 MiB.
@@ -104,6 +109,14 @@ const EnvShape = z.object({
   // already enforced at read time, so this only reclaims space on a long-lived broker).
   // Seconds; 0 = off. Runs on an unref'd timer only in DB mode with the broker enabled.
   OAUTH_EPHEMERA_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(3600),
+  // Workload identity federation (RFC 7523 JWT-bearer, docs/WORKLOAD_IDENTITY.md): a JSON
+  // array of trust configurations mapping an external issuer's tokens (Kubernetes
+  // service accounts, GitHub Actions OIDC) to a Gulley tenancy + scope. Each entry:
+  // { name, issuer, jwksUri?, audience?, allowInternal?, subject: { pattern? | claims? },
+  //   orgId, workspaceId, scope?: { allowedProviders?, allowedModels?, groups? },
+  //   ttlSeconds? (default 3600, max 86400), onBehalfOf?, displayName? }.
+  // Validated at boot (a malformed entry fails startup). Empty = grant type off.
+  WORKLOAD_FEDERATIONS: z.string().default('[]'),
 
   // Ed25519 private key (PEM) that SIGNS onboarding packs (GET .../onboarding-pack).
   // The org publishes the matching public key (served at /.well-known/gulley-onboarding-key)
@@ -121,6 +134,20 @@ const EnvShape = z.object({
   // Flag a provider whose shadow (bypassed) share of its billed spend is at/above
   // this many basis points. Default 500 bps = 5%.
   SHADOW_SPEND_FLAG_BPS: z.coerce.number().int().min(0).max(10_000).default(500),
+
+  // Runaway-session detector (K5 per-agent FinOps): every tick, score each agent session
+  // active in the last RUNAWAY_WINDOW_MINUTES against its principal's per-session spend
+  // baseline (2 × p95 over RUNAWAY_BASELINE_DAYS; the scope-wide p95 for a principal
+  // with < 20 sessions) and the scope-wide p99; a session above max(RUNAWAY_MIN_COST_USD,
+  // baseline) AND above the p99 is a runaway. `flag` audits + alerts; `block` also
+  // writes a session_block row (TTL RUNAWAY_BLOCK_TTL_MINUTES) the gateway refuses with
+  // 403. DB mode only; one replica runs each tick (advisory lock). 0 interval = off.
+  RUNAWAY_DETECTOR_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(300),
+  RUNAWAY_WINDOW_MINUTES: z.coerce.number().int().positive().default(60),
+  RUNAWAY_BASELINE_DAYS: z.coerce.number().int().positive().default(7),
+  RUNAWAY_MIN_COST_USD: z.coerce.number().nonnegative().default(5),
+  RUNAWAY_ACTION: z.enum(['flag', 'block']).default('flag'),
+  RUNAWAY_BLOCK_TTL_MINUTES: z.coerce.number().int().positive().default(240),
 
   // Compliance: an HMAC key that signs auditor attestations (GET /audit/attestation
   // and the audit:verify CLI). Absent = attestation export disabled (501). The
@@ -189,6 +216,21 @@ const EnvShape = z.object({
   SIEM_LOG_TYPE: z.string().optional(),
   SIEM_EXPORT_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   SIEM_BATCH_MAX: z.coerce.number().int().positive().default(200),
+
+  // Alerting: operational alerts (config applies, break-glass, key expiry; the gateway
+  // adds budget / breaker / guardrail events) to Slack, Microsoft Teams, PagerDuty,
+  // email (SMTP) and HMAC-signed webhooks. ONE JSON array of channel objects — see
+  // docs/ALERTING.md. Every target host passes the egress guard at boot (the outbound
+  // allowlist, https outside development, AIR_GAPPED) or boot fails. The value carries
+  // secrets (webhook URLs, routing keys, the SMTP password): secret store only, never a
+  // YAML export. Unset = alerts off (a no-op sink).
+  ALERT_CHANNELS: z.string().optional(),
+  // Key-expiry sweep: announce enabled virtual keys that expire within this many days
+  // (`key.expiring` + audit `key.expiring_soon`) and once they lapse (`key.expired`).
+  ALERT_KEY_EXPIRY_DAYS: z.coerce.number().int().positive().default(7),
+  // Sweep cadence (seconds); 0 = off. One replica runs each tick (advisory lock in DB
+  // mode). The announced set is per process, so a restart may repeat a notice.
+  ALERT_KEY_EXPIRY_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().nonnegative().default(3600),
 
   // Eval-in-the-loop rollout controller (offline golden-set gate). Suites + rollouts are
   // always manageable (owner-only); RUNNING a rollout proxies each case through the
@@ -270,6 +312,48 @@ const EnvShape = z.object({
   // plaintext IdP (dev only).
   OIDC_ALLOW_INSECURE_HTTP: envBool(false),
 
+  // SAML 2.0 session gate for the admin console (SP-initiated, HTTP-POST ACS), beside
+  // the OIDC gate. SAML_ENABLED=true needs the IdP entry point + issuer + signing cert
+  // and this SP's entity id + public ACS URL. Groups come from SAML_GROUPS_ATTRIBUTE
+  // (unioned with the common group/role attribute names) and map to roles through
+  // SAML_ROLE_MAP — the same JSON format as OIDC_ROLE_MAP; a custom role id is valid.
+  SAML_ENABLED: envBool(false),
+  SAML_IDP_ENTRY_POINT: z.string().url().optional(),
+  SAML_IDP_ISSUER: z.string().min(1).optional(),
+  // The IdP signing certificate (PEM, or the base64 body) inline or from a file; several
+  // certificates may be concatenated in the file for a key rollover.
+  SAML_IDP_CERT: z.string().min(1).optional(),
+  SAML_IDP_CERT_FILE: z.string().min(1).optional(),
+  SAML_SP_ENTITY_ID: z.string().min(1).optional(),
+  SAML_SP_CALLBACK_URL: z.string().url().optional(),
+  // Optional SP signing key (+ its certificate, published in the SP metadata) so the
+  // AuthnRequest is signed; required by some IdPs, verified by none otherwise.
+  SAML_SP_PRIVATE_KEY: z.string().min(1).optional(),
+  SAML_SP_PRIVATE_KEY_FILE: z.string().min(1).optional(),
+  SAML_SP_CERT: z.string().min(1).optional(),
+  SAML_SP_CERT_FILE: z.string().min(1).optional(),
+  SAML_GROUPS_ATTRIBUTE: z.string().min(1).default('groups'),
+  // `NameID` (the assertion subject) or an attribute name that becomes the admin subject.
+  SAML_SUBJECT_ATTRIBUTE: z.string().min(1).default('NameID'),
+  SAML_ROLE_MAP: z.string().default('[]'),
+  SAML_POST_LOGIN_REDIRECT: z.string().default('/'),
+  // The SAML flow cookie rides the IdP's cross-site POST, so it is SameSite=None and
+  // therefore MUST be Secure: true behind HTTPS (required in production).
+  SAML_COOKIE_SECURE: envBool(false),
+  // IdP-initiated SSO (a Response with no InResponseTo) is refused unless enabled; it
+  // forgoes the browser-bound flow binding and relies on signature + audience +
+  // destination + the assertion replay guard.
+  SAML_ALLOW_IDP_INITIATED: envBool(false),
+  // Which signature(s) to require. Either may be on; the library always needs at least
+  // one valid signature. Entra signs the assertion by default, Okta signs both.
+  SAML_WANT_ASSERTIONS_SIGNED: envBool(true),
+  SAML_WANT_RESPONSE_SIGNED: envBool(false),
+  // Clock skew tolerated on NotBefore / NotOnOrAfter (ms).
+  SAML_CLOCK_SKEW_MS: z.coerce.number().int().nonnegative().default(60_000),
+  // Production requires https for the IdP entry point and the ACS URL (the browser
+  // carries the assertion between them); opt out for a plaintext dev IdP only.
+  SAML_ALLOW_INSECURE_HTTP: envBool(false),
+
   // Entra (Azure AD) Graph adapter for the OAuth broker's revoke-on-deprovision.
   // When TENANT_ID + GRAPH_CLIENT_ID + GRAPH_CLIENT_SECRET are set, the broker checks
   // Microsoft Graph `accountEnabled` on refresh (app registration needs the
@@ -311,7 +395,98 @@ const EnvShape = z.object({
 /** Every environment variable the control-api reads, for documentation/CI checks. */
 export const ENV_KEYS: readonly string[] = Object.keys(EnvShape.shape);
 
+const StringList = z.array(z.string().min(1).max(256)).max(256);
+const AllowList = z.union([z.literal('*'), StringList]);
+
+/** One workload federation (trust configuration) — see @gulley/oauth WorkloadFederation. */
+export const WorkloadFederationSchema = z
+  .object({
+    name: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/, 'name: [A-Za-z0-9._-], 1-64 chars'),
+    issuer: z.string().url(),
+    jwksUri: z.string().url().optional(),
+    audience: z.union([z.string().min(1), z.array(z.string().min(1)).min(1).max(16)]).optional(),
+    allowInternal: z.boolean().optional(),
+    subject: z
+      .object({
+        pattern: z.string().min(1).max(512).optional(),
+        claims: z
+          .record(z.string().min(1), z.union([z.string(), z.array(z.string()).min(1).max(64)]))
+          .optional(),
+      })
+      .strict()
+      .refine((s) => s.pattern !== undefined || (!!s.claims && Object.keys(s.claims).length > 0), {
+        message: 'subject must constrain a pattern and/or claims',
+      }),
+    orgId: z.string().min(1),
+    workspaceId: z.string().min(1),
+    scope: z
+      .object({
+        allowedProviders: AllowList.optional(),
+        allowedModels: AllowList.optional(),
+        groups: StringList.optional(),
+      })
+      .strict()
+      .optional(),
+    ttlSeconds: z.number().int().min(1).max(86_400).optional(),
+    onBehalfOf: z.boolean().optional(),
+    displayName: z.string().min(1).max(256).optional(),
+  })
+  .strict();
+
+const WorkloadFederationsSchema = z
+  .array(WorkloadFederationSchema)
+  .max(256)
+  .superRefine((list, ctx) => {
+    const seen = new Set<string>();
+    list.forEach((f, i) => {
+      if (seen.has(f.name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [i, 'name'],
+          message: `duplicate federation name "${f.name}"`,
+        });
+      }
+      seen.add(f.name);
+    });
+  });
+
+export type WorkloadFederationConfig = z.infer<typeof WorkloadFederationSchema>;
+
+/** Parse + validate WORKLOAD_FEDERATIONS (throws a ZodError / SyntaxError). */
+export function parseWorkloadFederations(json: string): WorkloadFederationConfig[] {
+  return WorkloadFederationsSchema.parse(JSON.parse(json));
+}
+
 const Env = EnvShape.superRefine((c, ctx) => {
+  try {
+    const federations = parseWorkloadFederations(c.WORKLOAD_FEDERATIONS);
+    if (c.NODE_ENV === 'production') {
+      federations.forEach((f, i) => {
+        for (const [key, url] of [
+          ['issuer', f.issuer],
+          ['jwksUri', f.jwksUri],
+        ] as const) {
+          if (url && !/^https:\/\//i.test(url)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['WORKLOAD_FEDERATIONS', i, key],
+              message: `federation "${f.name}": ${key} must be https in production`,
+            });
+          }
+        }
+      });
+    }
+  } catch (err) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['WORKLOAD_FEDERATIONS'],
+      message: `WORKLOAD_FEDERATIONS is not a valid trust configuration: ${
+        err instanceof z.ZodError
+          ? err.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
+          : (err as Error).message
+      }`,
+    });
+  }
   if (
     c.NODE_ENV === 'production' &&
     c.OIDC_ISSUER &&
@@ -341,12 +516,66 @@ const Env = EnvShape.superRefine((c, ctx) => {
         'OIDC_COOKIE_SECURE must be true in production when SSO is enabled (or set OIDC_ALLOW_INSECURE_HTTP=true for a deliberate non-TLS edge)',
     });
   }
+
+  // SAML: the gate needs the full SP + IdP set when enabled; production needs https on
+  // both browser-facing URLs and a Secure flow/session cookie, like the OIDC gate.
+  if (c.SAML_ENABLED) {
+    const required: Array<[string, unknown]> = [
+      ['SAML_IDP_ENTRY_POINT', c.SAML_IDP_ENTRY_POINT],
+      ['SAML_IDP_ISSUER', c.SAML_IDP_ISSUER],
+      ['SAML_SP_ENTITY_ID', c.SAML_SP_ENTITY_ID],
+      ['SAML_SP_CALLBACK_URL', c.SAML_SP_CALLBACK_URL],
+    ];
+    for (const [key, value] of required) {
+      if (!value) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `${key} is required when SAML_ENABLED=true`,
+        });
+      }
+    }
+    if (!c.SAML_IDP_CERT && !c.SAML_IDP_CERT_FILE) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SAML_IDP_CERT'],
+        message: 'SAML_IDP_CERT or SAML_IDP_CERT_FILE is required when SAML_ENABLED=true',
+      });
+    }
+    if (c.NODE_ENV === 'production' && !c.SAML_ALLOW_INSECURE_HTTP) {
+      for (const [key, value] of [
+        ['SAML_IDP_ENTRY_POINT', c.SAML_IDP_ENTRY_POINT],
+        ['SAML_SP_CALLBACK_URL', c.SAML_SP_CALLBACK_URL],
+      ] as const) {
+        if (value && !/^https:\/\//i.test(value)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [key],
+            message: `${key} must be https in production (or set SAML_ALLOW_INSECURE_HTTP=true)`,
+          });
+        }
+      }
+      if (!c.SAML_COOKIE_SECURE) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['SAML_COOKIE_SECURE'],
+          message:
+            'SAML_COOKIE_SECURE must be true in production when SAML is enabled (or set SAML_ALLOW_INSECURE_HTTP=true for a deliberate non-TLS edge)',
+        });
+      }
+    }
+  }
 });
 
 export type Config = z.infer<typeof Env>;
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): Config {
   return Env.parse(normalizeEnv(source));
+}
+
+/** The validated workload federations (empty when the grant type is off). */
+export function workloadFederations(config: Config): WorkloadFederationConfig[] {
+  return parseWorkloadFederations(config.WORKLOAD_FEDERATIONS);
 }
 
 export function sessionSecrets(config: Config): string[] {

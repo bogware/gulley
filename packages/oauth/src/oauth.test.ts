@@ -54,7 +54,7 @@ async function issueViaDevice(broker: BrokerService): Promise<{ access: string; 
   await broker.deviceApprove(da.value.user_code, { subject: 'user-1', displayName: 'User One' });
   const tok = await broker.tokenDeviceCode(da.value.device_code, 'claude-code');
   if (!tok.ok) throw new Error(`token failed: ${JSON.stringify(tok)}`);
-  return { access: tok.value.access_token, refresh: tok.value.refresh_token };
+  return { access: tok.value.access_token, refresh: tok.value.refresh_token! };
 }
 
 describe('device flow + tenancy', () => {
@@ -153,7 +153,7 @@ describe('refresh rotation + reuse detection', () => {
     // family revoked: the still-valid access token no longer resolves
     expect((await broker.resolveBrokerToken(access)).ok).toBe(false);
     if (rot.ok)
-      expect((await broker.refresh(rot.value.refresh_token, 'claude-code')).ok).toBe(false);
+      expect((await broker.refresh(rot.value.refresh_token!, 'claude-code')).ok).toBe(false);
   });
 
   it('a forged reuse token does NOT revoke the active family (no DoS)', async () => {

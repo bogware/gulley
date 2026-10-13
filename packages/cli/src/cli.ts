@@ -10,6 +10,11 @@
  *       Prints a valid gko_at_ access token (refreshing through the broker when it
  *       is about to expire). This is what Claude Code's `apiKeyHelper` and Codex's
  *       `[model_providers.gulley.auth]` command run.
+ *   gulley token exchange --control <url> (--k8s-sa [--token-path <p>] | --github
+ *       [--audience <aud>] | --assertion-file <path>) [--client <id>] [--env]
+ *       Workload identity (RFC 7523 JWT-bearer): exchange a Kubernetes service-account
+ *       token or a GitHub Actions OIDC token for a short-lived, scoped gko_at_ token.
+ *       Prints the token (or `export ANTHROPIC_AUTH_TOKEN=…` with --env); stores nothing.
  *   gulley logout [--profile <name>]
  *       Revokes the token family at the broker and deletes the local credential.
  *   gulley status [--profile <name>]
@@ -43,6 +48,7 @@ import {
   revokeToken,
 } from './device-login';
 import { type OnboardingPack, verifyOnboardingPack } from './onboarding';
+import { exchangeJwtBearer, fetchGithubIdToken, K8S_SA_TOKEN_PATH } from './token-exchange';
 
 export interface CliIo {
   /** Returns undefined when the file does not exist. */
@@ -78,6 +84,7 @@ const USAGE = [
   'usage:',
   '  gulley login  --broker <url> --client <id> [--profile <name>]',
   '  gulley token  [--profile <name>] [--force-refresh]',
+  '  gulley token exchange --control <url> (--k8s-sa [--token-path <p>] | --github [--audience <aud>] | --assertion-file <path>) [--client <id>] [--env]',
   '  gulley logout [--profile <name>]',
   '  gulley status [--profile <name>]',
   '  gulley verify <pack.json> --pubkey <key.pem>',
@@ -199,6 +206,7 @@ async function login(args: string[], io: CliIo): Promise<number> {
 }
 
 async function token(args: string[], io: CliIo): Promise<number> {
+  if (args[0] === 'exchange') return tokenExchange(args.slice(1), io);
   const profile = flag(args, 'profile') ?? DEFAULT_PROFILE;
   const force = has(args, 'force-refresh');
   const { path, file } = loadFile(io);
@@ -265,6 +273,62 @@ async function token(args: string[], io: CliIo): Promise<number> {
     return 1;
   } finally {
     release();
+  }
+}
+
+/**
+ * `gulley token exchange` — workload identity. Reads the platform assertion from the
+ * chosen source, POSTs the RFC 7523 JWT-bearer grant to the control plane's token
+ * endpoint and prints ONLY the resulting access token on stdout (`--env` prints an
+ * `export ANTHROPIC_AUTH_TOKEN=` line for `eval`). Nothing is stored and the assertion
+ * is never logged: it is a bearer credential for the workload itself.
+ */
+async function tokenExchange(args: string[], io: CliIo): Promise<number> {
+  const controlUrl = flag(args, 'control') ?? flag(args, 'broker');
+  const clientId = flag(args, 'client');
+  const assertionFile = flag(args, 'assertion-file');
+  const k8s = has(args, 'k8s-sa');
+  const github = has(args, 'github');
+  if (!controlUrl) {
+    io.error('error: --control <url> is required (the control plane / OAuth broker URL)');
+    return 2;
+  }
+  if ([assertionFile !== undefined, k8s, github].filter(Boolean).length !== 1) {
+    io.error('error: choose exactly one of --k8s-sa, --github, --assertion-file <path>');
+    return 2;
+  }
+  try {
+    const endpoints = await discoverBroker(controlUrl, io.fetch);
+    let assertion: string | undefined;
+    let source: string;
+    if (github) {
+      // The audience defaults to the broker's issuer: the `aud` a federation expects
+      // unless it configures its own.
+      const audience = flag(args, 'audience') ?? endpoints.issuer;
+      assertion = await fetchGithubIdToken(io.env, io.fetch, audience);
+      source = `GitHub Actions OIDC token (audience ${audience})`;
+    } else {
+      const path = assertionFile ?? flag(args, 'token-path') ?? K8S_SA_TOKEN_PATH;
+      assertion = io.readText(path)?.trim();
+      if (!assertion) {
+        io.error(
+          k8s
+            ? `error: no service-account token at ${path} — project one with an audience for the broker (see docs/WORKLOAD_IDENTITY.md) or pass --token-path`
+            : `error: could not read the assertion at ${path}`,
+        );
+        return 1;
+      }
+      source = k8s ? `Kubernetes service-account token (${path})` : `assertion file (${path})`;
+    }
+    const tok = await exchangeJwtBearer(endpoints, { assertion, clientId }, io.fetch);
+    io.log(has(args, 'env') ? `export ANTHROPIC_AUTH_TOKEN=${tok.accessToken}` : tok.accessToken);
+    io.error(
+      `✓ exchanged ${source} for a gateway token valid ~${Math.round(tok.expiresIn / 60)} min`,
+    );
+    return 0;
+  } catch (err) {
+    io.error(`✗ token exchange failed: ${describe(err)}`);
+    return 1;
   }
 }
 

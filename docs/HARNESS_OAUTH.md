@@ -156,21 +156,24 @@ For a static **virtual key** instead (CI, service accounts) the same generators 
   and revokes on a disabled/deleted account.
 - **Theft signal**: `GET /admin/security/refresh-reuse` lists families auto-revoked
   because a superseded refresh token was replayed.
-- **Retention**: expired device/auth codes are swept every
+- **Retention**: expired device/auth codes and dead token families are swept every
   `OAUTH_EPHEMERA_SWEEP_INTERVAL_SECONDS`.
+- **Workloads (no human to consent)**: a Kubernetes service account or a GitHub Actions
+  job exchanges its platform token for a scoped, access-only `gko_at_` via the RFC 7523
+  JWT-bearer grant (`gulley token exchange`) — see `docs/WORKLOAD_IDENTITY.md`.
 - **TTLs**: `OAUTH_ACCESS_TTL_MS` (1h), `OAUTH_REFRESH_TTL_MS` (30d),
   `OAUTH_ABSOLUTE_TTL_MS` (90d), `OAUTH_DEVICE_CODE_TTL_MS` (15m).
 
 ## Endpoint reference
 
-| Endpoint                                      | Auth          | Purpose                                                                                                         |
-| --------------------------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------- |
-| `GET /.well-known/oauth-authorization-server` | none          | RFC 8414 metadata (+ `device_verification_uri`)                                                                 |
-| `POST /oauth/device_authorization`            | none          | RFC 8628 §3.1 — returns `verification_uri(_complete)`                                                           |
-| `GET /oauth/device`                           | page          | Consent page (console has a richer one)                                                                         |
-| `GET /oauth/device/preview?user_code=`        | admin session | Which client / workspace is asking                                                                              |
-| `POST /oauth/device/authorize` · `/deny`      | admin session | Consent decision (audited)                                                                                      |
-| `POST /oauth/token`                           | none          | `urn:ietf:params:oauth:grant-type:device_code` (or `device_code`), `authorization_code` (S256), `refresh_token` |
-| `POST /oauth/revoke`                          | none          | RFC 7009 (always 200; needs cryptographic proof)                                                                |
-| `POST /oauth/introspect`                      | none          | RFC 7662 for the access token you hold (`active`)                                                               |
-| `GET /oauth/authorize`                        | admin session | Auth-code + PKCE (loopback redirects only)                                                                      |
+| Endpoint                                      | Auth          | Purpose                                                                                                                                                                                                                   |
+| --------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /.well-known/oauth-authorization-server` | none          | RFC 8414 metadata (+ `device_verification_uri`)                                                                                                                                                                           |
+| `POST /oauth/device_authorization`            | none          | RFC 8628 §3.1 — returns `verification_uri(_complete)`                                                                                                                                                                     |
+| `GET /oauth/device`                           | page          | Consent page (console has a richer one)                                                                                                                                                                                   |
+| `GET /oauth/device/preview?user_code=`        | admin session | Which client / workspace is asking                                                                                                                                                                                        |
+| `POST /oauth/device/authorize` · `/deny`      | admin session | Consent decision (audited)                                                                                                                                                                                                |
+| `POST /oauth/token`                           | none          | `urn:ietf:params:oauth:grant-type:device_code` (or `device_code`), `authorization_code` (S256), `refresh_token`, `urn:ietf:params:oauth:grant-type:jwt-bearer` (RFC 7523 workload identity — `docs/WORKLOAD_IDENTITY.md`) |
+| `POST /oauth/revoke`                          | none          | RFC 7009 (always 200; needs cryptographic proof)                                                                                                                                                                          |
+| `POST /oauth/introspect`                      | none          | RFC 7662 for the access token you hold (`active`, plus `kind` / `federation` / `subject` / `scope`)                                                                                                                       |
+| `GET /oauth/authorize`                        | admin session | Auth-code + PKCE (loopback redirects only)                                                                                                                                                                                |

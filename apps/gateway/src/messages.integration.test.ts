@@ -5,6 +5,7 @@ import { generateVirtualKey, InMemoryKeyStore, parseHtpasswd, type Principal } f
 import { err, ok } from '@gulley/core';
 import { InMemoryAuditSink, InMemoryLedger, InMemoryRequestLog } from '@gulley/pipeline';
 import { type BudgetStore, InMemoryBudgetStore } from '@gulley/budget';
+import { SessionBlockSnapshot } from '@gulley/storage';
 import { InMemoryAesCipher } from '@gulley/crypto';
 import type { MaskVaultRecord } from '@gulley/storage';
 import { CelAuthorizer, CelTransformer, ExternalAuthorizer } from '@gulley/cel';
@@ -2787,7 +2788,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     expect(res.status).toBe(402);
     const json = (await res.json()) as { error: { type: string } };
-    expect(json.error.type).toBe('budget_exceeded');
+    expect(json.error.type).toBe('quota_for_entity_exceeded');
     expect(requestLog.entries).toHaveLength(0); // never called upstream
 
     await app.close();
@@ -2844,7 +2845,9 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     });
 
     expect(res.status).toBe(402);
-    expect(((await res.json()) as { error: { type: string } }).error.type).toBe('budget_exceeded');
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe(
+      'quota_for_entity_exceeded',
+    );
     expect(requestLog.entries).toHaveLength(0); // never dispatched
 
     // The workspace reservation must have been released on the model-level rejection:
@@ -7785,5 +7788,444 @@ describe('hot-path review follow-ups (Wave 1)', () => {
     expect(storeSpy).not.toHaveBeenCalled();
     await app.close();
     await new Promise<void>((r) => up.close(() => r()));
+  });
+});
+
+describe('hierarchical hard budgets (K4)', () => {
+  const NOW = Date.UTC(2026, 9, 11, 22, 0, 0); // 22:00 UTC — the daily window resets in 2h
+  const request = (base: string, token: string, extra: Record<string, string> = {}) =>
+    fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token, ...extra },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
+        stream: true,
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+  type Exceeded = {
+    error: {
+      type: string;
+      message: string;
+      scope: { kind: string; id: string; workspace_id?: string };
+      window: { period: string; resets_at?: string };
+    };
+  };
+
+  it("a key's default daily cap 402s with the typed error, retry-after until the reset, and the workspace reservation rolled back", async () => {
+    const { store, token } = seededStore();
+    let now = NOW;
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        ['ws_1', { capMicroUsd: 10_000_000 }],
+        ['key:ws_1:vk_1', { windows: [{ capMicroUsd: 500, period: { kind: 'daily' as const } }] }],
+      ]),
+      () => now,
+    );
+    const { ctx, requestLog, audit } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await request(base, token);
+    expect(res.status).toBe(402);
+    expect(res.headers.get('x-should-retry')).toBe('false');
+    const json = (await res.json()) as Exceeded;
+    // retry-after counts down to the window's reset on the WALL clock, floored at 1 s
+    // (the store's injected clock only decides WHICH window is active — once the wall
+    // clock passes that window's reset, the floor applies).
+    const untilReset = Math.max(
+      1,
+      Math.ceil((Date.parse(json.error.window.resets_at ?? '') - Date.now()) / 1000),
+    );
+    expect(Math.abs(Number(res.headers.get('retry-after')) - untilReset)).toBeLessThanOrEqual(5);
+    expect(json.error.type).toBe('quota_for_entity_exceeded');
+    expect(json.error.scope).toEqual({ kind: 'key', id: 'vk_1', workspace_id: 'ws_1' });
+    expect(json.error.window).toEqual({ period: 'daily', resets_at: '2026-10-12T00:00:00.000Z' });
+    expect(json.error.message).toMatch(
+      /^Key vk_1 budget exceeded\. Current spend: \$0\.00, limit: \$0\.0005 \(daily\)/,
+    );
+    expect(requestLog.entries).toHaveLength(0); // never called upstream
+    const rejected = audit.rows.find((r) => r.action === 'budget.rejected');
+    expect(rejected?.payload).toMatchObject({
+      scope: 'key:ws_1:vk_1',
+      scopeKind: 'key',
+      entity: 'vk_1',
+    });
+    // The workspace reservation taken before the key check was released: the whole
+    // workspace cap is free again.
+    expect((await budgets.reserve('ws_1', 'probe', 10_000_000))?.allowed).toBe(true);
+    await budgets.commit('ws_1', 'probe', 0);
+
+    // The next day the key's window is fresh — but the cap is still too small for this
+    // request, so it is the SAME typed rejection with the new reset time.
+    now = Date.UTC(2026, 9, 12, 1, 0, 0);
+    const again = (await (await request(base, token)).json()) as Exceeded;
+    expect(again.error.window.resets_at).toBe('2026-10-13T00:00:00.000Z');
+    await app.close();
+  });
+
+  it('a daily cap that is exhausted today admits the same request after midnight UTC', async () => {
+    const { store, token } = seededStore();
+    let now = NOW;
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        [
+          'key:ws_1:vk_1',
+          { windows: [{ capMicroUsd: 9_010_000, period: { kind: 'daily' as const } }] },
+        ],
+      ]),
+      () => now,
+    );
+    // Spend most of today's cap already.
+    await budgets.reserve('key:ws_1:vk_1', 'earlier', 9_000_000);
+    await budgets.commit('key:ws_1:vk_1', 'earlier', 9_000_000);
+    const { ctx } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    expect((await request(base, token)).status).toBe(402);
+    now = Date.UTC(2026, 9, 12, 0, 0, 1); // the window rolled
+    const ok = await request(base, token);
+    expect(ok.status).toBe(200);
+    await ok.text();
+    await app.close();
+  });
+
+  it('team (principal groups) and org caps bind in hierarchy order, each naming its entity', async () => {
+    const store = new InMemoryKeyStore();
+    const gen = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_team',
+      keyPrefix: gen.keyPrefix,
+      keyHash: gen.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_1',
+      displayName: 'team key',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: '*',
+      allowedModels: '*',
+      groups: ['ml', 'platform'],
+    });
+    const caps = new Map<string, { capMicroUsd: number }>([
+      ['org:org_1', { capMicroUsd: 500 }],
+      ['team:ws_1:platform', { capMicroUsd: 500 }],
+    ]);
+    const budgets = new InMemoryBudgetStore(caps, () => NOW);
+    const { ctx } = buildContext(store, budgets);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    // The org is checked before any team: it binds first.
+    let json = (await (await request(base, gen.token)).json()) as Exceeded;
+    expect(json.error.scope).toEqual({ kind: 'org', id: 'org_1' });
+    expect(json.error.window).toEqual({ period: 'lifetime' });
+    expect(json.error.message).toMatch(/^Organization budget exceeded/);
+    // Lift the org cap: the second group's cap binds (the first group has none).
+    caps.delete('org:org_1');
+    json = (await (await request(base, gen.token)).json()) as Exceeded;
+    expect(json.error.scope).toEqual({ kind: 'team', id: 'platform', workspace_id: 'ws_1' });
+    // Restrict BUDGET_SCOPES to the org only: the team cap is no longer consulted.
+    ctx.budgetScopes = new Set(['org']);
+    const ok = await request(base, gen.token);
+    expect(ok.status).toBe(200);
+    await ok.text();
+    await app.close();
+  });
+
+  it('a project cap keys off the `project` attribution and fires the hard-rejection alert once per window', async () => {
+    const { store, token } = seededStore();
+    const budgets = new InMemoryBudgetStore(
+      new Map([
+        [
+          'project:ws_1:checkout',
+          { windows: [{ capMicroUsd: 500, period: { kind: 'monthly' as const } }] },
+        ],
+      ]),
+      () => NOW,
+    );
+    const { ctx } = buildContext(store, budgets);
+    ctx.attributionHeaders = ['x-gulley-project'];
+    const alerts: Array<{ scope: string; threshold: number; exceeded?: boolean }> = [];
+    ctx.budgetAlerter = {
+      check: () => {},
+      exceeded: (scope, _u, _c, window) =>
+        alerts.push({ scope, threshold: 1, exceeded: true, ...(window ? {} : {}) }),
+    };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const other = await request(base, token, { 'x-gulley-project': 'search' });
+    expect(other.status).toBe(200); // a different project has no cap
+    await other.text();
+    const r1 = await request(base, token, { 'x-gulley-project': 'checkout' });
+    expect(r1.status).toBe(402);
+    const json = (await r1.json()) as Exceeded;
+    expect(json.error.scope).toEqual({ kind: 'project', id: 'checkout', workspace_id: 'ws_1' });
+    expect(json.error.window.period).toBe('monthly');
+    expect(alerts).toEqual([{ scope: 'project:ws_1:checkout', threshold: 1, exceeded: true }]);
+    await app.close();
+  });
+});
+
+describe('session kill switch (K5)', () => {
+  it('refuses a blocked session with 403 before any upstream work, audits it, and lifts an expired block', async () => {
+    const { store, token } = seededStore();
+    let now = Date.now();
+    const blocks = new SessionBlockSnapshot(
+      async () => [
+        { workspaceId: 'ws_1', session: 'sess-runaway', expiresAt: null },
+        { workspaceId: 'ws_1', session: 'sess-lapsed', expiresAt: new Date(now + 1_000) },
+        { workspaceId: 'ws_other', session: 'sess-ok', expiresAt: null }, // another workspace
+      ],
+      60_000,
+      () => now,
+    );
+    await blocks.start();
+    const { ctx, requestLog, audit } = buildContext(store);
+    ctx.sessionBlocks = blocks;
+    ctx.attributionHeaders = ['x-gulley-session'];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = (session: string) =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': token,
+          'x-gulley-session': session,
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+
+    const blocked = await send('sess-runaway');
+    expect(blocked.status).toBe(403);
+    expect(((await blocked.json()) as { error: { type: string } }).error.type).toBe(
+      'session_blocked',
+    );
+    expect(requestLog.entries).toHaveLength(0); // never reached an upstream
+    const row = audit.rows.find((r) => r.action === 'policy.session_blocked');
+    expect(row?.target).toBe('sess-runaway');
+    expect(row?.payload).toMatchObject({ session: 'sess-runaway', workspaceId: 'ws_1' });
+
+    const ok = await send('sess-ok'); // blocked only in another workspace
+    expect(ok.status).toBe(200);
+    await ok.text();
+    expect((await send('sess-lapsed')).status).toBe(403);
+    now += 2_000; // the block's TTL passed — it lifts locally without a reload
+    const lifted = await send('sess-lapsed');
+    expect(lifted.status).toBe(200);
+    await lifted.text();
+    blocks.stop();
+    await app.close();
+  });
+});
+
+describe('hot-path review fixes (wave 2)', () => {
+  const MSG_START =
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":1}}}\n\n';
+  const CLEAN_TAIL =
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const COMPACT_PING = 'event: ping\ndata: {"type":"ping"}\n\n';
+
+  async function serve(
+    handler: (req: http.IncomingMessage, res: http.ServerResponse) => void,
+  ): Promise<{ url: string; close: () => Promise<void>; hits: () => number }> {
+    let hits = 0;
+    const srv = http.createServer((req, res) => {
+      hits += 1;
+      handler(req, res);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+      hits: () => hits,
+    };
+  }
+  const streamBody = () =>
+    JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+  it("an Anthropic-dialect upstream's own compact pings keep the inactivity watchdog alive (only Bedrock's synthetic pings are ignored)", async () => {
+    // The ping frame bedrockToSse synthesizes is byte-identical to a compact Anthropic
+    // ping. The watchdog exclusion must apply only where the gateway did the
+    // synthesizing — on any other provider those bytes ARE upstream liveness.
+    const pinging = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START);
+      let n = 0;
+      const t = setInterval(() => {
+        n += 1;
+        res.write(COMPACT_PING);
+        if (n >= 12) {
+          clearInterval(t);
+          res.end(CLEAN_TAIL);
+        }
+      }, 40); // 480 ms of nothing but pings, against a 150 ms idle budget
+    });
+    const { store, token } = seededStore();
+    const { ctx, requestLog, breaker } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', pinging.url) },
+      },
+    ];
+    ctx.streamInactivityMs = 150;
+    ctx.watchdogBreakerThreshold = 1;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamBody(),
+    });
+    const text = await res.text();
+    await vi.waitFor(() => expect(requestLog.entries.length).toBe(1));
+    expect(text).toContain('message_stop');
+    expect(text).not.toContain('stalled');
+    expect(requestLog.entries[0]?.status).toBe('ok');
+    expect(requestLog.entries[0]?.attributes?.['abortReason']).toBeUndefined();
+    expect(breaker.isOpen('anthropic')).toBe(false);
+    expect(breaker.errorRate('anthropic')).toBe(0);
+
+    await app.close();
+    await pinging.close();
+  });
+
+  it('a watchdog-tripped target is not declared recovered by a probe that answers headers and hangs; a clean probe closes it', async () => {
+    let behaviour: 'hang' | 'clean' = 'hang';
+    const flaky = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START);
+      if (behaviour === 'clean') setTimeout(() => res.end(CLEAN_TAIL), 20);
+      // else: hang forever (headers + first frame only)
+    });
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    const closes: string[] = [];
+    const breaker = new CircuitBreaker({ cooldownMs: 200, onClose: (k) => closes.push(k) });
+    ctx.breaker = breaker;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', flaky.url) },
+      },
+    ];
+    ctx.streamInactivityMs = 150;
+    ctx.watchdogBreakerThreshold = 1; // one stall trips (keeps the test short)
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: streamBody(),
+      }).then((r) => r.text());
+
+    await send(); // stall → trip → OPEN
+    expect(breaker.isOpen('anthropic')).toBe(true);
+    await new Promise((r) => setTimeout(r, 220)); // cooldown over → half-open
+    expect(breaker.isOpen('anthropic')).toBe(false);
+    const probe = send(); // the probe: headers arrive at once, then it hangs
+    await vi.waitFor(() => expect(flaky.hits()).toBe(2));
+    await new Promise((r) => setTimeout(r, 30)); // headers → commitServed → recordSuccess
+    expect(closes).toEqual([]); // NOT recovered on first byte
+    expect(breaker.tryProbe('anthropic')).toBe(false); // probe token still held
+    await probe; // stalls → trips again
+    expect(breaker.isOpen('anthropic')).toBe(true);
+    expect(closes).toEqual([]);
+    await new Promise((r) => setTimeout(r, 420)); // 2× backoff (400 ms) elapsed
+    behaviour = 'clean';
+    const text = await send(); // the probe completes cleanly → recovered
+    expect(text).toContain('message_stop');
+    await vi.waitFor(() => expect(closes).toEqual(['anthropic']));
+    expect(breaker.tryProbe('anthropic')).toBe(true);
+    await vi.waitFor(() => expect(requestLog.entries.length).toBe(3));
+
+    await app.close();
+    await flaky.close();
+  });
+
+  it('count_tokens records a request record for a served count and for an upstream failure', async () => {
+    const counting = await serve((req, res) => {
+      if (req.url === '/v1/messages/count_tokens') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ input_tokens: 7 }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    const recorded: Array<{ statusCode: number; status: string; route: string; provider: string }> =
+      [];
+    ctx.telemetry = {
+      ...ctx.telemetry,
+      recordRequest: (d) =>
+        recorded.push({
+          statusCode: d.statusCode,
+          status: d.status,
+          route: d.route,
+          provider: d.provider,
+        }),
+    };
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', counting.url) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const count = () =>
+      fetch(`${base}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+
+    expect((await count()).status).toBe(200);
+    expect(recorded).toEqual([
+      { statusCode: 200, status: 'ok', route: '/v1/messages/count_tokens', provider: 'anthropic' },
+    ]);
+    await counting.close(); // the upstream is gone → 502
+    expect((await count()).status).toBe(502);
+    expect(recorded[1]).toEqual({
+      statusCode: 502,
+      status: 'error',
+      route: '/v1/messages/count_tokens',
+      provider: 'anthropic',
+    });
+    const anon = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(anon.status).toBe(401);
+    expect(recorded[2]).toMatchObject({ statusCode: 401, status: 'error' });
+
+    await app.close();
   });
 });

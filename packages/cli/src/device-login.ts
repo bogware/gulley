@@ -97,7 +97,7 @@ export async function discoverBroker(
   }
 }
 
-async function postForm(
+export async function postForm(
   fetchImpl: typeof fetch,
   url: string,
   fields: Record<string, string>,

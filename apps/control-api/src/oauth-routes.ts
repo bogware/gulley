@@ -1,4 +1,9 @@
-import { normalizeUserCode, type BrokerService, type OAuthError } from '@gulley/oauth';
+import {
+  type BrokerService,
+  JWT_BEARER_GRANT_TYPE,
+  normalizeUserCode,
+  type OAuthError,
+} from '@gulley/oauth';
 import { randomBytes } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { adminRoute, body, str } from './admin';
@@ -19,7 +24,7 @@ const DESCRIPTIONS: Partial<Record<OAuthError['error'], string>> = {
   access_denied: 'the request was denied at the consent page',
   invalid_grant: 'the grant is invalid, expired, revoked, or was already used',
   unsupported_grant_type:
-    'supported: device_code (RFC 8628 URN), authorization_code, refresh_token',
+    'supported: device_code (RFC 8628 URN), authorization_code, refresh_token, urn:ietf:params:oauth:grant-type:jwt-bearer (RFC 7523, when workload federations are configured)',
 };
 
 function sendError(reply: FastifyReply, err: OAuthError | OAuthError['error']): FastifyReply {
@@ -66,7 +71,9 @@ const DEVICE_GRANT_TYPES = new Set(['device_code', 'urn:ietf:params:oauth:grant-
  *   GET  /oauth/device/preview?user_code=          which client/tenancy is asking (admin session)
  *   POST /oauth/device/authorize | /deny           consent decision (admin session)
  *   POST /oauth/token                              device_code (short form or RFC URN),
- *                                                  authorization_code (PKCE S256), refresh_token
+ *                                                  authorization_code (PKCE S256), refresh_token,
+ *                                                  urn:ietf:params:oauth:grant-type:jwt-bearer
+ *                                                  (RFC 7523 workload identity exchange)
  *   POST /oauth/revoke                             RFC 7009 (always 200)
  *   GET  /oauth/authorize                          auth-code + PKCE (admin session)
  *
@@ -92,6 +99,8 @@ export function registerOAuthRoutes(
         'urn:ietf:params:oauth:grant-type:device_code',
         'authorization_code',
         'refresh_token',
+        // Advertised only when at least one workload federation is configured.
+        ...(broker.supportsJwtBearer ? [JWT_BEARER_GRANT_TYPE] : []),
       ],
       response_types_supported: ['code'],
       code_challenge_methods_supported: ['S256'],
@@ -221,6 +230,42 @@ export function registerOAuthRoutes(
       const r = await broker.tokenAuthCode({ code, codeVerifier: verifier, redirectUri, clientId });
       return r.ok ? reply.send(r.value) : sendError(reply, r.error);
     }
+    // RFC 7523 §2.1: a workload (Kubernetes service account, GitHub Actions job)
+    // presents its platform-issued JWT as `assertion` and receives a short-lived,
+    // scoped, ACCESS-ONLY token for the service principal its federation maps to. The
+    // expected `aud` defaults to this broker's public origin. Any failure is one generic
+    // `invalid_grant` on the wire; the reason goes to the log (never the assertion).
+    if (grantType === JWT_BEARER_GRANT_TYPE) {
+      const assertion = str(b['assertion']);
+      if (!assertion) return sendError(reply, 'invalid_request');
+      const r = await broker.tokenJwtBearer({
+        assertion,
+        clientId: clientId || undefined,
+        defaultAudience: publicOrigin(ctx, request),
+      });
+      if (!r.ok) {
+        request.log.info(
+          { event: 'oauth.jwt_bearer_rejected', error: r.error.error, reason: r.error.reason },
+          'workload token exchange rejected',
+        );
+        return sendError(reply, r.error.error);
+      }
+      const id = r.value.identity;
+      await ctx.audit.append({
+        orgId: id.orgId,
+        actor: id.principalId,
+        action: 'oauth.token_exchanged',
+        target: id.handle,
+        payload: {
+          federation: id.federation,
+          subject: id.subject,
+          clientId: clientId || 'workload',
+          workspaceId: id.workspaceId,
+          expiresAt: new Date(id.expiresAt).toISOString(),
+        },
+      });
+      return reply.send(r.value.token);
+    }
     return sendError(reply, 'unsupported_grant_type');
   });
 
@@ -242,6 +287,12 @@ export function registerOAuthRoutes(
             client_id: r.clientId,
             sub: r.principalId,
             exp: Math.floor(r.accessTokenExpiresAt / 1000),
+            // Gulley extensions: what KIND of principal this is and its data-plane scope.
+            kind: r.kind,
+            ...(r.federation ? { federation: r.federation } : {}),
+            ...(r.subject ? { subject: r.subject } : {}),
+            scope: r.scope,
+            on_behalf_of: r.onBehalfOf,
           }
         : { active: false },
     );

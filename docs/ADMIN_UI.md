@@ -3,9 +3,10 @@
 The control-plane UI (`apps/web`), built on the control-api endpoints.
 
 > **Status: ✅ DELIVERED.** The pages below are built and the app builds clean
-> (`next build`). Auth supports both a **bootstrap/paste-token** flow (dev /
-> break-glass) and **Entra SSO** ("Sign in with SSO" — see
-> [ENTRA_SETUP.md](ENTRA_SETUP.md)). `pnpm --filter @gulley/web dev` serves it on :3000;
+> (`next build`). Auth supports a **bootstrap/paste-token** flow (dev /
+> break-glass) and browser SSO through **OIDC** ([ENTRA_SETUP.md](ENTRA_SETUP.md))
+> and/or **SAML 2.0** ([SAML_SETUP.md](SAML_SETUP.md)) — one "Sign in with SSO"
+> button per enabled gate. `pnpm --filter @gulley/web dev` serves it on :3000;
 > `/control/*` proxies to the control-api (`CONTROL_API_URL`, default
 > `http://localhost:8081`) — read at **request time** by
 > `app/control/[...path]/route.ts` (streams bodies, forwards `Set-Cookie`, never
@@ -28,38 +29,41 @@ The control-plane UI (`apps/web`), built on the control-api endpoints.
 ## Auth flow (dependency)
 
 The console authenticates against the control-api with an **admin session bearer
-token**. In production that token is minted by the **Entra OIDC login → admin
-session** gate (auth-code + PKCE; see [ENTRA_SETUP.md](ENTRA_SETUP.md)). For dev or
-break-glass, a **bootstrap admin token** is pasted into the console (kept in
-`sessionStorage` for the tab's lifetime — never `localStorage` — and sent as
-`Authorization: Bearer`). Any `401` from the control-api signs the console out again
-and shows why; every call carries a 15 s deadline.
+token**. In production that token is minted by an SSO gate — the **OIDC login**
+(auth-code + PKCE; [ENTRA_SETUP.md](ENTRA_SETUP.md)) or the **SAML 2.0 login**
+(SP-initiated, HTTP-POST ACS; [SAML_SETUP.md](SAML_SETUP.md)) — both of which end in
+the same session-minting tail and set the `gulley_admin_session` cookie. `GET
+/auth/config` tells the sign-in page which gates are on. For dev or break-glass, a
+**bootstrap admin token** is pasted into the console (kept in `sessionStorage` for
+the tab's lifetime — never `localStorage` — and sent as `Authorization: Bearer`). Any
+`401` from the control-api signs the console out again and shows why; every call
+carries a 15 s deadline.
 
 ## Routes / pages
 
 The sidebar (`components/app-shell.tsx`) groups the pages below; every route is
 exercised by the Playwright navigation flow (`e2e/flows/navigate.spec.ts`).
 
-| Route                      | Purpose                                                                                                                                       | Primary control-api endpoints                                                                                                   |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `/`                        | Overview: spend + usage tiles, recent requests                                                                                                | `/admin/analytics/usage`, `/admin/logs`                                                                                         |
-| `/logs`                    | Request-log browser: filter (provider/model/status/time), keyset paginate, row → detail drawer                                                | `/admin/logs`, `/admin/logs/:requestId`                                                                                         |
-| `/analytics`               | Time-bucketed spend/token charts, split by provider/model                                                                                     | `/admin/analytics/usage`                                                                                                        |
-| `/observability`           | Live gateway metrics snapshot (backs off while the metrics listener is down)                                                                  | `/admin/observability/metrics`, `/admin/observability/status`                                                                   |
-| `/compliance`              | Audit chain verify + events, attestation, evidence bundle, WORM / anchor / SIEM status, mask-vault reveal, crypto-shred                       | `/audit/*`, `/admin/mask-vault/:requestId`, `/admin/crypto-shred/:subject`                                                      |
-| `/guardrails`              | Per-workspace guardrail policy collection                                                                                                     | `/guardrails`                                                                                                                   |
-| `/rollouts`                | Eval suites + eval-gated model rollouts                                                                                                       | `/admin/eval-suites`, `/admin/rollouts`                                                                                         |
-| `/finops`                  | Chargeback by workspace/model/provider/attribution + shadow-spend (bypass) reconciliation                                                     | `/admin/analytics/chargeback`, `/admin/analytics/shadow-spend`                                                                  |
-| `/budgets`, `/rate-limits` | Per-workspace policy collections                                                                                                              | `/budgets`, `/rate-limits`                                                                                                      |
-| `/identity`                | Users & sessions, memberships, OAuth broker (clients, grants, device codes, refresh-reuse alerts), onboarding (client configs + signed packs) | `/admin/users`, `/admin/sessions`, `/memberships`, `/admin/oauth/*`, `/admin/security/refresh-reuse`, `/admin/workspaces/:id/*` |
-| `/keys`                    | Mint / list / disable / rotate virtual keys (token shown once)                                                                                | `/keys`, `/keys/:id`, `/keys/:id/disable`, `/keys/:id/rotate`                                                                   |
-| `/config`                  | GitOps config console: export, plan/diff, apply, drift, version history                                                                       | `/config/*`                                                                                                                     |
-| `/routes`                  | Route groups — fallback / load-balance groups per client path (the `routes` entity shape the gateway applies); legacy entries flagged         | `/routes`                                                                                                                       |
-| `/providers`               | Providers + secret-ref credentials                                                                                                            | `/providers`, `/providers/:id/credential`                                                                                       |
-| `/prompts`                 | Governed prompt registry: versions, render, chain verify                                                                                      | `/prompts`, `/prompts/:id/*`                                                                                                    |
-| `/orgs`                    | Org → workspace tree                                                                                                                          | `/orgs`, `/workspaces`                                                                                                          |
-| `/settings`                | Control-api status/version, runtime log level, config dump                                                                                    | `/admin/status`, `/admin/log-level`, `/admin/config-dump`                                                                       |
-| `/oauth/device`            | Device-flow consent page (preview → approve / deny; needs a signed-in admin)                                                                  | `/oauth/device/preview`, `/oauth/device/authorize`, `/oauth/device/deny`                                                        |
+| Route                      | Purpose                                                                                                                                                                                                     | Primary control-api endpoints                                                                                                                                                        |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/`                        | Overview: spend + usage tiles, recent requests                                                                                                                                                              | `/admin/analytics/usage`, `/admin/logs`                                                                                                                                              |
+| `/logs`                    | Request-log browser: filter (provider/model/status/time), keyset paginate, row → detail drawer                                                                                                              | `/admin/logs`, `/admin/logs/:requestId`                                                                                                                                              |
+| `/analytics`               | Time-bucketed spend/token charts, split by provider/model                                                                                                                                                   | `/admin/analytics/usage`                                                                                                                                                             |
+| `/observability`           | Live gateway metrics snapshot (backs off while the metrics listener is down)                                                                                                                                | `/admin/observability/metrics`, `/admin/observability/status`                                                                                                                        |
+| `/compliance`              | Audit chain verify + events, attestation, evidence bundle, WORM / anchor / SIEM status, mask-vault reveal, crypto-shred                                                                                     | `/audit/*`, `/admin/mask-vault/:requestId`, `/admin/crypto-shred/:subject`                                                                                                           |
+| `/guardrails`              | Per-workspace guardrail policy collection                                                                                                                                                                   | `/guardrails`                                                                                                                                                                        |
+| `/rollouts`                | Eval suites + eval-gated model rollouts                                                                                                                                                                     | `/admin/eval-suites`, `/admin/rollouts`                                                                                                                                              |
+| `/finops`                  | Chargeback by workspace/model/provider/attribution + FOCUS 1.2 export, agent cost tree (session → prompt → subagent), runaway-session blocks (list / block / unblock), shadow-spend (bypass) reconciliation | `/admin/analytics/chargeback`, `/admin/analytics/focus`, `/admin/analytics/agent-tree`, `/admin/sessions/blocked`, `/admin/sessions/:session/block`, `/admin/analytics/shadow-spend` |
+| `/budgets`, `/rate-limits` | Per-workspace policy collections                                                                                                                                                                            | `/budgets`, `/rate-limits`                                                                                                                                                           |
+| `/identity`                | Users & sessions, memberships, OAuth broker (clients, grants, device codes, refresh-reuse alerts), onboarding (client configs + signed packs)                                                               | `/admin/users`, `/admin/sessions`, `/memberships`, `/admin/oauth/*`, `/admin/security/refresh-reuse`, `/admin/workspaces/:id/*`                                                      |
+| `/keys`                    | Mint / list / disable / rotate virtual keys (token shown once)                                                                                                                                              | `/keys`, `/keys/:id`, `/keys/:id/disable`, `/keys/:id/rotate`                                                                                                                        |
+| `/config`                  | GitOps config console: export, plan/diff, apply, drift, version history                                                                                                                                     | `/config/*`                                                                                                                                                                          |
+| `/routes`                  | Route groups — fallback / load-balance groups per client path (the `routes` entity shape the gateway applies); legacy entries flagged                                                                       | `/routes`                                                                                                                                                                            |
+| `/providers`               | Providers + secret-ref credentials                                                                                                                                                                          | `/providers`, `/providers/:id/credential`                                                                                                                                            |
+| `/prompts`                 | Governed prompt registry: versions, render, chain verify                                                                                                                                                    | `/prompts`, `/prompts/:id/*`                                                                                                                                                         |
+| `/orgs`                    | Org → workspace tree                                                                                                                                                                                        | `/orgs`, `/workspaces`                                                                                                                                                               |
+| `/settings`                | Control-api status/version, runtime log level, config dump                                                                                                                                                  | `/admin/status`, `/admin/log-level`, `/admin/config-dump`                                                                                                                            |
+| `/oauth/device`            | Device-flow consent page (preview → approve / deny; needs a signed-in admin)                                                                                                                                | `/oauth/device/preview`, `/oauth/device/authorize`, `/oauth/device/deny`                                                                                                             |
 
 ## Components
 
@@ -76,8 +80,11 @@ exercised by the Playwright navigation flow (`e2e/flows/navigate.spec.ts`).
   / model aliases (they share the `{ workspaceId, name, config }` shape).
 - **Key minting** — mint → show the token once with a copy button, then never again;
   rotate/disable confirm first.
-- **TokenGate** — the sign-in screen: "Sign in with SSO" when `/auth/config` reports
-  OIDC enabled, else the paste-token form.
+- **TokenGate** — the sign-in screen: a "Sign in with SSO" button per gate
+  `/auth/config` reports enabled (OIDC and/or SAML), plus the paste-token form.
+- **Identity → Roles** — the role catalogue: built-ins (read-only) and custom roles,
+  with a create/edit form whose permission grid is grouped by resource from the
+  catalogue `GET /roles` returns; the Access tab's role picker reads the same list.
 
 ## Data-fetching pattern
 

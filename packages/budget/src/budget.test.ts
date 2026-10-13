@@ -175,12 +175,115 @@ describe('RedisBudgetStore.commit idempotency token', () => {
     await store.commit('ws_1', 'req_1', 100);
     const call = redis.calls[0];
     expect(call).toBeDefined();
+    // KEYS = [reserved, commit-id, committed window(s)…]; ARGV = [field, actual, dedupTtl, n, …]
     expect(call?.numKeys).toBe(3);
-    expect(call?.args[2]).toBe('budget:{ws_1}:cid:req_1');
+    expect(call?.args[1]).toBe('budget:{ws_1}:cid:req_1');
+    expect(call?.args[2]).toBe('budget:{ws_1}:committed');
     expect(call?.args[3]).toBe('req_1');
-    expect(Number(call?.args[6])).toBe(600); // dedup TTL = reservation lifetime, seconds
+    expect(Number(call?.args[5])).toBe(600); // dedup TTL = reservation lifetime, seconds
     expect(call?.script).toContain("'SET', commitIdKey, '1', 'NX', 'EX', dedupTtl");
     expect(call?.script).not.toContain('SADD');
     expect(call?.script).not.toContain('committed_ids');
+  });
+});
+
+/** Answers the RESERVE script with "admitted, window 1" and records every call, so the
+ *  commit's KEYS/ARGV can be asserted without a live Redis. */
+class LayoutRedis implements EvalRedis {
+  readonly calls: Array<{ script: string; numKeys: number; args: (string | number)[] }> = [];
+  async eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown> {
+    this.calls.push({ script, numKeys, args });
+    return script.includes('HGETALL') ? [1, 1, 0, 1_000_000] : 1;
+  }
+}
+
+describe('RedisBudgetStore.commit credits the counters the reservation was admitted against', () => {
+  const T = Date.UTC(2026, 9, 11, 23, 59, 50);
+  const commitCall = (r: LayoutRedis) => r.calls.find((c) => c.script.includes('commitIdKey'));
+
+  it('a calendar budget commits to the reserve-time window even when the cap resolver is down', async () => {
+    const redis = new LayoutRedis();
+    let now = T;
+    let resolverDown = false;
+    const store = new RedisBudgetStore(
+      redis,
+      async () => {
+        if (resolverDown) throw new Error('postgres unreachable');
+        return { windows: [{ capMicroUsd: 10_000_000, period: { kind: 'daily' } }] };
+      },
+      600_000,
+      () => now,
+    );
+    expect((await store.reserve('ws_1', 'req_1', 4_000_000))?.allowed).toBe(true);
+    resolverDown = true;
+    now = T + 365_000; // the stream ran past midnight AND the resolver went away
+    await store.commit('ws_1', 'req_1', 4_000_000);
+    const c = commitCall(redis);
+    // The spend lands in the window the request was admitted in (2026-10-11), in
+    // calendar mode — never the lifetime key, which calendar admission never reads.
+    expect(c?.args.slice(0, 3)).toEqual([
+      'budget:{ws_1}:reserved',
+      'budget:{ws_1}:cid:req_1',
+      'budget:{ws_1}:committed:d:2026-10-11',
+    ]);
+    expect(c?.args[7]).toBe('calendar');
+    expect(Number(c?.args[8])).toBeGreaterThan(7 * 86_400);
+  });
+
+  it('a legacy fixed window keeps its mode + TTL on a resolver outage (never PERSISTed)', async () => {
+    const redis = new LayoutRedis();
+    let resolverDown = false;
+    const store = new RedisBudgetStore(
+      redis,
+      async () => {
+        if (resolverDown) throw new Error('down');
+        return { capMicroUsd: 1_000_000, periodSeconds: 86_400 };
+      },
+      600_000,
+      () => T,
+    );
+    await store.reserve('ws_1', 'req_2', 100);
+    resolverDown = true;
+    await store.commit('ws_1', 'req_2', 100);
+    const c = commitCall(redis);
+    expect(c?.args[2]).toBe('budget:{ws_1}:committed');
+    expect(c?.args[7]).toBe('fixed');
+    expect(Number(c?.args[8])).toBe(86_400);
+  });
+
+  it('a commit with no reserve-time layout and no resolver credits the lifetime key without touching any TTL', async () => {
+    const redis = new LayoutRedis();
+    const store = new RedisBudgetStore(
+      redis,
+      async () => {
+        throw new Error('down');
+      },
+      600_000,
+      () => T,
+    );
+    await store.commit('ws_1', 'unknown_req', 100); // reserved elsewhere / never here
+    const c = commitCall(redis);
+    expect(c?.numKeys).toBe(3);
+    expect(c?.args[2]).toBe('budget:{ws_1}:committed');
+    expect(c?.args[7]).toBe('keep');
+    expect(c?.script).toContain("elseif mode == 'none' then"); // 'keep' falls through: no PERSIST
+  });
+
+  it('a commit without a layout but with a healthy resolver uses the current windows (and consumes the layout once)', async () => {
+    const redis = new LayoutRedis();
+    const store = new RedisBudgetStore(
+      redis,
+      async () => ({ windows: [{ capMicroUsd: 5, period: { kind: 'monthly' } }] }),
+      600_000,
+      () => T,
+    );
+    await store.reserve('ws_1', 'req_3', 1);
+    await store.commit('ws_1', 'req_3', 1);
+    await store.commit('ws_1', 'req_3', 1); // a resend: layout already consumed → resolver path
+    const commits = redis.calls.filter((c) => c.script.includes('commitIdKey'));
+    expect(commits.map((c) => c.args[2])).toEqual([
+      'budget:{ws_1}:committed:m:2026-10',
+      'budget:{ws_1}:committed:m:2026-10',
+    ]);
   });
 });

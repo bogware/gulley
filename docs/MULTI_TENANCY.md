@@ -17,7 +17,10 @@ through the whole pipeline.
 
 - **Budgets & rate limits** are keyed by `workspaceId` (Redis counters + the
   Postgres `budget`/`rate_limit` tables), enforced per request. One tenant can't
-  spend another's budget or exhaust its rate window.
+  spend another's budget or exhaust its rate window. Budget rows below the workspace
+  (per key / user / team / project, and their `*` defaults) are partitioned by
+  `workspace_id`; an **org** budget (`workspace_id` NULL, `PUT /orgs/:id/budget`) caps
+  every workspace of the org together and is checked right after the workspace cap.
 - **Metering & audit** rows carry `orgId`/`workspaceId`; the hash-chained audit
   trail is org-scoped.
 - **Cache** is partitioned by authz scope, so a cached response never crosses a

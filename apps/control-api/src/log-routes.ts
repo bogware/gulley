@@ -19,7 +19,7 @@ function query(request: FastifyRequest): Record<string, string | undefined> {
  *  - null — the caller can see nothing; return an empty result rather than leak an
  *    unscoped query.
  */
-function readScope(
+export function readScope(
   request: FastifyRequest,
   ctx: ControlContext,
   admin: AdminPrincipal,
@@ -35,7 +35,7 @@ function readScope(
   return visible.size > 0 ? [...visible] : null;
 }
 
-function parseDate(v: string | undefined): Date | undefined {
+export function parseDate(v: string | undefined): Date | undefined {
   if (!v) return undefined;
   const d = new Date(v);
   return Number.isNaN(d.getTime()) ? undefined : d;

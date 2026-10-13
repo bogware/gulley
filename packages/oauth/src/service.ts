@@ -1,9 +1,17 @@
 import type { Principal } from '@gulley/auth';
 import { err, ok, type Result } from '@gulley/core';
 import { randomBytes } from 'node:crypto';
+import type { FederationVerifierPort } from './federation';
 import type { IdentityProvider } from './idp';
 import { pkceVerifyS256, validateLoopbackRedirect } from './pkce';
-import type { AuthCodeStore, DeviceCodeStore, Grant, GrantStore, OAuthClientStore } from './stores';
+import type {
+  AuthCodeStore,
+  DeviceCodeStore,
+  Grant,
+  GrantScope,
+  GrantStore,
+  OAuthClientStore,
+} from './stores';
 import {
   mintAccessToken,
   mintRefreshToken,
@@ -41,8 +49,36 @@ export interface TokenResponse {
   access_token: string;
   token_type: 'Bearer';
   expires_in: number;
-  refresh_token: string;
+  /** Absent on an ACCESS-ONLY grant (the RFC 7523 JWT-bearer exchange): a workload
+   *  re-presents a fresh assertion instead of refreshing. */
+  refresh_token?: string;
 }
+
+/** The RFC 7523 grant type URN (`grant_type` of a JWT-bearer token exchange). */
+export const JWT_BEARER_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
+
+/** A successful JWT-bearer exchange: the wire response plus the identity it was
+ *  bound to (for the caller's audit row — never echoed to the workload). */
+export interface JwtBearerIssued {
+  token: TokenResponse;
+  identity: {
+    handle: string;
+    principalId: string;
+    federation: string;
+    subject: string;
+    orgId: string;
+    workspaceId: string;
+    expiresAt: number;
+  };
+}
+
+/** The built-in pseudo-client a JWT-bearer exchange is recorded under when the
+ *  caller sends no `client_id`. It is not in the client registry and can do nothing
+ *  else (no device/auth-code/refresh capability); the FEDERATION, not the client,
+ *  decides tenancy + scope. A registered client may be named instead, in which case
+ *  it must be enabled, carry the jwt-bearer grant type, and share the federation's
+ *  tenancy. */
+export const WORKLOAD_CLIENT_ID = 'workload';
 
 /** Authorizes the consenting admin against the client's tenancy. Returns false
  *  to deny (deny-by-default). Wired by the control-api consent routes so a viewer
@@ -77,6 +113,9 @@ export interface BrokerDeps {
   codes: AuthCodeStore;
   clients: OAuthClientStore;
   idp: IdentityProvider;
+  /** Workload identity federation verifier (RFC 7523 JWT-bearer). Absent ⇒ the
+   *  jwt-bearer grant type is `unsupported_grant_type`. */
+  federation?: FederationVerifierPort;
 }
 
 const USER_CODE_ALPHABET = 'BCDFGHJKLMNPQRSTVWXZ0123456789';
@@ -108,6 +147,12 @@ export class BrokerService {
     return this.cfg.now?.() ?? Date.now();
   }
 
+  /** True when a workload federation verifier is wired (the jwt-bearer grant type
+   *  is served and advertised). */
+  get supportsJwtBearer(): boolean {
+    return this.deps.federation !== undefined;
+  }
+
   private async issueGrant(base: {
     clientId: string;
     principalId: string;
@@ -133,6 +178,7 @@ export class BrokerService {
       prevRefreshTokenHash: null,
       refreshGeneration: 1,
       absoluteExpiresAt: now + this.cfg.absoluteTtlMs,
+      kind: 'user',
     };
     await this.deps.grants.create(grant);
     return {
@@ -141,6 +187,131 @@ export class BrokerService {
       expires_in: Math.floor(this.cfg.accessTtlMs / 1000),
       refresh_token: rt.token,
     };
+  }
+
+  // --- RFC 7523 JWT-bearer: workload identity → scoped, access-only token ---
+
+  /**
+   * Exchange a verified workload assertion (Kubernetes service-account token, GitHub
+   * Actions OIDC token, …) for an ACCESS-ONLY grant bound to the service principal
+   * the matching federation maps it to. No refresh token is minted: the family's
+   * absolute expiry IS the access expiry, and a refresh attempt with any token of
+   * this family is `invalid_grant`. Every verification failure is a single generic
+   * `invalid_grant` (the reason is logged by the caller, never echoed).
+   *
+   * `clientId` is optional: absent, the grant is recorded under the built-in
+   * {@link WORKLOAD_CLIENT_ID}; present, the client must exist, be enabled, carry the
+   * jwt-bearer grant type and share the federation's tenancy (`invalid_client`).
+   */
+  async tokenJwtBearer(params: {
+    assertion: string;
+    clientId?: string;
+    /** The broker's public origin — the `aud` a federation expects unless it
+     *  configures its own. */
+    defaultAudience?: string;
+  }): Promise<Result<JwtBearerIssued, OAuthError & { reason?: string }>> {
+    const verifier = this.deps.federation;
+    if (!verifier) return e('unsupported_grant_type');
+    if (!params.assertion) return e('invalid_request');
+
+    // Resolve the client record the grant is issued under. The built-in pseudo-client
+    // is never registered: it resolves to a synthetic, tenancy-less record. Any other
+    // id must be a registered, enabled, jwt-bearer-capable client — checked BEFORE the
+    // assertion is verified so an invalid client never consumes the assertion's `jti`.
+    const client = await this.resolveJwtBearerClient(params.clientId);
+    if (!client) return e('invalid_client');
+    const v = await verifier.verify(params.assertion, { defaultAudience: params.defaultAudience });
+    if (!v.ok) return err({ error: 'invalid_grant', reason: v.error.reason });
+    // A registered client scopes to ONE tenancy; it cannot mint for another.
+    if (
+      client.orgId !== null &&
+      (v.value.orgId !== client.orgId || v.value.workspaceId !== client.workspaceId)
+    ) {
+      return err({ error: 'invalid_client', reason: 'tenancy-mismatch' });
+    }
+    return this.issueServiceGrant(client.clientId, v.value);
+  }
+
+  /** The client a jwt-bearer grant is recorded under: the requested registered client
+   *  when it exists, is enabled and carries the grant type; the built-in pseudo-client
+   *  (no tenancy of its own — the federation decides) when none was named; null when
+   *  the named client cannot be used. */
+  private async resolveJwtBearerClient(
+    requested: string | undefined,
+  ): Promise<{ clientId: string; orgId: string | null; workspaceId: string | null } | null> {
+    const id = requested && requested.length > 0 ? requested : WORKLOAD_CLIENT_ID;
+    const registered = await this.deps.clients.get(id);
+    if (registered) {
+      if (!registered.enabled || !registered.grantTypes.includes(JWT_BEARER_GRANT_TYPE)) {
+        return null;
+      }
+      return {
+        clientId: registered.clientId,
+        orgId: registered.orgId,
+        workspaceId: registered.workspaceId,
+      };
+    }
+    return id === WORKLOAD_CLIENT_ID
+      ? { clientId: WORKLOAD_CLIENT_ID, orgId: null, workspaceId: null }
+      : null;
+  }
+
+  private async issueServiceGrant(
+    clientId: string,
+    id: {
+      principalId: string;
+      displayName: string;
+      federation: string;
+      subject: string;
+      orgId: string;
+      workspaceId: string;
+      scope: GrantScope;
+      ttlSeconds: number;
+      onBehalfOf: boolean;
+    },
+  ): Promise<Result<JwtBearerIssued, OAuthError>> {
+    const now = this.now();
+    const handle = newHandle();
+    const at = mintAccessToken(this.cfg.pepper, handle);
+    const expiresAt = now + id.ttlSeconds * 1000;
+    const grant: Grant = {
+      handle,
+      clientId,
+      principalId: id.principalId,
+      displayName: id.displayName,
+      orgId: id.orgId,
+      workspaceId: id.workspaceId,
+      status: 'active',
+      accessTokenHash: at.hash,
+      accessTokenExpiresAt: expiresAt,
+      refreshTokenHash: null, // access-only: nothing to rotate
+      prevRefreshTokenHash: null,
+      refreshGeneration: 0,
+      absoluteExpiresAt: expiresAt,
+      kind: 'service',
+      federation: id.federation,
+      subject: id.subject,
+      scope: id.scope,
+      onBehalfOf: id.onBehalfOf,
+    };
+    await this.deps.grants.create(grant);
+    return ok({
+      token: { access_token: at.token, token_type: 'Bearer', expires_in: id.ttlSeconds },
+      identity: {
+        handle,
+        principalId: id.principalId,
+        federation: id.federation,
+        subject: id.subject,
+        orgId: id.orgId,
+        workspaceId: id.workspaceId,
+        expiresAt,
+      },
+    });
+  }
+
+  /** Revoke every active family of a principal (SCIM / IdP deprovision). */
+  async revokePrincipal(principalId: string): Promise<number> {
+    return this.deps.grants.revokeByPrincipal(principalId);
   }
 
   // --- device flow ---
@@ -387,6 +558,10 @@ export class BrokerService {
     const grant = await this.deps.grants.get(parsed.handle);
     if (!grant || grant.status !== 'active' || grant.clientId !== clientId)
       return e('invalid_grant');
+    // A service (JWT-bearer) grant is access-only: there is no refresh secret to
+    // verify, so no IdP call and no state change — the workload re-presents a fresh
+    // assertion instead.
+    if (grant.kind === 'service' || grant.refreshTokenHash === null) return e('invalid_grant');
     const now = this.now();
     if (now >= grant.absoluteExpiresAt) {
       await this.deps.grants.revoke(grant.handle);
@@ -473,11 +648,19 @@ export class BrokerService {
 
   // --- introspection (RFC 7662, access tokens only) ---
 
-  /** Active ⇒ the grant's identity/expiry; null for any inactive/unknown/forged token.
-   *  Read-only, constant-time secret verify, no state change. */
-  async introspectAccessToken(
-    token: string,
-  ): Promise<{ clientId: string; principalId: string; accessTokenExpiresAt: number } | null> {
+  /** Active ⇒ the grant's identity/expiry (+ kind / federation / subject / scope for
+   *  a service grant); null for any inactive/unknown/forged token. Read-only,
+   *  constant-time secret verify, no state change. */
+  async introspectAccessToken(token: string): Promise<{
+    clientId: string;
+    principalId: string;
+    accessTokenExpiresAt: number;
+    kind: Grant['kind'];
+    federation?: string;
+    subject?: string;
+    scope: GrantScope;
+    onBehalfOf: boolean;
+  } | null> {
     const at = parseAccess(token);
     if (!at) return null;
     const g = await this.deps.grants.get(at.handle);
@@ -488,6 +671,11 @@ export class BrokerService {
       clientId: g.clientId,
       principalId: g.principalId,
       accessTokenExpiresAt: g.accessTokenExpiresAt,
+      kind: g.kind ?? 'user',
+      federation: g.federation,
+      subject: g.subject,
+      scope: grantScope(g),
+      onBehalfOf: g.onBehalfOf === true,
     };
   }
 
@@ -529,6 +717,8 @@ export async function resolveBrokerAccessToken(
   if (now() >= g.accessTokenExpiresAt) return err({ reason: 'expired' });
   if (!verifyHash(deps.pepper, at.secret, g.accessTokenHash)) return err({ reason: 'bad-secret' });
   if (!g.orgId || !g.workspaceId) return err({ reason: 'no-tenancy' }); // deny by default
+  const scope = grantScope(g);
+  const service = g.kind === 'service';
   return ok({
     kind: 'oauth-broker',
     id: g.principalId,
@@ -537,8 +727,23 @@ export async function resolveBrokerAccessToken(
     scope: {
       orgId: g.orgId,
       workspaceId: g.workspaceId,
-      allowedProviders: '*',
-      allowedModels: '*',
+      allowedProviders: scope.allowedProviders,
+      allowedModels: scope.allowedModels,
+      ...(scope.groups ? { groups: scope.groups } : {}),
     },
+    // A user grant IS its consenting user; a service grant is a workload and may
+    // only assert a user per request when its federation says so.
+    ...(service
+      ? {
+          serviceAccount: g.federation ?? 'unknown',
+          onBehalfOf: g.onBehalfOf === true,
+        }
+      : { userId: g.principalId }),
   });
+}
+
+/** The data-plane scope stored on a grant; legacy user grants (no stored scope)
+ *  resolve to everything the client tenancy allows. */
+export function grantScope(g: Pick<Grant, 'scope'>): GrantScope {
+  return g.scope ?? { allowedProviders: '*', allowedModels: '*' };
 }

@@ -1,10 +1,18 @@
+import { JWT_BEARER_GRANT_TYPE } from '@gulley/oauth';
 import type { FastifyInstance } from 'fastify';
 
 import { adminRoute, body, forbidden, notFound, str, strMax } from './admin';
 import type { ControlContext } from './context';
 
-/** The grant types the broker implements (see /.well-known/oauth-authorization-server). */
-const GRANT_TYPES = new Set(['device_code', 'authorization_code', 'refresh_token']);
+/** The grant types the broker implements (see /.well-known/oauth-authorization-server).
+ *  The RFC 7523 URN lets a registered client be named on a workload token exchange
+ *  (optional — the built-in `workload` pseudo-client is used otherwise). */
+const GRANT_TYPES = new Set([
+  'device_code',
+  'authorization_code',
+  'refresh_token',
+  JWT_BEARER_GRANT_TYPE,
+]);
 
 /** A redirect allowlist entry: an absolute http(s) URL, or a loopback path template. */
 function validRedirectEntry(v: unknown): v is string {
@@ -171,7 +179,8 @@ export function registerOAuthAdminRoutes(app: FastifyInstance, ctx: ControlConte
   app.post(
     '/admin/oauth/grants/:handle/revoke',
     adminRoute(ctx, async (request, reply, admin) => {
-      if (!(await ctx.access.can(admin, 'key:create', {}))) return forbidden(reply);
+      // Revoking a token family is a delete, not a mint.
+      if (!(await ctx.access.can(admin, 'key:delete', {}))) return forbidden(reply);
       if (!ctx.oauthAdmin) return reply.code(501).send(noDb);
       const handle = (request.params as { handle: string }).handle;
       if (!(await ctx.oauthAdmin.grants.revoke(handle))) return notFound(reply, 'grant');

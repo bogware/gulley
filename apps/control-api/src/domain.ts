@@ -113,4 +113,7 @@ export interface KeyAdmin {
   disable(id: string): Promise<KeyView | undefined>;
   /** Rotate the secret (new token, same id); bumps the epoch. */
   rotate(id: string): Promise<MintedKey | undefined>;
+  /** Enabled keys whose expiry is at or before `before`, soonest first (the expiry
+   *  alert sweep); keys without an expiry are never returned. */
+  listExpiring(before: Date): Promise<KeyView[]>;
 }
