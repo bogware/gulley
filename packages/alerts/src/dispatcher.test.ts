@@ -306,7 +306,7 @@ describe('AlertDispatcher — egress guard at construction', () => {
     } as AlertChannelConfig;
     expect(
       () => new AlertDispatcher({ channels: [pd], egress: { allowlist: ['x.test'] } }),
-    ).toThrow(/events\.pagerduty\.com/);
+    ).toThrow('events.pagerduty.com');
     expect(
       () => new AlertDispatcher({ channels: [pd], egress: { allowlist: ALLOW } }),
     ).not.toThrow();

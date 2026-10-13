@@ -44,7 +44,13 @@ function timedFetch(
   return fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'error' });
 }
 
-const normalizeIssuer = (s: string): string => s.replace(/\/+$/, '');
+/** Trailing slashes off an issuer, without a backtracking regex (`/\/+$/` is
+ *  quadratic on a long run of slashes). */
+const normalizeIssuer = (s: string): string => {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47) end -= 1;
+  return s.slice(0, end);
+};
 
 function assertEndpoint(name: string, url: string, guard: OidcFetchGuard | undefined): void {
   let u: URL;

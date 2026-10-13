@@ -214,26 +214,46 @@ export class BrokerService {
     if (!verifier) return e('unsupported_grant_type');
     if (!params.assertion) return e('invalid_request');
 
-    let clientId = WORKLOAD_CLIENT_ID;
-    if (params.clientId && params.clientId !== WORKLOAD_CLIENT_ID) {
-      const client = await this.deps.clients.get(params.clientId);
-      if (!client || !client.enabled || !client.grantTypes.includes(JWT_BEARER_GRANT_TYPE)) {
-        return e('invalid_client');
-      }
-      clientId = client.clientId;
-      const v = await verifier.verify(params.assertion, {
-        defaultAudience: params.defaultAudience,
-      });
-      if (!v.ok) return err({ error: 'invalid_grant', reason: v.error.reason });
-      // A registered client scopes to ONE tenancy; it cannot mint for another.
-      if (v.value.orgId !== client.orgId || v.value.workspaceId !== client.workspaceId) {
-        return err({ error: 'invalid_client', reason: 'tenancy-mismatch' });
-      }
-      return this.issueServiceGrant(clientId, v.value);
-    }
+    // Resolve the client record the grant is issued under. The built-in pseudo-client
+    // is never registered: it resolves to a synthetic, tenancy-less record. Any other
+    // id must be a registered, enabled, jwt-bearer-capable client — checked BEFORE the
+    // assertion is verified so an invalid client never consumes the assertion's `jti`.
+    const client = await this.resolveJwtBearerClient(params.clientId);
+    if (!client) return e('invalid_client');
     const v = await verifier.verify(params.assertion, { defaultAudience: params.defaultAudience });
     if (!v.ok) return err({ error: 'invalid_grant', reason: v.error.reason });
-    return this.issueServiceGrant(clientId, v.value);
+    // A registered client scopes to ONE tenancy; it cannot mint for another.
+    if (
+      client.orgId !== null &&
+      (v.value.orgId !== client.orgId || v.value.workspaceId !== client.workspaceId)
+    ) {
+      return err({ error: 'invalid_client', reason: 'tenancy-mismatch' });
+    }
+    return this.issueServiceGrant(client.clientId, v.value);
+  }
+
+  /** The client a jwt-bearer grant is recorded under: the requested registered client
+   *  when it exists, is enabled and carries the grant type; the built-in pseudo-client
+   *  (no tenancy of its own — the federation decides) when none was named; null when
+   *  the named client cannot be used. */
+  private async resolveJwtBearerClient(
+    requested: string | undefined,
+  ): Promise<{ clientId: string; orgId: string | null; workspaceId: string | null } | null> {
+    const id = requested && requested.length > 0 ? requested : WORKLOAD_CLIENT_ID;
+    const registered = await this.deps.clients.get(id);
+    if (registered) {
+      if (!registered.enabled || !registered.grantTypes.includes(JWT_BEARER_GRANT_TYPE)) {
+        return null;
+      }
+      return {
+        clientId: registered.clientId,
+        orgId: registered.orgId,
+        workspaceId: registered.workspaceId,
+      };
+    }
+    return id === WORKLOAD_CLIENT_ID
+      ? { clientId: WORKLOAD_CLIENT_ID, orgId: null, workspaceId: null }
+      : null;
   }
 
   private async issueServiceGrant(

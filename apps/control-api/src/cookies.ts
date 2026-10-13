@@ -4,12 +4,24 @@
 
 export const SESSION_COOKIE = 'gulley_admin_session';
 
+const COOKIE_NAME_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** Parse a Cookie header into a prototype-less map. Only well-formed names are kept
+ *  (so a client-chosen name can never address `__proto__` or a prototype property),
+ *  and a value that is not valid percent-encoding is skipped rather than thrown on. */
 export function parseCookies(header: string | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
+  const out: Record<string, string> = Object.create(null) as Record<string, string>;
   if (!header) return out;
   for (const part of header.split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i <= 0) continue;
+    const name = part.slice(0, i).trim();
+    if (!COOKIE_NAME_RE.test(name)) continue;
+    try {
+      out[name] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      /* malformed percent-encoding: ignore this cookie */
+    }
   }
   return out;
 }

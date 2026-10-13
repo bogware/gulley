@@ -67,11 +67,24 @@ export function mapMemberships(
 /** A post-login destination is honoured only as a same-origin path (`/x?y`), never
  *  an absolute or scheme-relative URL — the console passes its current page so a deep
  *  link (e.g. the device-consent page with its code) survives the SSO round trip. */
+const RETURN_TO_ORIGIN = 'https://return-to.invalid';
+
+/** A post-login destination must be a same-origin path. The candidate is resolved
+ *  against a sentinel origin and the redirect is rebuilt from the PARSED path, query
+ *  and fragment — anything that escapes the origin (`//evil`, `/\\evil`, a scheme, a
+ *  backslash trick) resolves elsewhere and falls back. */
 export function safeReturnTo(raw: unknown, fallback: string): string {
   if (typeof raw !== 'string' || raw.length === 0 || raw.length > 2_048) return fallback;
   if (!raw.startsWith('/') || raw.startsWith('//') || raw.startsWith('/\\')) return fallback;
-  if (/[\r\n]/.test(raw)) return fallback;
-  return raw;
+  if (/[\r\n\\]/.test(raw)) return fallback;
+  let u: URL;
+  try {
+    u = new URL(raw, RETURN_TO_ORIGIN);
+  } catch {
+    return fallback;
+  }
+  if (u.origin !== RETURN_TO_ORIGIN) return fallback;
+  return `${u.pathname}${u.search}${u.hash}`;
 }
 
 // --- the session-minting tail ---

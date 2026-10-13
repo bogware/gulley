@@ -139,7 +139,13 @@ export interface FederationVerifierOptions {
   keyringFor?: (federation: WorkloadFederation) => IssuerKeyring;
 }
 
-const normalizeIssuer = (s: string): string => s.replace(/\/+$/, '');
+/** Trailing slashes off an issuer, without a backtracking regex (`/\/+$/` is
+ *  quadratic on a long run of slashes). */
+const normalizeIssuer = (s: string): string => {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47) end -= 1;
+  return s.slice(0, end);
+};
 
 /**
  * Compile a `:`-segmented subject glob. `*` matches exactly one segment (any run of
