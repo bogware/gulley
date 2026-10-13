@@ -7832,10 +7832,12 @@ describe('hierarchical hard budgets (K4)', () => {
     expect(res.status).toBe(402);
     expect(res.headers.get('x-should-retry')).toBe('false');
     const json = (await res.json()) as Exceeded;
-    // retry-after counts down to the window's reset on the wall clock (the store's
-    // injected clock only decides WHICH window is active).
-    const untilReset = Math.ceil(
-      (Date.parse(json.error.window.resets_at ?? '') - Date.now()) / 1000,
+    // retry-after counts down to the window's reset on the WALL clock, floored at 1 s
+    // (the store's injected clock only decides WHICH window is active — once the wall
+    // clock passes that window's reset, the floor applies).
+    const untilReset = Math.max(
+      1,
+      Math.ceil((Date.parse(json.error.window.resets_at ?? '') - Date.now()) / 1000),
     );
     expect(Math.abs(Number(res.headers.get('retry-after')) - untilReset)).toBeLessThanOrEqual(5);
     expect(json.error.type).toBe('quota_for_entity_exceeded');
@@ -8023,6 +8025,207 @@ describe('session kill switch (K5)', () => {
     expect(lifted.status).toBe(200);
     await lifted.text();
     blocks.stop();
+    await app.close();
+  });
+});
+
+describe('hot-path review fixes (wave 2)', () => {
+  const MSG_START =
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":1}}}\n\n';
+  const CLEAN_TAIL =
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const COMPACT_PING = 'event: ping\ndata: {"type":"ping"}\n\n';
+
+  async function serve(
+    handler: (req: http.IncomingMessage, res: http.ServerResponse) => void,
+  ): Promise<{ url: string; close: () => Promise<void>; hits: () => number }> {
+    let hits = 0;
+    const srv = http.createServer((req, res) => {
+      hits += 1;
+      handler(req, res);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+      hits: () => hits,
+    };
+  }
+  const streamBody = () =>
+    JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      stream: true,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+  it("an Anthropic-dialect upstream's own compact pings keep the inactivity watchdog alive (only Bedrock's synthetic pings are ignored)", async () => {
+    // The ping frame bedrockToSse synthesizes is byte-identical to a compact Anthropic
+    // ping. The watchdog exclusion must apply only where the gateway did the
+    // synthesizing — on any other provider those bytes ARE upstream liveness.
+    const pinging = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START);
+      let n = 0;
+      const t = setInterval(() => {
+        n += 1;
+        res.write(COMPACT_PING);
+        if (n >= 12) {
+          clearInterval(t);
+          res.end(CLEAN_TAIL);
+        }
+      }, 40); // 480 ms of nothing but pings, against a 150 ms idle budget
+    });
+    const { store, token } = seededStore();
+    const { ctx, requestLog, breaker } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', pinging.url) },
+      },
+    ];
+    ctx.streamInactivityMs = 150;
+    ctx.watchdogBreakerThreshold = 1;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: streamBody(),
+    });
+    const text = await res.text();
+    await vi.waitFor(() => expect(requestLog.entries.length).toBe(1));
+    expect(text).toContain('message_stop');
+    expect(text).not.toContain('stalled');
+    expect(requestLog.entries[0]?.status).toBe('ok');
+    expect(requestLog.entries[0]?.attributes?.['abortReason']).toBeUndefined();
+    expect(breaker.isOpen('anthropic')).toBe(false);
+    expect(breaker.errorRate('anthropic')).toBe(0);
+
+    await app.close();
+    await pinging.close();
+  });
+
+  it('a watchdog-tripped target is not declared recovered by a probe that answers headers and hangs; a clean probe closes it', async () => {
+    let behaviour: 'hang' | 'clean' = 'hang';
+    const flaky = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START);
+      if (behaviour === 'clean') setTimeout(() => res.end(CLEAN_TAIL), 20);
+      // else: hang forever (headers + first frame only)
+    });
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    const closes: string[] = [];
+    const breaker = new CircuitBreaker({ cooldownMs: 200, onClose: (k) => closes.push(k) });
+    ctx.breaker = breaker;
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', flaky.url) },
+      },
+    ];
+    ctx.streamInactivityMs = 150;
+    ctx.watchdogBreakerThreshold = 1; // one stall trips (keeps the test short)
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: streamBody(),
+      }).then((r) => r.text());
+
+    await send(); // stall → trip → OPEN
+    expect(breaker.isOpen('anthropic')).toBe(true);
+    await new Promise((r) => setTimeout(r, 220)); // cooldown over → half-open
+    expect(breaker.isOpen('anthropic')).toBe(false);
+    const probe = send(); // the probe: headers arrive at once, then it hangs
+    await vi.waitFor(() => expect(flaky.hits()).toBe(2));
+    await new Promise((r) => setTimeout(r, 30)); // headers → commitServed → recordSuccess
+    expect(closes).toEqual([]); // NOT recovered on first byte
+    expect(breaker.tryProbe('anthropic')).toBe(false); // probe token still held
+    await probe; // stalls → trips again
+    expect(breaker.isOpen('anthropic')).toBe(true);
+    expect(closes).toEqual([]);
+    await new Promise((r) => setTimeout(r, 420)); // 2× backoff (400 ms) elapsed
+    behaviour = 'clean';
+    const text = await send(); // the probe completes cleanly → recovered
+    expect(text).toContain('message_stop');
+    await vi.waitFor(() => expect(closes).toEqual(['anthropic']));
+    expect(breaker.tryProbe('anthropic')).toBe(true);
+    await vi.waitFor(() => expect(requestLog.entries.length).toBe(3));
+
+    await app.close();
+    await flaky.close();
+  });
+
+  it('count_tokens records a request record for a served count and for an upstream failure', async () => {
+    const counting = await serve((req, res) => {
+      if (req.url === '/v1/messages/count_tokens') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ input_tokens: 7 }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    const recorded: Array<{ statusCode: number; status: string; route: string; provider: string }> =
+      [];
+    ctx.telemetry = {
+      ...ctx.telemetry,
+      recordRequest: (d) =>
+        recorded.push({
+          statusCode: d.statusCode,
+          status: d.status,
+          route: d.route,
+          provider: d.provider,
+        }),
+    };
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', counting.url) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const count = () =>
+      fetch(`${base}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+
+    expect((await count()).status).toBe(200);
+    expect(recorded).toEqual([
+      { statusCode: 200, status: 'ok', route: '/v1/messages/count_tokens', provider: 'anthropic' },
+    ]);
+    await counting.close(); // the upstream is gone → 502
+    expect((await count()).status).toBe(502);
+    expect(recorded[1]).toEqual({
+      statusCode: 502,
+      status: 'error',
+      route: '/v1/messages/count_tokens',
+      provider: 'anthropic',
+    });
+    const anon = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(anon.status).toBe(401);
+    expect(recorded[2]).toMatchObject({ statusCode: 401, status: 'error' });
+
     await app.close();
   });
 });

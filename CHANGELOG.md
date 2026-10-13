@@ -145,6 +145,30 @@ with custom roles.
   `BUDGET_ALERT_WEBHOOK_URL` payload gained `scope`, `scopeKind`, `entity` and
   `window`; `workspaceId` is still present for workspace-partitioned scopes.
 
+### Fixed
+
+- **A compact `event: ping` from an Anthropic-compatible upstream no longer stalls the
+  inactivity watchdog.** The 0.6.0 exclusion of the gateway's own synthetic Bedrock ping
+  from the watchdog applied to every provider by byte pattern, so an Anthropic-dialect
+  proxy or chained gateway that keeps a quiet stream alive with compact pings was torn
+  down as "stalled" and, three times in a row, tripped the breaker on a healthy target.
+  The exclusion now applies only to the Bedrock adapter, the only one that synthesizes.
+- **A watchdog-tripped target is no longer declared recovered by a probe's first byte.**
+  A provider that answers headers and then hangs passed every half-open probe at its
+  headers, so the circuit closed, `breaker.closed` fired, the backoff never escalated
+  and three more requests had to burn the idle budget each cycle. Recovery for a tripped
+  target now waits for a clean stream end (`recordRecovered`); the probe token stays
+  held meanwhile, and a probe that stalls again escalates the backoff.
+- **A budget commit credits the counters the reservation was admitted against.** The
+  Redis store remembers each reservation's window layout from reserve to commit; a cap
+  resolver outage at commit time used to drop the spend into a lifetime key that
+  calendar admission never reads (under-enforcing the cap) and PERSIST a fixed-window
+  counter (spurious 402s afterwards). With no layout and no resolver the spend is
+  credited without touching any TTL.
+- **`count_tokens` records a request record on every outcome** (served, upstream
+  failure, denial), not only on a guardrail denial, so the surface shows up in
+  `gulley_requests_total`, latency histograms and traces like every other route.
+
 ## [0.6.0] — 2026-10-11
 
 Wave 1 of the October 2026 cycle — **agent trust**: the changes that make Gulley safe

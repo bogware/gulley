@@ -1,7 +1,6 @@
 import { LuaScript, type ScriptRedis } from '@gulley/core';
 import {
   type BudgetDecision,
-  type BudgetSpec,
   type BudgetStore,
   type BudgetWindow,
   type CapResolver,
@@ -94,8 +93,9 @@ return {1, bestIdx, bestUsed, bestCap}
 // ARGV = [field, actual, dedupTtl, n, mode_1, ttl_1 … mode_n, ttl_n] where mode is
 // 'calendar' (counter expires `ttl` seconds after the window resets — set on every
 // commit, cheap), 'fixed' (the pre-0.7 window: TTL set when the key is first created,
-// so the window starts at first spend), or 'none' (lifetime: PERSIST). Ordering +
-// guards matter:
+// so the window starts at first spend), 'none' (lifetime: PERSIST), or 'keep' (the
+// window is UNKNOWN — a commit with no reserve-time layout and no resolver: credit the
+// spend, never touch the key's TTL). Ordering + guards matter:
 //  * the spend is added BEFORE the reservation bookkeeping, so a fault in the
 //    __total arithmetic can never drop real spend;
 //  * `HINCRBY … -0` is skipped — Redis 7.0 rejects the "-0" Lua renders for a
@@ -146,7 +146,7 @@ for i = 1, n do
       redis.call('EXPIRE', committedKey, ttl)
     elseif mode == 'fixed' then
       if redis.call('TTL', committedKey) == -1 then redis.call('EXPIRE', committedKey, ttl) end
-    else
+    elseif mode == 'none' then
       if redis.call('TTL', committedKey) > 0 then redis.call('PERSIST', committedKey) end
     end
   end
@@ -208,7 +208,20 @@ return {0, 0}
  *  late commit / reveal still lands in the right window. */
 const CALENDAR_GRACE_SECONDS = 7 * 86_400;
 
+/** The counters a reservation was admitted against, remembered in-process from reserve
+ *  to commit (both run on the replica that serves the request). */
+interface ReserveLayout {
+  windows: Array<{ key: string; mode: string; ttl: number }>;
+  at: number;
+}
+
+/** Upper bound on remembered layouts (one per in-flight reservation; pruned by age). */
+const MAX_LAYOUTS = 100_000;
+
 export class RedisBudgetStore implements BudgetStore {
+  /** reserve-time window layout per `scope\0requestId`, consumed by commit. */
+  private readonly layouts = new Map<string, ReserveLayout>();
+
   constructor(
     private readonly redis: EvalRedis,
     private readonly capFor: CapResolver,
@@ -275,6 +288,20 @@ export class RedisBudgetStore implements BudgetStore {
       number,
     ];
     const w = spec.windows[res[1] - 1] as BudgetWindow;
+    if (res[0] === 1) {
+      // Remember the exact counters this reservation was admitted against: commit
+      // credits THOSE (the window the request was admitted in), independent of the cap
+      // resolver — a resolver outage at commit time used to drop the spend into a
+      // lifetime key that calendar admission never reads (a cap under-enforced by every
+      // such commit) and PERSIST a fixed-window counter (spurious 402s after).
+      this.remember(scope, requestId, {
+        windows: spec.windows.map((win) => ({
+          key: this.committedKey(scope, win.period, nowMs),
+          ...this.commitTtl(win.period, nowMs),
+        })),
+        at: nowMs,
+      });
+    }
     return {
       allowed: res[0] === 1,
       capMicroUsd: res[3],
@@ -298,39 +325,68 @@ export class RedisBudgetStore implements BudgetStore {
     );
   }
 
-  /** The windows are resolved again at commit so the spend lands in each counter; a
-   *  resolver failure must never block the commit (a Postgres blip used to strand every
-   *  in-flight reservation until the orphan sweep) — it falls back to the lifetime key. */
-  async commit(scope: string, requestId: string, actualMicroUsd: number): Promise<void> {
-    const nowMs = this.now();
-    let spec: BudgetSpec = { windows: [{ capMicroUsd: 0, period: { kind: 'none' } }] };
+  private remember(scope: string, requestId: string, layout: ReserveLayout): void {
+    if (this.layouts.size >= MAX_LAYOUTS) {
+      // Prune by age (insertion order = reserve order): anything past the reservation
+      // lifetime was swept server-side and will never be committed from here.
+      const horizon = layout.at - this.maxReservationLifetimeMs;
+      for (const [k, v] of this.layouts) {
+        if (v.at > horizon && this.layouts.size < MAX_LAYOUTS) break;
+        this.layouts.delete(k);
+      }
+    }
+    this.layouts.set(`${scope}\u0000${requestId}`, layout);
+  }
+
+  /** The counters a commit credits, in order of trust: the reserve-time layout (what
+   *  the request was admitted against); else the resolver's current windows (a commit
+   *  for a reservation this replica did not take — a rollback after failover, a heal);
+   *  else — resolver down AND no layout — the shared lifetime key in `keep` mode, which
+   *  credits the spend without touching any TTL. A resolver failure never blocks the
+   *  commit (a Postgres blip used to strand every in-flight reservation until the
+   *  orphan sweep), and it never changes WHERE the spend lands for a known reservation. */
+  private async commitLayout(
+    scope: string,
+    requestId: string,
+    nowMs: number,
+  ): Promise<ReserveLayout['windows']> {
+    const key = `${scope}\u0000${requestId}`;
+    const remembered = this.layouts.get(key);
+    if (remembered) {
+      this.layouts.delete(key);
+      return remembered.windows;
+    }
     try {
       const budget = await this.capFor(scope);
-      if (budget) spec = normalizeBudget(budget);
+      if (budget) {
+        return normalizeBudget(budget).windows.map((w) => ({
+          key: this.committedKey(scope, w.period, nowMs),
+          ...this.commitTtl(w.period, nowMs),
+        }));
+      }
     } catch {
-      /* fall back to the lifetime counter */
+      /* resolver down: fall through */
     }
+    return [{ key: this.committedKey(scope, { kind: 'none' }, nowMs), mode: 'keep', ttl: 0 }];
+  }
+
+  async commit(scope: string, requestId: string, actualMicroUsd: number): Promise<void> {
+    const nowMs = this.now();
+    const windows = await this.commitLayout(scope, requestId, nowMs);
     // One self-expiring idempotency key PER request (never a shared, ever-growing set);
     // same {scope} hash-tag slot as the other keys (Redis Cluster).
     const commitIdKey = `budget:{${scope}}:cid:${requestId}`;
     // Dedup window: a lost-reply retry lands within seconds, so the reservation lifetime is
     // an ample TTL for the per-request idempotency key (which then expires on its own).
     const dedupTtl = Math.max(1, Math.ceil(this.maxReservationLifetimeMs / 1000));
-    const keys = [
-      this.reservedKey(scope),
-      commitIdKey,
-      ...spec.windows.map((w) => this.committedKey(scope, w.period, nowMs)),
-    ];
+    const keys = [this.reservedKey(scope), commitIdKey, ...windows.map((w) => w.key)];
     const args: string[] = [
       requestId,
       String(Math.max(0, Math.round(actualMicroUsd))),
       String(dedupTtl),
-      String(spec.windows.length),
+      String(windows.length),
     ];
-    for (const w of spec.windows) {
-      const t = this.commitTtl(w.period, nowMs);
-      args.push(t.mode, String(t.ttl));
-    }
+    for (const w of windows) args.push(w.mode, String(w.ttl));
     await COMMIT_LUA.run(this.redis, keys.length, ...keys, ...args);
   }
 

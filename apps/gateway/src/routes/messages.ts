@@ -3995,10 +3995,16 @@ async function handleProxy(
   };
   resetWatchdog();
 
+  // A synthesized Bedrock ping is gateway-made (bedrockToSse), not upstream liveness: it
+  // keeps the CLIENT's idle watchdog happy but must not keep OURS from catching a hung
+  // upstream. Only the Bedrock adapter synthesizes pings. On every other provider a
+  // byte-identical frame IS the upstream's own keepalive (an Anthropic-compatible proxy,
+  // a chained gateway) and resets the watchdog like any other byte — discarding it tore
+  // down healthy streams and, three in a row, tripped the breaker on a target that
+  // never faulted.
+  const synthesizesPings = servedTarget.provider === 'bedrock';
   upstreamBody.on('data', (chunk: Buffer) => {
-    // A synthesized Bedrock ping is gateway-made, not upstream liveness: it keeps the
-    // CLIENT's idle watchdog happy but must not keep OURS from catching a hung upstream.
-    if (!isSyntheticPingChunk(chunk)) resetWatchdog();
+    if (!(synthesizesPings && isSyntheticPingChunk(chunk))) resetWatchdog();
     if (reply.raw.destroyed) {
       // The client socket is gone: stop pulling (and paying for) bytes nobody reads.
       abortWith('client');
@@ -4110,8 +4116,13 @@ async function handleProxy(
   });
 
   upstreamBody.on('end', () => {
-    // A stream that ended cleanly proves the target alive: reset its watchdog run.
-    if (abortReason === undefined) watchdogRuns.delete(servedTarget.name);
+    // A stream that ended cleanly proves the target alive: reset its watchdog run and
+    // — for a target the watchdog had tripped — let the breaker close on THIS evidence
+    // (its first-byte success proved nothing: a hung provider answers headers too).
+    if (abortReason === undefined) {
+      watchdogRuns.delete(servedTarget.name);
+      ctx.breaker.recordRecovered(servedTarget.name);
+    }
     // The buffered-output branch consults the async output plugin, so the whole
     // handler runs in an async IIFE with teardown guaranteed in `finally`.
     void (async () => {

@@ -52,8 +52,29 @@ export async function handleCountTokens(
   const ctx = holder.ctx;
   const startedAtMs = Date.now();
   const path = (request.url.split('?')[0] ?? request.url) || '/';
+  // Every reply on this surface gets a request record (metric + span), exactly like the
+  // inference path: a served count, an upstream failure and a denial are all traffic an
+  // operator must be able to see. Provider/model are filled in as they become known.
+  let recordedProvider = 'unknown';
+  let recordedModel = 'unknown';
+  const recordOutcome = (statusCode: number): void => {
+    deps.record(ctx, request.log, {
+      provider: recordedProvider,
+      requestModel: recordedModel,
+      responseModel: recordedModel,
+      route: `${path}`,
+      statusCode,
+      status: statusCode < 400 ? 'ok' : 'error',
+      inputTokens: 0,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      streamed: false,
+      startedAtMs,
+    });
+  };
   const route = holder.routeFor(path.replace(/\/count_tokens$/, ''));
   if (!route) {
+    recordOutcome(404);
     await error(reply, 404, 'not_found_error', 'no route for path');
     return;
   }
@@ -61,12 +82,14 @@ export async function handleCountTokens(
   const resolved = await deps.resolvePrincipal(ctx, request);
   if (resolved.kind !== 'ok') {
     if (resolved.kind === 'unavailable') {
+      recordOutcome(503);
       await reply
         .code(503)
         .header('retry-after', '2')
         .send({ type: 'error', error: { type: 'api_error', message: 'auth store unavailable' } });
       return;
     }
+    recordOutcome(401);
     await error(reply, 401, 'authentication_error', 'invalid credentials');
     return;
   }
@@ -79,10 +102,12 @@ export async function handleCountTokens(
     if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('not an object');
     parsed = v as Record<string, unknown>;
   } catch {
+    recordOutcome(400);
     await error(reply, 400, 'invalid_request_error', 'body must be a JSON object');
     return;
   }
   if (typeof parsed['model'] !== 'string' || parsed['model'].length === 0) {
+    recordOutcome(400);
     await error(reply, 400, 'invalid_request_error', 'model is required');
     return;
   }
@@ -99,11 +124,15 @@ export async function handleCountTokens(
       parsed['model'] = model;
     }
   }
+  recordedModel = model;
+  recordedProvider = strategy.mode === 'single' ? strategy.target.provider : 'unknown';
   if (!scopeAllowsModel(principal.scope, model)) {
+    recordOutcome(403);
     await error(reply, 403, 'permission_error', 'model not permitted for this key');
     return;
   }
   if (ctx.modelPolicy && !modelAllowedByPolicy(ctx.modelPolicy, model)) {
+    recordOutcome(403);
     await error(reply, 403, 'permission_error', 'model denied by policy');
     return;
   }
@@ -180,10 +209,13 @@ export async function handleCountTokens(
   }).filter((t) => scopeAllowsProvider(principal.scope, t.provider));
   const target = candidates[0];
   if (!target) {
+    recordOutcome(403);
     await error(reply, 403, 'permission_error', 'no permitted upstream for this request');
     return;
   }
+  recordedProvider = target.provider;
   if (!target.adapter.countTokens) {
+    recordOutcome(404);
     await error(reply, 404, 'not_found_error', 'count_tokens is not available on this upstream');
     return;
   }
@@ -203,10 +235,12 @@ export async function handleCountTokens(
     });
   } catch (err) {
     if (err instanceof ProviderRequestError) {
+      recordOutcome(400);
       await error(reply, 400, 'invalid_request_error', err.message);
       return;
     }
     request.log.warn({ err, target: target.name }, 'count_tokens upstream failed');
+    recordOutcome(502);
     await error(reply, 502, 'api_error', 'upstream count_tokens failed');
     return;
   }
@@ -214,6 +248,7 @@ export async function handleCountTokens(
   const payload = await readCapped(upstream.body, MAX_RESPONSE_BYTES);
   const headers = deps.filterResponseHeaders(upstream.headers);
   delete headers['content-length'];
+  recordOutcome(upstream.statusCode);
   await reply
     .code(upstream.statusCode)
     .headers(headers)
