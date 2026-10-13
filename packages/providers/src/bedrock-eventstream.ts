@@ -1,3 +1,4 @@
+import { shapeBedrockError } from './bedrock-errors';
 import { PassThrough, type Readable } from 'node:stream';
 
 /**
@@ -119,14 +120,67 @@ function parseHeaders(buf: Buffer): Record<string, string> {
   return headers;
 }
 
+export interface BedrockSseOptions {
+  /** Emit an Anthropic `ping` event after this many ms without an upstream frame,
+   *  once the stream has started (Bedrock sends no pings of its own; a client idle
+   *  watchdog such as Claude Code's trips during a long pause otherwise). 0/absent =
+   *  off. */
+  pingIntervalMs?: number;
+  /** Stop synthesizing after this long without a REAL frame (default 5 min) so a hung
+   *  upstream is eventually visible to the gateway's own inactivity watchdog. */
+  pingMaxIdleMs?: number;
+}
+
+const PING_FRAME = 'event: ping\ndata: {"type":"ping"}\n\n';
+/** The exact bytes of one synthesized ping. A gateway consuming the translated
+ *  stream must NOT count these as upstream liveness: they are produced here, not by
+ *  the provider, so a hung upstream would otherwise look alive to an inactivity
+ *  watchdog for as long as synthesis runs. */
+export const SYNTHETIC_PING_FRAME: Buffer = Buffer.from(PING_FRAME, 'utf8');
+
+/** True when `chunk` consists solely of synthesized ping frames (one, or a few that
+ *  coalesced in the stream buffer) — i.e. carries no upstream bytes. */
+export function isSyntheticPingChunk(chunk: Buffer): boolean {
+  const n = SYNTHETIC_PING_FRAME.length;
+  if (chunk.length === 0 || chunk.length % n !== 0 || chunk.length > n * 8) return false;
+  for (let off = 0; off < chunk.length; off += n) {
+    if (!chunk.subarray(off, off + n).equals(SYNTHETIC_PING_FRAME)) return false;
+  }
+  return true;
+}
+const DEFAULT_PING_MAX_IDLE_MS = 300_000;
+
 /** Wrap a Bedrock eventstream response body into an Anthropic-SSE Readable. */
-export function bedrockToSse(upstream: Readable): Readable {
+export function bedrockToSse(upstream: Readable, options: BedrockSseOptions = {}): Readable {
   const out = new PassThrough();
   const parser = new EventstreamParser();
   // Set once an exception/error frame ended `out` cleanly: the upstream is then
   // destroyed early, and an undici body reports that as its own 'error' — which must
   // not destroy `out` and discard the shaped error frame still queued for the client.
   let ended = false;
+
+  // Ping synthesis: armed after every real frame, fires only while nothing else has
+  // been written, and gives up after `pingMaxIdleMs` of silence.
+  const pingInterval = Math.max(0, options.pingIntervalMs ?? 0);
+  const pingMaxIdle = options.pingMaxIdleMs ?? DEFAULT_PING_MAX_IDLE_MS;
+  let pingTimer: NodeJS.Timeout | undefined;
+  let lastFrameAt = 0;
+  const stopPings = (): void => {
+    if (pingTimer) clearTimeout(pingTimer);
+    pingTimer = undefined;
+  };
+  const armPing = (): void => {
+    if (pingInterval === 0 || ended) return;
+    stopPings();
+    pingTimer = setTimeout(() => {
+      pingTimer = undefined;
+      if (ended || out.destroyed || out.writableEnded) return;
+      if (Date.now() - lastFrameAt >= pingMaxIdle) return; // let the watchdog see the hang
+      out.write(PING_FRAME);
+      armPing();
+    }, pingInterval);
+    pingTimer.unref?.();
+  };
 
   // Bedrock's exception/error frames arrive as the upstream's LAST message: shape them
   // into the Anthropic `event: error` envelope the pipeline and every client SDK
@@ -135,11 +189,13 @@ export function bedrockToSse(upstream: Readable): Readable {
   // as an upstream fault: status error, breaker fault, request-log upstreamErrorFrame).
   // Destroying `out` instead raced the frame: under client backpressure the PassThrough
   // dropped it unread, and the gateway's error path appended a second, generic frame.
-  const failWithFrame = (type: string, message: string): void => {
+  const failWithFrame = (bedrockType: string, message: string): void => {
     ended = true;
-    out.end(
-      `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type, message } })}\n\n`,
-    );
+    stopPings();
+    // Anthropic error types + the contract's `capability_rejected:` token, so client
+    // SDKs classify the failure and Claude Code's recovery can match it.
+    const shaped = shapeBedrockError(0, bedrockType, message);
+    out.end(`event: error\ndata: ${JSON.stringify(shaped)}\n\n`);
     upstream.destroy();
   };
 
@@ -167,6 +223,8 @@ export function bedrockToSse(upstream: Readable): Readable {
           const evt = JSON.parse(decoded) as { type?: string };
           const name = evt.type ?? 'message';
           out.write(`event: ${name}\ndata: ${decoded}\n\n`);
+          lastFrameAt = Date.now();
+          armPing();
         } catch {
           /* skip a malformed chunk */
         }
@@ -205,11 +263,14 @@ export function bedrockToSse(upstream: Readable): Readable {
     }
   });
   upstream.on('end', () => {
+    stopPings();
     if (!ended) out.end();
   });
   upstream.on('error', (err: Error) => {
+    stopPings();
     if (!ended) out.destroy(err);
   });
+  out.on('close', stopPings);
 
   return out;
 }

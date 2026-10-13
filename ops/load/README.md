@@ -38,3 +38,10 @@ Provider wire-format correctness is a separate, CI-run suite:
 (`apps/gateway/src/conformance/fixtures/*.sse`) through the full gateway and
 asserts raw-byte fidelity, meter-from-raw-usage, and single-teardown per fixture.
 Add a provider quirk = add a fixture + a row.
+
+The gateway-contract suite, `apps/gateway/src/contract.conformance.test.ts`, executes
+the rules of Anthropic's Claude Code gateway compatibility guide and OpenAI's Codex
+gateway checklist as black-box HTTP cases and renders `docs/CONFORMANCE.md`
+(`pnpm --filter @gulley/gateway conformance:report`); `ci/conformance.sh` fails when
+the committed report drifts, and the release workflow attaches it to the GitHub
+Release.

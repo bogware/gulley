@@ -70,4 +70,10 @@ export class ModelRouter {
   knownModels(): string[] {
     return [...this.exact.keys()].sort();
   }
+
+  /** Every rule the router holds (exact first, then globs by specificity) — for
+   *  readiness checks over the configured targets, not for resolution. */
+  rules(): ModelRouteRule[] {
+    return [...this.exact.values(), ...this.globs.map((g) => g.rule)];
+  }
 }

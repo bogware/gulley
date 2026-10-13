@@ -26,7 +26,13 @@ import {
   OpenAIEmbeddingProvider,
   type VectorIndex,
 } from '@gulley/cache';
-import { loadCatalogFromFile } from '@gulley/catalog';
+import {
+  loadBundledSnapshot,
+  loadCatalogFromFile,
+  ModelCatalog,
+  parsePricingOverrides,
+  watchCatalogFile,
+} from '@gulley/catalog';
 import {
   type AuthzRuleConfig,
   CelAuthorizer,
@@ -54,6 +60,7 @@ import { parseToolPolicy } from './tool-governance';
 import { modelPolicyFromEnv } from './model-policy';
 import { isEmptyResidencyPolicy, residencyPolicyFromEnv } from './residency-policy';
 import { parseCascadePolicy } from './cascade';
+import { deriveVaultMaster } from './conversation';
 import { RequestTracer } from './tracer';
 import {
   AzureContentSafetyPlugin,
@@ -561,10 +568,21 @@ export function buildRoutes(config: Config): ProviderRoute[] {
         target: {
           name: 'bedrock',
           provider: 'bedrock',
-          adapter: new BedrockAdapter({ region: config.BEDROCK_REGION }),
+          adapter: new BedrockAdapter({
+            region: config.BEDROCK_REGION,
+            pingIntervalMs: config.BEDROCK_PING_INTERVAL_MS,
+            // Synthesis never outlives the gateway's own inactivity bound (and the
+            // gateway ignores synthetic pings for that watchdog anyway).
+            pingMaxIdleMs: config.STREAM_INACTIVITY_MS,
+            betaDeny: config.BEDROCK_BETA_DENY.split(',')
+              .map((b) => b.trim())
+              .filter(Boolean),
+          }),
           credential: { scheme: 'bearer', value: config.BEDROCK_UPSTREAM_API_KEY },
           upstreamPath: '/v1/messages',
-          alwaysStream: true,
+          // Not alwaysStream any more: the adapter answers a `stream:false` request
+          // through `invoke` with the JSON message, so the client's delivery mode is
+          // honoured (and a non-streamed request is no longer excluded from groups).
           ...stamp(config.BEDROCK_REGION, config.BEDROCK_ZDR),
         },
       },
@@ -623,11 +641,15 @@ export function buildCustomProviders(config: Config): {
   routes: ProviderRoute[];
   modelRules: ModelRouteRule[];
   models: string[];
+  /** Local-runtime presets (Ollama, vLLM, …): their models are free to serve, so the
+   *  unpriced-model readiness check never flags them. */
+  freeProviders: string[];
 } {
   const routes: ProviderRoute[] = [];
   const modelRules: ModelRouteRule[] = [];
   const models: string[] = [];
-  if (!config.CUSTOM_PROVIDERS) return { routes, modelRules, models };
+  const freeProviders: string[] = [];
+  if (!config.CUSTOM_PROVIDERS) return { routes, modelRules, models, freeProviders };
 
   let entries: CustomProviderConfig[];
   try {
@@ -643,6 +665,7 @@ export function buildCustomProviders(config: Config): {
     const r = resolveCustomProvider(entry);
     if (seen.has(r.provider)) throw new Error(`duplicate custom provider label: ${r.provider}`);
     seen.add(r.provider);
+    if (r.local) freeProviders.push(r.provider);
     const credential: UpstreamCredential = { scheme: 'bearer', value: r.apiKey };
     const adapter = new PassthroughAdapter({ name: r.provider, baseUrl: r.baseUrl });
     const target: RouteTarget = {
@@ -680,7 +703,40 @@ export function buildCustomProviders(config: Config): {
       modelRules.push({ pattern: m, strategy, provider: r.provider });
     }
   }
-  return { routes, modelRules, models };
+  return { routes, modelRules, models, freeProviders };
+}
+
+/**
+ * The env-sourced route overlays, applied over a base route table (env `buildRoutes`
+ * at boot, or the config document's routes on every DB-mode reconcile): custom/local
+ * OpenAI-compatible providers, the shared `/v1/chat/completions` default when no
+ * built-in OpenAI route claimed it, and the ROUTE_GROUPS multi-target composition
+ * (fallback/loadbalance/breaker/outlier/P2C/HRW/hedge needs >=2 targets). Pure over
+ * its inputs; `custom` may be pre-built so the boot path reuses its model rules.
+ */
+export function overlayEnvRoutes(
+  config: Config,
+  base: ProviderRoute[],
+  custom: ReturnType<typeof buildCustomProviders> = buildCustomProviders(config),
+): ProviderRoute[] {
+  const routes = [...base, ...custom.routes];
+  // If no built-in OpenAI route claimed the shared chat path but custom/local
+  // providers exist, expose /v1/chat/completions with the first as the default
+  // target; the model router dispatches per requested model to the right backend.
+  if (
+    !routes.some((r) => r.clientPaths.includes('/v1/chat/completions')) &&
+    custom.routes.length > 0
+  ) {
+    const first = custom.routes[0] as ProviderRoute;
+    routes.push({
+      clientPaths: ['/v1/chat/completions', '/openai/v1/chat/completions'],
+      createExtractor: () => new OpenAIUsageExtractor(),
+      strategy: first.strategy,
+    });
+  }
+  // M19: fold ROUTE_GROUPS into multi-target routes so the resilience library
+  // (fallback/loadbalance/breaker/outlier/P2C/HRW/hedge) has >=2 targets to work on.
+  return applyRouteGroups(routes, parseRouteGroups(config.ROUTE_GROUPS), config.HEDGE_DELAY_MS);
 }
 
 export function createProductionContext(
@@ -724,28 +780,13 @@ export function createProductionContext(
     },
   });
 
-  let routes = buildRoutes(config);
   const custom = buildCustomProviders(config);
-  routes.push(...custom.routes);
-
-  // If no built-in OpenAI route claimed the shared chat path but custom/local
-  // providers exist, expose /v1/chat/completions with the first as the default
-  // target; the model router dispatches per requested model to the right backend.
-  if (
-    !routes.some((r) => r.clientPaths.includes('/v1/chat/completions')) &&
-    custom.routes.length > 0
-  ) {
-    const first = custom.routes[0] as ProviderRoute;
-    routes.push({
-      clientPaths: ['/v1/chat/completions', '/openai/v1/chat/completions'],
-      createExtractor: () => new OpenAIUsageExtractor(),
-      strategy: first.strategy,
-    });
-  }
-
-  // M19: fold ROUTE_GROUPS into multi-target routes so the resilience library
-  // (fallback/loadbalance/breaker/outlier/P2C/HRW/hedge) has >=2 targets to work on.
-  routes = applyRouteGroups(routes, parseRouteGroups(config.ROUTE_GROUPS), config.HEDGE_DELAY_MS);
+  // Env-only overlays (custom/local providers, the shared chat path, ROUTE_GROUPS) are
+  // applied through ONE function that the DB-mode reconcile re-runs on every swap —
+  // the first reconcile used to replace the whole table with provider-only single
+  // routes, silently dropping failover/LB/hedge/arbitrage and every OpenAI-compatible
+  // provider in exactly the mode production is meant to run in.
+  const routes = overlayEnvRoutes(config, buildRoutes(config), custom);
 
   // In DB config mode the route table is loaded from Postgres by the reload
   // watcher AFTER boot, so an empty env route set is expected — the gateway boots
@@ -759,15 +800,27 @@ export function createProductionContext(
   const modelRouter = custom.modelRules.length > 0 ? new ModelRouter(custom.modelRules) : undefined;
   const catalogModels = custom.models.length > 0 ? [...new Set(custom.models)] : undefined;
 
-  // Optional models.dev-derived pricing catalog (operator-maintained file loaded
-  // on boot); absent = seed rate tables only.
-  let rateResolver: RateResolver | undefined;
-  if (config.MODELS_CATALOG_FILE) {
-    try {
-      rateResolver = loadCatalogFromFile(config.MODELS_CATALOG_FILE).resolver();
-    } catch (err) {
-      throw new Error(`failed to load MODELS_CATALOG_FILE: ${(err as Error).message}`);
-    }
+  // Pricing catalog: the operator's MODELS_CATALOG_FILE (raw models.dev api.json or
+  // the entry-array format) when set, else the models.dev snapshot bundled with this
+  // release; the in-tree seeds remain the fallback for anything the catalog lacks.
+  // Contracted rates (PRICING_OVERRIDES[_FILE]) layer over both. The catalog INSTANCE
+  // is kept so a file reload (PRICING_RELOAD_INTERVAL_SECONDS) swaps rates in place
+  // for new requests without a restart.
+  const catalog = loadPricingCatalog(config, log);
+  const rateResolver: RateResolver = catalog.resolver();
+  if (config.MODELS_CATALOG_FILE && config.PRICING_RELOAD_INTERVAL_SECONDS > 0) {
+    const path = config.MODELS_CATALOG_FILE;
+    maintenanceStops.push(
+      watchCatalogFile(
+        path,
+        (c) => log.info({ path, models: c.size }, 'pricing catalog reloaded'),
+        {
+          intervalMs: config.PRICING_RELOAD_INTERVAL_SECONDS * 1000,
+          into: catalog,
+          log: (msg, err) => log.warn({ path, err }, msg),
+        },
+      ),
+    );
   }
 
   // Optional CEL authorization rules (strict-compiled against the known surface).
@@ -1186,7 +1239,10 @@ export function createProductionContext(
   log.info(
     {
       pricingAsOf: PRICING_AS_OF,
-      catalog: config.MODELS_CATALOG_FILE ?? 'seed',
+      catalog: config.MODELS_CATALOG_FILE ?? 'bundled models.dev snapshot',
+      catalogModels: catalog.size,
+      pricingOverrides: catalog.overrideCount,
+      reloadIntervalSeconds: config.PRICING_RELOAD_INTERVAL_SECONDS,
       version: GULLEY_VERSION,
     },
     'pricing tables loaded',
@@ -1249,6 +1305,7 @@ export function createProductionContext(
     maskVault,
     maskVaultEncryptor,
     maskVaultTtlSeconds: config.MASK_VAULT_TTL_SECONDS,
+    maskVaultMaster: deriveVaultMaster(config.GULLEY_KEY_PEPPER),
     telemetry,
     guardrails,
     cache: config.CACHE_ENABLED
@@ -1267,9 +1324,14 @@ export function createProductionContext(
     // Cascade routing policies (env-config). Empty = off. Parse THROWS on bad JSON so a
     // malformed policy fails boot rather than silently disabling escalation.
     cascade,
+    signedThinkingSubstitution: config.SIGNED_THINKING_SUBSTITUTION,
     models: catalogModels,
     rateResolver,
+    catalog,
     streamInactivityMs: config.STREAM_INACTIVITY_MS,
+    watchdogBreakerThreshold: config.STREAM_WATCHDOG_BREAKER_THRESHOLD,
+    unpricedConfig: config.METER_UNPRICED_CONFIG,
+    freeProviders: custom.freeProviders,
     cacheLookupTimeoutMs: config.CACHE_LOOKUP_TIMEOUT_MS,
     upstreamHeadersTimeoutMs: config.UPSTREAM_HEADERS_TIMEOUT_MS,
     inflightTeardowns: new Set<Promise<void>>(),
@@ -1302,6 +1364,8 @@ export function createProductionContext(
     injectStreamUsage: config.METER_INJECT_STREAM_USAGE,
     meterFailClosedOnUnpriced: config.METER_FAIL_CLOSED_ON_UNPRICED,
     requestDeadlineMs: config.REQUEST_DEADLINE_MS > 0 ? config.REQUEST_DEADLINE_MS : undefined,
+    agentHeaderAttribution: config.AGENT_HEADER_ATTRIBUTION,
+    clientRoutingPreferences: config.CLIENT_ROUTING_PREFERENCES,
     attributionHeaders: config.ATTRIBUTION_HEADERS
       ? config.ATTRIBUTION_HEADERS.split(',')
           .map((h) => h.trim().toLowerCase())
@@ -1391,4 +1455,47 @@ export function buildBasicAuth(config: Config): BasicAuthConfig | undefined {
     defaultAllowedProviders: defaultList(config.BASIC_AUTH_DEFAULT_ALLOWED_PROVIDERS),
     defaultAllowedModels: defaultList(config.BASIC_AUTH_DEFAULT_ALLOWED_MODELS),
   };
+}
+
+/** Load the pricing catalog per the boot rules above. Throws on an unreadable
+ *  operator file or malformed overrides (loud, at boot); a missing bundled snapshot
+ *  degrades to the seeds with a warning (a build without the data file). */
+export function loadPricingCatalog(
+  config: Pick<Config, 'MODELS_CATALOG_FILE' | 'PRICING_OVERRIDES_FILE' | 'PRICING_OVERRIDES'>,
+  log: BootLogger,
+): ModelCatalog {
+  let catalog: ModelCatalog;
+  if (config.MODELS_CATALOG_FILE) {
+    try {
+      catalog = loadCatalogFromFile(config.MODELS_CATALOG_FILE);
+    } catch (err) {
+      throw new Error(`failed to load MODELS_CATALOG_FILE: ${(err as Error).message}`);
+    }
+  } else {
+    try {
+      catalog = loadBundledSnapshot();
+    } catch (err) {
+      log.warn({ err }, 'bundled pricing snapshot unavailable — seed prices only');
+      catalog = new ModelCatalog([]);
+    }
+  }
+  const overrides = [];
+  if (config.PRICING_OVERRIDES_FILE) {
+    try {
+      overrides.push(
+        ...parsePricingOverrides(JSON.parse(readFileSync(config.PRICING_OVERRIDES_FILE, 'utf8'))),
+      );
+    } catch (err) {
+      throw new Error(`failed to load PRICING_OVERRIDES_FILE: ${(err as Error).message}`);
+    }
+  }
+  if (config.PRICING_OVERRIDES) {
+    try {
+      overrides.push(...parsePricingOverrides(JSON.parse(config.PRICING_OVERRIDES)));
+    } catch (err) {
+      throw new Error(`invalid PRICING_OVERRIDES: ${(err as Error).message}`);
+    }
+  }
+  if (overrides.length > 0) catalog.setOverrides(overrides);
+  return catalog;
 }

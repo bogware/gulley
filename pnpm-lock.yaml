@@ -348,6 +348,9 @@ importers:
       '@types/node':
         specifier: ^22.10.2
         version: 22.20.1
+      tsx:
+        specifier: ^4.19.2
+        version: 4.23.12
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
@@ -397,9 +400,15 @@ importers:
       '@gulley/rbac':
         specifier: workspace:*
         version: link:../rbac
+      '@gulley/routing':
+        specifier: workspace:*
+        version: link:../routing
       yaml:
         specifier: ^2.6.1
         version: 2.9.0
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
@@ -679,6 +688,9 @@ importers:
       '@gulley/providers':
         specifier: workspace:*
         version: link:../providers
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^22.10.2

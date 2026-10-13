@@ -1,11 +1,12 @@
 import type { ConfigDocument, ConfigStore, ConfigVersionStore } from '@gulley/config';
 import { InMemoryConfigVersionStore } from '@gulley/config';
 import { MapSecretResolver } from '@gulley/core';
-import { CircuitBreaker, LoadScoreboard } from '@gulley/routing';
+import { allTargets, CircuitBreaker, LoadScoreboard } from '@gulley/routing';
 import { type ConfigSignal, InMemoryConfigBus } from '@gulley/storage';
 import { describe, expect, it, vi } from 'vitest';
-import { ConfigWatcher, GatewayReconciler } from './reconcile';
-import { type GatewayContext, RouteHolder } from './routes/messages';
+import { ConfigWatcher, GatewayReconciler, type RouteOverlay } from './reconcile';
+import { applyRouteGroups } from './route-groups';
+import { type GatewayContext, type ProviderRoute, RouteHolder } from './routes/messages';
 
 const ARN = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:anthropic';
 
@@ -385,5 +386,188 @@ describe('ConfigWatcher', () => {
     await vi.waitFor(() => expect(holder.routeFor('/v1/chat/completions')).toBeDefined());
 
     await watcher.stop();
+  });
+});
+
+describe('GatewayReconciler document route groups', () => {
+  // anthropic serves /v1/messages (+ /anthropic/v1/messages); bedrock serves
+  // /bedrock/v1/messages — a suffix match, so both are candidates for a /v1/messages group.
+  const twoProviderDoc = (
+    routes: Array<{ name: string; config: Record<string, unknown> }>,
+  ): ConfigDocument => {
+    const d = docWith('anthropic');
+    const ws = d.orgs[0]!.workspaces[0]!;
+    ws.providers.push({
+      kind: 'bedrock',
+      baseUrl: 'us-east-1',
+      enabled: true,
+      credential: { secretArn: ARN, secretVersion: 'v1' } as never,
+    });
+    ws.routes = routes;
+    return d;
+  };
+  const group = {
+    clientPath: '/v1/messages',
+    mode: 'fallback' as const,
+    providers: ['anthropic', 'bedrock'],
+  };
+  const resolver = () => new MapSecretResolver(new Map([[ARN, 'sk-ant-x']]));
+  // What config-reload wires: the env ROUTE_GROUPS overlay (here one fallback group).
+  const envOverlay: RouteOverlay = {
+    apply: (base) => applyRouteGroups(base, [{ ...group, onStatusCodes: [429] }], 0),
+    modelRules: [],
+  };
+
+  it('folds a document `routes` entity into a live multi-target route', async () => {
+    const { holder } = holderWithState();
+    const ok = await new GatewayReconciler(
+      holder,
+      storeReturning(twoProviderDoc([{ name: 'messages-ha', config: group }])),
+      resolver(),
+    ).reconcile();
+    expect(ok).toBe(true);
+    const r = holder.routeFor('/v1/messages')!;
+    expect(r.strategy.mode).toBe('fallback');
+    expect(allTargets(r.strategy).map((t) => t.provider)).toEqual(['anthropic', 'bedrock']);
+    // The group inherits the template's paths; the native bedrock path stays single-target.
+    expect(holder.routeFor('/bedrock/v1/messages')?.strategy.mode).toBe('single');
+  });
+
+  it('a document group SHADOWS the env ROUTE_GROUPS group on the same clientPath; env-only groups still apply', async () => {
+    const { holder } = holderWithState();
+    const docGroup = { ...group, mode: 'loadbalance', select: 'cheapest' };
+    await new GatewayReconciler(
+      holder,
+      storeReturning(twoProviderDoc([{ name: 'messages-ha', config: docGroup }])),
+      resolver(),
+      undefined,
+      undefined,
+      envOverlay,
+    ).reconcile();
+    expect(holder.routeFor('/v1/messages')?.strategy).toMatchObject({
+      mode: 'loadbalance',
+      select: 'cheapest',
+    });
+
+    // No document groups → the env group wins the path, exactly as before.
+    await new GatewayReconciler(
+      holder,
+      storeReturning(twoProviderDoc([])),
+      resolver(),
+      undefined,
+      undefined,
+      envOverlay,
+    ).reconcile();
+    expect(holder.routeFor('/v1/messages')?.strategy).toMatchObject({
+      mode: 'fallback',
+      onStatusCodes: [429],
+    });
+  });
+
+  it('skips a legacy console-shape entity (no clientPath) with ONE warning naming it', async () => {
+    const { holder } = holderWithState();
+    const warn = vi.fn();
+    const info = vi.fn();
+    const legacy = {
+      name: 'old-default',
+      config: { strategy: { mode: 'loadbalance', targets: [{ name: 'a', weight: 50 }] } },
+    };
+    const ok = await new GatewayReconciler(
+      holder,
+      storeReturning(twoProviderDoc([legacy, { name: 'messages-ha', config: group }])),
+      resolver(),
+      { info, warn, error: vi.fn() },
+    ).reconcile();
+    expect(ok).toBe(true); // never a failed reconcile
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toMatch(/Acme\/prod\/old-default/);
+    expect(warn.mock.calls[0]?.[0]).toMatch(/legacy/);
+    // The valid group next to it still applies.
+    expect(holder.routeFor('/v1/messages')?.strategy.mode).toBe('fallback');
+
+    // A logger without `warn` gets the same line on `info`.
+    const infoOnly = vi.fn();
+    await new GatewayReconciler(holder, storeReturning(twoProviderDoc([legacy])), resolver(), {
+      info: infoOnly,
+      error: vi.fn(),
+    }).reconcile();
+    expect(infoOnly.mock.calls.some(([m]) => /old-default/.test(String(m)))).toBe(true);
+    expect(holder.routeFor('/v1/messages')?.strategy.mode).toBe('single'); // nothing applied
+  });
+
+  it('threads the global hedge delay into a document group that sets none', async () => {
+    const { holder } = holderWithState();
+    await new GatewayReconciler(
+      holder,
+      storeReturning(twoProviderDoc([{ name: 'messages-ha', config: group }])),
+      resolver(),
+      undefined,
+      undefined,
+      undefined,
+      250,
+    ).reconcile();
+    expect(holder.routeFor('/v1/messages')?.hedgeDelayMs).toBe(250);
+    // A per-group value overrides the global default.
+    await new GatewayReconciler(
+      holder,
+      storeReturning(
+        twoProviderDoc([{ name: 'messages-ha', config: { ...group, hedgeDelayMs: 40 } }]),
+      ),
+      resolver(),
+      undefined,
+      undefined,
+      undefined,
+      250,
+    ).reconcile();
+    expect(holder.routeFor('/v1/messages')?.hedgeDelayMs).toBe(40);
+  });
+});
+
+describe('GatewayReconciler env overlay', () => {
+  it('re-applies the env overlay (custom providers, route groups) and merges its model rules on EVERY reconcile', async () => {
+    // The first DB-mode reconcile used to replace the whole table with the document's
+    // provider-only single routes, silently dropping ROUTE_GROUPS and every
+    // CUSTOM_PROVIDERS route (failover/LB/hedge/arbitrage gone in production mode).
+    const { holder } = holderWithState();
+    const overlayRoute = {
+      clientPaths: ['/ollama/v1/chat/completions'],
+      createExtractor: () => {
+        throw new Error('unused');
+      },
+      strategy: {
+        mode: 'single',
+        target: {
+          name: 'ollama',
+          provider: 'ollama',
+          adapter: undefined,
+          credential: undefined,
+          upstreamPath: '/v1/chat/completions',
+        },
+      },
+    } as unknown as ProviderRoute;
+    let applied = 0;
+    const reconciler = new GatewayReconciler(
+      holder,
+      storeReturning(docWith('anthropic')),
+      new MapSecretResolver(new Map([[ARN, 'k']])),
+      undefined,
+      undefined,
+      {
+        apply: (base) => {
+          applied += 1;
+          return [...base, overlayRoute];
+        },
+        modelRules: [{ pattern: 'llama3', provider: 'ollama' }],
+      },
+    );
+    await reconciler.reconcile();
+    expect(applied).toBe(1);
+    expect(holder.routeFor('/v1/messages')).toBeDefined(); // the document's route
+    expect(holder.routeFor('/ollama/v1/chat/completions')).toBeDefined(); // the overlay survived
+    expect(holder.ctx.modelRouter?.resolve('llama3')?.provider).toBe('ollama');
+    await reconciler.reconcile(); // and again on the next swap
+    expect(applied).toBe(2);
+    expect(holder.routeFor('/ollama/v1/chat/completions')).toBeDefined();
+    expect(holder.ctx.modelRouter?.resolve('llama3')?.provider).toBe('ollama');
   });
 });

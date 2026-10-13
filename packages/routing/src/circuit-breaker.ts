@@ -212,18 +212,42 @@ export class CircuitBreaker {
 
     const tripConsecutive = s.consecutiveFailures >= this.threshold;
     const tripRate = s.samples >= this.minSamples && s.ewmaError >= this.errorRateThreshold;
-    if (tripConsecutive || tripRate) {
-      const wasOpen = s.openUntil > this.now(); // distinguish a fresh ejection from a re-trip
-      s.ejections += 1;
-      const backoff = Math.min(this.cooldownMs * 2 ** (s.ejections - 1), this.maxCooldownMs);
-      // The upstream's Retry-After raises the floor but never past maxCooldownMs: an
-      // hours-long (or epoch-shaped) header would otherwise eject the target for that
-      // long on EVERY replica via publishOpen.
-      s.openUntil = this.now() + Math.min(Math.max(backoff, retryAfterMs ?? 0), this.maxCooldownMs);
-      // Broadcast so peer replicas eject this target too (fire-and-forget).
-      this.sync.publishOpen(key, s.openUntil);
-      // Notify only on a CLOSED → OPEN transition (not every extend), best-effort.
-      if (!wasOpen) this.notify(this.onOpen, key);
-    }
+    if (tripConsecutive || tripRate) this.open(key, s, retryAfterMs);
+  }
+
+  /**
+   * Force the circuit OPEN for `key`: the caller observed ejection-grade evidence that
+   * the per-sample rules cannot express. The case: a run of consecutive inactivity-
+   * watchdog stalls. Every stalled stream ALSO recorded a first-byte success (needed to
+   * resolve a half-open probe), which resets the consecutive counter and holds the EWMA
+   * under its threshold no matter how many stalls follow — so booking the run as one
+   * more ordinary failure never opened anything, and a provider that accepts every
+   * request and then hangs was never ejected. The failure is still counted as a sample;
+   * backoff, the Retry-After floor, the peer broadcast and the onOpen hook are the same
+   * as a threshold trip.
+   */
+  trip(key: string, retryAfterMs?: number): void {
+    const s = this.get(key);
+    s.consecutiveFailures += 1;
+    s.ewmaError = s.ewmaError * (1 - this.alpha) + this.alpha;
+    s.samples += 1;
+    s.probeUntil = 0;
+    this.open(key, s, retryAfterMs);
+  }
+
+  /** The CLOSED → OPEN (or OPEN → re-extended) transition shared by the per-sample
+   *  rules and {@link trip}. */
+  private open(key: string, s: CircuitState, retryAfterMs?: number): void {
+    const wasOpen = s.openUntil > this.now(); // distinguish a fresh ejection from a re-trip
+    s.ejections += 1;
+    const backoff = Math.min(this.cooldownMs * 2 ** (s.ejections - 1), this.maxCooldownMs);
+    // The upstream's Retry-After raises the floor but never past maxCooldownMs: an
+    // hours-long (or epoch-shaped) header would otherwise eject the target for that
+    // long on EVERY replica via publishOpen.
+    s.openUntil = this.now() + Math.min(Math.max(backoff, retryAfterMs ?? 0), this.maxCooldownMs);
+    // Broadcast so peer replicas eject this target too (fire-and-forget).
+    this.sync.publishOpen(key, s.openUntil);
+    // Notify only on a CLOSED → OPEN transition (not every extend), best-effort.
+    if (!wasOpen) this.notify(this.onOpen, key);
   }
 }

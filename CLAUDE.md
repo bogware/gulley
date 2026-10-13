@@ -76,7 +76,7 @@ pnpm --filter @gulley/control-api ssrf:check     # real DNS-rebind blocking
 ### Terraform
 
 ```bash
-bash ci/tf-check.sh              # fmt -check + validate for envs/dev and envs/prod (no cloud creds)
+bash ci/tf-check.sh              # fmt -check + validate for infra/terraform and infra/eks (no cloud creds)
 ```
 
 ## Architecture map
@@ -182,3 +182,27 @@ primitives), `oauth` (device + auth-code/PKCE broker, refresh-reuse detection), 
 dependency-bump}.yml`) and Azure Pipelines (`.azuredevops/*.yml`) stay at parity. Dependency
   bumps are **`workflow_dispatch`-only** — never add scheduled Dependabot/renovate.
 - **Commits: DCO sign-off required** (`git commit -s`); CI enforces `Signed-off-by`.
+
+## Public repository: no personal data, ever
+
+This repo is public. Nothing that identifies a person or a private account may enter the
+tree, the git history, a PR, an issue, or a release note:
+
+- **Commit and sign off with the GitHub-provided `noreply` identity only**
+  (`<id>+<handle>@users.noreply.github.com`). Never a personal or work email address — not
+  in `user.email`, not in `Signed-off-by`, not in `Co-authored-by`, not in `package.json`
+  `author`, not in docs or examples. If a commit lands with a personal address, rewrite it
+  before pushing (`git commit --amend --reset-author` after fixing `user.email`).
+- **No real names beyond the git author name, no phone numbers, no home/office addresses,
+  no AWS/Azure/GCP account IDs, no internal hostnames or IPs, no customer names, no
+  calendar or chat excerpts.** Test fixtures use `example.com` / `@corp` style placeholders
+  and obviously fake IDs (`123456789012`, `2222…`).
+- **Research reports, audit reports, and design docs are scrubbed before they are
+  committed**: strip anything copied from a private channel, a billing console, or a
+  personal account page.
+- Before every push, both of these must show only the noreply identity:
+
+  ```bash
+  git grep -n -i -E "gmail|outlook|hotmail|yahoo|@users\.noreply" -- . ':!pnpm-lock.yaml'
+  git log --format='%an <%ae>' | sort -u
+  ```

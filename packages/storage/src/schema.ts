@@ -71,6 +71,12 @@ export const virtualKey = pgTable(
     groups: jsonb('groups')
       .notNull()
       .default(sql`'[]'::jsonb`),
+    // Per-key authz scope, enforced by the gateway on the RESOLVED provider/model:
+    // NULL = unrestricted (`*`), a JSON string array = the allow-list. The data-plane
+    // key store hard-coded `*` before these columns existed, so per-key scoping was
+    // silently impossible in production.
+    allowedProviders: jsonb('allowed_providers'),
+    allowedModels: jsonb('allowed_models'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
@@ -273,6 +279,9 @@ export const maskVault = pgTable(
     direction: text('direction').notNull(), // 'input' | 'output'
     workspaceId: uuid('workspace_id').notNull(),
     orgId: uuid('org_id'),
+    // The conversation the request belonged to (K2 conversation-stable masking):
+    // a bounded printable id (`session:…` / `conv:…` / `fp:…` / `principal:…`).
+    conversationId: text('conversation_id'),
     ciphertext: jsonb('ciphertext').notNull(), // EnvelopeCiphertext (encrypted-at-rest)
     tokenCount: integer('token_count').notNull().default(0),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
@@ -282,6 +291,7 @@ export const maskVault = pgTable(
     primaryKey({ columns: [t.requestId, t.direction] }),
     index('mask_vault_workspace_idx').on(t.workspaceId),
     index('mask_vault_expires_idx').on(t.expiresAt),
+    index('mask_vault_conversation_idx').on(t.conversationId),
   ],
 );
 

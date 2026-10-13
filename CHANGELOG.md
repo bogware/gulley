@@ -6,6 +6,248 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-11
+
+Wave 1 of the October 2026 cycle — **agent trust**: the changes that make Gulley safe
+to put in front of Claude Code and Codex on the Claude 5.5 generation and provable as
+such. Conversation-stable masking (the per-request mask token that broke preserved
+thinking and prompt caching is gone), signed reasoning pins the model, the Claude Code
+gateway contract is executed as a published conformance report, zero-config agent
+attribution, a live pricing catalog with `/v1/models` pricing, request-level routing
+preferences with per-attempt provenance, and route groups as first-class DB config.
+
+### Upgrade notes
+
+- **`METER_FAIL_CLOSED_ON_UNPRICED` now defaults to `true`:** a served model with no
+  price in the catalog or the seeds is charged its worst-case reservation instead of
+  metering $0. Models of a `local` custom provider (Ollama, vLLM, …) are free and are
+  never charged. Set it to `false` to restore the 0.5 behaviour.
+- **`onStatusCodes` on a route group may list only 408, 409, 429 or a 5xx** (env
+  `ROUTE_GROUPS` and DB route groups alike); a configured terminal 4xx is now rejected
+  by validation and ignored by the failover check, so one bad request can never record
+  a breaker fault or eject a healthy upstream.
+- **Sonnet 5.5 cache reads are billed at 0.05× base ($0.10/MTok)**, matching Anthropic's
+  list price; the 0.5.1 seed billed 0.1×. A drift test now holds the bundled snapshot
+  and the seed tables to the same prices.
+- The bundled models.dev snapshot becomes the default pricing catalog; prices for
+  Claude on Bedrock and Vertex now come from the catalog (partner list prices) rather
+  than the Anthropic seed table. Pin `MODELS_CATALOG_FILE` or `PRICING_OVERRIDES` for
+  contracted rates.
+- **Console `routes` entities change shape.** Entities written by the previous Routes
+  page (`{ strategy | mode, targets[] }`, no `clientPath`) were never applied by the
+  gateway; they still export/apply unchanged but are now listed as "legacy (ignored by
+  the gateway)" and logged once per reconcile. Convert each in place on the Route groups
+  page (fill in the client path and two or more providers) or delete it. New writes must
+  be the route-group shape; `ROUTE_GROUPS` env entries are unchanged.
+
+### Added
+
+- **Route groups are first-class in DB-config mode.** A config document's `routes`
+  entity is now a route group — the same shape as an env `ROUTE_GROUPS` entry
+  (`clientPath`, `mode`, `providers`, `select`, `weights`, `onStatusCodes`,
+  `hedgeDelayMs`, `modelMap`; the entity `name` is the group name; schema
+  `routeGroupSchema` in `@gulley/routing`). The gateway folds document groups on every
+  reconcile after the env overlay, so a DB group shadows an env group on the same client
+  path (the `routes` collection used to be stored and never read). GitOps plan/apply and
+  the console's `POST`/`PUT /routes` reject a malformed group (400 with the schema
+  `issues`). The console's Route groups page lists, creates, edits and deletes them.
+
+- **Conversation-stable reversible masking (K2).** Guardrail `mask` tokens are now
+  derived by HMAC under a per-workspace × per-conversation key, so the same value masks
+  to the same `<<GULLEY_EMAIL_<24 hex>>>` on every turn, in every replica and in both
+  directions. The masked request prefix is byte-identical turn after turn, which keeps
+  the provider's prompt cache hitting and passes the Claude 5.5-generation
+  preserved-thinking prefix check; the previous per-request random token broke both
+  (every masked multi-turn conversation on Opus 5.5 / Sonnet 5.5 / Fable 5.1 was
+  rejected with "bound to a different conversation" and missed its cache prefix). The
+  conversation is identified by `x-gulley-conversation-id` or Claude Code's
+  `x-claude-code-session-id`, else a fingerprint of the system prompt + first user turn,
+  else the virtual key. A token echoed back in the history is never re-masked. Persisted
+  vault records carry the conversation id (migration `0026`) and the control plane can
+  reveal a whole conversation: `GET /admin/mask-vault/conversation/:conversationId`.
+
+- **Signed reasoning pins the model** (`SIGNED_THINKING_SUBSTITUTION`, default `pin`).
+  A request whose history carries Anthropic `thinking` signatures / `redacted_thinking`
+  or OpenAI Responses `reasoning.encrypted_content` keeps its requested model: the
+  budget downshift, the cascade escalation and the smart re-route are skipped for it and
+  audited as `policy.substitution_pinned`. Substituting the model made the API drop that
+  reasoning silently and restarted the prompt cache. Set `allow` to substitute anyway.
+
+- **Certified gateway-contract conformance (K6).** A black-box suite executes the rules
+  of Anthropic's Claude Code gateway compatibility guide (open-list beta forwarding, no
+  buffering, ping relay and Bedrock ping synthesis, event order, verbatim error bodies
+  with `retry-after` / `x-should-retry` / `anthropic-ratelimit-unified-*`, model
+  discovery timing, `count_tokens`, an unchanged `system` array and body fields,
+  `capability_rejected:` tokens, consumed attribution headers) and OpenAI's Codex
+  checklist (incremental Responses SSE through `response.completed`,
+  `function_call_output` pairing, distinct error classes, model routing) against the
+  assembled gateway on every CI run, and renders the committed per-release report
+  `docs/CONFORMANCE.md` (`pnpm --filter @gulley/gateway conformance:report`; CI fails
+  on drift; attached to each GitHub Release).
+- **Request-level routing preferences and per-attempt provenance (P7).** An
+  OpenRouter-compatible `provider` object (`order`, `only`, `ignore`, `allow_fallbacks`,
+  `sort`, `zdr`, `max_price`) or Vercel's `providerOptions.gateway` (`order`, `only`,
+  `sort`) in the request narrows or re-orders the route's candidates after scope, model
+  policy, residency and the breaker have applied; an unsatisfiable preference is a 404.
+  The fields are stripped before the cache key and the upstream see the body
+  (`CLIENT_ROUTING_PREFERENCES`). Every response carries `x-gulley-attempts`
+  (`<target>:<outcome>[:<status>][:<ms>]`) and a request that touched more than one
+  attempt records it as the request-log `attempts` attribute.
+- **Live pricing catalog (P8).** A models.dev snapshot ships in the image
+  (`packages/catalog/data`, refreshed by a manual script) and is the default catalog;
+  `MODELS_CATALOG_FILE` accepts the raw models.dev `api.json` as well as the entry-array
+  format and can be reloaded in place when it changes (`PRICING_RELOAD_INTERVAL_SECONDS`);
+  catalog long-context tiers, cache multipliers, context windows and output limits are
+  honoured; contracted rates layer over everything (`PRICING_OVERRIDES[_FILE]`);
+  `GET /v1/models` lists every priced model of a configured provider with per-token
+  pricing, context window and max output in Anthropic's list shape; unpriced requests
+  carry the `gulley.pricing.unpriced` span attribute.
+- **Zero-config agent attribution** (`AGENT_HEADER_ATTRIBUTION`, default on). Claude
+  Code's `x-claude-code-*` headers (session, subagent, parent agent, prompt, request
+  class, agent type, compaction) and Codex's `originator` become attribution tags —
+  `session`, `cc_agent`, `cc_parent_agent`, `prompt`, `request_class`, `agent_type`,
+  `compaction`, `context_compacted` and `agent` (`claude-code` | `codex`) — on every
+  ledger, request-log and audit row, so chargeback by session / prompt / subagent /
+  agent product and per-attribution caps work without any `ATTRIBUTION_HEADERS`.
+- **Claude Code gateway-contract fixes.** `POST /v1/messages/count_tokens` (also under
+  `/anthropic` and `/bedrock`) is served through the same authn / scope / policy /
+  residency / input-guardrail gates as inference, with no spend, via the adapter's
+  `countTokens` (Anthropic passthrough; Bedrock `CountTokens`). The Bedrock translation
+  synthesizes `ping` events during pauses (`BEDROCK_PING_INTERVAL_MS`, default 15 s)
+  so Claude Code's streaming idle watchdog survives a long thinking pause, forwards the
+  client's `anthropic-beta` header as the body's `anthropic_beta` list (an open list;
+  `BEDROCK_BETA_DENY` strips values a region rejects), and reshapes Bedrock errors —
+  HTTP and mid-stream — into Anthropic's envelope with the status kept, the message
+  verbatim and `capability_rejected: prompt_too_long` for a prompt that does not fit.
+  Gateway-generated errors carry `x-should-retry` (`true` for 429/502/503/504, `false`
+  for other 4xx) and the 404 type is Anthropic's `not_found_error`. `GET /v1/models` is
+  also served under `/anthropic` and `/bedrock`.
+
+### Changed
+
+- **The spotlight directive is appended, not prepended, and on every request**
+  (`GUARDRAILS_SPOTLIGHT_DIRECTIVE`): it follows the client's own system content so a
+  Claude Code attribution block stays first (Anthropic's strip is positional) and the
+  system prompt is identical turn after turn (prompt cache + preserved thinking). It
+  used to be prepended only on turns that carried a tool result, which changed the
+  system prompt mid-conversation. OpenAI-shaped bodies get it on their leading system
+  message instead of an invalid top-level `system` field.
+- **Load-balancer session affinity defaults to the conversation identity** (the session
+  header or the prefix fingerprint) when `LB_SESSION_AFFINITY_HEADER` is unset, so a
+  multi-turn conversation stays on one provider — thinking signatures and prompt caches
+  are provider-bound. Single-turn / unparseable requests keep the least-load spread.
+- Mask token format: keyed tokens have no per-request counter
+  (`<<GULLEY_EMAIL_<24 hex>>>`); the keyless library form keeps `_<nonce>_<n>`.
+
+## [0.5.1] — 2026-10-10
+
+A correctness patch from the October 2026 audit: eight HIGH defects (one a regression
+from 0.5.0) in the data plane, the MEDIUM tail behind them, per-key scoping that the
+schema could not hold, and four console DTO mismatches. Every fix ships with regression
+tests; the data-plane changes went through the adversarial hot-path review.
+
+### Upgrade notes
+
+- **Run migration `0025`** (`node dist/control-api/migrate.mjs`): it adds the additive
+  `allowed_providers` / `allowed_models` columns to `virtual_key`. Existing keys stay
+  unrestricted.
+- **Pricing seeds are refreshed to October 2026**, so chargeback and budget figures
+  change: Claude Sonnet 5 was seeded at $3/$15 against its $2/$10 list price (reports
+  were a third too high); Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1 and Mythos 5.1
+  were absent and **metered $0 — budgets never consumed for the default model**; OpenAI
+  cached input is 0.1× on the GPT-5.x generation (older families keep their own
+  multiplier) and the GPT-5.x, o-series and `text-embedding-*` models are priced
+  (embeddings metered $0). Per-model cache-read multipliers (Opus 5.5 0.05×, Fable 5.1
+  0.025×) and long-context tiers (Haiku 5.5 above 100K, GPT-5.x above 272K) apply —
+  under a `MODELS_CATALOG_FILE` override the tier is scaled to the catalog's base
+  price, so a negotiated Bedrock/Azure rate keeps governing above the threshold.
+- **`METER_UNPRICED_CONFIG`** (new, default `fail`): `/ready` reports 503 while an
+  operator-configured model (a model-alias target, `BUDGET_DOWNSHIFT_MODEL`, a cascade
+  escalation target, a `ROUTE_GROUPS` model map entry) has no price in the seed or the
+  catalog, since it would meter $0 on every request. Set `warn` to stay ready and list
+  them; local-runtime presets are exempt; `gulley doctor` runs the same check.
+- **Cache entries are now partitioned by delivery mode** (`stream`) and by
+  `anthropic-version`. Entries written by 0.5.0 are not reused (they expire within
+  `CACHE_TTL_SECONDS`).
+- **`TOOL_POLICY` governs only requests that declare `tools` or a `tool_choice`.** Every
+  other request streams unbuffered again. **Behavior change** — 0.5.0 buffered every
+  response deployment-wide once a tool policy was set.
+- **`STREAM_WATCHDOG_BREAKER_THRESHOLD`** (new, default `3`): an inactivity-watchdog abort
+  faults the circuit breaker only after that many consecutive aborts on one target; set
+  `1` for the 0.5.0 behavior.
+- **Bedrock answers `stream:false` with JSON** through `invoke` (0.5.0 always returned SSE).
+- **DB-config mode re-applies `CUSTOM_PROVIDERS` and `ROUTE_GROUPS` on every reconcile.**
+  Deployments that saw those routes vanish after the first reconcile get them back.
+
+### Security
+
+- **The budget commit idempotency token no longer grows without bound (regression from
+  0.5.0).** The committed-ids SET had its TTL re-stamped on every commit, so under steady
+  traffic it never expired and grew by one member per request on the noeviction counters
+  Redis until the store refused writes — at which point `BUDGET_FAIL_OPEN` (the default)
+  admitted every request with no reservation. The token is now one self-expiring key per
+  request (`SET NX EX`); verified against a live Redis over 5,000 commits.
+- **A budget downshift can no longer leave the key's model scope.** The downshift
+  reassigned the model after the authz gate without checking the key's own allow-list,
+  so a compliance pin to one model could be undone by the cap.
+- **Tool-call governance reads every chat choice and every OpenAI Responses `*_call`
+  item.** A tool call on a second choice (`n>1`), a `local_shell_call`,
+  `custom_tool_call`, `computer_call` or `mcp_call`, and the legacy `function_call` were
+  invisible to the policy, so an allow-list passed them as "no tool calls".
+- **A cached streamed response is never replayed to a non-streaming caller** (or the
+  reverse); the exact key stripped `stream` while the hit path returned the stored bytes
+  verbatim.
+- **The default model is priced again** (see upgrade notes): an unpriced flagship model
+  reserved at the floor but committed $0, so workspace, model and attribution caps never
+  consumed.
+
+### Fixed
+
+- **DB-config mode kept its env-only routing.** The first reconcile replaced the route
+  table with the document's provider-only single routes and never re-applied
+  `CUSTOM_PROVIDERS`, the shared chat path or `ROUTE_GROUPS` — the recommended production
+  mode ran with no failover, load-balance, hedge, arbitrage or OpenAI-compatible provider.
+- **`TOOL_POLICY` no longer disables streaming deployment-wide** (gated on declared
+  tools: `tools` / `tool_choice`, the legacy chat `functions` / `function_call`, or a
+  Responses stored `prompt`; anything the extractor governs is still buffered).
+- **A quiet reasoning stream no longer opens the circuit, and a hung one still does.** A
+  single watchdog abort was a breaker fault; five long thinks on a provider without
+  keepalives opened the breaker (fleet-wide under `BREAKER_SHARED`). A run of
+  `STREAM_WATCHDOG_BREAKER_THRESHOLD` consecutive stalls now trips the circuit outright
+  (`CircuitBreaker.trip`): each stalled stream also records a first-byte success, so the
+  per-sample rules alone could never eject a provider that accepts every request and
+  then hangs.
+- **The semantic cache works on the pgvector default again.** The vector partition was
+  joined with a NUL byte, which Postgres rejects in a `text` column; every semantic
+  lookup threw and, because the engine awaits it after the exact-tier miss, the WHOLE
+  cache was bypassed with `CACHE_SEMANTIC_ENABLED` on pgvector (pre-existing; hidden
+  because the in-process Postgres tests strip the vector extension). The separator is
+  now the ASCII unit separator.
+- **Embeddings requests reserve input-only.** They reserved the 8k default output at the
+  unknown-pricing floor (about $0.61 per call) and were refused with 402 near any real
+  cap; the unpriced-model warning is throttled to once a minute per model.
+- **In-stream enforcement no longer withholds sequential multi-block streams.** Every
+  Anthropic server-tool answer (text → `server_tool_use` → text) and multi-part Responses
+  streams were failed closed; only interleaved text blocks are now.
+- **Per-key allow-lists work in production.** The data-plane key store hard-coded `*`
+  because `virtual_key` had no such columns (migration `0025`).
+- **Console:** the keys list showed a blank name column (`displayName` vs `name`), the
+  shadow-spend ratio rendered `NaN%` (`shadowRatioBps` vs `shadowRatio`), durable role
+  grants showed "—" for every subject (`userId`), and the routes page offered
+  `latency` / `cost` / `conditional` strategies the gateway rejects on hot-reload (it
+  now offers `single` / `loadbalance` / `fallback`; the dry-run panel says it is a local
+  projection).
+- `CLAUDE.md` named the long-gone `envs/dev` / `envs/prod` Terraform roots.
+
+### Added
+
+- **Per-key scope on mint:** `POST /keys` takes `allowedModels`, `allowedProviders`,
+  `expiresAt` and `groups` (validated, audited, returned in the secret-free view); the
+  control client and the console key form expose them.
+- **Unpriced-model readiness check** (`METER_UNPRICED_CONFIG`, `/ready`, `gulley doctor`).
+- **Opt-in live Redis test** for the budget scripts (`GULLEY_TEST_REDIS_URL`).
+- `docs/research/competitor-landscape-2026-10.md` — the October 2026 competitor research.
+
 ## [0.5.0] — 2026-09-28
 
 A hardening release: two waves of security and correctness fixes from a full
@@ -433,7 +675,9 @@ _Resolved during pre-release hardening (these never shipped in a public release)
   token on `x-api-key` as well as the bearer; IPv6 loopback (`[::1]`) PKCE redirects
   are accepted; and `gulley init` merges into an existing settings file.
 
-[Unreleased]: https://github.com/bogware/gulley/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/bogware/gulley/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/bogware/gulley/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/bogware/gulley/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/bogware/gulley/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bogware/gulley/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bogware/gulley/releases/tag/v0.3.0

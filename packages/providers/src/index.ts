@@ -6,6 +6,7 @@ export * from './presets';
 export * from './anthropic-usage';
 export * from './anthropic';
 export * from './extractors';
+export * from './bedrock-errors';
 export * from './bedrock-eventstream';
 export * from './bedrock';
 export * from './bedrock-guardrail';

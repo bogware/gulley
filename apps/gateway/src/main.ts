@@ -68,6 +68,7 @@ async function start(): Promise<void> {
     if (app.routeHolder) {
       configWatcher = buildConfigWatcher(config, app.routeHolder, {
         info: (msg) => app.log.info(msg),
+        warn: (msg) => app.log.warn(msg),
         error: (err, msg) => app.log.error({ err }, msg),
       });
       if (configWatcher) {

@@ -58,14 +58,18 @@ function isTextDelta(parsed: Record<string, unknown>): boolean {
 export class AnthropicSseRewriter {
   private readonly parser = new SSEParser();
   private lastTextIndex = 0;
-  private firstTextIndex: number | undefined;
+  /** The text content block currently OPEN (deltas seen, no content_block_stop yet). */
+  private openTextIndex: number | undefined;
   private _failClosed = false;
 
   constructor(private readonly transform: TextTransform) {}
 
-  /** Symmetry with {@link OpenAiSseRewriter}: set when a second TEXT content-block
-   *  index appears (multi-text stream), which this single-transform rewriter cannot
-   *  enforce without mis-attributing text; the caller terminates rather than corrupt. */
+  /** Symmetry with {@link OpenAiSseRewriter}: set when text_deltas for two content-block
+   *  indexes INTERLEAVE (a second text block opens before the first one's
+   *  content_block_stop), which one windowed transform cannot enforce without
+   *  mis-attributing its held tail; the caller terminates rather than corrupt.
+   *  Sequential text blocks (text → server_tool_use → text, the shape of every
+   *  server-tool answer) are fine: each block's tail is flushed at its stop. */
   get failClosed(): boolean {
     return this._failClosed;
   }
@@ -99,9 +103,9 @@ export class AnthropicSseRewriter {
     if (type === 'content_block_delta' && isTextDelta(parsed)) {
       const index =
         typeof parsed['index'] === 'number' ? (parsed['index'] as number) : this.lastTextIndex;
-      if (this.firstTextIndex === undefined) this.firstTextIndex = index;
-      else if (index !== this.firstTextIndex) {
-        this._failClosed = true; // a second text block — refuse rather than mis-attribute
+      if (this.openTextIndex === undefined) this.openTextIndex = index;
+      else if (index !== this.openTextIndex) {
+        this._failClosed = true; // two text blocks interleaved — refuse rather than mis-attribute
         return '';
       }
       this.lastTextIndex = index;
@@ -123,6 +127,14 @@ export class AnthropicSseRewriter {
         this._failClosed = true; // the flush hit a block: no structural frame after it
         return tail;
       }
+      // The open text block ended (its tail is flushed above), so a LATER text block on
+      // another index is a sequential continuation, not an interleave.
+      if (
+        type !== 'content_block_stop' ||
+        parsed['index'] === undefined ||
+        parsed['index'] === this.openTextIndex
+      )
+        this.openTextIndex = undefined;
       return tail + reframe(ev);
     }
 
@@ -333,15 +345,21 @@ type ResponsesEnvelope = Partial<Record<'item_id' | 'output_index' | 'content_in
  */
 export class ResponsesSseRewriter {
   private readonly parser = new SSEParser();
-  private acc = ''; // the transformed text emitted so far, for echo substitution
-  private envelope: ResponsesEnvelope = {};
-  private firstPart: string | undefined; // `${output_index}:${content_index}` of the 1st part
+  /** Transformed text per output_text part, keyed `${output_index}:${content_index}`,
+   *  for echo substitution (output_text.done, content_part.done, the item and
+   *  completed echoes all re-carry a part's full text). */
+  private readonly parts = new Map<string, string>();
+  private envelope: ResponsesEnvelope = {}; // of the part currently open
+  private openPart: string | undefined; // the part receiving deltas now
+  private readonly closedParts = new Set<string>(); // parts whose output_text.done arrived
   private _failClosed = false;
 
   constructor(private readonly transform: TextTransform) {}
 
-  /** Set when a second output_text part appears — a single windowed transform can't
-   *  enforce two without mis-attributing its held tail; the caller terminates. */
+  /** Set when deltas for two output_text parts INTERLEAVE (a second part opens before
+   *  the first one's output_text.done) — one windowed transform can't enforce that
+   *  without mis-attributing its held tail; the caller terminates. Sequential parts
+   *  (text → tool call → text) are enforced one after another. */
   get failClosed(): boolean {
     return this._failClosed;
   }
@@ -362,8 +380,13 @@ export class ResponsesSseRewriter {
     if (this._failClosed) return '';
     const tail = this.transform.flush();
     if (!tail) return '';
-    this.acc += tail;
+    this.append(tail);
     return this.synthDelta(tail);
+  }
+
+  private append(text: string): void {
+    if (this.openPart === undefined) return;
+    this.parts.set(this.openPart, (this.parts.get(this.openPart) ?? '') + text);
   }
 
   private rewrite(ev: SSEEvent): string {
@@ -377,17 +400,21 @@ export class ResponsesSseRewriter {
 
     if (type === 'response.output_text.delta') {
       const key = `${parsed['output_index']}:${parsed['content_index']}`;
-      if (this.firstPart === undefined) {
-        this.firstPart = key;
+      if (key !== this.openPart) {
+        // A new part may only start once the previous one has ENDED (output_text.done
+        // seen, its tail drained there): sequential parts are enforced in turn, while
+        // interleaved deltas across two open parts cannot be attributed — fail closed.
+        if (this.openPart !== undefined && !this.closedParts.has(this.openPart))
+          return this.failClose();
+        this.openPart = key;
+        if (!this.parts.has(key)) this.parts.set(key, '');
+        this.envelope = {};
         for (const k of ['item_id', 'output_index', 'content_index'] as const)
           if (parsed[k] !== undefined) this.envelope[k] = parsed[k];
-      } else if (key !== this.firstPart) {
-        this._failClosed = true; // a second output_text part — refuse rather than mis-attribute
-        return '';
       }
       const delta = typeof parsed['delta'] === 'string' ? (parsed['delta'] as string) : '';
       const emitted = this.transform.push(delta);
-      this.acc += emitted;
+      this.append(emitted);
       delete parsed['logprobs']; // per-token logprobs echo the RAW text — strip them
       if (this.transform.terminal?.()) {
         this._failClosed = true; // safe prefix only; no echoes / completion after a block
@@ -401,26 +428,27 @@ export class ResponsesSseRewriter {
     }
 
     // Terminal echo of the part text: flush the held tail (emit it as a synthetic
-    // delta for delta-only consumers), then substitute the full accumulator. If we
+    // delta for delta-only consumers), then substitute the part's accumulator. If we
     // never saw a delta for this part, the enforcer never windowed this text, so
-    // substituting the (empty) accumulator would blank it and passing it through
+    // substituting an (empty) accumulator would blank it and passing it through
     // would bypass enforcement — fail closed instead (a non-conformant upstream).
     if (type === 'response.output_text.done') {
-      if (this.firstPart === undefined && String(parsed['text'] ?? '') !== '')
-        return this.failClose();
+      const key = `${parsed['output_index']}:${parsed['content_index']}`;
+      if (!this.parts.has(key) && String(parsed['text'] ?? '') !== '') return this.failClose();
       const pre = this.drainTail();
       if (this._failClosed) return pre;
-      parsed['text'] = this.acc;
+      parsed['text'] = this.parts.get(key) ?? '';
       delete parsed['logprobs'];
+      this.closedParts.add(key);
       return pre + reframe({ event: ev.event, data: JSON.stringify(parsed) });
     }
 
     if (type === 'response.content_part.done') {
       const part = parsed['part'] as Record<string, unknown> | undefined;
       if (part && part['type'] === 'output_text') {
-        if (this.firstPart === undefined && String(part['text'] ?? '') !== '')
-          return this.failClose();
-        part['text'] = this.acc;
+        const key = `${parsed['output_index']}:${parsed['content_index']}`;
+        if (!this.parts.has(key) && String(part['text'] ?? '') !== '') return this.failClose();
+        part['text'] = this.parts.get(key) ?? '';
         delete part['logprobs'];
       }
       return reframe({ event: ev.event, data: JSON.stringify(parsed) });
@@ -433,7 +461,8 @@ export class ResponsesSseRewriter {
       const pre = this.drainTail();
       if (this._failClosed) return pre;
       const item = parsed['item'] as Record<string, unknown> | undefined;
-      if (!this.substituteContent(item?.['content'])) return this.failClose();
+      const outputIndex = typeof parsed['output_index'] === 'number' ? parsed['output_index'] : 0;
+      if (!this.substituteContent(item?.['content'], outputIndex)) return this.failClose();
       return pre + reframe({ event: ev.event, data: JSON.stringify(parsed) });
     }
 
@@ -456,17 +485,17 @@ export class ResponsesSseRewriter {
     return '';
   }
 
-  /** Flush the transform tail once, folding it into the accumulator and emitting it
-   *  as a synthetic delta (idempotent — empty once drained). */
+  /** Flush the transform tail once, folding it into the open part's accumulator and
+   *  emitting it as a synthetic delta (idempotent — empty once drained). */
   private drainTail(): string {
     const tail = this.transform.flush();
     if (this.transform.terminal?.()) this._failClosed = true; // caller emits no echo after this
     if (!tail) return '';
-    this.acc += tail;
+    this.append(tail);
     return this.synthDelta(tail);
   }
 
-  /** Overwrite every output_text `.text` in a terminal response object with the
+  /** Overwrite every output_text `.text` in a terminal response object with its part's
    *  accumulator (and strip its logprobs), leaving usage + every sibling byte-intact.
    *  Returns false (→ fail closed) if an echo carries text we never windowed. */
   private substituteCompleted(parsed: Record<string, unknown>): boolean {
@@ -474,22 +503,24 @@ export class ResponsesSseRewriter {
     if (!response || typeof response !== 'object') return true;
     const output = (response as Record<string, unknown>)['output'];
     if (!Array.isArray(output)) return true;
-    for (const item of output) {
-      if (!this.substituteContent((item as Record<string, unknown>)?.['content'])) return false;
+    for (const [outputIndex, item] of output.entries()) {
+      if (!this.substituteContent((item as Record<string, unknown>)?.['content'], outputIndex))
+        return false;
     }
     return true;
   }
 
-  /** Scrub one item's content[] blocks: each output_text block's `text` becomes the
-   *  accumulator and its per-token `logprobs` are stripped. Returns false if a block
-   *  carries text that was never windowed via a delta (→ the caller fails closed). */
-  private substituteContent(content: unknown): boolean {
+  /** Scrub one item's content[] blocks: each output_text block's `text` becomes its
+   *  part's accumulator and its per-token `logprobs` are stripped. Returns false if a
+   *  block carries text that was never windowed via a delta (→ the caller fails closed). */
+  private substituteContent(content: unknown, outputIndex: number): boolean {
     if (!Array.isArray(content)) return true;
-    for (const c of content) {
+    for (const [contentIndex, c] of content.entries()) {
       const block = c as Record<string, unknown>;
       if (block?.['type'] !== 'output_text') continue;
-      if (this.firstPart === undefined && String(block['text'] ?? '') !== '') return false;
-      block['text'] = this.acc;
+      const key = `${outputIndex}:${contentIndex}`;
+      if (!this.parts.has(key) && String(block['text'] ?? '') !== '') return false;
+      block['text'] = this.parts.get(key) ?? '';
       delete block['logprobs'];
     }
     return true;

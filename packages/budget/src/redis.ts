@@ -69,18 +69,22 @@ return {1, reserved + committed + worst}
 const COMMIT_LUA = new LuaScript(`
 local reservedKey = KEYS[1]
 local committedKey = KEYS[2]
-local committedIdsKey = KEYS[3]
+local commitIdKey = KEYS[3]
 local field = ARGV[1]
 local actual = tonumber(ARGV[2])
 local ttlArg = tonumber(ARGV[3])
 local dedupTtl = tonumber(ARGV[4])
 -- Idempotency: a resent commit (ioredis auto-retries a command whose reply was lost after
--- the script already ran server-side) must not double-count. SADD returns 1 only the FIRST
--- time this request id commits to this scope; a resend sees 0 and skips the INCRBY. This is
--- the idempotency token — NOT the reservation field, which is deleted on first commit — so
--- a swept-then-committed request still records exactly once. A short TTL bounds the set.
-local fresh = redis.call('SADD', committedIdsKey, field)
-if dedupTtl > 0 then redis.call('EXPIRE', committedIdsKey, dedupTtl) end
+-- the script already ran server-side) must not double-count. The token is ONE
+-- self-expiring key per request id (SET NX EX): it is created only the FIRST time this
+-- request id commits to this scope, so a resend finds it and skips the INCRBY. It is NOT
+-- the reservation field (deleted on first commit), so a swept-then-committed request
+-- still records exactly once. A per-request key keeps the footprint BOUNDED under
+-- continuous traffic: the previous shared set re-stamped its TTL on every commit, so it
+-- never expired and grew by one member per request on the noeviction counters store.
+if dedupTtl < 1 then dedupTtl = 1 end
+local fresh = 0
+if redis.call('SET', commitIdKey, '1', 'NX', 'EX', dedupTtl) then fresh = 1 end
 local raw = redis.call('HGET', reservedKey, field)
 local worst = 0
 local ttl = ttlArg or 0
@@ -219,8 +223,9 @@ export class RedisBudgetStore implements BudgetStore {
    *  blip used to strand every in-flight reservation until the orphan sweep. */
   async commit(workspaceId: string, requestId: string, actualMicroUsd: number): Promise<void> {
     const [reservedKey, committedKey] = this.keys(workspaceId);
-    // Same {workspaceId} hash-tag slot as the other two keys (Redis Cluster).
-    const committedIdsKey = `budget:{${workspaceId}}:committed_ids`;
+    // One self-expiring idempotency key PER request (never a shared, ever-growing set);
+    // same {workspaceId} hash-tag slot as the other two keys (Redis Cluster).
+    const commitIdKey = `budget:{${workspaceId}}:cid:${requestId}`;
     let ttlArg = '';
     try {
       const budget = await this.capFor(workspaceId);
@@ -229,14 +234,14 @@ export class RedisBudgetStore implements BudgetStore {
       /* fall back to the period carried on the reservation field */
     }
     // Dedup window: a lost-reply retry lands within seconds, so the reservation lifetime is
-    // an ample, self-bounding TTL for the committed-ids set.
-    const dedupTtl = Math.ceil(this.maxReservationLifetimeMs / 1000);
+    // an ample TTL for the per-request idempotency key (which then expires on its own).
+    const dedupTtl = Math.max(1, Math.ceil(this.maxReservationLifetimeMs / 1000));
     await COMMIT_LUA.run(
       this.redis,
       3,
       reservedKey,
       committedKey,
-      committedIdsKey,
+      commitIdKey,
       requestId,
       String(Math.max(0, Math.round(actualMicroUsd))),
       ttlArg,

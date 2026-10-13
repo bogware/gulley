@@ -8,7 +8,7 @@ import type {
   GuardrailPolicies,
   GuardrailPolicy,
 } from './types';
-import { redactText, TokenVault } from './vault';
+import { redactText, TokenVault, type TokenVaultOptions } from './vault';
 
 export interface FindingSummary {
   total: number;
@@ -85,6 +85,14 @@ export interface OutputInspection {
  * and response text, applying the direction's policy. Audit-only never mutates;
  * block/mask/redact do. The default policies are audit in both directions.
  */
+/** Per-inspection options. */
+export interface InspectOptions {
+  /** The conversation's mask-vault key ({@link TokenVaultOptions.key}): with it a
+   *  `mask` action mints conversation-stable tokens; without it, request-scoped
+   *  nonce'd tokens. */
+  vaultKey?: TokenVaultOptions['key'];
+}
+
 export interface GuardrailEngineHooks {
   /** Called when the external plugin returned its FAILURE policy (it did not see the
    *  text): the host logs/meters "DLP enforcement degraded" — otherwise a fail-open
@@ -164,7 +172,7 @@ export class GuardrailEngine {
     return resolveOverlaps(all);
   }
 
-  async inspectInput(text: string): Promise<InputInspection> {
+  async inspectInput(text: string, opts: InspectOptions = {}): Promise<InputInspection> {
     const policy = this.policies.input;
     // Native findings are the ONLY spans a native transform (mask/redact) applies to.
     // A plugin's findings are whole-text markers (start 0, end length, confidence 1)
@@ -214,7 +222,7 @@ export class GuardrailEngine {
       };
     }
     if (policy.action === 'mask' && nativeFindings.length > 0) {
-      const vault = new TokenVault();
+      const vault = new TokenVault({ key: opts.vaultKey });
       return {
         findings,
         summary,
@@ -250,14 +258,14 @@ export class GuardrailEngine {
    *  returned `vault` restores originals for an authorized consumer); `redact`
    *  replaces irreversibly. Mirrors the streaming enforcer so `mask` means the
    *  same thing on both paths. */
-  inspectOutputText(text: string): OutputInspection {
+  inspectOutputText(text: string, opts: InspectOptions = {}): OutputInspection {
     const policy = this.policies.output;
     const findings = filterByPolicy(this.detectAll(text), policy);
     const summary = summarize(findings);
     if (findings.length === 0) return { findings, summary, blocked: false };
     if (policy.action === 'block') return { findings, summary, blocked: true };
     if (policy.action === 'mask') {
-      const vault = new TokenVault();
+      const vault = new TokenVault({ key: opts.vaultKey });
       return {
         findings,
         summary,
@@ -281,8 +289,8 @@ export class GuardrailEngine {
    * policy. Use this on the buffered / hold-then-flush path; the streaming audit
    * scanner stays detector-only.
    */
-  async inspectOutput(text: string): Promise<OutputInspection> {
-    const native = this.inspectOutputText(text);
+  async inspectOutput(text: string, opts: InspectOptions = {}): Promise<OutputInspection> {
+    const native = this.inspectOutputText(text, opts);
     if (!this.plugin) return native;
 
     const result = await this.plugin.inspect(text, 'output');
@@ -301,7 +309,7 @@ export class GuardrailEngine {
       // what remains (a GitHub token or phone number the plugin's SDP config does
       // not cover used to be forwarded unmasked because the native transform was
       // discarded here). Re-run the natives over the plugin-masked text.
-      const chained = this.inspectOutputText(result.maskedText);
+      const chained = this.inspectOutputText(result.maskedText, opts);
       if (chained.blocked) return { findings, summary, blocked: true };
       return {
         findings,

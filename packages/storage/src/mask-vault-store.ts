@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 
 import type { Database } from './db';
 import {
@@ -20,6 +20,9 @@ export interface MaskVaultRecord {
   direction: MaskDirection;
   workspaceId: string;
   orgId: string | null;
+  /** The conversation the request belonged to (K2): tokens are stable per
+   *  conversation, so a reveal can collect every record of a conversation. */
+  conversationId?: string | null;
   ciphertext: unknown;
   tokenCount: number;
   ttlSeconds: number;
@@ -30,6 +33,7 @@ export interface MaskVaultView {
   direction: MaskDirection;
   workspaceId: string;
   orgId: string | null;
+  conversationId: string | null;
   ciphertext: unknown;
   tokenCount: number;
 }
@@ -41,6 +45,9 @@ export interface MaskVaultStore {
   get(requestId: string, direction: MaskDirection): Promise<MaskVaultView | undefined>;
   /** All non-expired directions for a request (the reveal endpoint). */
   list(requestId: string): Promise<MaskVaultView[]>;
+  /** Every non-expired record of a conversation, oldest first (reveal by
+   *  conversation). Optionally restricted to one workspace. */
+  listByConversation(conversationId: string, workspaceId?: string): Promise<MaskVaultView[]>;
   sweepExpired(now: Date): Promise<number>;
 }
 
@@ -62,13 +69,19 @@ export class PostgresMaskVaultStore implements MaskVaultStore {
         direction: record.direction,
         workspaceId: record.workspaceId,
         orgId: record.orgId,
+        conversationId: record.conversationId ?? null,
         ciphertext: record.ciphertext,
         tokenCount: record.tokenCount,
         expiresAt,
       })
       .onConflictDoUpdate({
         target: [maskVault.requestId, maskVault.direction],
-        set: { ciphertext: record.ciphertext, tokenCount: record.tokenCount, expiresAt },
+        set: {
+          ciphertext: record.ciphertext,
+          tokenCount: record.tokenCount,
+          conversationId: record.conversationId ?? null,
+          expiresAt,
+        },
       });
   }
 
@@ -78,6 +91,7 @@ export class PostgresMaskVaultStore implements MaskVaultStore {
       direction: r.direction as MaskDirection,
       workspaceId: r.workspaceId,
       orgId: r.orgId,
+      conversationId: r.conversationId ?? null,
       ciphertext: r.ciphertext,
       tokenCount: r.tokenCount,
     };
@@ -104,6 +118,21 @@ export class PostgresMaskVaultStore implements MaskVaultStore {
       .select()
       .from(maskVault)
       .where(and(eq(maskVault.requestId, requestId), sql`${maskVault.expiresAt} > now()`));
+    return rows.map((r) => this.toView(r));
+  }
+
+  async listByConversation(conversationId: string, workspaceId?: string): Promise<MaskVaultView[]> {
+    const where = [
+      eq(maskVault.conversationId, conversationId),
+      sql`${maskVault.expiresAt} > now()`,
+    ];
+    if (workspaceId !== undefined) where.push(eq(maskVault.workspaceId, workspaceId));
+    const rows = await this.db
+      .select()
+      .from(maskVault)
+      .where(and(...where))
+      .orderBy(asc(maskVault.createdAt), asc(maskVault.requestId), asc(maskVault.direction))
+      .limit(1000);
     return rows.map((r) => this.toView(r));
   }
 

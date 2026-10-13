@@ -199,7 +199,18 @@ export class ControlClient {
   }
 
   // --- virtual keys ---
-  mintKey(input: { workspaceId: string; name?: string }): Promise<MintedKey> {
+  mintKey(input: {
+    workspaceId: string;
+    name?: string;
+    /** Provider / model allow-lists the gateway enforces on the resolved target;
+     *  absent or `'*'` = unrestricted. */
+    allowedProviders?: readonly string[] | '*';
+    allowedModels?: readonly string[] | '*';
+    /** ISO-8601 timestamp in the future after which the key is refused. */
+    expiresAt?: string;
+    /** Group/team tags carried onto the key's principal scope. */
+    groups?: readonly string[];
+  }): Promise<MintedKey> {
     return this.req('POST', '/keys', input);
   }
   getKey(id: string): Promise<{ key: unknown }> {

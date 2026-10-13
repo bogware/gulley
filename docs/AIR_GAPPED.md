@@ -69,7 +69,7 @@ the three role-split Redis instances (`redis:7-alpine`; eviction policies as in
 
 ## 2. Pin the cost catalog
 
-`models.dev` is unreachable offline, so pin the catalog file and point both apps at it:
+`models.dev` is unreachable offline. Since 0.6.0 the image carries a models.dev snapshot (`GULLEY_CATALOG_SNAPSHOT`), so pricing works with no catalog file; to refresh prices between releases, pin a catalog file and point both apps at it:
 
 ```bash
 MODELS_CATALOG_FILE=/etc/gulley/models.catalog.json

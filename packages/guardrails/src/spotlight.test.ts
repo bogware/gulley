@@ -174,15 +174,77 @@ describe('spotlightUntrusted', () => {
     expect(body.messages[0]!.content).toBe('evil'); // original untouched
   });
 
-  it('optionally prepends a system directive (preserving existing system)', () => {
+  it('optionally APPENDS a system directive after the existing system content', () => {
     const body = {
       system: 'be concise',
       messages: [{ role: 'tool', tool_call_id: 'c1', content: 'evil' }],
     };
-    const { body: out } = spotlightUntrusted(body, { directive: true });
+    const { body: out, directive } = spotlightUntrusted(body, { directive: true });
     const sys = (out as { system: string }).system;
-    expect(sys).toMatch(/^Content inside <untrusted_content>/);
-    expect(sys).toContain('be concise'); // original preserved
+    expect(directive).toBe(true);
+    expect(sys).toMatch(/^be concise\n\nContent inside <untrusted_content>/); // original first
+    expect(sys).toMatch(/inside those tags\.$/);
+  });
+
+  it('appends the directive as the LAST system block, keeping a leading attribution block first', () => {
+    const body = {
+      system: [
+        { type: 'text', text: 'x-attribution: claude-code/2.1.300 fp=abc' },
+        { type: 'text', text: 'be concise', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'evil' }] },
+      ],
+    };
+    const { body: out } = spotlightUntrusted(body, { directive: true });
+    const sys = (out as { system: Array<{ type: string; text: string; cache_control?: unknown }> })
+      .system;
+    expect(sys).toHaveLength(3);
+    expect(sys[0]).toEqual(body.system[0]); // untouched, still first
+    expect(sys[1]).toEqual(body.system[1]); // breakpoint untouched
+    expect(sys[2]!.text).toMatch(/^Content inside <untrusted_content>/);
+  });
+
+  it('applies the directive on EVERY request (even with nothing to mark) and is idempotent', () => {
+    const body = {
+      system: 'be concise',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+    const once = spotlightUntrusted(body, { directive: true });
+    expect(once.marked).toBe(0);
+    expect(once.directive).toBe(true);
+    const sys = (once.body as { system: string }).system;
+    expect(sys.startsWith('be concise')).toBe(true);
+    const twice = spotlightUntrusted(once.body, { directive: true });
+    expect(twice.directive).toBe(false); // already present ⇒ nothing changes
+    expect(twice.body).toBe(once.body);
+    // Without the directive option the no-span path is still allocation-free.
+    const plain = spotlightUntrusted(body);
+    expect(plain.body).toBe(body);
+    expect(plain.directive).toBe(false);
+  });
+
+  it('places the directive in an OpenAI-shaped body: appended to a leading system message, else a leading one', () => {
+    const chat = {
+      messages: [
+        { role: 'system', content: 'be concise' },
+        { role: 'tool', tool_call_id: 'c1', content: 'evil' },
+      ],
+    };
+    const { body: out } = spotlightUntrusted(chat, { directive: true });
+    const msgs = (out as { messages: Array<{ role: string; content: string }>; system?: unknown })
+      .messages;
+    expect((out as { system?: unknown }).system).toBeUndefined(); // never a top-level `system` for OpenAI
+    expect(msgs[0]!.content).toMatch(/^be concise\n\nContent inside/);
+    const noSystem = { messages: [{ role: 'tool', tool_call_id: 'c1', content: 'evil' }] };
+    const { body: out2 } = spotlightUntrusted(noSystem, { directive: true });
+    const msgs2 = (out2 as { messages: Array<{ role: string; content: string }> }).messages;
+    expect(msgs2[0]!.role).toBe('system');
+    expect(msgs2).toHaveLength(2);
+    const anthropicNoSystem = { max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] };
+    const { body: out3 } = spotlightUntrusted(anthropicNoSystem, { directive: true });
+    expect((out3 as { system: string }).system).toMatch(/^Content inside/);
   });
 
   it('honors custom delimiters', () => {

@@ -5,7 +5,8 @@ import { adminRoute, notFound, visibleWorkspaceIds } from './admin';
 import type { ControlContext } from './context';
 
 /**
- * Mask-vault reveal (M22 D). `GET /admin/mask-vault/:requestId` decrypts and returns
+ * Mask-vault reveal (M22 D). `GET /admin/mask-vault/:requestId` (and, since K2,
+ * `GET /admin/mask-vault/conversation/:conversationId`) decrypts and returns
  * the guardrail-mask token↔original map for a masked request, so an authorized admin
  * can de-tokenize a response the gateway masked. Deny-by-default and high-privilege:
  *
@@ -96,6 +97,93 @@ export function registerMaskVaultRoutes(app: FastifyInstance, ctx: ControlContex
       });
 
       return reply.send({ requestId, reveals });
+    }),
+  );
+
+  /**
+   * Reveal by CONVERSATION (K2): every persisted record of a conversation, so an
+   * authorized admin can de-tokenize a whole masked conversation at once (tokens
+   * are stable per conversation, so one map covers every turn). Same deny-by-
+   * default rules as the per-request reveal, evaluated per workspace: records in
+   * a workspace the caller may not reveal are omitted, and a caller permitted for
+   * none gets the same 404 as an unknown conversation (no existence oracle).
+   */
+  app.get(
+    '/admin/mask-vault/conversation/:conversationId',
+    adminRoute(ctx, async (request, reply, admin) => {
+      const store = ctx.maskVault;
+      const encryptor = ctx.maskVaultEncryptor;
+      if (!store || !encryptor) {
+        return reply
+          .code(501)
+          .send({ error: { type: 'not_configured', message: 'mask-vault reveal not enabled' } });
+      }
+      const conversationId = (request.params as { conversationId: string }).conversationId;
+      const all = await store.listByConversation(conversationId);
+      const visible = visibleWorkspaceIds(ctx, admin);
+      const permitted = new Map<string, boolean>();
+      const records: typeof all = [];
+      for (const rec of all) {
+        if (!visible.has(rec.workspaceId)) continue;
+        let ok = permitted.get(rec.workspaceId);
+        if (ok === undefined) {
+          ok = await ctx.access.can(admin, 'guardrail:reveal', {
+            orgId: rec.orgId ?? undefined,
+            workspaceId: rec.workspaceId,
+          });
+          permitted.set(rec.workspaceId, ok);
+        }
+        if (ok) records.push(rec);
+      }
+      if (records.length === 0) return notFound(reply, 'mask vault');
+
+      const reveals: Array<{
+        requestId: string;
+        direction: string;
+        tokenCount: number;
+        tokens: Record<string, string>;
+      }> = [];
+      for (const rec of records) {
+        let entries: Array<[string, string]>;
+        try {
+          const plaintext = await encryptor.decrypt(rec.ciphertext as EnvelopeCiphertext, {
+            aad: `${rec.requestId}:${rec.workspaceId}:${rec.direction}`,
+          });
+          entries = JSON.parse(Buffer.from(plaintext).toString('utf8')) as Array<[string, string]>;
+        } catch (err) {
+          if (err instanceof Error && err.message.startsWith('crypto-shredded')) {
+            return reply.code(410).send({
+              error: {
+                type: 'crypto_shredded',
+                message: "this subject's mask-vault data was crypto-shredded and is unrecoverable",
+              },
+            });
+          }
+          return reply
+            .code(502)
+            .send({ error: { type: 'decrypt_failed', message: 'could not decrypt mask vault' } });
+        }
+        reveals.push({
+          requestId: rec.requestId,
+          direction: rec.direction,
+          tokenCount: rec.tokenCount,
+          tokens: Object.fromEntries(entries),
+        });
+      }
+
+      await ctx.audit.append({
+        orgId: records[0]?.orgId ?? null,
+        actor: admin.subject,
+        action: 'guardrail.reveal',
+        target: `conversation:${conversationId}`,
+        payload: {
+          conversationId,
+          requestIds: [...new Set(reveals.map((r) => r.requestId))],
+          tokenCount: reveals.reduce((n, r) => n + r.tokenCount, 0),
+        },
+      });
+
+      return reply.send({ conversationId, reveals });
     }),
   );
 }

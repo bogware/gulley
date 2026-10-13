@@ -21,6 +21,7 @@
     "load:check": "tsx --env-file-if-exists=../../.env src/load-check.ts",
     "smart:check": "tsx --env-file-if-exists=../../.env src/smart-check.ts",
     "doctor": "tsx --env-file-if-exists=../../.env src/doctor.ts",
+    "conformance:report": "tsx src/conformance/report-cli.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run --passWithNoTests"

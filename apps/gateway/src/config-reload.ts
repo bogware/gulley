@@ -11,7 +11,13 @@ import {
   PostgresConfigVersionStore,
 } from '@gulley/storage';
 import type { Config } from './config';
-import { ConfigWatcher, GatewayReconciler, type ReconcileLog } from './reconcile';
+import { buildCustomProviders, overlayEnvRoutes } from './context';
+import {
+  ConfigWatcher,
+  GatewayReconciler,
+  type ReconcileLog,
+  type RouteOverlay,
+} from './reconcile';
 import type { RouteHolder } from './routes/messages';
 import { buildSecretResolver } from './secrets';
 
@@ -73,21 +79,47 @@ export function buildConfigWatcher(
       `centroid ANN disabled: EMBEDDINGS_DIMENSIONS=${config.EMBEDDINGS_DIMENSIONS} != 256 (vector column dim); using in-memory scan`,
     );
   }
-  const reconciler = new GatewayReconciler(holder, store, resolver, log, {
-    enabled: config.SMART_ROUTING_ENABLED,
-    embedder,
-    breaker: config.SMART_ROUTING_ENABLED ? breaker : undefined,
-    similarityThreshold: config.SMART_ROUTING_SIMILARITY_THRESHOLD,
-    // Outer race budget (> the embed/LLM inner HTTP timeout) so classification can
-    // actually complete before falling back — without it the engine default (200ms)
-    // aborts every real embed/LLM call.
-    classifyTimeoutMs: config.SMART_ROUTING_CLASSIFY_TIMEOUT_MS,
-    // Surface classifier outcomes (esp. a mis-tuned-budget `timeout` rate) as a metric.
-    onOutcome: (outcome) => holder.ctx.metrics?.recordClassifierOutcome(outcome),
-    store: persistCentroids ? new PostgresCentroidStore(db) : undefined,
-    model: persistCentroids ? config.EMBEDDINGS_MODEL : undefined,
-    annIndex: annEligible ? new PostgresCentroidIndex(db, config.EMBEDDINGS_MODEL) : undefined,
-  });
+  // The env-only overlays (CUSTOM_PROVIDERS, ROUTE_GROUPS, the shared chat path) are
+  // re-applied over the document's routes on every reconcile — the same function the
+  // boot path uses — so DB mode never loses them. Custom providers are built once here.
+  const custom = buildCustomProviders(config);
+  const overlay: RouteOverlay = {
+    apply: (base) => overlayEnvRoutes(config, base, custom),
+    modelRules: custom.modelRules,
+  };
+  const reconciler = new GatewayReconciler(
+    holder,
+    store,
+    resolver,
+    log,
+    {
+      enabled: config.SMART_ROUTING_ENABLED,
+      embedder,
+      breaker: config.SMART_ROUTING_ENABLED ? breaker : undefined,
+      similarityThreshold: config.SMART_ROUTING_SIMILARITY_THRESHOLD,
+      // Outer race budget (> the embed/LLM inner HTTP timeout) so classification can
+      // actually complete before falling back — without it the engine default (200ms)
+      // aborts every real embed/LLM call.
+      classifyTimeoutMs: config.SMART_ROUTING_CLASSIFY_TIMEOUT_MS,
+      // Surface classifier outcomes (esp. a mis-tuned-budget `timeout` rate) as a metric.
+      onOutcome: (outcome) => holder.ctx.metrics?.recordClassifierOutcome(outcome),
+      store: persistCentroids ? new PostgresCentroidStore(db) : undefined,
+      model: persistCentroids ? config.EMBEDDINGS_MODEL : undefined,
+      annIndex: annEligible ? new PostgresCentroidIndex(db, config.EMBEDDINGS_MODEL) : undefined,
+    },
+    overlay,
+    // The document's route groups default to the same global hedge as the env overlay.
+    config.HEDGE_DELAY_MS,
+    {
+      bedrock: {
+        pingIntervalMs: config.BEDROCK_PING_INTERVAL_MS,
+        pingMaxIdleMs: config.STREAM_INACTIVITY_MS,
+        betaDeny: config.BEDROCK_BETA_DENY.split(',')
+          .map((b) => b.trim())
+          .filter(Boolean),
+      },
+    },
+  );
 
   const listen = createListenConnection(config.DATABASE_URL);
   // The reconnect hook references the watcher created just below; a const ref

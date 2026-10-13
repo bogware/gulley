@@ -17,7 +17,9 @@
     "@gulley/egress": "workspace:*",
     "@gulley/pipeline": "workspace:*",
     "@gulley/rbac": "workspace:*",
-    "yaml": "^2.6.1"
+    "@gulley/routing": "workspace:*",
+    "yaml": "^2.6.1",
+    "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

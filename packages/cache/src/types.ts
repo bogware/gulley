@@ -14,6 +14,10 @@ export interface CacheableRequest {
    *  `anthropic-beta` header / capability fingerprint); folded into the exact + vector
    *  keys so a differing capability can never reuse another's entry. */
   variant?: string;
+  /** Delivery mode of the request (`stream: true` ⇒ an SSE body is stored). Part of
+   *  both tiers' partition: a streamed and a buffered answer for the same prompt are
+   *  different byte sequences and must never be served across modes. Absent = buffered. */
+  stream?: boolean;
   /** Per-route override of the semantic (fuzzy) tier. `false` disables it for this
    *  request even when the deployment has semantic caching on — for routes carrying
    *  sensitive/high-variance prompts where an approximate near-neighbor answer is

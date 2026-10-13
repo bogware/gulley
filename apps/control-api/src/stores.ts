@@ -262,9 +262,10 @@ export class KeyAdminStore implements KeyAdmin {
       displayName: args.name,
       epoch: 0,
       disabled: false,
-      expiresAt: null,
+      expiresAt: args.expiresAt ? new Date(args.expiresAt) : null,
       allowedProviders: args.allowedProviders ?? '*',
       allowedModels: args.allowedModels ?? '*',
+      groups: args.groups ?? [],
     };
     this.keyStore.add(stored);
     this.views.set(id, {
@@ -275,6 +276,10 @@ export class KeyAdminStore implements KeyAdmin {
       keyPrefix: gen.keyPrefix,
       disabled: false,
       createdAt: nowIso(),
+      expiresAt: stored.expiresAt ? stored.expiresAt.toISOString() : null,
+      allowedProviders: stored.allowedProviders,
+      allowedModels: stored.allowedModels,
+      groups: stored.groups ?? [],
     });
     return { id, token: gen.token, keyPrefix: gen.keyPrefix };
   }

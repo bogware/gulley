@@ -217,13 +217,19 @@ describe('path ids and scope sentinels (F8/F14)', () => {
 
 describe('collection update audit diff (F16) and fixed egress errors', () => {
   it('records whether the name and/or config changed, with content hashes', async () => {
-    const created = await post('/routes', { workspaceId, name: 'r', config: { a: 1 } });
+    // A `routes` entity's config is a route group (schema-validated on write).
+    const group = {
+      clientPath: '/v1/messages',
+      mode: 'fallback',
+      providers: ['anthropic', 'bedrock'],
+    };
+    const created = await post('/routes', { workspaceId, name: 'r', config: group });
     const id = (created.json() as { entity: { id: string } }).entity.id;
     const upd = await app.inject({
       method: 'PUT',
       url: `/routes/${id}`,
       headers: auth(),
-      payload: JSON.stringify({ config: { a: 2 } }),
+      payload: JSON.stringify({ config: { ...group, hedgeDelayMs: 250 } }),
     });
     expect(upd.statusCode).toBe(200);
     const events = (await get('/audit/events?limit=3')).json() as {
@@ -244,5 +250,52 @@ describe('collection update audit diff (F16) and fixed egress errors', () => {
     const body = r.json() as { error: { message: string; reason: string } };
     expect(body.error.message).toBe('baseUrl is not an allowed egress destination');
     expect(body.error.reason).toBeTruthy();
+  });
+});
+
+describe('POST /keys scope fields (wave 0)', () => {
+  it('mints a key with allow-lists, expiry and groups and returns them in the secret-free view', async () => {
+    const expiresAt = new Date(Date.now() + 86_400_000).toISOString();
+    const r = await post('/keys', {
+      workspaceId,
+      name: 'scoped',
+      allowedModels: ['claude-sonnet-5-5'],
+      allowedProviders: ['anthropic'],
+      expiresAt,
+      groups: ['platform-eng'],
+    });
+    expect(r.statusCode).toBe(201);
+    const { id } = r.json() as { id: string };
+    const view = ((await get(`/keys/${id}`)).json() as { key: Record<string, unknown> }).key;
+    expect(view['allowedModels']).toEqual(['claude-sonnet-5-5']);
+    expect(view['allowedProviders']).toEqual(['anthropic']);
+    expect(view['expiresAt']).toBe(expiresAt);
+    expect(view['groups']).toEqual(['platform-eng']);
+    expect(view).not.toHaveProperty('token');
+  });
+
+  it('rejects a malformed scope and keeps `*` / absent unrestricted', async () => {
+    const bad = [
+      { allowedModels: 'claude-sonnet-5-5' }, // not an array
+      { allowedModels: [''] }, // empty entry
+      { allowedProviders: [42] }, // non-string
+      { groups: 'platform-eng' },
+      { expiresAt: '2020-01-01T00:00:00Z' }, // past
+      { expiresAt: 'tomorrow' }, // not ISO-8601
+    ];
+    for (const extra of bad) {
+      const r = await post('/keys', { workspaceId, name: 'x', ...extra });
+      expect(r.statusCode, JSON.stringify(extra)).toBe(422);
+    }
+    const open = await post('/keys', { workspaceId, name: 'open', allowedModels: '*' });
+    expect(open.statusCode).toBe(201);
+    const view = (
+      (await get(`/keys/${(open.json() as { id: string }).id}`)).json() as {
+        key: Record<string, unknown>;
+      }
+    ).key;
+    expect(view['allowedModels']).toBe('*');
+    expect(view['allowedProviders']).toBe('*');
+    expect(view['expiresAt']).toBeNull();
   });
 });

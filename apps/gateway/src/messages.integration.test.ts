@@ -24,6 +24,7 @@ import {
   OpenAIUsageExtractor,
   ProviderRequestError,
   SSEParser,
+  BedrockAdapter,
 } from '@gulley/providers';
 import { InMemoryRateLimitStore, RateLimiter } from '@gulley/ratelimit';
 import { AdaptiveLimiter, CircuitBreaker, ModelRouter, type RouteTarget } from '@gulley/routing';
@@ -34,6 +35,8 @@ import { loadConfig } from './config';
 import { buildCustomProviders } from './context';
 import type { GatewayContext, ProviderRoute } from './routes/messages';
 import { buildServer } from './server';
+import { ModelCatalog } from '@gulley/catalog';
+import { deriveVaultMaster } from './conversation';
 import { buildSmartRouter } from './smart-router';
 import type { ClassifierCompleter, SmartRoutingPolicy } from '@gulley/routing';
 
@@ -56,6 +59,12 @@ const GOLDEN_SSE = [
   '',
 ].join('\n');
 
+/** A declared tool for the tool-governance tests: governance (and the buffering it
+ *  needs) only applies to requests that can yield tool calls at all. */
+const GOVERNED_TOOLS = [
+  { name: 'shell', description: 'run a command', input_schema: { type: 'object' } },
+];
+
 let upstream: http.Server;
 let upstreamUrl: string;
 let received: {
@@ -63,6 +72,7 @@ let received: {
   auth?: string;
   traceparent?: string;
   tenant?: string;
+  ccSession?: string;
   body: string;
 } = { body: '' };
 
@@ -71,6 +81,7 @@ beforeAll(async () => {
     let body = '';
     received = { apiKey: undefined, auth: undefined, body: '' };
     received.apiKey = single(req.headers['x-api-key']);
+    received.ccSession = single(req.headers['x-claude-code-session-id']);
     received.auth = single(req.headers['authorization']);
     received.traceparent = single(req.headers['traceparent']);
     received.tenant = single(req.headers['x-tenant']);
@@ -1620,6 +1631,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'delete everything' }],
       }),
@@ -1681,6 +1693,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'list files' }],
       }),
@@ -1752,6 +1765,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'clean up' }],
@@ -1806,6 +1820,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'go' }],
       }),
@@ -1874,6 +1889,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'print the key' }],
@@ -1925,6 +1941,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'go' }],
       }),
@@ -1976,6 +1993,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'go' }],
       }),
     };
@@ -2039,6 +2057,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'contact jane@example.com please' }],
       }),
     });
@@ -2078,6 +2097,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'go' }],
       }),
     }).catch(() => undefined);
@@ -2140,6 +2160,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'contact alice@corp.com please' }],
       }),
     });
@@ -2194,6 +2215,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'hi' }],
       }),
     }).catch(() => undefined);
@@ -2254,6 +2276,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
     const base = await app.listen({ port: 0, host: '127.0.0.1' });
     const body = {
       model: 'claude-sonnet-4-6',
+      tools: GOVERNED_TOOLS,
       max_tokens: 100,
       messages: [{ role: 'user', content: 'read it' }],
     };
@@ -2323,6 +2346,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 50,
         messages: [{ role: 'user', content: 'why is the sky blue' }],
       }),
@@ -2386,6 +2410,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 50,
         messages: [{ role: 'user', content: 'what is my key' }],
       }),
@@ -2460,6 +2485,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 50,
         messages: [{ role: 'user', content: 'tell me the detail' }],
       }),
@@ -2752,6 +2778,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 1000,
         messages: [{ role: 'user', content: 'hi' }],
@@ -2778,6 +2805,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'hi' }],
@@ -2924,6 +2952,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -2965,6 +2994,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -3020,6 +3050,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         top_p: 0.9,
         messages: [{ role: 'user', content: 'hi' }],
@@ -3061,6 +3092,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 10,
         messages: [{ role: 'user', content: 'hi' }],
@@ -3273,6 +3305,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -3313,6 +3346,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers,
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -3440,6 +3474,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -3715,6 +3750,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'contact jane@example.com please' }],
       }),
@@ -3754,6 +3790,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       },
       get: async () => undefined,
       list: async () => [],
+      listByConversation: async () => [],
       sweepExpired: async () => 0,
     };
     ctx.maskVaultEncryptor = cipher;
@@ -3777,6 +3814,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token, 'request-id': requestId },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'contact jane@example.com please' }],
       }),
@@ -3821,6 +3859,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       put: async () => {},
       get: async () => undefined,
       list: async () => [],
+      listByConversation: async () => [],
       sweepExpired: async () => 0,
     };
     ctx.maskVaultEncryptor = {
@@ -3847,6 +3886,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'contact jane@example.com please' }],
       }),
@@ -4352,7 +4392,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
 
     expect(res.status).toBe(200);
     expect(ct).not.toContain('jane@example.com'); // raw value never reaches the client
-    const tokens = [...ct.matchAll(/<<GULLEY_EMAIL_[0-9A-F]+_\d+>>/g)].map((m) => m[0]);
+    const tokens = [...ct.matchAll(/<<GULLEY_EMAIL_[0-9A-F]+(?:_\d+)?>>/g)].map((m) => m[0]);
     expect(tokens.length).toBe(2); // both occurrences tokenized
     expect(tokens[0]).toBe(tokens[1]); // stable token (coreference preserved)
     expect(ledger.entries).toHaveLength(1);
@@ -4487,6 +4527,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         messages: [{ role: 'user', content: 'hi' }],
       }),
     });
@@ -4523,6 +4564,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -4604,6 +4646,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'shadow me' }],
       }),
@@ -4634,6 +4677,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -4687,6 +4731,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token, traceparent: inbound },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -4719,6 +4764,7 @@ describe('POST /v1/messages (Anthropic passthrough)', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -5016,6 +5062,7 @@ describe('data residency + ZDR', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         max_tokens: 10,
         messages: [{ role: 'user', content: 'hi' }],
       }),
@@ -5045,6 +5092,7 @@ describe('data residency + ZDR', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 100,
         messages: [{ role: 'user', content: 'hi' }],
@@ -5531,6 +5579,7 @@ describe('same-model arbitrage', () => {
       headers: { 'content-type': 'application/json', 'x-api-key': token },
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
+        tools: GOVERNED_TOOLS,
         stream: true,
         max_tokens: 10,
         messages: [{ role: 'user', content: 'hi' }],
@@ -5651,6 +5700,7 @@ describe('hot-path hardening (refine cycle 2026-09)', () => {
     ];
     ctx.streamInactivityMs = 150;
     ctx.metrics = new GatewayMetrics();
+    ctx.watchdogBreakerThreshold = 1; // this test asserts the fault on a single stall
     const app = buildServer(testConfig(), ctx);
     const base = await app.listen({ port: 0, host: '127.0.0.1' });
 
@@ -5672,6 +5722,59 @@ describe('hot-path hardening (refine cycle 2026-09)', () => {
 
     await app.close();
     await hung.close();
+  });
+
+  it('a single watchdog stall is NOT a breaker fault; three consecutive stalls are, and a clean stream end resets the run', async () => {
+    // A watchdog fire is a liveness guess: a reasoning model can go quiet past the idle
+    // budget on a provider that sends no keepalives. One such abort used to fault the
+    // breaker, so `failureThreshold` quiet streams opened the circuit fleet-wide.
+    const CLEAN_TAIL =
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+    let hang = true;
+    const srv = await serve((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(MSG_START);
+      if (!hang) res.end(CLEAN_TAIL);
+    });
+    const { store, token } = seededStore();
+    const { ctx, breaker } = buildContext(store);
+    // A target name no other test shares: the consecutive-stall run is kept per target.
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic-wd', srv.url) },
+      },
+    ];
+    ctx.streamInactivityMs = 150;
+    ctx.watchdogBreakerThreshold = 3;
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const call = async (): Promise<string> => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: streamBody(),
+      });
+      return res.text();
+    };
+    expect(await call()).toContain('stalled'); // stall 1
+    expect(await call()).toContain('stalled'); // stall 2
+    expect(breaker.errorRate('anthropic-wd')).toBe(0); // below the run threshold: no fault
+    hang = false;
+    expect(await call()).toContain('message_stop'); // a clean end resets the run
+    hang = true;
+    expect(await call()).toContain('stalled'); // stall 1 of a fresh run
+    expect(await call()).toContain('stalled'); // stall 2
+    expect(breaker.errorRate('anthropic-wd')).toBe(0); // the reset held
+    expect(breaker.isOpen('anthropic-wd')).toBe(false);
+    expect(await call()).toContain('stalled'); // stall 3: a run of three on one target
+    // The run TRIPS the circuit (not just one more sample): every stalled stream also
+    // recorded a first-byte success, so the per-sample rules alone could never open it.
+    expect(breaker.isOpen('anthropic-wd')).toBe(true);
+    expect(breaker.errorRate('anthropic-wd')).toBeGreaterThan(0);
+    await app.close();
+    await srv.close();
   });
 
   it('a client disconnect mid-stream is recorded as ABORTED with reason client and frees the limiter slot without a drop', async () => {
@@ -6442,3 +6545,1245 @@ describe('hot-path review fixes (refine cycle 2026-09, wave 9)', () => {
 function single(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }
+
+describe('wave 0 regressions (2026-10)', () => {
+  it('TOOL_POLICY does not buffer a request that declares no tools: the stream stays a raw pipe', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.toolPolicy = parseToolPolicy(JSON.stringify([{ effect: 'deny', expr: 'true' }]));
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    // No `tools` in the request ⇒ nothing can be governed ⇒ no buffering, no withholding:
+    // the upstream SSE reaches the client byte for byte (TOOL_POLICY used to turn streaming
+    // off deployment-wide for every plain chat request).
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-tool-policy')).toBeNull();
+    expect(text).toBe(GOLDEN_SSE);
+    await app.close();
+  });
+
+  it('an embeddings request reserves input-only: an unpriced embedding model no longer holds the 8k-output floor', async () => {
+    const emb = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          object: 'list',
+          model: 'mystery-embed',
+          data: [{ object: 'embedding', index: 0, embedding: [0.1, 0.2] }],
+          usage: { prompt_tokens: 8, total_tokens: 8 },
+        }),
+      );
+    });
+    await new Promise<void>((r) => emb.listen(0, '127.0.0.1', r));
+    const embUrl = `http://127.0.0.1:${(emb.address() as AddressInfo).port}`;
+    // A HOSTED (non-local) OpenAI-compatible provider, so the unknown-pricing floor applies.
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      CUSTOM_PROVIDERS: JSON.stringify([
+        { provider: 'embedco', baseUrl: embUrl, embeddings: true },
+      ]),
+    } as NodeJS.ProcessEnv);
+    const custom = buildCustomProviders(config);
+    const { store, token } = seededStore();
+    // $0.05 cap: the old reservation ($15/MTok floor on input + $75/MTok x 8192 default
+    // output ≈ $0.61) was refused with 402 on every embeddings call near any real cap.
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 50_000 }]]));
+    const { ctx, ledger } = buildContext(store, budgets);
+    ctx.routes = custom.routes;
+    const app = buildServer(config, ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/embedco/v1/embeddings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({ model: 'mystery-embed', input: 'hello there' }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(ledger.entries.length).toBe(1));
+    expect(ledger.entries[0]?.cost.totalInputTokens).toBe(8);
+    await app.close();
+    await new Promise<void>((r) => emb.close(() => r()));
+  });
+
+  it('never budget-downshifts to a model outside the key scope (a compliance pin survives the cap)', async () => {
+    const { store, token } = restrictedStore(['claude-opus-4-8']);
+    const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+    await budgets.reserve('ws_1', 'seed', 8_200_000);
+    await budgets.commit('ws_1', 'seed', 8_200_000); // 82% used — above the 0.8 threshold
+    const { ctx } = buildContext(store);
+    ctx.budgets = budgets;
+    ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    // The key may only use Opus: the downshift (to Haiku, outside its scope) is skipped.
+    expect(JSON.parse(received.body).model).toBe('claude-opus-4-8');
+    await app.close();
+  });
+
+  it('a cached streamed response is never replayed to a non-streaming request (delivery mode partitions the cache)', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = async (stream: boolean): Promise<string | null> => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream,
+          max_tokens: 100,
+          messages: [{ role: 'user', content: 'same prompt' }],
+        }),
+      });
+      await res.text();
+      return res.headers.get('x-gulley-cache');
+    };
+    expect(await send(true)).toBe('miss');
+    await vi.waitFor(async () => expect(await send(true)).toBe('hit-exact'));
+    // Same body, stream:false — the stored bytes are SSE, so this must be a miss.
+    expect(await send(false)).toBe('miss');
+    await app.close();
+  });
+});
+
+describe('wave 0 review follow-ups', () => {
+  it('TOOL_POLICY governs a legacy OpenAI `functions` request (no `tools` key), streamed', async () => {
+    // The gate that spares tool-less requests from buffering must recognise every shape
+    // the extractor governs: a chat.completions request declaring `functions` (legacy)
+    // yields `delta.function_call`, which the extractor reads — so it must be buffered
+    // and governed, not piped through.
+    const chunk = (obj: unknown): string => `data: ${JSON.stringify(obj)}\n\n`;
+    const CHAT_SSE =
+      chunk({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: { role: 'assistant' } }],
+      }) +
+      chunk({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [
+          {
+            index: 0,
+            delta: { function_call: { name: 'run_shell', arguments: '{"cmd":"rm -rf /"}' } },
+          },
+        ],
+      }) +
+      chunk({
+        id: 'c1',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: 'function_call' }],
+        usage: { prompt_tokens: 5, completion_tokens: 8 },
+      }) +
+      'data: [DONE]\n\n';
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(CHAT_SSE);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const srvUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'silent',
+      CUSTOM_PROVIDERS: JSON.stringify([
+        { provider: 'compat', baseUrl: srvUrl, models: ['gpt-x'] },
+      ]),
+    } as NodeJS.ProcessEnv);
+    const custom = buildCustomProviders(config);
+    const { store, token } = seededStore();
+    const { ctx, audit } = buildContext(store);
+    ctx.routes = custom.routes;
+    ctx.toolPolicy = parseToolPolicy(
+      JSON.stringify([{ effect: 'deny', expr: 'tool.name == "run_shell"' }]),
+    );
+    const app = buildServer(config, ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/compat/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'gpt-x',
+        stream: true,
+        functions: [{ name: 'run_shell', parameters: { type: 'object' } }],
+        function_call: 'auto',
+        messages: [{ role: 'user', content: 'wipe it' }],
+      }),
+    });
+    const text = await res.text();
+    expect(res.headers.get('x-gulley-tool-policy')).toBe('blocked');
+    expect(text).not.toContain('rm -rf');
+    expect(audit.rows.some((e) => e.action === 'tool_policy.blocked')).toBe(true);
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+});
+
+describe('conversation-stable masking (K2)', () => {
+  const EMAIL = 'jane@example.com';
+  const TOKEN_RE = /<<GULLEY_EMAIL_[0-9A-F]{24}>>/;
+
+  function echoUpstream(): { server: http.Server; bodies: string[] } {
+    const bodies: string[] = [];
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        bodies.push(raw);
+        const body = JSON.parse(raw) as { messages?: Array<{ content?: unknown }> };
+        const last = body.messages?.[body.messages.length - 1]?.content;
+        const echoed = typeof last === 'string' ? last : JSON.stringify(last);
+        const sse =
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5}}}\n\n' +
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n' +
+          'event: content_block_delta\ndata: ' +
+          JSON.stringify({
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: echoed },
+          }) +
+          '\n\n' +
+          'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+          'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"output_tokens":5}}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(sse);
+      });
+    });
+    return { server, bodies };
+  }
+
+  async function maskingApp(url: string) {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.maskVaultMaster = deriveVaultMaster('test-pepper-for-k2-masking');
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('mask', url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    return { app, base, token };
+  }
+
+  const turn1 = (system = 'You are helpful') => ({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 50,
+    system,
+    messages: [{ role: 'user', content: `email ${EMAIL} please` }],
+  });
+
+  it('masks the same value to the same token on every turn of a session, so the provider-side prefix is byte-identical', async () => {
+    const { server, bodies } = echoUpstream();
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { app, base, token } = await maskingApp(url);
+    const headers = (session: string) => ({
+      'content-type': 'application/json',
+      'x-api-key': token,
+      'x-claude-code-session-id': session,
+    });
+
+    const r1 = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: headers('sess-k2-1'),
+      body: JSON.stringify(turn1()),
+    });
+    const t1 = await r1.text();
+    expect(r1.status).toBe(200);
+    expect(t1).toContain(EMAIL); // detokenized for the client
+    const up1 = JSON.parse(bodies[0]!) as { messages: Array<{ content: string }> };
+    const tok = TOKEN_RE.exec(up1.messages[0]!.content)?.[0];
+    expect(tok).toBeDefined();
+
+    // Turn 2: the client replays turn 1 with the REAL value (it never saw the token),
+    // plus the assistant reply it received and a new user turn mentioning it again.
+    const t2body = {
+      ...turn1(),
+      messages: [
+        turn1().messages[0],
+        { role: 'assistant', content: [{ type: 'text', text: `email ${EMAIL} please` }] },
+        { role: 'user', content: `and again ${EMAIL}` },
+      ],
+    };
+    const r2 = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: headers('sess-k2-1'),
+      body: JSON.stringify(t2body),
+    });
+    await r2.text();
+    expect(r2.status).toBe(200);
+    const up2 = JSON.parse(bodies[1]!) as {
+      messages: [{ content: string }, { content: Array<{ text: string }> }, { content: string }];
+    };
+    expect(up2.messages[0]).toEqual(up1.messages[0]); // identical prefix ⇒ prompt cache + preserved thinking hold
+    expect(up2.messages[1].content[0]!.text).toContain(tok!);
+    expect(up2.messages[2].content).toContain(tok!);
+    expect(bodies[1]).not.toContain(EMAIL);
+
+    // Another session ⇒ a different token for the same value (no cross-conversation linkability).
+    const r3 = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: headers('sess-k2-2'),
+      body: JSON.stringify(turn1()),
+    });
+    await r3.text();
+    const up3 = JSON.parse(bodies[2]!) as { messages: Array<{ content: string }> };
+    expect(up3.messages[0]!.content).toMatch(TOKEN_RE);
+    expect(up3.messages[0]!.content).not.toContain(tok!);
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  it('keys on the conversation fingerprint (system prompt + first user turn) when no session header is sent', async () => {
+    const { server, bodies } = echoUpstream();
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const { app, base, token } = await maskingApp(url);
+    const headers = { 'content-type': 'application/json', 'x-api-key': token };
+    const post = (body: unknown) =>
+      fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(body) }).then(
+        async (r) => {
+          await r.text();
+          return r.status;
+        },
+      );
+
+    expect(await post(turn1())).toBe(200);
+    expect(
+      await post({
+        ...turn1(),
+        messages: [
+          turn1().messages[0],
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: `again ${EMAIL}` },
+        ],
+      }),
+    ).toBe(200);
+    expect(await post(turn1('A different system prompt'))).toBe(200);
+    const [a, b, c] = bodies.map((raw) => TOKEN_RE.exec(raw)?.[0]);
+    expect(a).toBeDefined();
+    expect(b).toBe(a); // same conversation prefix ⇒ same token
+    expect(c).toBeDefined();
+    expect(c).not.toBe(a); // another conversation ⇒ another token
+
+    await app.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+});
+
+describe('signed reasoning pins the model (SIGNED_THINKING_SUBSTITUTION=pin)', () => {
+  const SIGNED_HISTORY = [
+    { role: 'user', content: 'hi' },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'hmm', signature: 'EqoBCkgIARABGAIiQfakethinkingsig' },
+        { type: 'text', text: 'hello' },
+      ],
+    },
+    { role: 'user', content: 'hard question' },
+  ];
+  const pinnedAudit = (rows: Array<{ action: string; payload?: unknown }>, stage: string) =>
+    rows.find(
+      (r) =>
+        r.action === 'policy.substitution_pinned' &&
+        (r.payload as { stage?: string })?.stage === stage,
+    );
+
+  it('does NOT budget-downshift a conversation that carries signed thinking (audited), but still does under `allow`', async () => {
+    for (const mode of ['pin', 'allow'] as const) {
+      const { store, token } = seededStore();
+      const budgets = new InMemoryBudgetStore(new Map([['ws_1', { capMicroUsd: 10_000_000 }]]));
+      await budgets.reserve('ws_1', 'seed', 8_200_000);
+      await budgets.commit('ws_1', 'seed', 8_200_000);
+      const { ctx, audit } = buildContext(store);
+      ctx.budgets = budgets;
+      ctx.budgetDownshift = { threshold: 0.8, model: 'claude-haiku-4-5' };
+      ctx.signedThinkingSubstitution = mode;
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          max_tokens: 100,
+          messages: SIGNED_HISTORY,
+        }),
+      }).then((r) => r.text());
+      if (mode === 'pin') {
+        expect(JSON.parse(received.body).model).toBe('claude-opus-4-8'); // pinned
+        expect(pinnedAudit(audit.rows, 'budget_downshift')).toBeDefined();
+      } else {
+        expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5'); // substituted
+        expect(pinnedAudit(audit.rows, 'budget_downshift')).toBeUndefined();
+      }
+      await app.close();
+    }
+  });
+
+  it('does NOT smart-reroute a conversation that carries signed thinking (audited)', async () => {
+    const { store, token } = seededStore();
+    const { ctx, audit } = buildContext(store);
+    const policy: SmartRoutingPolicy = {
+      name: 'cost',
+      objective: 'cost-tier',
+      classifier: { mode: 'rules-then-llm', rules: [{ category: 'cheap', maxChars: 20 }] },
+      categoryRoutes: { cheap: 'claude-haiku-4-5' },
+      selector: {},
+    };
+    ctx.smartRouter = buildSmartRouter([policy], ctx.routes);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = (messages: unknown) =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 10, messages }),
+      }).then((r) => r.text());
+    await send([{ role: 'user', content: 'hi' }]);
+    expect(JSON.parse(received.body).model).toBe('claude-haiku-4-5'); // the rule fires without history
+    await send(SIGNED_HISTORY);
+    expect(JSON.parse(received.body).model).toBe('claude-sonnet-4-6'); // pinned
+    expect(pinnedAudit(audit.rows, 'smart_routing')).toBeDefined();
+    await app.close();
+  });
+
+  it('does NOT arm the cascade for a conversation that carries signed thinking (tier-0 served as is, audited)', async () => {
+    const REFUSAL =
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5}}}\n\n' +
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"CHEAP-REFUSAL"}}\n\n' +
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}\n\n' +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    const models: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        models.push(String((JSON.parse(b) as { model?: string }).model ?? ''));
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(REFUSAL);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, audit } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', url) },
+      },
+    ];
+    ctx.cascade = [
+      { model: 'claude-haiku-*', escalateTo: 'claude-sonnet-4-6', stopReasons: ['refusal'] },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        stream: true,
+        max_tokens: 100,
+        messages: SIGNED_HISTORY,
+      }),
+    });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).toContain('CHEAP-REFUSAL'); // tier-0 served untouched, streamed
+    expect(models).toEqual(['claude-haiku-4-5']); // no tier-1 dispatch
+    expect(pinnedAudit(audit.rows, 'cascade')).toBeDefined();
+    await app.close();
+    await new Promise<void>((r) => srv.close(() => r()));
+  });
+});
+
+describe('POST /v1/messages/count_tokens (gateway contract)', () => {
+  const scopedStore = (scope: {
+    allowedProviders: readonly string[] | '*';
+    allowedModels: readonly string[] | '*';
+  }): { store: InMemoryKeyStore; token: string } => {
+    const store = new InMemoryKeyStore();
+    const gen = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_ct',
+      keyPrefix: gen.keyPrefix,
+      keyHash: gen.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_1',
+      displayName: 'scoped',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: scope.allowedProviders,
+      allowedModels: scope.allowedModels,
+    });
+    return { store, token: gen.token };
+  };
+  async function countingUpstream(): Promise<{
+    url: string;
+    bodies: string[];
+    close: () => Promise<void>;
+  }> {
+    const bodies: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => {
+        if (req.url === '/v1/messages/count_tokens') {
+          bodies.push(b);
+          res.writeHead(200, { 'content-type': 'application/json', 'request-id': 'req_up_1' });
+          res.end(JSON.stringify({ input_tokens: 42 }));
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      bodies,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+    };
+  }
+
+  it('counts through the route (authn, scope, no spend) and relays the Anthropic reply', async () => {
+    const up = await countingUpstream();
+    const { store, token } = seededStore();
+    const { ctx, ledger, requestLog } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', up.url) },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ input_tokens: 42 });
+    expect(res.headers.get('x-gulley-target')).toBe('anthropic');
+    expect(res.headers.get('request-id')).toBe('req_up_1'); // upstream headers relayed
+    expect(up.bodies).toHaveLength(1);
+    expect(ledger.entries).toHaveLength(0); // free: no reservation, no ledger row
+    expect(requestLog.entries).toHaveLength(0);
+
+    // Unauthenticated ⇒ 401 with the contract's x-should-retry: false.
+    const anon = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"model":"claude-sonnet-4-6","messages":[]}',
+    });
+    expect(anon.status).toBe(401);
+    expect(anon.headers.get('x-should-retry')).toBe('false');
+    await app.close();
+    await up.close();
+  });
+
+  it('is gated like inference: out-of-scope model ⇒ 403, masked prompt reaches the upstream masked', async () => {
+    const up = await countingUpstream();
+    const { store, token } = scopedStore({
+      allowedProviders: '*',
+      allowedModels: ['claude-haiku-4-5'],
+    });
+    const { ctx } = buildContext(store);
+    ctx.maskVaultMaster = deriveVaultMaster('test-pepper-for-count-tokens');
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', up.url) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'mask', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const post = (body: unknown) =>
+      fetch(`${base}/v1/messages/count_tokens`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify(body),
+      });
+    const denied = await post({
+      model: 'claude-opus-4-8',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    expect(denied.status).toBe(403);
+    expect(up.bodies).toHaveLength(0);
+    const ok = await post({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'mail jane@example.com' }],
+    });
+    expect(ok.status).toBe(200);
+    expect(up.bodies[0]).not.toContain('jane@example.com');
+    expect(up.bodies[0]).toMatch(/<<GULLEY_EMAIL_[0-9A-F]{24}>>/);
+    await app.close();
+    await up.close();
+  });
+
+  it('answers 404 not_found_error when the upstream has no token-counting API, and for an unknown path', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    const target = anthropicTarget('nocount', 'http://127.0.0.1:9');
+    target.adapter = { name: 'nocount', forward: target.adapter.forward.bind(target.adapter) };
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: '{"model":"claude-sonnet-4-6","messages":[]}',
+    });
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe('not_found_error');
+    const unknown = await fetch(`${base}/v1/nope`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: '{}',
+    });
+    expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as { error: { type: string } }).error.type).toBe(
+      'not_found_error',
+    );
+    expect(unknown.headers.get('x-should-retry')).toBe('false');
+    await app.close();
+  });
+});
+
+describe('zero-config agent attribution (x-claude-code-*, originator)', () => {
+  it('lands Claude Code session / subagent / prompt / request-class tags on the ledger and request log, and forwards the headers', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger, requestLog } = buildContext(store);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': token,
+        'user-agent': 'claude-cli/2.1.300 (external, cli)',
+        'x-claude-code-session-id': 'sess-attr-1',
+        'x-claude-code-agent-id': 'agent-7',
+        'x-claude-code-request-class': 'main',
+        'x-claude-code-prompt-id': 'p-1',
+        'x-claude-code-prev-tool-durations': 'Bash=742;Read=9',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).then(async (r) => {
+      const text = await r.text();
+      expect(r.status, text).toBe(200);
+    });
+
+    expect(ledger.entries[0]?.attributes).toMatchObject({
+      session: 'sess-attr-1',
+      cc_agent: 'agent-7',
+      request_class: 'main',
+      prompt: 'p-1',
+      agent: 'claude-code',
+    });
+    expect(ledger.entries[0]?.attributes).not.toHaveProperty('prev_tool_durations');
+    expect(requestLog.entries[0]?.attributes?.['session']).toBe('sess-attr-1');
+    expect(requestLog.entries[0]?.attributes?.['agent']).toBe('claude-code');
+    // Consumed AND forwarded: the upstream still sees the headers (contract: open list).
+    expect(received.ccSession).toBe('sess-attr-1');
+    await app.close();
+  });
+
+  it('a configured ATTRIBUTION_HEADERS mapping wins on a shared key, and the knob turns the zero-config tags off', async () => {
+    const { store, token } = seededStore();
+    const { ctx, ledger } = buildContext(store);
+    ctx.attributionHeaders = ['x-gulley-session'];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': token,
+          'x-gulley-session': 'operator-session',
+          'x-claude-code-session-id': 'cc-session',
+          originator: 'codex_cli_rs',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          stream: true,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      }).then((r) => r.text());
+    await send();
+    expect(ledger.entries[0]?.attributes).toMatchObject({
+      session: 'operator-session',
+      agent: 'codex',
+    });
+    ctx.agentHeaderAttribution = false;
+    await send();
+    expect(ledger.entries[1]?.attributes).toEqual({ session: 'operator-session' });
+    await app.close();
+  });
+});
+
+describe('GET /v1/models with pricing (P8)', () => {
+  it('lists catalog models of configured providers with per-token pricing, context and limits, Anthropic list shape', async () => {
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.catalog = new ModelCatalog([
+      {
+        provider: 'anthropic',
+        model: 'claude-sonnet-5-5',
+        input: 2,
+        output: 10,
+        cache: { read: 0.1, write5m: 1.25, write1h: 2 },
+        contextLength: 1_000_000,
+        maxOutputTokens: 128_000,
+        displayName: 'Claude Sonnet 5.5',
+        releaseDate: '2026-06-01',
+      },
+      { provider: 'anthropic', model: 'claude-haiku-5-5', input: 0.1, output: 0.5 },
+      { provider: 'openai', model: 'gpt-5.4', input: 2.5, output: 15 }, // no openai route ⇒ not listed
+    ]);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/models?limit=1000`, { headers: { 'x-api-key': token } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      object: string;
+      has_more: boolean;
+      first_id: string;
+      last_id: string;
+      data: Array<Record<string, unknown>>;
+    };
+    expect(body.object).toBe('list');
+    expect(body.has_more).toBe(false);
+    expect(body.data.map((m) => m['id'])).toEqual(['claude-haiku-5-5', 'claude-sonnet-5-5']);
+    expect(body.first_id).toBe('claude-haiku-5-5');
+    expect(body.last_id).toBe('claude-sonnet-5-5');
+    expect(body.data[1]).toEqual({
+      id: 'claude-sonnet-5-5',
+      object: 'model',
+      type: 'model',
+      display_name: 'Claude Sonnet 5.5',
+      owned_by: 'anthropic',
+      created_at: '2026-06-01T00:00:00Z',
+      context_window: 1_000_000,
+      max_tokens: 128_000,
+      pricing: {
+        input: '0.000002',
+        output: '0.00001',
+        input_cache_read: '0.0000002',
+        input_cache_write: '0.0000025',
+      },
+    });
+    // Pagination: a limit below the total sets has_more.
+    const page = (await fetch(`${base}/v1/models?limit=1`, {
+      headers: { 'x-api-key': token },
+    }).then((r) => r.json())) as {
+      has_more: boolean;
+      data: unknown[];
+    };
+    expect(page.data).toHaveLength(1);
+    expect(page.has_more).toBe(true);
+    await app.close();
+  });
+
+  it('hides a catalog model the key may not use (scope is enforced on the listing)', async () => {
+    const store = new InMemoryKeyStore();
+    const gen = generateVirtualKey(PEPPER);
+    store.add({
+      id: 'vk_models',
+      keyPrefix: gen.keyPrefix,
+      keyHash: gen.keyHash,
+      orgId: 'org_1',
+      workspaceId: 'ws_1',
+      displayName: 'scoped',
+      epoch: 0,
+      disabled: false,
+      expiresAt: null,
+      allowedProviders: '*',
+      allowedModels: ['claude-haiku-5-5'],
+    });
+    const { ctx } = buildContext(store);
+    ctx.catalog = new ModelCatalog([
+      { provider: 'anthropic', model: 'claude-sonnet-5-5', input: 2, output: 10 },
+      { provider: 'anthropic', model: 'claude-haiku-5-5', input: 0.1, output: 0.5 },
+    ]);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const body = (await fetch(`${base}/v1/models`, { headers: { 'x-api-key': gen.token } }).then(
+      (r) => r.json(),
+    )) as {
+      data: Array<{ id: string }>;
+    };
+    expect(body.data.map((m) => m.id)).toEqual(['claude-haiku-5-5']);
+    await app.close();
+  });
+});
+
+describe('fail-closed metering of unpriced models (0.6 default) spares free providers', () => {
+  it('charges the worst case for an unpriced PAID model but $0 for a model of a free (local) provider', async () => {
+    // The metered model is the one the upstream REPORTS (message_start.message.model).
+    const UNPRICED_SSE = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_u","model":"mystery-model-9","usage":{"input_tokens":50,"output_tokens":1}}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+      '',
+    ].join('\n');
+    const up = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(UNPRICED_SSE);
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const upUrl = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+    for (const free of [false, true]) {
+      const { store, token } = seededStore();
+      const { ctx, ledger, requestLog } = buildContext(store);
+      ctx.meterFailClosedOnUnpriced = true;
+      ctx.freeProviders = free ? ['anthropic'] : [];
+      ctx.routes = [
+        {
+          clientPaths: ['/v1/messages'],
+          createExtractor: () => new AnthropicUsageExtractor(),
+          strategy: { mode: 'single', target: anthropicTarget('anthropic', upUrl) },
+        },
+      ];
+      const app = buildServer(testConfig(), ctx);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+      await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'mystery-model-9',
+          stream: true,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      }).then((r) => r.text());
+      expect(requestLog.entries[0]?.attributes?.['unpriced']).toBe(true);
+      if (free) expect(ledger.entries[0]?.costMicroUsd).toBe(0);
+      else expect(ledger.entries[0]?.costMicroUsd ?? 0).toBeGreaterThan(0);
+      await app.close();
+    }
+    await new Promise<void>((r) => up.close(() => r()));
+  });
+});
+
+describe('request-level routing preferences + attempt provenance (P7)', () => {
+  const GOLDEN_FROM = (name: string) => (req: http.IncomingMessage, res: http.ServerResponse) => {
+    req.resume();
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-upstream': name });
+    res.end(GOLDEN_SSE);
+  };
+  async function serve(
+    handler: http.RequestListener,
+  ): Promise<{ url: string; close: () => Promise<void>; hits: () => number; bodies: string[] }> {
+    let hits = 0;
+    const bodies: string[] = [];
+    const srv = http.createServer((req, res) => {
+      hits++;
+      let b = '';
+      req.on('data', (c: Buffer) => (b += c.toString('utf8')));
+      req.on('end', () => bodies.push(b));
+      handler(req, res);
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    return {
+      url: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`,
+      close: () => new Promise<void>((r) => srv.close(() => r())),
+      hits: () => hits,
+      bodies,
+    };
+  }
+  const post = (base: string, token: string, body: unknown) =>
+    fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify(body),
+    });
+  const req = (over: Record<string, unknown>) => ({
+    model: 'claude-sonnet-4-6',
+    stream: true,
+    max_tokens: 10,
+    messages: [{ role: 'user', content: 'hi' }],
+    ...over,
+  });
+
+  it('`order` promotes a provider, `only` restricts, the fields are stripped upstream, and x-gulley-attempts names the served target', async () => {
+    const a = await serve(GOLDEN_FROM('a'));
+    const b = await serve(GOLDEN_FROM('b'));
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: {
+          mode: 'fallback',
+          targets: [
+            anthropicTarget('alpha', a.url),
+            { ...anthropicTarget('bravo', b.url), provider: 'bedrock' },
+          ],
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const r1 = await post(base, token, req({ provider: { order: ['bedrock'] } }));
+    await r1.text();
+    expect(r1.headers.get('x-gulley-target')).toBe('bravo');
+    expect(r1.headers.get('x-gulley-attempts')).toMatch(/^bravo:served:200:\d+ms$/);
+    expect(JSON.parse(b.bodies[0] ?? '{}')).not.toHaveProperty('provider');
+
+    const r2 = await post(base, token, req({ providerOptions: { gateway: { only: ['alpha'] } } }));
+    await r2.text();
+    expect(r2.headers.get('x-gulley-target')).toBe('alpha');
+
+    const r3 = await post(base, token, req({ provider: { only: ['vertex'] } }));
+    expect(r3.status).toBe(404);
+    const err = (await r3.json()) as { error: { type: string; message: string } };
+    expect(err.error.type).toBe('not_found_error');
+    expect(err.error.message).toMatch(/only=\[vertex\].*available: anthropic, bedrock/);
+
+    // The knob off: stripped (upstream never sees it) but ignored (declared order).
+    ctx.clientRoutingPreferences = false;
+    const r4 = await post(base, token, req({ provider: { only: ['vertex'] } }));
+    await r4.text();
+    expect(r4.status).toBe(200);
+    expect(r4.headers.get('x-gulley-target')).toBe('alpha');
+
+    await app.close();
+    await a.close();
+    await b.close();
+  });
+
+  it('records every attempt of a failover in x-gulley-attempts and the request-log `attempts` attribute', async () => {
+    const bad = await serve((req, res) => {
+      req.resume();
+      res.writeHead(529, { 'content-type': 'application/json' });
+      res.end('{"type":"error","error":{"type":"overloaded_error","message":"busy"}}');
+    });
+    const good = await serve(GOLDEN_FROM('good'));
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: {
+          mode: 'fallback',
+          targets: [anthropicTarget('bad', bad.url), anthropicTarget('good', good.url)],
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await post(base, token, req({}));
+    await res.text();
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-gulley-attempts')).toMatch(
+      /^bad:failover:529:\d+ms;good:served:200:\d+ms$/,
+    );
+    expect(requestLog.entries[0]?.attributes?.['attempts']).toMatch(
+      /^bad:failover:529:\d+ms;good:served:200:\d+ms$/,
+    );
+    await app.close();
+    await bad.close();
+    await good.close();
+  });
+});
+
+describe('hot-path review follow-ups (Wave 1)', () => {
+  function bedrockFrame(headers: Record<string, string>, payload: Buffer): Buffer {
+    const headerBufs: Buffer[] = [];
+    for (const [name, value] of Object.entries(headers)) {
+      const n = Buffer.from(name, 'utf8');
+      const v = Buffer.from(value, 'utf8');
+      const b = Buffer.alloc(1 + n.length + 1 + 2 + v.length);
+      let o = 0;
+      b.writeUInt8(n.length, o);
+      o += 1;
+      n.copy(b, o);
+      o += n.length;
+      b.writeUInt8(7, o);
+      o += 1;
+      b.writeUInt16BE(v.length, o);
+      o += 2;
+      v.copy(b, o);
+      headerBufs.push(b);
+    }
+    const headersBuf = Buffer.concat(headerBufs);
+    const total = 4 + 4 + 4 + headersBuf.length + payload.length + 4;
+    const frame = Buffer.alloc(total);
+    let o = 0;
+    frame.writeUInt32BE(total, o);
+    o += 4;
+    frame.writeUInt32BE(headersBuf.length, o);
+    o += 4;
+    frame.writeUInt32BE(0, o);
+    o += 4;
+    headersBuf.copy(frame, o);
+    o += headersBuf.length;
+    payload.copy(frame, o);
+    o += payload.length;
+    frame.writeUInt32BE(0, o);
+    return frame;
+  }
+  const bedrockChunk = (event: object) =>
+    bedrockFrame(
+      { ':message-type': 'event', ':event-type': 'chunk' },
+      Buffer.from(JSON.stringify({ bytes: Buffer.from(JSON.stringify(event)).toString('base64') })),
+    );
+
+  it('synthetic Bedrock pings keep the client alive but never reset the gateway inactivity watchdog', async () => {
+    // Bedrock answers message_start, then the connection hangs (half-open) forever.
+    const sockets = new Set<import('node:net').Socket>();
+    const up = http.createServer((req, res) => {
+      req.resume();
+      sockets.add(req.socket);
+      res.writeHead(200, { 'content-type': 'application/vnd.amazon.eventstream' });
+      res.write(
+        bedrockChunk({ type: 'message_start', message: { id: 'm', usage: { input_tokens: 3 } } }),
+      );
+      // never ends
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx, requestLog } = buildContext(store);
+    ctx.streamInactivityMs = 150;
+    ctx.routes = [
+      {
+        clientPaths: ['/bedrock/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: {
+          mode: 'single',
+          target: {
+            name: 'bedrock',
+            provider: 'bedrock',
+            adapter: new BedrockAdapter({
+              baseUrl: url,
+              pingIntervalMs: 20,
+              pingMaxIdleMs: 10_000,
+            }),
+            credential: { scheme: 'bearer', value: 'k' },
+            upstreamPath: '/v1/messages',
+          },
+        },
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const started = Date.now();
+    const res = await fetch(`${base}/bedrock/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'anthropic.claude-sonnet-5-5',
+        stream: true,
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const text = await res.text();
+    const elapsed = Date.now() - started;
+    expect(text).toContain('event: ping'); // the client saw liveness
+    expect(text).toContain('event: error'); // …and then the gateway's own watchdog verdict
+    expect(elapsed).toBeLessThan(1500); // ≈ STREAM_INACTIVITY_MS, not pingMaxIdle + it
+    expect(requestLog.entries).toHaveLength(1); // teardown ran: the reservation is released
+    expect(requestLog.entries[0]?.attributes?.['abortReason']).toBe('watchdog');
+    await app.close();
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((r) => up.close(() => r()));
+  });
+
+  it('an unsatisfiable routing preference is recorded (request log + audit) like every other denial', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog, audit } = buildContext(store);
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'hi' }],
+        provider: { only: ['vertex'] },
+      }),
+    });
+    expect(res.status).toBe(404);
+    // Pre-dispatch denials record through the telemetry/metrics emitter (like the scope
+    // and policy 403s) and leave an audit row; the durable request log is a teardown
+    // artifact of dispatched requests.
+    expect(requestLog.entries).toHaveLength(0);
+    expect(audit.rows.some((r) => r.action === 'policy.routing_preferences_unsatisfied')).toBe(
+      true,
+    );
+    await app.close();
+  });
+
+  it('a blocked count_tokens prompt is audited and recorded like a blocked inference prompt', async () => {
+    const { store, token } = seededStore();
+    const { ctx, requestLog, audit } = buildContext(store);
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', upstreamUrl) },
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'block', minConfidence: 0.5 },
+          output: { action: 'audit' },
+        }),
+      },
+    ];
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`${base}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'mail jane@example.com' }],
+      }),
+    });
+    expect(res.status).toBe(403);
+    const row = audit.rows.find((r) => r.action === 'guardrail.blocked');
+    expect(row).toBeDefined();
+    expect((row?.payload as { surface?: string })?.surface).toBe('count_tokens');
+    expect((row?.payload as { direction?: string })?.direction).toBe('input');
+    expect(requestLog.entries).toHaveLength(0); // no dispatch, no teardown row (as for the proxy's block)
+    await app.close();
+  });
+
+  it('a buffered response that echoes an opaque secret-looking token is never cached (raw findings gate the store)', async () => {
+    const TOKEN = 'opaque-9F3kQ2mZ8pL1vX7cR4tB6nW0yH5jD2sA-session';
+    const up = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id: 'msg_1',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-sonnet-4-6',
+          content: [{ type: 'text', text: `your token is ${TOKEN}` }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 5, output_tokens: 12 },
+        }),
+      );
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${(up.address() as AddressInfo).port}`;
+    const { store, token } = seededStore();
+    const { ctx } = buildContext(store);
+    ctx.cache = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    ctx.routes = [
+      {
+        clientPaths: ['/v1/messages'],
+        createExtractor: () => new AnthropicUsageExtractor(),
+        strategy: { mode: 'single', target: anthropicTarget('anthropic', url) },
+        cacheable: true,
+        // A buffered path with an enforcing output policy whose floor (0.5) hides the
+        // entropy detector's 0.4 finding from the policy-filtered set.
+        guardrails: new GuardrailEngine([new NativeDetector({})], {
+          input: { action: 'audit' },
+          output: { action: 'block', minConfidence: 0.5 },
+        }),
+      },
+    ];
+    const storeSpy = vi.spyOn(ctx.cache, 'store');
+    const app = buildServer(testConfig(), ctx);
+    const base = await app.listen({ port: 0, host: '127.0.0.1' });
+    const send = () =>
+      fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'token?' }],
+        }),
+      });
+    const r1 = await send();
+    await r1.text();
+    const r2 = await send();
+    await r2.text();
+    expect(r1.headers.get('x-gulley-cache')).toBe('miss');
+    expect(r2.headers.get('x-gulley-cache')).toBe('miss'); // never stored, never a hit
+    expect(storeSpy).not.toHaveBeenCalled();
+    await app.close();
+    await new Promise<void>((r) => up.close(() => r()));
+  });
+});

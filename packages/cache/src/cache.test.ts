@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CacheEngine } from './engine';
+import { CacheEngine, VECTOR_SCOPE_SEPARATOR, vectorScope } from './engine';
 import { InMemoryExactCache } from './exact';
 import { exactKey, semanticText } from './key';
 import type { CacheableRequest, CachedResponse, EmbeddingProvider } from './types';
@@ -161,5 +161,60 @@ describe('CacheEngine semantic tier', () => {
 
     const otherScope = req('ws2', { messages: [{ role: 'user', content: 'Capital of France' }] });
     expect((await engine.lookup(otherScope)).status).toBe('miss');
+  });
+});
+
+describe('cache delivery-mode partition', () => {
+  const body = { model: 'm', messages: [{ role: 'user', content: 'Hello there!' }] };
+
+  it('keys a streamed and a buffered request differently; absent means buffered', () => {
+    const streamed = exactKey(req('ws1', body, { stream: true }));
+    const buffered = exactKey(req('ws1', body, { stream: false }));
+    const absent = exactKey(req('ws1', body));
+    expect(streamed).not.toBe(buffered);
+    expect(absent).toBe(buffered);
+  });
+
+  it('never replays a streamed body to a buffered request on the exact tier', async () => {
+    const engine = new CacheEngine({ exact: new InMemoryExactCache(), ttlSeconds: 60 });
+    const streamed = req('ws1', body, { stream: true });
+    const miss = await engine.lookup(streamed);
+    await engine.store(streamed, resp('data: {"type":"message_start"}'), miss);
+    expect((await engine.lookup(streamed)).status).toBe('hit-exact');
+    expect((await engine.lookup(req('ws1', body, { stream: false }))).status).toBe('miss');
+  });
+
+  it('never crosses delivery modes on the semantic tier either', async () => {
+    const engine = new CacheEngine({
+      exact: new InMemoryExactCache(),
+      semantic: { embed: new FakeEmbed(), index: new InMemoryVectorIndex(), threshold: 0.9 },
+      ttlSeconds: 60,
+    });
+    const streamed = req('ws1', body, { stream: true });
+    const miss = await engine.lookup(streamed);
+    await engine.store(streamed, resp('data: {"type":"message_start"}'), miss);
+    const paraphrase = { model: 'm', messages: [{ role: 'user', content: 'hello there' }] };
+    expect((await engine.lookup(req('ws1', paraphrase, { stream: false }))).status).toBe('miss');
+    expect((await engine.lookup(req('ws1', paraphrase, { stream: true }))).status).toBe(
+      'hit-semantic',
+    );
+  });
+});
+
+describe('vector scope', () => {
+  it('is Postgres-safe (no NUL byte) and carries every partition dimension', () => {
+    const scope = vectorScope(
+      req('ws1', { model: 'm', messages: [] }, { variant: 'beta-x|2023-06-01', stream: true }),
+    );
+    expect(scope).not.toContain('\u0000');
+    const parts = scope.split(VECTOR_SCOPE_SEPARATOR);
+    expect(parts).toEqual([
+      'ws1',
+      'anthropic',
+      'claude-haiku-4-5',
+      '/v1/messages',
+      'beta-x|2023-06-01',
+      'stream',
+    ]);
   });
 });

@@ -78,6 +78,17 @@ const EnvShape = z.object({
   BEDROCK_UPSTREAM_API_KEY: z.string().min(1).optional(),
   BEDROCK_REGION: z.string().default('us-east-1'),
   BEDROCK_ZDR: envBool(false),
+  // Bedrock streams carry no `ping` events; a client idle watchdog (Claude Code's
+  // streaming idle timeout) trips during a long thinking pause. The gateway emits an
+  // Anthropic `ping` after this many ms without an upstream frame, once the stream has
+  // started (15 s = Anthropic's own cadence; 0 = off). Synthetic pings are NOT upstream
+  // liveness: the gateway's inactivity watchdog ignores them, so a hung Bedrock stream
+  // still aborts at STREAM_INACTIVITY_MS, and synthesis stops at that bound too.
+  BEDROCK_PING_INTERVAL_MS: z.coerce.number().int().min(0).default(15_000),
+  // `anthropic-beta` values are forwarded to Bedrock as the body's `anthropic_beta`
+  // list (an OPEN list, per Anthropic's gateway contract). Comma-separated values to
+  // strip for a region/model that rejects them. Empty = forward everything.
+  BEDROCK_BETA_DENY: z.string().default(''),
   // Azure AI Foundry / Azure OpenAI: resource endpoint + api-key (Entra later).
   AZURE_ENDPOINT: z.string().url().optional(),
   AZURE_UPSTREAM_API_KEY: z.string().min(1).optional(),
@@ -89,6 +100,14 @@ const EnvShape = z.object({
   // manually from models.dev with `pnpm --filter @gulley/gateway catalog:refresh`
   // (per the manual-updates rule; there is no runtime auto-fetch).
   MODELS_CATALOG_FILE: z.string().optional(),
+  // Contracted / negotiated rates layered OVER the catalog and the seeds: a JSON array of
+  // catalog entries ({provider, model, input, output, cache?, tier?, …}, USD per MTok),
+  // from a file and/or inline. A listed (provider, model) is priced from here first.
+  PRICING_OVERRIDES_FILE: z.string().optional(),
+  PRICING_OVERRIDES: z.string().optional(),
+  // Reload MODELS_CATALOG_FILE in place when it changes on disk (polled every N seconds;
+  // 0 = load once at boot). A bad write keeps the previous catalog and logs. No network.
+  PRICING_RELOAD_INTERVAL_SECONDS: z.coerce.number().int().min(0).default(0),
   MODELS_DEV_URL: z.string().url().default('https://models.dev/api.json'),
 
   // Inbound JWT/JWKS auth mode (data plane) — clients authenticate with their
@@ -159,6 +178,14 @@ const EnvShape = z.object({
   // decision is made BEFORE any client byte; both legs are billed. Empty = off.
   // e.g. CASCADE_POLICY=[{"model":"claude-haiku-*","escalateTo":"claude-sonnet-4-6"}]
   CASCADE_POLICY: z.string().optional(),
+  // Signed reasoning in the request history (Anthropic `thinking` signatures /
+  // `redacted_thinking`, OpenAI Responses `reasoning.encrypted_content`) is bound to the
+  // model that produced it: a substitution makes the API drop it silently and restarts
+  // the prompt cache. `pin` (default) keeps the requested model whenever the history
+  // carries signed reasoning — the budget downshift, cascade escalation and smart
+  // re-route are skipped (and audited as `policy.substitution_pinned`) for that
+  // request. `allow` restores substitution.
+  SIGNED_THINKING_SUBSTITUTION: z.enum(['pin', 'allow']).default('pin'),
   // CEL authorization rules — a JSON array of { expr, effect: allow|deny, name? }.
   // Deny-first, then allow-list; expressions run over { request, principal }.
   // e.g. [{"effect":"deny","expr":"request.model.startsWith(\"experimental-\")"}]
@@ -315,8 +342,9 @@ const EnvShape = z.object({
   // output, the classic indirect-injection vector) — in trust-tag delimiters so the
   // model can tell external data from instructions. Deterministic + structure-
   // preserving (cache-safe), off by default. GUARDRAILS_SPOTLIGHT_DIRECTIVE also
-  // prepends a system directive explaining the tags (maximizes efficacy, but the
-  // added system prefix shifts Anthropic prompt-cache breakpoints — opt in).
+  // APPENDS a system directive explaining the tags — on every request and after the
+  // client's own system content, so the system prompt is identical turn after turn
+  // (prompt cache + preserved thinking safe) and a client attribution block stays first.
   GUARDRAILS_SPOTLIGHT: envBool(false),
   GUARDRAILS_SPOTLIGHT_DIRECTIVE: envBool(false),
   // M17: windowed in-stream enforcement of the output policy on Anthropic-canonical
@@ -401,6 +429,12 @@ const EnvShape = z.object({
   // budget reservation). Also bounds a buffered cascade leg's idle. Validated (was a raw,
   // module-load-time process.env read).
   STREAM_INACTIVITY_MS: z.coerce.number().int().positive().default(120_000),
+  // How many CONSECUTIVE watchdog aborts on one upstream target count as a circuit-breaker
+  // fault. A single quiet stream (a reasoning model past the idle budget on a provider that
+  // sends no keepalive pings) is a liveness guess, not an observed fault; counting each one
+  // opened the circuit — fleet-wide under BREAKER_SHARED — after a handful of long thinks.
+  // A clean stream end on the target resets the run. 1 = every watchdog abort is a fault.
+  STREAM_WATCHDOG_BREAKER_THRESHOLD: z.coerce.number().int().min(1).default(3),
   // Graceful-drain backstop (ms): the bounded window a SIGTERM/SIGINT drain (or an
   // uncaughtException drain) is given before process.exit fires. MUST be strictly LESS than
   // the platform's stop deadline (ECS stopTimeout / k8s terminationGracePeriodSeconds*1000)
@@ -529,6 +563,22 @@ const EnvShape = z.object({
   // is the header name lowercased with a leading `x-`/`x-gulley-` stripped
   // (`X-Gulley-Repo` -> `repo`). e.g. ATTRIBUTION_HEADERS=x-gulley-repo,x-gulley-dev
   ATTRIBUTION_HEADERS: z.string().optional(),
+  // Zero-config agent attribution: consume Claude Code's `x-claude-code-*` headers
+  // (session, subagent, parent agent, prompt, request class, agent type, compaction)
+  // and Codex's `originator` as attribution tags — `session`, `cc_agent`,
+  // `cc_parent_agent`, `prompt`, `request_class`, `agent_type`, `compaction`,
+  // `context_compacted` and `agent` (claude-code | codex) — so spend rolls up by
+  // session / prompt / subagent / agent product with no ATTRIBUTION_HEADERS. A
+  // configured header that maps to the same key wins. The headers still reach the
+  // upstream untouched.
+  AGENT_HEADER_ATTRIBUTION: envBool(true),
+  // Request-level routing preferences: an OpenRouter-compatible `provider` object
+  // ({order, only, ignore, allow_fallbacks, sort: price|latency|throughput, zdr,
+  // max_price}) or Vercel's `providerOptions.gateway` ({order, only, sort: cost|ttft|tps})
+  // in the body narrows / re-orders the route's candidates AFTER scope, model policy,
+  // residency and the breaker have applied (a request can tighten ZDR, never relax it).
+  // The fields are always stripped before forwarding; off = stripped and ignored.
+  CLIENT_ROUTING_PREFERENCES: envBool(true),
 
   // When a successful (2xx) response emits NO provider usage (some OpenAI-compatible
   // and local backends omit stream usage), the request would otherwise bill $0 and
@@ -548,7 +598,15 @@ const EnvShape = z.object({
   // bypassing the budget. Off-catalog requests are always observed (a warn log +
   // gulley_unpriced_requests_total + a request-log/audit attribute); opt in here to
   // ALSO fail closed by charging the worst-case reservation so it can't slip the cap.
-  METER_FAIL_CLOSED_ON_UNPRICED: envBool(false),
+  // Default ON since 0.6.0: an unpriced paid model is charged its worst case; models of
+  // a `local` custom provider (Ollama, vLLM, …) are free and never charged.
+  METER_FAIL_CLOSED_ON_UNPRICED: envBool(true),
+  // A model the OPERATOR configured (a model-alias target, BUDGET_DOWNSHIFT_MODEL, a
+  // CASCADE_POLICY escalation target, a ROUTE_GROUPS modelMap entry) with no price in the
+  // seed table or MODELS_CATALOG_FILE would meter $0 on every request it serves. `fail`
+  // (default) reports /ready 503 with the list until it is priced; `warn` stays ready and
+  // lists them in the /ready body. Local-runtime presets (Ollama, vLLM, …) are exempt.
+  METER_UNPRICED_CONFIG: z.enum(['fail', 'warn']).default('fail'),
 
   // Static request/response header set/remove applied to every proxied request
   // (the non-CEL sibling of CEL_TRANSFORM). JSON:

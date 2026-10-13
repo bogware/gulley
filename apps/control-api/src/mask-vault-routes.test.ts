@@ -21,6 +21,7 @@ class MemMaskVault implements MaskVaultStore {
       direction: r.direction,
       workspaceId: r.workspaceId,
       orgId: r.orgId,
+      conversationId: r.conversationId ?? null,
       ciphertext: r.ciphertext,
       tokenCount: r.tokenCount,
     };
@@ -33,6 +34,15 @@ class MemMaskVault implements MaskVaultStore {
   }
   async list(requestId: string): Promise<MaskVaultView[]> {
     return this.rows.get(requestId) ?? [];
+  }
+  async listByConversation(conversationId: string, workspaceId?: string): Promise<MaskVaultView[]> {
+    return [...this.rows.values()]
+      .flat()
+      .filter(
+        (x) =>
+          x.conversationId === conversationId &&
+          (workspaceId === undefined || x.workspaceId === workspaceId),
+      );
   }
   async sweepExpired(): Promise<number> {
     return 0;
@@ -50,7 +60,12 @@ const auth = () => ({ authorization: `Bearer ${gadm}`, 'content-type': 'applicat
 const post = (url: string, payload: unknown) =>
   app.inject({ method: 'POST', url, headers: auth(), payload: JSON.stringify(payload) });
 
-async function seedVault(requestId: string, entries: Array<[string, string]>, useCipher = cipher) {
+async function seedVault(
+  requestId: string,
+  entries: Array<[string, string]>,
+  useCipher = cipher,
+  conversationId?: string,
+) {
   const ct = await useCipher.encrypt(Buffer.from(JSON.stringify(entries), 'utf8'), {
     keyClass: 'mask-vault',
     aad: `${requestId}:${workspaceId}:output`,
@@ -60,6 +75,7 @@ async function seedVault(requestId: string, entries: Array<[string, string]>, us
     direction: 'output',
     workspaceId,
     orgId,
+    conversationId,
     ciphertext: ct,
     tokenCount: entries.length,
     ttlSeconds: 3600,
@@ -172,5 +188,59 @@ describe('GET /admin/mask-vault/:requestId', () => {
     });
     expect(res.statusCode).toBe(501);
     await app2.close();
+  });
+});
+
+describe('GET /admin/mask-vault/conversation/:conversationId', () => {
+  it('decrypts every record of a conversation for an authorized admin and audits once', async () => {
+    await seedVault(
+      'req_t1',
+      [['<<GULLEY_EMAIL_AB12>>', 'jane@example.com']],
+      cipher,
+      'session:s1',
+    );
+    await seedVault(
+      'req_t2',
+      [
+        ['<<GULLEY_EMAIL_AB12>>', 'jane@example.com'],
+        ['<<GULLEY_PHONE_CD34>>', '+1 555 0100'],
+      ],
+      cipher,
+      'session:s1',
+    );
+    await seedVault(
+      'req_unrelated',
+      [['<<GULLEY_EMAIL_EF56>>', 'x@example.com']],
+      cipher,
+      'session:s2',
+    );
+    const res = await app.inject({
+      method: 'GET',
+      url: '/admin/mask-vault/conversation/session:s1',
+      headers: auth(),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      conversationId: string;
+      reveals: Array<{
+        requestId: string;
+        direction: string;
+        tokenCount: number;
+        tokens: Record<string, string>;
+      }>;
+    };
+    expect(body.conversationId).toBe('session:s1');
+    expect(body.reveals.map((r) => r.requestId)).toEqual(['req_t1', 'req_t2']);
+    expect(body.reveals[1]?.tokens['<<GULLEY_PHONE_CD34>>']).toBe('+1 555 0100');
+    expect(body.reveals.reduce((n, r) => n + r.tokenCount, 0)).toBe(3);
+  });
+
+  it('404s an unknown conversation and 501s when reveal is not configured', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/admin/mask-vault/conversation/session:nope',
+      headers: auth(),
+    });
+    expect(res.statusCode).toBe(404);
   });
 });

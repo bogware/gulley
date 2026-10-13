@@ -76,3 +76,36 @@ describe('PostgresKeyAdminStore (real SQL via pglite)', () => {
     expect(await admin.disable('99999999-9999-9999-9999-999999999999')).toBeUndefined();
   });
 });
+
+describe('virtual key scope (allow-lists, expiry, groups)', () => {
+  it('stores per-key allow-lists, expiry and groups and the gateway store reads them back', async () => {
+    const admin = new PostgresKeyAdminStore(db, 'pepper');
+    const gw = new PostgresKeyStore(db);
+    const expiresAt = new Date(Date.now() + 86_400_000).toISOString();
+    const minted = await admin.mint({
+      workspaceId: WS,
+      orgId: ORG,
+      name: 'scoped',
+      allowedModels: ['claude-sonnet-5-5'],
+      allowedProviders: ['anthropic'],
+      expiresAt,
+      groups: ['platform-eng'],
+    });
+    // The data-plane store used to hard-code `*` here, so per-key scoping was impossible.
+    const resolved = await gw.findByPrefix(minted.keyPrefix);
+    expect(resolved?.allowedModels).toEqual(['claude-sonnet-5-5']);
+    expect(resolved?.allowedProviders).toEqual(['anthropic']);
+    expect(resolved?.expiresAt?.toISOString()).toBe(expiresAt);
+    expect(resolved?.groups).toEqual(['platform-eng']);
+    const view = await admin.get(minted.id);
+    expect(view?.allowedModels).toEqual(['claude-sonnet-5-5']);
+    expect(view?.expiresAt).toBe(expiresAt);
+
+    // An unscoped key stays unrestricted (NULL columns ⇒ `*`).
+    const open = await admin.mint({ workspaceId: WS, orgId: ORG, name: 'open' });
+    const openResolved = await gw.findByPrefix(open.keyPrefix);
+    expect(openResolved?.allowedModels).toBe('*');
+    expect(openResolved?.allowedProviders).toBe('*');
+    expect(openResolved?.expiresAt).toBeNull();
+  });
+});

@@ -287,7 +287,7 @@ function AccessTab() {
             {list.map((m: Membership, i) => (
               <GridRow key={m.id ?? i} cols="minmax(0,1fr) 90px minmax(0,1fr) 80px">
                 <Cell mono tone="ink">
-                  {m.subject ?? '—'}
+                  {m.subject ?? m.userId ?? '—'}
                 </Cell>
                 <Cell>
                   <StatusChip tone="blue">{m.role}</StatusChip>

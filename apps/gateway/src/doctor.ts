@@ -1,4 +1,7 @@
+import { parseCascadePolicy } from './cascade';
 import { type Config, loadConfig } from './config';
+import { unpricedModels } from './pricing-readiness';
+import { parseRouteGroups } from './route-groups';
 
 /** A single preflight finding. `error` fails the check (non-zero exit); `warn` is
  *  advisory; `ok`/`info` are informational. */
@@ -152,10 +155,10 @@ export function runDoctor(config: Config): DoctorFinding[] {
     });
     if (!config.MODELS_CATALOG_FILE) {
       f.push({
-        level: 'warn',
+        level: 'info',
         check: 'air-gapped',
         detail:
-          'AIR_GAPPED without MODELS_CATALOG_FILE — pricing falls back to in-tree seeds and no models.dev refresh is possible offline. Pin a catalog file.',
+          'AIR_GAPPED without MODELS_CATALOG_FILE — pricing uses the models.dev snapshot bundled with this release (no refresh offline). Pin a newer catalog file to update prices.',
       });
     }
     if (config.GUARDRAILS_WEBHOOK_URL && !config.GUARDRAILS_WEBHOOK_ALLOW_INTERNAL) {
@@ -205,7 +208,56 @@ export function runDoctor(config: Config): DoctorFinding[] {
     }
   }
 
+  // Unpriced configured models: a model the operator named (downshift, cascade escalation,
+  // ROUTE_GROUPS modelMap) with no seed rate meters $0 on every request. Doctor is pure
+  // (no I/O), so with a catalog file set the check is deferred to /ready, which loads it.
+  pricingFindings(config, f);
+
   return f;
+}
+
+function pricingFindings(config: Config, f: DoctorFinding[]): void {
+  if (config.MODELS_CATALOG_FILE) {
+    f.push({
+      level: 'info',
+      check: 'pricing',
+      detail:
+        'MODELS_CATALOG_FILE is set; the unpriced-configured-model check runs against it on /ready (doctor reads no files).',
+    });
+    return;
+  }
+  const providers: string[] = [];
+  if (config.ANTHROPIC_UPSTREAM_API_KEY) providers.push('anthropic');
+  if (config.OPENAI_UPSTREAM_API_KEY) providers.push('openai');
+  if (config.BEDROCK_UPSTREAM_API_KEY) providers.push('bedrock');
+  if (config.AZURE_UPSTREAM_API_KEY) providers.push('azure');
+  let modelMaps: Array<{ provider: string; model: string }> = [];
+  let cascade: ReturnType<typeof parseCascadePolicy> = [];
+  try {
+    modelMaps = parseRouteGroups(config.ROUTE_GROUPS).flatMap((g) =>
+      Object.entries(g.modelMap ?? {}).flatMap(([provider, map]) =>
+        Object.values(map).map((model) => ({ provider, model })),
+      ),
+    );
+    cascade = parseCascadePolicy(config.CASCADE_POLICY);
+  } catch {
+    return; // a malformed policy is reported by boot, not here
+  }
+  const unpriced = unpricedModels({
+    providers,
+    modelMaps,
+    downshiftModel: config.BUDGET_DOWNSHIFT_MODEL,
+    cascade,
+  });
+  if (unpriced.length === 0) {
+    f.push({ level: 'ok', check: 'pricing', detail: 'every configured model has a seed rate' });
+    return;
+  }
+  f.push({
+    level: config.METER_UNPRICED_CONFIG === 'fail' ? 'error' : 'warn',
+    check: 'pricing',
+    detail: `configured models with no seed rate (they meter $0): ${unpriced.join(', ')} — set MODELS_CATALOG_FILE (pnpm catalog:refresh) or METER_UNPRICED_CONFIG=warn; /ready reports 503 under =fail.`,
+  });
 }
 
 function main(): void {

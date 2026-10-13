@@ -114,6 +114,12 @@ export class PassthroughAdapter implements ProviderAdapter {
       body: res.body as unknown as Readable,
     };
   }
+
+  /** Anthropic-format upstreams expose `<inference path>/count_tokens`; forward the
+   *  (already gated, possibly masked) body there verbatim. */
+  async countTokens(req: ForwardRequest): Promise<ForwardResponse> {
+    return this.forward({ ...req, path: `${req.path.replace(/\/$/, '')}/count_tokens` });
+  }
 }
 
 export class AnthropicAdapter extends PassthroughAdapter {

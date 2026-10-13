@@ -20,7 +20,15 @@ import {
   type CacheLookup,
   semanticText,
 } from '@gulley/cache';
-import { computeCost, emptyUsage, rankPrice, type RateResolver, toMicroUsd } from '@gulley/cost';
+import {
+  computeCost,
+  emptyUsage,
+  rankPrice,
+  type RateResolver,
+  toMicroUsd,
+  PROVIDER_PRICING,
+  resolveRate,
+} from '@gulley/cost';
 import { isErr, type Result } from '@gulley/core';
 import {
   filterByPolicy,
@@ -31,6 +39,7 @@ import {
   StreamingReplacer,
   StreamingScanner,
   type TokenVault,
+  type Finding,
 } from '@gulley/guardrails';
 import type { CelAuthorizer, CelTransformer, ExternalAuthorizer, HeaderChanges } from '@gulley/cel';
 import {
@@ -47,6 +56,11 @@ import {
   residencyAllowedRegions,
 } from '../residency-policy';
 import { type CascadePolicy, matchCascade, shouldEscalate } from '../cascade';
+import type { CatalogEntry, ModelCatalog } from '@gulley/catalog';
+import { agentAttribution } from '../agent-attribution';
+import { conversationIdentity, maskVaultKey } from '../conversation';
+import { COUNT_TOKENS_PATHS, type CountTokensDeps, handleCountTokens } from './count-tokens';
+import { hasSignedThinking, type SignedThinkingSubstitution } from '../thinking';
 import { applyHeaderRules, type HeaderModifierConfig, type RequestMirror } from '@gulley/http-edge';
 import type { GatewayMetrics } from '@gulley/metrics';
 import { type JwtAuthConfig, looksLikeJwt, resolveJwtPrincipal } from '../jwt-auth';
@@ -65,6 +79,7 @@ import {
   SSEParser,
   type TextTransform,
   type UsageExtractor,
+  isSyntheticPingChunk,
 } from '@gulley/providers';
 import type { Encryptor } from '@gulley/crypto';
 import type { MaskDirection, MaskVaultStore, SchemaStatus } from '@gulley/storage';
@@ -86,6 +101,9 @@ import {
   residencyCompliant,
   selectCandidates,
   shapeRequestBody,
+  applyRoutingPreferences,
+  extractRoutingPreferences,
+  type RoutingPreferences,
 } from '@gulley/routing';
 import {
   type AccessLogFieldEngine,
@@ -109,6 +127,15 @@ import {
 } from 'node:zlib';
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+/** Consecutive watchdog aborts on one target before the breaker is faulted (ctx override:
+ *  STREAM_WATCHDOG_BREAKER_THRESHOLD). */
+const DEFAULT_WATCHDOG_BREAKER_THRESHOLD = 3;
+/** Per-target run of consecutive inactivity-watchdog aborts (process-local; a clean
+ *  stream end on the target resets it). Bounded by the number of configured targets. */
+const watchdogRuns = new Map<string, number>();
+/** Last time an unpriced-model warning was logged per provider/model (throttle). */
+const unpricedLogAt = new Map<string, number>();
+const UNPRICED_LOG_INTERVAL_MS = 60_000;
 
 /** A client-facing surface backed by a routing strategy (single / load-balance
  *  / fallback across upstream targets). */
@@ -182,6 +209,10 @@ export interface GatewayContext {
    *  the request is re-dispatched once to the stronger `escalateTo` model before any
    *  client byte. Empty/absent = no cascade. */
   cascade?: CascadePolicy[];
+  /** `pin` (default): a request whose history carries signed reasoning keeps its
+   *  requested model — smart re-route, budget downshift and cascade are skipped for
+   *  it (audited). `allow`: substitute regardless. See ../thinking.ts. */
+  signedThinkingSubstitution?: SignedThinkingSubstitution;
   budgets: BudgetStore;
   /** Behavior when the budget counter store is unreachable at admission: true/undefined
    *  = fail-open (serve without a reservation + audit; the ledger self-heals the
@@ -283,6 +314,20 @@ export interface GatewayContext {
    *  idle. Zod-validated in production; absent (tests/smoke scripts) ⇒
    *  DEFAULT_STREAM_INACTIVITY_MS. */
   streamInactivityMs?: number;
+  /** How many CONSECUTIVE inactivity-watchdog aborts on one target count as a breaker
+   *  fault. A watchdog fire is a liveness guess, not an observed upstream fault: a
+   *  reasoning model can legitimately go quiet past the idle budget on a provider that
+   *  sends no keepalives, and one such abort per request used to open the circuit —
+   *  fleet-wide with BREAKER_SHARED — after `failureThreshold` quiet streams. Absent
+   *  (tests) ⇒ DEFAULT_WATCHDOG_BREAKER_THRESHOLD; a clean stream end resets the run. */
+  watchdogBreakerThreshold?: number;
+  /** What an unpriced CONFIGURED model (an alias target, downshift model, cascade
+   *  escalation target or route-group model map) does to /ready: `fail` (503) or `warn`
+   *  (ready, with the list in the body). Absent ⇒ no check. */
+  unpricedConfig?: 'fail' | 'warn';
+  /** Provider names whose models are free to serve (local runtimes), so an unpriced
+   *  model on them is expected and never flagged by the readiness check. */
+  freeProviders?: readonly string[];
   /** Hard deadline for the whole cache lookup (config.CACHE_LOOKUP_TIMEOUT_MS). */
   cacheLookupTimeoutMs?: number;
   /** Stop every background maintenance timer this context started (SIGTERM drain). */
@@ -294,9 +339,20 @@ export interface GatewayContext {
   inflightTeardowns?: Set<Promise<void>>;
   /** Upstream time-to-headers budget (config.UPSTREAM_HEADERS_TIMEOUT_MS). */
   upstreamHeadersTimeoutMs?: number;
+  /** The pricing catalog instance behind `rateResolver` (bundled models.dev snapshot
+   *  or MODELS_CATALOG_FILE, with contracted overrides). `/v1/models` lists its
+   *  entries with pricing; a file reload swaps its rates in place. */
+  catalog?: ModelCatalog;
   /** Request header names whose values are captured as cost-attribution tags on the
    *  ledger/request-log/audit (already lowercased). Empty/absent = no attribution. */
   attributionHeaders?: string[];
+  /** Consume Claude Code's `x-claude-code-*` headers and Codex's `originator` as
+   *  attribution tags (session / cc_agent / prompt / request_class / … / agent) with
+   *  no configuration. Default true. See ../agent-attribution.ts. */
+  agentHeaderAttribution?: boolean;
+  /** Honour request-level routing preferences (OpenRouter `provider`, Vercel
+   *  `providerOptions.gateway`). Default true; the fields are stripped either way. */
+  clientRoutingPreferences?: boolean;
   /** Indirect-injection spotlighting: wrap untrusted request spans (tool_result /
    *  role:"tool" output) in trust-tag delimiters before forwarding. Absent = off. */
   spotlightUntrusted?: boolean;
@@ -337,6 +393,10 @@ export interface GatewayContext {
   maskVaultEncryptor?: Encryptor;
   /** Retention for a persisted mask-vault record. */
   maskVaultTtlSeconds?: number;
+  /** Deployment-wide mask-vault master secret (K2): every `mask` token is derived
+   *  from a per-conversation key under it, so the same value masks to the same
+   *  token on every turn. Unset ⇒ request-scoped nonce'd tokens (tests/libraries). */
+  maskVaultMaster?: Uint8Array;
 }
 
 const JSON_PARSE_CAP = 8 * 1024 * 1024;
@@ -434,7 +494,7 @@ export function registerRoutes(app: FastifyInstance, holder: RouteHolder): void 
     if (!route) {
       return reply.code(404).send({
         type: 'error',
-        error: { type: 'not_found', message: 'no route for path' },
+        error: { type: 'not_found_error', message: 'no route for path' },
       }) as unknown as void;
     }
     const startedAtMs = Date.now();
@@ -468,10 +528,30 @@ export function registerRoutes(app: FastifyInstance, holder: RouteHolder): void 
       }) as unknown as void;
     });
   });
-  // Model discovery (OpenAI-shaped list), filtered to the caller's allowed models.
+  // Model discovery, filtered to the caller's allowed models. Served under every
+  // provider prefix so a client pointed at `/anthropic` or `/bedrock` discovers too.
   const modelsHandler = (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
     handleModels(holder.ctx, req, reply);
-  for (const path of ['/v1/models', '/openai/v1/models']) app.get(path, modelsHandler);
+  for (const path of [
+    '/v1/models',
+    '/openai/v1/models',
+    '/anthropic/v1/models',
+    '/bedrock/v1/models',
+  ])
+    app.get(path, modelsHandler);
+
+  // Token counting (Anthropic's optional gateway endpoint) — static routes win over
+  // the `/*` dispatcher; each resolves its parent inference route from the holder.
+  const countTokensDeps: CountTokensDeps = {
+    resolvePrincipal: resolveAnyPrincipal,
+    filterResponseHeaders,
+    record: safeRecord,
+  };
+  for (const path of COUNT_TOKENS_PATHS) {
+    app.post(path, (req: FastifyRequest, reply: FastifyReply): Promise<void> =>
+      handleCountTokens(holder, req, reply, countTokensDeps),
+    );
+  }
 
   // Playground preflight — a static POST route, so it wins over the `/*` proxy
   // dispatcher. Reuses the real pipeline components but never proxies or spends.
@@ -494,7 +574,7 @@ function handleDebugTrace(ctx: GatewayContext, request: FastifyRequest, reply: F
   }
   const tracer = ctx.tracer;
   if (!tracer) {
-    void reply.code(404).send({ type: 'error', error: { type: 'not_found' } });
+    void reply.code(404).send({ type: 'error', error: { type: 'not_found_error' } });
     return;
   }
   reply.hijack();
@@ -533,7 +613,7 @@ function handleDebugTrace(ctx: GatewayContext, request: FastifyRequest, reply: F
  * Used by the read-only endpoints (model discovery) so a harness authenticating with
  * a broker token or a JWT is not 401'd on discovery while its POSTs succeed.
  */
-async function resolveAnyPrincipal(
+export async function resolveAnyPrincipal(
   ctx: GatewayContext,
   request: FastifyRequest,
 ): Promise<{ kind: 'ok'; principal: Principal } | { kind: 'unauthorized' | 'unavailable' }> {
@@ -588,23 +668,132 @@ async function handleModels(
     return;
   }
   const principal = resolved.principal;
-  const ids = new Set<string>([...(ctx.models ?? []), ...(ctx.modelRouter?.knownModels() ?? [])]);
-  const data = [...ids]
+  const permitted = (id: string): boolean => {
     // Advertise an id only if a request for it would actually be permitted. Both the
     // per-key scope and the central policy are enforced on the RESOLVED model (after
     // alias/pin rewrite), so resolve the advertised id the same way here — otherwise
     // an alias whose target is denied would be advertised (then 403), or one whose
     // target is allowed would be hidden.
-    .filter((id) => {
-      const resolved = ctx.modelRouter?.resolve(id)?.resolved ?? id;
-      return (
-        scopeAllowsModel(principal.scope, resolved) &&
-        (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, resolved))
-      );
-    })
-    .sort()
-    .map((id) => ({ id, object: 'model', owned_by: 'gulley' }));
-  await reply.send({ object: 'list', data });
+    const resolvedId = ctx.modelRouter?.resolve(id)?.resolved ?? id;
+    return (
+      scopeAllowsModel(principal.scope, resolvedId) &&
+      (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, resolvedId))
+    );
+  };
+  const query = (request.query ?? {}) as Record<string, unknown>;
+  const limitRaw = Number(query['limit']);
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw >= 1 ? Math.min(1000, Math.floor(limitRaw)) : 1000;
+
+  const listed = new Map<string, ModelListing>();
+  // Priced models of every configured provider (bundled snapshot / catalog, else the
+  // seed table for the first-party providers), each with its pricing so a client can
+  // discover cost as well as availability (Vercel-style, Anthropic list shape). Region-
+  // prefixed Bedrock ids are folded into the base id.
+  const providers = new Set(
+    ctx.routes.flatMap((r) => allTargets(r.strategy).map((t) => t.provider)),
+  );
+  for (const provider of providers) {
+    const entries = ctx.catalog?.entriesFor(provider) ?? [];
+    for (const e of entries) {
+      if (REGION_PREFIX_RE.test(e.model)) continue;
+      if (!listed.has(e.model)) listed.set(e.model, catalogListing(e));
+    }
+    if (entries.length === 0 && provider !== 'bedrock' && provider !== 'azure') {
+      const seed = PROVIDER_PRICING[provider];
+      for (const [id, rate] of Object.entries(seed?.rates ?? {})) {
+        if (!listed.has(id)) {
+          listed.set(id, {
+            id,
+            object: 'model',
+            type: 'model',
+            display_name: id,
+            owned_by: provider,
+            pricing: pricingOf(
+              rate.input,
+              rate.output,
+              rate.cache?.read ?? seed?.cache.read,
+              rate.cache?.write5m ?? seed?.cache.write5m,
+            ),
+          });
+        }
+      }
+    }
+  }
+  // Declared custom-provider models and exact aliases — what this deployment serves
+  // beyond the catalog.
+  for (const id of [...(ctx.models ?? []), ...(ctx.modelRouter?.knownModels() ?? [])]) {
+    if (!listed.has(id)) {
+      listed.set(id, { id, object: 'model', type: 'model', display_name: id, owned_by: 'gulley' });
+    }
+  }
+  const all = [...listed.values()]
+    .filter((m) => permitted(m.id))
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+  const data = all.slice(0, limit);
+  await reply.send({
+    object: 'list',
+    data,
+    has_more: all.length > data.length,
+    first_id: data[0]?.id ?? null,
+    last_id: data[data.length - 1]?.id ?? null,
+  });
+}
+
+/** One `/v1/models` entry: Anthropic's shape (`type`, `display_name`, `created_at`)
+ *  plus OpenAI's (`object`, `owned_by`) plus Vercel-style discovery fields. Prices are
+ *  USD per TOKEN as decimal strings (never floats). */
+interface ModelListing {
+  id: string;
+  object: 'model';
+  type: 'model';
+  display_name: string;
+  owned_by: string;
+  created_at?: string;
+  context_window?: number;
+  max_tokens?: number;
+  pricing?: {
+    input: string;
+    output: string;
+    input_cache_read?: string;
+    input_cache_write?: string;
+  };
+}
+
+const REGION_PREFIX_RE = /^(us|eu|apac|global|jp|au|ca|sa)\./;
+
+function catalogListing(e: CatalogEntry): ModelListing {
+  return {
+    id: e.model,
+    object: 'model',
+    type: 'model',
+    display_name: e.displayName ?? e.model,
+    owned_by: e.provider,
+    ...(e.releaseDate ? { created_at: `${e.releaseDate}T00:00:00Z` } : {}),
+    ...(e.contextLength ? { context_window: e.contextLength } : {}),
+    ...(e.maxOutputTokens ? { max_tokens: e.maxOutputTokens } : {}),
+    pricing: pricingOf(e.input, e.output, e.cache?.read, e.cache?.write5m),
+  };
+}
+
+function pricingOf(
+  inputPerMTok: number,
+  outputPerMTok: number,
+  cacheRead?: number,
+  cacheWrite?: number,
+): ModelListing['pricing'] {
+  return {
+    input: perToken(inputPerMTok),
+    output: perToken(outputPerMTok),
+    ...(cacheRead !== undefined ? { input_cache_read: perToken(inputPerMTok * cacheRead) } : {}),
+    ...(cacheWrite !== undefined ? { input_cache_write: perToken(inputPerMTok * cacheWrite) } : {}),
+  };
+}
+
+/** USD per million tokens → USD per token, as a decimal string with no float noise. */
+function perToken(usdPerMTok: number): string {
+  const s = (usdPerMTok / 1_000_000).toFixed(12);
+  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
 }
 
 /** Drain a Readable fully into buffered chunks, capped at `limit` bytes. On overflow it
@@ -691,7 +880,7 @@ function decodeForEval(buf: Buffer, encoding: string | string[] | undefined): Bu
 /** Emit a request metric without ever letting a telemetry fault escape into the
  *  request/teardown path (a throw here must not turn a clean 4xx into a 500, nor
  *  reject the fire-and-forget teardown promise and skip the tracer/span close). */
-function safeRecord(
+export function safeRecord(
   ctx: GatewayContext,
   log: { error: (obj: object, msg?: string) => void },
   args: Parameters<Telemetry['recordRequest']>[0],
@@ -763,7 +952,11 @@ async function handleProxy(
   // Cost-attribution tags from configured request headers (repo/branch/PR/session/
   // developer/…), captured once and threaded onto the ledger, request-log, and audit
   // so spend rolls up by any SDLC dimension for chargeback.
-  const attribution = buildAttribution(request, ctx.attributionHeaders);
+  const attribution = buildAttribution(
+    request,
+    ctx.attributionHeaders,
+    ctx.agentHeaderAttribution ?? true,
+  );
   let body = (request.body as Buffer | undefined) ?? Buffer.alloc(0);
 
   let parsed: Record<string, unknown> = {};
@@ -774,6 +967,31 @@ async function handleProxy(
     parseOk = false; /* malformed body still gets forwarded verbatim */
   }
   let requestedModel = typeof parsed['model'] === 'string' ? parsed['model'] : 'unknown';
+  // Signed reasoning in the history is bound to the model that produced it: under the
+  // default `pin`, every stage that would substitute the model (smart re-route, budget
+  // downshift, cascade) is skipped for this request, each skip audited.
+  const pinnedByThinking =
+    parseOk && (ctx.signedThinkingSubstitution ?? 'pin') === 'pin' && hasSignedThinking(parsed);
+  // Request-level routing preferences (OpenRouter `provider` / Vercel
+  // `providerOptions.gateway`): read, then STRIPPED before anything else sees the body
+  // — no upstream accepts the fields, and the cache key must not vary on them.
+  let routingPrefs: RoutingPreferences | undefined;
+  if (parseOk) {
+    const extracted = extractRoutingPreferences(parsed);
+    if (extracted.stripped) body = Buffer.from(JSON.stringify(parsed), 'utf8');
+    if ((ctx.clientRoutingPreferences ?? true) && extracted.prefs) routingPrefs = extracted.prefs;
+  }
+  // Per-attempt routing provenance (`x-gulley-attempts`, request-log `attempts`):
+  // every target this request touched and how it ended. Bounded.
+  const attempts: RoutingAttempt[] = [];
+  const noteAttempt = (
+    target: string,
+    outcome: RoutingAttempt['outcome'],
+    status?: number,
+    ms?: number,
+  ): void => {
+    if (attempts.length < MAX_ROUTING_ATTEMPTS) attempts.push({ target, outcome, status, ms });
+  };
 
   // --- model routing + request shaping (only when the body parsed cleanly) ---
   // Resolve the requested model through the router (alias/pin the upstream model,
@@ -913,6 +1131,16 @@ async function handleProxy(
     principal = auth.value;
   }
 
+  // --- conversation identity (K2): keys the mask vault so tokens are stable for the
+  // lifetime of a conversation (explicit id header → prefix fingerprint → principal),
+  // and pins a conversation to one provider under load balancing. Computed BEFORE any
+  // stage rewrites the body (smart routing, spotlighting, masking) so the fingerprint
+  // sees the same bytes on every turn.
+  const conversation = conversationIdentity(request.headers, parsed, parseOk, principal.id);
+  const vaultKey = ctx.maskVaultMaster
+    ? maskVaultKey(ctx.maskVaultMaster, principal.scope.workspaceId, conversation)
+    : undefined;
+
   // --- per-tenant routing override (most specific: wins over the shared route
   // and the model router) ---
   // A workspace may reroute this client path to its own strategy/provider. Applied
@@ -926,6 +1154,16 @@ async function handleProxy(
   if (tenantRoute) {
     strategy = tenantRoute.strategy;
     if (tenantRoute.createExtractor) createExtractor = tenantRoute.createExtractor;
+  } else if (ctx.smartRouter && parseOk && pinnedByThinking) {
+    // Signed reasoning pins the model: a smart re-route (possibly to another provider)
+    // would make the API drop that reasoning. Skip it, audibly.
+    await auditSafe({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'policy.substitution_pinned',
+      target: requestedModel,
+      payload: { stage: 'smart_routing', reason: 'signed_thinking' },
+    });
   } else if (ctx.smartRouter && parseOk) {
     // --- smart routing (M15): classify the prompt, reroute by category ---
     // Runs ONLY when no residency pin applies (the tenant override wins outright,
@@ -1035,9 +1273,16 @@ async function handleProxy(
     });
     return;
   }
+  // Session affinity: the configured header, else the conversation identity (an
+  // explicit session id or the prefix fingerprint) so a multi-turn conversation stays
+  // on ONE provider — thinking signatures and prompt caches are provider-bound. A
+  // principal-only identity (single-turn / unparseable body) keeps the old
+  // least-load / weighted spread.
   const sessionKey = ctx.sessionAffinityHeader
-    ? (headerValue(request, ctx.sessionAffinityHeader) ?? principal.id)
-    : undefined;
+    ? (headerValue(request, ctx.sessionAffinityHeader) ?? conversation.id)
+    : conversation.source === 'principal'
+      ? undefined
+      : conversation.id;
   // Data-residency / ZDR: drop any upstream that does not satisfy the deployment
   // policy BEFORE a target is chosen. Enforced inside selectCandidates so it gates the
   // single-mode return and the all-open pool fallback (never re-admitting an
@@ -1055,6 +1300,41 @@ async function handleProxy(
     allowedRegions,
     requireZdr,
   }).filter((t) => scopeAllowsProvider(principal.scope, t.provider));
+  // Request-level preferences narrow / re-order what the policies above left — they
+  // can never widen it. An unsatisfiable preference is a 404 (OpenRouter's semantics),
+  // never a fall-through to a provider the client excluded.
+  if (routingPrefs && candidates.length > 0) {
+    const applied = applyRoutingPreferences(candidates, routingPrefs, {
+      rateOf: (t) =>
+        resolveRate(t.provider, t.modelMap?.[requestedModel] ?? requestedModel, ctx.rateResolver),
+      ...(ctx.outlier ? { latencyOf: (t) => ctx.outlier!.latency(t.name) } : {}),
+    });
+    if (applied.candidates.length === 0) {
+      request.log.info(
+        { prefs: routingPrefs, reason: applied.reason },
+        'routing preferences unsatisfied',
+      );
+      // Like every other pre-dispatch denial: a request-log / metrics record and an
+      // audit row, so a client-excluded provider is never an invisible failure.
+      recordDenied(404, candidates[0]?.provider ?? 'unknown');
+      await auditSafe({
+        orgId: principal.scope.orgId,
+        actor: principal.id,
+        action: 'policy.routing_preferences_unsatisfied',
+        target: requestedModel,
+        payload: { preferences: routingPrefs, reason: applied.reason },
+      });
+      await reply.code(404).send({
+        type: 'error',
+        error: {
+          type: 'not_found_error',
+          message: applied.reason ?? 'no provider satisfies the routing preferences',
+        },
+      });
+      return;
+    }
+    candidates = applied.candidates;
+  }
   // A stream-only upstream (alwaysStream, e.g. Bedrock) can't serve a NON-streamed
   // request without flipping the client-visible response to SSE. In a multi-target
   // (arbitrage/failover) group, drop such targets for a non-streamed request — but keep
@@ -1124,10 +1404,26 @@ async function handleProxy(
         provider: string;
       }
     | undefined;
-  const cascadePolicy =
+  const cascadeMatch =
     parseOk && ctx.cascade && ctx.cascade.length > 0
       ? matchCascade(ctx.cascade, requestedModel)
       : undefined;
+  if (cascadeMatch && pinnedByThinking) {
+    // An escalation re-dispatches the history to another model, which drops the
+    // signed reasoning the cheap model produced so far. Serve tier-0 as is, audibly.
+    await auditSafe({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'policy.substitution_pinned',
+      target: requestedModel,
+      payload: {
+        stage: 'cascade',
+        reason: 'signed_thinking',
+        to: cascadeMatch.escalateTo,
+      },
+    });
+  }
+  const cascadePolicy = pinnedByThinking ? undefined : cascadeMatch;
   if (cascadePolicy) {
     const t1res = ctx.modelRouter?.resolve(cascadePolicy.escalateTo);
     const t1Model = t1res?.resolved ?? cascadePolicy.escalateTo;
@@ -1282,6 +1578,12 @@ async function handleProxy(
     ) {
       (h as Record<string, string | string[]>)['x-gulley-served-region'] = servedRegion;
     }
+    if (
+      attempts.length > 0 &&
+      (h as Record<string, string | string[]>)['x-gulley-attempts'] === undefined
+    ) {
+      (h as Record<string, string | string[]>)['x-gulley-attempts'] = formatAttempts(attempts);
+    }
     return h;
   };
 
@@ -1356,7 +1658,7 @@ async function handleProxy(
   // structure-preserving, so cache hits are preserved — no `inputMasked` gate.
   if (parseOk && ctx.spotlightUntrusted) {
     const sl = spotlightUntrusted(parsed, { directive: ctx.spotlightDirective });
-    if (sl.marked > 0) {
+    if (sl.marked > 0 || sl.directive) {
       parsed = sl.body as Record<string, unknown>;
       body = Buffer.from(JSON.stringify(parsed), 'utf8');
     }
@@ -1398,7 +1700,9 @@ async function handleProxy(
     // `@` as `\u0040` (or a newline as `\n`), which every detector missed while the
     // provider decoded it back into the real value — a one-escape DLP bypass. The
     // masked output stays a JSON object, so the re-parse below still applies.
-    const gr = await engine.inspectInput(parseOk ? JSON.stringify(parsed) : body.toString('utf8'));
+    const gr = await engine.inspectInput(parseOk ? JSON.stringify(parsed) : body.toString('utf8'), {
+      vaultKey,
+    });
     inputFindings = gr.summary.total;
     if (gr.blocked) {
       await auditSafe({
@@ -1515,7 +1819,10 @@ async function handleProxy(
       model: requestedModel,
       path: route.clientPaths[0] ?? '',
       body,
-      variant: headerValue(request, 'anthropic-beta'),
+      variant: cacheVariant(request),
+      // Delivery mode is part of the partition: the stored bytes are replayed verbatim
+      // on a hit, so a streamed (SSE) entry must never answer a non-streaming caller.
+      stream: parseOk && parsed['stream'] === true,
       semantic: route.semantic,
     };
     try {
@@ -1559,16 +1866,22 @@ async function handleProxy(
   // --- budget: reserve worst-case at admission (hard cap, TOCTOU-safe) ---
   // Clamped to a positive integer: a negative/zero/NaN value made the worst-case
   // estimate <= 0, which skipped the reservation (and the commit) entirely.
+  // An embeddings request produces no completion, so its output ceiling is the 1-token
+  // floor: reserving the 8k default against the unknown-pricing floor ($75/MTok) held
+  // ~$0.61 per embeddings call and spuriously 402'd workspaces near their cap.
+  const embeddingsRoute = route.clientPaths.some((p) => p.endsWith('/v1/embeddings'));
   const maxOutput = Math.max(
     1,
     Math.floor(
-      numField(parsed['max_tokens']) ??
-        numField(parsed['max_output_tokens']) ??
-        // OpenAI reasoning / o-series / gpt-5-class models take `max_completion_tokens`
-        // (and reject `max_tokens`); without this a request that sets only that field
-        // reserves against the 8k default and can breach the hard cap at scale.
-        numField(parsed['max_completion_tokens']) ??
-        DEFAULT_MAX_OUTPUT_TOKENS,
+      embeddingsRoute
+        ? 1
+        : (numField(parsed['max_tokens']) ??
+            numField(parsed['max_output_tokens']) ??
+            // OpenAI reasoning / o-series / gpt-5-class models take `max_completion_tokens`
+            // (and reject `max_tokens`); without this a request that sets only that field
+            // reserves against the 8k default and can breach the hard cap at scale.
+            numField(parsed['max_completion_tokens']) ??
+            DEFAULT_MAX_OUTPUT_TOKENS),
     ),
   );
   let worstCase = estimateWorstCaseMicroUsd(
@@ -1757,13 +2070,39 @@ async function handleProxy(
   let downshiftedFrom: string | undefined;
   if (
     downshift &&
+    pinnedByThinking &&
+    admittedUtilization >= downshift.threshold &&
+    requestedModel !== downshift.model
+  ) {
+    // The downshift would have applied, but the history carries signed reasoning bound
+    // to the requested model — keep it (the budget it was about to breach still applies).
+    await auditSafe({
+      orgId: principal.scope.orgId,
+      actor: principal.id,
+      action: 'policy.substitution_pinned',
+      target: requestedModel,
+      payload: {
+        stage: 'budget_downshift',
+        reason: 'signed_thinking',
+        to: downshift.model,
+        utilization: admittedUtilization,
+      },
+    });
+  }
+  if (
+    downshift &&
+    !pinnedByThinking &&
     admittedUtilization >= downshift.threshold &&
     requestedModel !== downshift.model &&
     // Never downshift TO a model the central policy denies — the downshift reassigns
     // the model AFTER the authz gate, so an unchecked target would bypass the policy.
     // If the cheaper model is denied, skip the downshift (keep the allowed model,
     // subject to the budget it was about to breach).
-    (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, downshift.model))
+    (!ctx.modelPolicy || modelAllowedByPolicy(ctx.modelPolicy, downshift.model)) &&
+    // ...and never to a model the KEY's own scope does not allow (a compliance pin to one
+    // model must not be undone by the budget): the same check the cascade and smart
+    // router apply before reassigning the model.
+    scopeAllowsModel(principal.scope, downshift.model)
   ) {
     request.log.info(
       { from: requestedModel, to: downshift.model, utilization: admittedUtilization },
@@ -1983,6 +2322,7 @@ async function handleProxy(
     servedRegion = target.region;
     dispatchMs = fwdStart;
     firstByteMs = Date.now();
+    noteAttempt(target.name, 'served', resp.statusCode, firstByteMs - fwdStart);
     ctx.outlier?.recordLatency(
       target.name,
       firstByteMs - fwdStart,
@@ -2053,6 +2393,7 @@ async function handleProxy(
     if (ctx.limiter) {
       if (!ctx.limiter.tryAcquire(target.name)) {
         anySaturation = true;
+        noteAttempt(target.name, 'shed');
         return { kind: 'saturated', target };
       }
       limiterAcquired = true;
@@ -2062,6 +2403,7 @@ async function handleProxy(
     if (!ctx.breaker.tryProbe(target.name)) {
       if (limiterAcquired) ctx.limiter?.release(target.name);
       anySaturation = true;
+      noteAttempt(target.name, 'shed');
       return { kind: 'saturated', target };
     }
     // Resolve the tenant credential OUTSIDE the attempt: a Postgres/Secrets Manager
@@ -2076,6 +2418,7 @@ async function handleProxy(
       credentialUnavailable = true;
       if (limiterAcquired) ctx.limiter?.release(target.name);
       ctx.breaker.releaseProbe(target.name);
+      noteAttempt(target.name, 'error');
       return { kind: 'failed', target };
     }
     anyRealAttempt = true;
@@ -2093,6 +2436,7 @@ async function handleProxy(
         ctx.breaker.recordFailure(target.name, parseRetryAfterMs(resp.headers));
         if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
         resp.body.resume();
+        noteAttempt(target.name, 'failover', resp.statusCode, Date.now() - forwardStart);
         return { kind: 'failed', target };
       }
       return { kind: 'usable', target, resp, forwardStart, limiterAcquired };
@@ -2294,6 +2638,7 @@ async function handleProxy(
         if (!ctx.limiter.tryAcquire(target.name)) {
           anySaturation = true;
           ctx.metrics?.recordShed('adaptive_limit');
+          noteAttempt(target.name, 'shed');
           request.log.warn({ target: target.name }, 'target at capacity — skipping');
           continue;
         }
@@ -2311,6 +2656,7 @@ async function handleProxy(
         if (limiterAcquired) ctx.limiter?.release(target.name);
         anySaturation = true;
         ctx.metrics?.recordShed('half_open_probe');
+        noteAttempt(target.name, 'shed');
         request.log.warn({ target: target.name }, 'half-open probe in flight — shedding');
         continue;
       }
@@ -2327,6 +2673,7 @@ async function handleProxy(
         credentialUnavailable = true;
         if (limiterAcquired) ctx.limiter?.release(target.name);
         ctx.breaker.releaseProbe(target.name);
+        noteAttempt(target.name, 'error');
         continue;
       }
       anyRealAttempt = true;
@@ -2362,6 +2709,7 @@ async function handleProxy(
           ) {
             ctx.breaker.recordFailure(target.name, retryAfterMs);
             r.body.resume();
+            noteAttempt(target.name, 'retry', r.statusCode, Date.now() - forwardStart);
             request.log.warn({ target: target.name, status: r.statusCode, attempt }, 'retrying');
             continue;
           }
@@ -2417,6 +2765,12 @@ async function handleProxy(
         ctx.breaker.recordFailure(target.name);
         if (limiterAcquired)
           ctx.limiter?.record(target.name, forwardStart ? Date.now() - forwardStart : 0, true);
+        noteAttempt(
+          target.name,
+          'error',
+          undefined,
+          forwardStart ? Date.now() - forwardStart : undefined,
+        );
         continue; // fail over to the next candidate
       }
 
@@ -2425,6 +2779,7 @@ async function handleProxy(
         if (limiterAcquired) ctx.limiter?.record(target.name, Date.now() - forwardStart, true);
         ctx.metrics?.recordFailover(target.name);
         resp.body.resume(); // discard the failed body, then try the next target
+        noteAttempt(target.name, 'failover', resp.statusCode, Date.now() - forwardStart);
         request.log.warn({ target: target.name, status: resp.statusCode }, 'failing over');
         continue;
       }
@@ -2756,7 +3111,12 @@ async function handleProxy(
   // buffered and its tool calls reassembled from the SSE, so `stream:true` can't
   // bypass governance). Buffering is required so a denied call withholds the whole
   // response fail-closed before any byte reaches the client's executor.
-  const toolGovern = ctx.toolPolicy !== undefined && statusCode < 400;
+  // Only a request that DECLARED tools (or forced a tool choice) can yield tool calls, so
+  // governance — and the full buffering it needs — is gated on that. Without the gate,
+  // setting TOOL_POLICY turned streaming off deployment-wide for every plain chat request,
+  // which the Claude Code gateway contract calls a stall.
+  const toolGovern =
+    ctx.toolPolicy !== undefined && statusCode < 400 && requestDeclaresTools(parsed, parseOk);
   const bufferOutput =
     (outputEnforcing && !streamed && statusCode < 400) || holdStreamed || toolGovern;
 
@@ -2798,6 +3158,7 @@ async function handleProxy(
           engine.combinedDetector(),
           engine.outputPolicy,
           ctx.streamEnforceWindowChars ?? 512,
+          { vaultKey },
         )
       : undefined;
   // The client-bound transform: detokenize masked-input values (in logical-text
@@ -2833,6 +3194,10 @@ async function handleProxy(
   let fullBytes = 0;
   let captureOverflow = false;
   let outputEnforced: OutputInspection | undefined;
+  // RAW (unfiltered) detector findings over a buffered body, for the cache gate: the
+  // output policy's confidence floor drops the unkeyed-secret detectors (entropy 0.4),
+  // and a response echoing an opaque token must never be cached and replayed.
+  let rawBufferedOutFindings: Finding[] | undefined;
   // Tool-call governance state (set in onUpstreamEnd, read in teardown for the
   // cache-store gate + telemetry): whether the response carried any tool call, and
   // the first policy-denied call if governance withheld the response.
@@ -2902,11 +3267,19 @@ async function handleProxy(
     // durable attribute); optionally fail closed by charging the worst-case reserve
     // so an off-catalog model can't be used to drive real spend past the cap.
     const unpriced = n.seen && !cost.priced && statusCode < 400;
-    const chargeUnpriced = unpriced && ctx.meterFailClosedOnUnpriced === true;
-    if (unpriced) {
+    // Fail closed on an unpriced PAID model only: a `local` custom provider (Ollama,
+    // vLLM, …) is free, so its models meter $0 by design, never the worst case.
+    const chargeUnpriced =
+      unpriced &&
+      ctx.meterFailClosedOnUnpriced === true &&
+      !(ctx.freeProviders?.includes(provider) ?? false);
+    // Throttled per (provider, model): one line per minute, not one per request — an
+    // unpriced embeddings or local model otherwise spammed the log on every call while
+    // the metric (gulley_unpriced_requests_total) already counts each one.
+    if (unpriced && shouldLogUnpriced(`${provider}/${meteredModel}`)) {
       request.log.warn(
         { provider, model: meteredModel, failClosed: chargeUnpriced },
-        'served a model with no catalog price — metering $0 unless fail-closed',
+        'served a model with no catalog price — metering $0 unless fail-closed (throttled: once per minute per model)',
       );
     }
     // A request the upstream accepted but never answered (headers timeout) was in all
@@ -2937,7 +3310,9 @@ async function handleProxy(
     //     findings and treat ANY secret/entropy-source finding as sensitive, else a response
     //     echoing an opaque token is cached and replayed to another caller in the same scope.
     const cacheGateFindings =
-      outScanner && !redactor && !bufferOutput ? outScanner.findings() : outFindings;
+      outScanner && !redactor && !bufferOutput
+        ? outScanner.findings()
+        : (rawBufferedOutFindings ?? outFindings);
     const outputSensitive =
       outputScanFailed ||
       cacheGateFindings.some(
@@ -3095,6 +3470,9 @@ async function handleProxy(
           ...(rateLimitDegraded ? { rateLimitUnenforced: true } : {}),
           ...(downshiftedFrom ? { downshiftedFrom } : {}),
           ...(cascadeEscalatedFrom ? { cascadeEscalatedFrom } : {}),
+          // Routing provenance only when the request touched more than one attempt
+          // (a shed, retry or failover) — a single served attempt is already `target`.
+          ...(attempts.length > 1 ? { attempts: formatAttempts(attempts) } : {}),
         },
       });
     } catch (err) {
@@ -3262,6 +3640,7 @@ async function handleProxy(
             direction,
             workspaceId: principal.scope.workspaceId,
             orgId: principal.scope.orgId,
+            conversationId: conversation.id,
             ciphertext: ct,
             tokenCount: v.size,
             ttlSeconds: ctx.maskVaultTtlSeconds ?? 604_800,
@@ -3480,7 +3859,9 @@ async function handleProxy(
   resetWatchdog();
 
   upstreamBody.on('data', (chunk: Buffer) => {
-    resetWatchdog();
+    // A synthesized Bedrock ping is gateway-made, not upstream liveness: it keeps the
+    // CLIENT's idle watchdog happy but must not keep OURS from catching a hung upstream.
+    if (!isSyntheticPingChunk(chunk)) resetWatchdog();
     if (reply.raw.destroyed) {
       // The client socket is gone: stop pulling (and paying for) bytes nobody reads.
       abortWith('client');
@@ -3592,6 +3973,8 @@ async function handleProxy(
   });
 
   upstreamBody.on('end', () => {
+    // A stream that ended cleanly proves the target alive: reset its watchdog run.
+    if (abortReason === undefined) watchdogRuns.delete(servedTarget.name);
     // The buffered-output branch consults the async output plugin, so the whole
     // handler runs in an async IIFE with teardown guaranteed in `finally`.
     void (async () => {
@@ -3617,7 +4000,7 @@ async function handleProxy(
                   'content-type': streamed ? 'text/event-stream' : 'application/json',
                   'x-gulley-request-id': requestId,
                   'x-gulley-target': servedTarget.name,
-                  'x-gulley-cache': 'bypass',
+                  'x-gulley-cache': cacheLookup?.status ?? 'bypass',
                 }),
               );
               reply.raw.write(
@@ -3776,7 +4159,7 @@ async function handleProxy(
             'content-type': streamed ? 'text/event-stream' : 'application/json',
             'x-gulley-request-id': requestId,
             'x-gulley-target': servedTarget.name,
-            'x-gulley-cache': 'bypass',
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             'x-gulley-tool-policy': 'blocked',
           }),
         );
@@ -3812,7 +4195,7 @@ async function handleProxy(
             'content-type': sse ? 'text/event-stream' : 'application/json',
             'x-gulley-request-id': requestId,
             'x-gulley-target': servedTarget.name,
-            'x-gulley-cache': 'bypass',
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             'x-gulley-guardrail': bufferFailClosed
               ? 'output-blocked-overflow'
               : 'overflow-unenforced',
@@ -3839,10 +4222,10 @@ async function handleProxy(
       // Fail safe on an unrecognised framing: nothing extractable → scan the raw text.
       const logical = extractTextFromSse(text, clientDialect) || text;
       const inspectDetok = vault ? new StreamingReplacer(vault.entries()) : undefined;
-      const out = await engine.inspectOutput(
-        inspectDetok ? inspectDetok.push(logical) + inspectDetok.flush() : logical,
-      );
+      const inspected = inspectDetok ? inspectDetok.push(logical) + inspectDetok.flush() : logical;
+      const out = await engine.inspectOutput(inspected, { vaultKey });
       outputEnforced = out;
+      rawBufferedOutFindings = engine.combinedDetector().detect(inspected);
       const withhold = out.blocked || out.transformedText !== undefined;
       const bodyOut = withhold
         ? providerErrorFrame(clientDialect, 'response withheld by guardrail')
@@ -3858,7 +4241,7 @@ async function handleProxy(
             'content-type': 'text/event-stream',
             'x-gulley-request-id': requestId,
             'x-gulley-target': servedTarget.name,
-            'x-gulley-cache': 'bypass',
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             'x-gulley-guardrail': withhold ? 'output-blocked' : 'audit',
           }),
         );
@@ -3876,8 +4259,9 @@ async function handleProxy(
       // values with its own fresh tokens, with no collision.
       const raw = Buffer.concat(fullChunks).toString('utf8');
       const text = detok ? detok.push(raw) + detok.flush() : raw;
-      const out = await engine.inspectOutput(text);
+      const out = await engine.inspectOutput(text, { vaultKey });
       outputEnforced = out;
+      rawBufferedOutFindings = engine.combinedDetector().detect(text);
       const bodyOut = out.blocked
         ? Buffer.from(
             JSON.stringify({
@@ -3895,7 +4279,7 @@ async function handleProxy(
             'content-type': 'application/json',
             'x-gulley-request-id': requestId,
             'x-gulley-target': servedTarget.name,
-            'x-gulley-cache': 'bypass',
+            'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             'x-gulley-guardrail': out.blocked
               ? 'output-blocked'
               : out.transformedText
@@ -3948,7 +4332,25 @@ async function handleProxy(
     // so a provider stalling mid-stream never looks like users pressing Ctrl-C on
     // the ledger, in metrics or in traces.
     status = abortReason === 'client' ? 'aborted' : 'error';
-    if (abortReason === 'watchdog') ctx.breaker.recordFailure(servedTarget.name);
+    // A watchdog fire is a liveness GUESS (a reasoning model can go quiet past the idle
+    // budget on a provider that sends no keepalives), so one abort is not an observed
+    // fault: only a run of consecutive watchdog aborts on the same target — with no clean
+    // stream end in between — ejects it. Every abort is still an `error` here. The run
+    // TRIPS the breaker outright: each stalled stream already recorded a first-byte
+    // success (commitServed, to resolve a half-open probe), which resets the consecutive
+    // counter and keeps the EWMA under its threshold, so booking the run as one more
+    // ordinary failure could never open the circuit — a headers-then-hang provider was
+    // never ejected and every request paid the full idle budget before failing.
+    if (abortReason === 'watchdog') {
+      const runs = (watchdogRuns.get(servedTarget.name) ?? 0) + 1;
+      const threshold = ctx.watchdogBreakerThreshold ?? DEFAULT_WATCHDOG_BREAKER_THRESHOLD;
+      if (runs >= threshold) {
+        watchdogRuns.delete(servedTarget.name);
+        ctx.breaker.trip(servedTarget.name);
+      } else {
+        watchdogRuns.set(servedTarget.name, runs);
+      }
+    }
     if (abortReason === 'client') {
       request.log.info({ target: servedTarget.name }, 'client disconnected mid-stream');
     } else {
@@ -3969,7 +4371,7 @@ async function handleProxy(
               'content-type': streamed ? 'text/event-stream' : 'application/json',
               'x-gulley-request-id': requestId,
               'x-gulley-target': servedTarget.name,
-              'x-gulley-cache': 'bypass',
+              'x-gulley-cache': cacheLookup?.status ?? 'bypass',
             }),
           );
           reply.raw.write(
@@ -4284,9 +4686,13 @@ const ATTRIBUTION_VALUE_UNSAFE_RE = /[{}\p{Cc}]/u;
 function buildAttribution(
   request: FastifyRequest,
   headerNames: string[] | undefined,
+  agentHeaders = true,
 ): Record<string, string> | undefined {
-  if (!headerNames || headerNames.length === 0) return undefined;
-  const out: Record<string, string> = {};
+  // Zero-config agent tags first; a configured header mapping to the same key wins.
+  const out: Record<string, string> = agentHeaders ? (agentAttribution(request.headers) ?? {}) : {};
+  if (!headerNames || headerNames.length === 0) {
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
   for (const name of headerNames) {
     const raw = request.headers[name];
     const val = Array.isArray(raw) ? raw[0] : raw;
@@ -4359,6 +4765,27 @@ function numField(v: unknown): number | undefined {
   return typeof v === 'number' ? v : undefined;
 }
 
+/** One routing attempt of a request, for the `x-gulley-attempts` header and the
+ *  request-log `attempts` attribute: `<target>:<outcome>[:<status>][:<ms>]`. */
+interface RoutingAttempt {
+  target: string;
+  outcome: 'served' | 'failover' | 'retry' | 'shed' | 'error';
+  status?: number;
+  ms?: number;
+}
+const MAX_ROUTING_ATTEMPTS = 32;
+
+function formatAttempts(attempts: readonly RoutingAttempt[]): string {
+  return attempts
+    .map((a) => {
+      let s = `${a.target}:${a.outcome}`;
+      if (a.status !== undefined) s += `:${a.status}`;
+      if (a.ms !== undefined) s += `:${a.ms}ms`;
+      return s;
+    })
+    .join(';');
+}
+
 function headerValue(request: FastifyRequest, name: string): string | undefined {
   const v = request.headers[name];
   return Array.isArray(v) ? v[0] : v;
@@ -4389,6 +4816,43 @@ function brokeredAccessToken(
   return undefined;
 }
 
+/** The request attributes (beyond body/model/path) that change what the upstream
+ *  returns for the same body, folded into the cache partition: the `anthropic-beta`
+ *  capability set and the `anthropic-version` API version. Either alone is enough
+ *  to make two otherwise-identical requests different responses. */
+function cacheVariant(request: FastifyRequest): string | undefined {
+  const beta = headerValue(request, 'anthropic-beta');
+  const version = headerValue(request, 'anthropic-version');
+  if (beta === undefined && version === undefined) return undefined;
+  return `${beta ?? ''}|${version ?? ''}`;
+}
+
+/** Throttle the unpriced-model warning to one line per minute per provider/model. */
+function shouldLogUnpriced(key: string): boolean {
+  const now = Date.now();
+  const prev = unpricedLogAt.get(key);
+  if (prev !== undefined && now - prev < UNPRICED_LOG_INTERVAL_MS) return false;
+  if (unpricedLogAt.size >= 1024) unpricedLogAt.clear(); // bounded; a clear just re-logs
+  unpricedLogAt.set(key, now);
+  return true;
+}
+
+/** True when the request can yield tool calls at all — every shape the extractor
+ *  governs: `tools` (Anthropic, OpenAI chat and Responses) or a forcing `tool_choice`;
+ *  the legacy OpenAI chat `functions` list or a forcing `function_call` (they yield
+ *  `delta.function_call`, which the extractor reads); and a Responses stored `prompt`
+ *  object, which can carry its own tool definitions the body never shows. A malformed
+ *  (unparseable) body is treated as tool-bearing so governance stays fail-closed. */
+function requestDeclaresTools(parsed: Record<string, unknown>, parseOk: boolean): boolean {
+  if (!parseOk) return true;
+  const nonEmptyList = (v: unknown): boolean => Array.isArray(v) && v.length > 0;
+  const forcing = (v: unknown): boolean => v !== undefined && v !== null && v !== 'none';
+  if (nonEmptyList(parsed['tools']) || nonEmptyList(parsed['functions'])) return true;
+  if (forcing(parsed['tool_choice']) || forcing(parsed['function_call'])) return true;
+  const prompt = parsed['prompt'];
+  return prompt !== null && typeof prompt === 'object';
+}
+
 function bearerToken(request: FastifyRequest): string | undefined {
   const auth = headerValue(request, 'authorization');
   if (auth && auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
@@ -4400,7 +4864,7 @@ function cacheControlHas(request: FastifyRequest, directive: string): boolean {
   return cc !== undefined && cc.toLowerCase().includes(directive);
 }
 
-function filterResponseHeaders(
+export function filterResponseHeaders(
   headers: Record<string, string | string[] | undefined>,
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};

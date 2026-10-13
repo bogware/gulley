@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { GuardrailEngine, NativeDetector } from '@gulley/guardrails';
 import {
   buildModelRouterFromDocument,
+  buildRouteGroupsFromDocument,
   buildRoutesFromDocument,
   buildWorkspaceGuardrails,
   routesForProvider,
@@ -167,6 +168,39 @@ describe('buildRoutesFromDocument', () => {
       expect(r.guardrails?.outputPolicy.action).toBe('block');
       expect(r.guardrails?.inputPolicy.action).toBe('block');
     }
+  });
+});
+
+describe('buildRouteGroupsFromDocument', () => {
+  const withRoutes = (
+    routes: Array<{ name: string; config: Record<string, unknown> }>,
+  ): ConfigDocument => {
+    const d = structuredClone(doc);
+    d.orgs[0]!.workspaces[0]!.routes = routes;
+    return d;
+  };
+  const group = {
+    clientPath: '/v1/messages',
+    mode: 'fallback',
+    providers: ['anthropic', 'bedrock'],
+  };
+
+  it('returns valid entities as groups named per entity, and names what it skips', () => {
+    const r = buildRouteGroupsFromDocument(
+      withRoutes([
+        { name: 'messages-ha', config: group },
+        { name: 'old', config: { strategy: { mode: 'loadbalance', targets: [] } } }, // legacy
+        { name: 'solo', config: { ...group, providers: ['anthropic'] } }, // invalid
+      ]),
+    );
+    expect(r.groups).toEqual([{ name: 'messages-ha', ...group }]);
+    expect(r.skipped).toHaveLength(2);
+    expect(r.skipped[0]).toMatch(/^Acme\/prod\/old: legacy/);
+    expect(r.skipped[1]).toMatch(/^Acme\/prod\/solo: invalid route group: providers/);
+  });
+
+  it('is empty for a document without route entities', () => {
+    expect(buildRouteGroupsFromDocument(doc)).toEqual({ groups: [], skipped: [] });
   });
 });
 

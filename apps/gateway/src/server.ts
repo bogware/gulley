@@ -2,6 +2,7 @@ import { GULLEY_VERSION } from '@gulley/core';
 import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from 'fastify';
 import type { Config } from './config';
+import { unpricedConfiguredModels } from './pricing-readiness';
 import { type GatewayContext, registerRoutes, RouteHolder } from './routes/messages';
 
 /** A built gateway server carries its RouteHolder so the config-reload watcher
@@ -79,6 +80,18 @@ export function buildServer(
   // onSend and set the header themselves at writeHead.
   app.addHook('onSend', (request, reply, payload, done) => {
     if (!reply.hasHeader('x-gulley-request-id')) reply.header('x-gulley-request-id', request.id);
+    // Anthropic's gateway contract: `x-should-retry` is one input to Claude Code's
+    // retry decision. Upstream replies carry the upstream's value (hijacked, never
+    // through this hook); a gateway-generated error says whether retrying can help —
+    // a throttle / overload / timeout can clear, a denial or a bad request cannot.
+    if (!reply.hasHeader('x-should-retry')) {
+      const status = reply.statusCode;
+      if (status === 429 || status === 502 || status === 503 || status === 504) {
+        reply.header('x-should-retry', 'true');
+      } else if (status >= 400 && status < 500) {
+        reply.header('x-should-retry', 'false');
+      }
+    }
     done(null, payload);
   });
 
@@ -144,7 +157,27 @@ export function buildServer(
       reply.code(503);
       return { status: 'degraded', reason: `database schema: ${schema.reason}`, providers, schema };
     }
-    return { status: 'ready', providers, ...(schema ? { schema } : {}) };
+    // An operator-configured model with no price (alias target, downshift model, cascade
+    // escalation, route-group model map) would meter $0 on every request it serves.
+    // METER_UNPRICED_CONFIG=fail keeps the task out of service until it is priced;
+    // `warn` stays ready and surfaces the list. Recomputed per probe so a reconcile
+    // (new aliases) or a catalog change is reflected.
+    const unpriced = holder.ctx.unpricedConfig ? unpricedConfiguredModels(holder.ctx) : [];
+    if (unpriced.length > 0 && holder.ctx.unpricedConfig === 'fail') {
+      reply.code(503);
+      return {
+        status: 'degraded',
+        reason: `unpriced configured models: ${unpriced.join(', ')} (seed/MODELS_CATALOG_FILE has no rate; METER_UNPRICED_CONFIG=warn to override)`,
+        providers,
+        unpricedModels: unpriced,
+      };
+    }
+    return {
+      status: 'ready',
+      providers,
+      ...(schema ? { schema } : {}),
+      ...(unpriced.length > 0 ? { unpricedModels: unpriced } : {}),
+    };
   });
   app.get('/', async () => ({ name: 'gulley-gateway', version: GULLEY_VERSION }));
 

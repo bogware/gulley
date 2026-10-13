@@ -1,11 +1,18 @@
-import type { ConfigDocument, ConfigEntity, ConfigProvider } from '@gulley/config';
+import {
+  type ConfigDocument,
+  type ConfigEntity,
+  type ConfigProvider,
+  routeGroupsFromDocument,
+  skippedRouteEntities,
+} from '@gulley/config';
 import type { SecretResolver } from '@gulley/core';
-import { type ModelRouteRule, ModelRouter } from '@gulley/routing';
+import { type ModelRouteRule, ModelRouter, type RouteGroup } from '@gulley/routing';
 import {
   AnthropicAdapter,
   AnthropicUsageExtractor,
   AzureAdapter,
   BedrockAdapter,
+  type BedrockAdapterOptions,
   OpenAIAdapter,
   OpenAIUsageExtractor,
   type UpstreamCredential,
@@ -32,9 +39,14 @@ function anthropicCredential(value: string): UpstreamCredential {
  * from the CUSTOM_PROVIDERS env before, so DB-configured aliases were inert). An
  * alias entity maps a requested-model pattern (its `config.pattern`, else its name)
  * to an upstream `target` rewrite and/or a `provider` label. Single-tenant v1:
- * aliases across all workspaces are flattened into one global router.
+ * aliases across all workspaces are flattened into one global router. `extraRules`
+ * (the env CUSTOM_PROVIDERS model rules) are appended AFTER the document's, so a
+ * document alias wins on a duplicate pattern (the router keeps the first exact rule).
  */
-export function buildModelRouterFromDocument(doc: ConfigDocument): ModelRouter | undefined {
+export function buildModelRouterFromDocument(
+  doc: ConfigDocument,
+  extraRules: readonly ModelRouteRule[] = [],
+): ModelRouter | undefined {
   const rules: ModelRouteRule[] = [];
   for (const org of doc.orgs) {
     for (const ws of org.workspaces) {
@@ -49,7 +61,32 @@ export function buildModelRouterFromDocument(doc: ConfigDocument): ModelRouter |
       }
     }
   }
-  return rules.length > 0 ? new ModelRouter(rules) : undefined;
+  const all = [...rules, ...extraRules];
+  return all.length > 0 ? new ModelRouter(all) : undefined;
+}
+
+/** The config document's route groups plus what the gateway skips. */
+export interface DocumentRouteGroups {
+  /** Valid `routes` entities as route groups, in document order, named per entity. */
+  groups: RouteGroup[];
+  /** `org/workspace/name: reason` for each entity NOT applied — a legacy console-shape
+   *  row (no clientPath) or, defensively, one failing the schema (plan/apply and the
+   *  console reject those up front). Logged once per reconcile. */
+  skipped: string[];
+}
+
+/**
+ * Route groups from the config document's `routes` entities (single-tenant v1:
+ * every workspace's groups are flattened). The reconciler folds them with
+ * `applyRouteGroups` AFTER the env overlay, so a DB group shadows an env
+ * `ROUTE_GROUPS` entry on the same clientPath and a later entity wins among
+ * document groups. Pure over the document — no secrets, no I/O.
+ */
+export function buildRouteGroupsFromDocument(doc: ConfigDocument): DocumentRouteGroups {
+  return {
+    groups: routeGroupsFromDocument(doc),
+    skipped: skippedRouteEntities(doc).map((s) => `${s.name}: ${s.reason}`),
+  };
 }
 
 /** A workspace's resolved guardrail configuration, attached to each of its routes. */
@@ -169,10 +206,16 @@ export function buildWorkspaceGuardrails(
  * been resolved from its ARN; this only maps a provider kind → adapter + paths.
  * An unknown kind yields no routes (skipped, not an error).
  */
+/** Env-derived adapter options DB-config mode cannot express in the document. */
+export interface ProviderBuildOptions {
+  bedrock?: BedrockAdapterOptions;
+}
+
 export function routesForProvider(
   kind: string,
   baseUrl: string | null,
   value: string,
+  opts: ProviderBuildOptions = {},
 ): ProviderRoute[] {
   switch (kind) {
     case 'anthropic':
@@ -231,10 +274,9 @@ export function routesForProvider(
             target: {
               name: 'bedrock',
               provider: 'bedrock',
-              adapter: new BedrockAdapter({ region: baseUrl ?? 'us-east-1' }),
+              adapter: new BedrockAdapter({ ...opts.bedrock, region: baseUrl ?? 'us-east-1' }),
               credential: { scheme: 'bearer', value },
               upstreamPath: '/v1/messages',
-              alwaysStream: true,
               // DB-config mode overloads the Bedrock baseUrl column as the region, so
               // the residency region is that value (residency for other DB-mode
               // providers awaits per-provider region/zdr columns).
@@ -286,6 +328,7 @@ export async function buildRoutesFromDocument(
   doc: ConfigDocument,
   resolver: SecretResolver,
   baseGuardrails?: GuardrailEngine,
+  opts: ProviderBuildOptions = {},
 ): Promise<ProviderRoute[]> {
   const routes: ProviderRoute[] = [];
   for (const org of doc.orgs) {
@@ -301,7 +344,7 @@ export async function buildRoutesFromDocument(
       for (const p of ws.providers as ConfigProvider[]) {
         if (!p.enabled || !p.credential) continue;
         const value = await resolver.resolve(p.credential);
-        for (const route of routesForProvider(p.kind, p.baseUrl ?? null, value)) {
+        for (const route of routesForProvider(p.kind, p.baseUrl ?? null, value, opts)) {
           // Stamp the provider's data-residency posture onto its target so DB-config-mode
           // routes can satisfy an active residency/ZDR policy (the env path stamps from
           // ANTHROPIC_REGION/ZDR etc.). Explicit region wins; otherwise any adapter-derived

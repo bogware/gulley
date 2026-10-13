@@ -271,7 +271,7 @@ function ShadowSpend() {
                     {formatUsd(r.shadowMicroUsd)}
                   </Cell>
                   <Cell align="right" mono tone="secondary">
-                    {(r.shadowRatioBps / 100).toFixed(1)}%
+                    {(r.shadowRatio * 100).toFixed(1)}%
                   </Cell>
                   <div className="flex justify-end">
                     <StatusChip tone={r.flagged ? 'red' : 'green'}>

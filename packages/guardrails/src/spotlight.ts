@@ -34,9 +34,12 @@ export interface SpotlightOptions {
   open?: string;
   /** Closing delimiter. */
   close?: string;
-  /** Prepend a system directive explaining the delimiters. Default OFF: adding a
-   *  system prefix shifts Anthropic prompt-cache breakpoints, so the operator opts
-   *  in knowing the cache trade-off. Wrapping alone still gives the model a hook. */
+  /** Append a system directive explaining the delimiters. Default OFF. When on it
+   *  is applied on EVERY request (not only when a span was marked) and AFTER the
+   *  client's own system content, so the system prompt is identical turn after
+   *  turn — the provider's prompt cache and the preserved-thinking prefix check both
+   *  require that — and a client's leading attribution block (Claude Code's) stays
+   *  first, where Anthropic's positional strip expects it. Idempotent. */
   directive?: boolean;
 }
 
@@ -169,10 +172,13 @@ function wrap(text: string, open: string, close: string): string {
 
 export interface SpotlightResult {
   /** A NEW body with untrusted spans wrapped; the input is never mutated. When
-   *  nothing was marked this is the original body reference (no clone cost). */
+   *  nothing was marked (and no directive was appended) this is the original body
+   *  reference (no clone cost). */
   body: unknown;
   /** How many untrusted text spans were wrapped. */
   marked: number;
+  /** True when the system directive was appended to this body. */
+  directive: boolean;
 }
 
 /**
@@ -184,18 +190,21 @@ export interface SpotlightResult {
  */
 export function spotlightUntrusted(body: unknown, options?: SpotlightOptions): SpotlightResult {
   const b = asRecord(body);
-  if (!b) return { body, marked: 0 };
+  if (!b) return { body, marked: 0, directive: false };
   const open = options?.open ?? DEFAULT_OPEN;
   const close = options?.close ?? DEFAULT_CLOSE;
+  const wantDirective = options?.directive === true;
 
-  // Only clone once we know there is something to mark, so the no-untrusted path
+  // Only clone once we know there is something to do, so the no-untrusted path
   // stays allocation-free on the hot path.
-  if (extractContentSpans(body).every((s) => s.trust === 'trusted')) return { body, marked: 0 };
+  const hasUntrusted = !extractContentSpans(body).every((s) => s.trust === 'trusted');
+  if (!hasUntrusted && !wantDirective) return { body, marked: 0, directive: false };
 
   const clone = structuredClone(b) as Record<string, unknown>;
   let marked = 0;
 
-  const messages = Array.isArray(clone['messages']) ? (clone['messages'] as unknown[]) : [];
+  const messages =
+    hasUntrusted && Array.isArray(clone['messages']) ? (clone['messages'] as unknown[]) : [];
   for (const m of messages) {
     const msg = asRecord(m);
     if (!msg) continue;
@@ -254,21 +263,59 @@ export function spotlightUntrusted(body: unknown, options?: SpotlightOptions): S
     }
   }
 
-  if (marked === 0) return { body, marked: 0 };
-
-  if (options?.directive) prependSystemDirective(clone);
-  return { body: clone, marked };
+  const directive = wantDirective ? appendSystemDirective(clone) : false;
+  if (marked === 0 && !directive) return { body, marked: 0, directive: false };
+  return { body: clone, marked, directive };
 }
 
-/** Prepend the spotlight directive to the request's `system` field so the model
- *  is told what the delimiters mean. Preserves the existing system content. */
-function prependSystemDirective(clone: Record<string, unknown>): void {
+/** Append the spotlight directive AFTER the request's own system content so the
+ *  model is told what the delimiters mean. Appending (never prepending) keeps a
+ *  client's leading system block first and leaves every earlier system block —
+ *  and any `cache_control` breakpoint on it — byte-identical. Anthropic bodies
+ *  carry `system` (string or block array); OpenAI chat bodies carry a leading
+ *  `role: "system"` message; a body with neither gets a top-level `system` when it
+ *  is Anthropic-shaped (`max_tokens` is required there) or a leading system message
+ *  when it is OpenAI-shaped. Returns false when nothing changed (already present, or
+ *  no place to put it). */
+function appendSystemDirective(clone: Record<string, unknown>): boolean {
   const system = clone['system'];
-  if (system === undefined || system === null) {
-    clone['system'] = DEFAULT_DIRECTIVE;
-  } else if (typeof system === 'string') {
-    clone['system'] = `${DEFAULT_DIRECTIVE}\n\n${system}`;
-  } else if (Array.isArray(system)) {
-    clone['system'] = [{ type: 'text', text: DEFAULT_DIRECTIVE }, ...system];
+  if (typeof system === 'string') {
+    if (system.endsWith(DEFAULT_DIRECTIVE)) return false;
+    clone['system'] = system.length > 0 ? `${system}\n\n${DEFAULT_DIRECTIVE}` : DEFAULT_DIRECTIVE;
+    return true;
   }
+  if (Array.isArray(system)) {
+    const last = asRecord(system[system.length - 1]);
+    if (last && textOf(last) === DEFAULT_DIRECTIVE) return false;
+    clone['system'] = [...system, { type: 'text', text: DEFAULT_DIRECTIVE }];
+    return true;
+  }
+  const turns = Array.isArray(clone['messages']) ? (clone['messages'] as unknown[]) : undefined;
+  const first = turns ? asRecord(turns[0]) : undefined;
+  if (first && first['role'] === 'system') {
+    const c = first['content'];
+    if (typeof c === 'string') {
+      if (c.endsWith(DEFAULT_DIRECTIVE)) return false;
+      first['content'] = c.length > 0 ? `${c}\n\n${DEFAULT_DIRECTIVE}` : DEFAULT_DIRECTIVE;
+      return true;
+    }
+    if (Array.isArray(c)) {
+      const last = asRecord(c[c.length - 1]);
+      if (last && textOf(last) === DEFAULT_DIRECTIVE) return false;
+      first['content'] = [...c, { type: 'text', text: DEFAULT_DIRECTIVE }];
+      return true;
+    }
+    return false;
+  }
+  if (system === undefined || system === null) {
+    if (typeof clone['max_tokens'] === 'number') {
+      clone['system'] = DEFAULT_DIRECTIVE;
+      return true;
+    }
+    if (turns) {
+      clone['messages'] = [{ role: 'system', content: DEFAULT_DIRECTIVE }, ...turns];
+      return true;
+    }
+  }
+  return false;
 }

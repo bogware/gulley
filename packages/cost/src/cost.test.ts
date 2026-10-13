@@ -5,6 +5,7 @@ import {
   lookupRate,
   normalizeModelId,
   toMicroUsd,
+  type NormalizedUsage,
 } from './index';
 
 describe('pricing', () => {
@@ -45,8 +46,8 @@ describe('computeAnthropicCost', () => {
   });
 
   it('applies cache read/write multipliers on the input rate', () => {
-    // Sonnet-5 input $3/MTok. read x0.1 => $0.30; write5m x1.25 => $3.75 per MTok.
-    const c = computeAnthropicCost('claude-sonnet-5', {
+    // Sonnet 4.6 input $3/MTok. read x0.1 => $0.30; write5m x1.25 => $3.75 per MTok.
+    const c = computeAnthropicCost('claude-sonnet-4-6', {
       input_tokens: 0,
       output_tokens: 0,
       cache_read_input_tokens: 1_000_000,
@@ -160,5 +161,194 @@ describe('computeCost (provider-generic)', () => {
     });
     expect(c.priced).toBe(false);
     expect(c.outputTokens).toBe(5);
+  });
+});
+
+describe('seed pricing (2026-10)', () => {
+  const usage = (over: Partial<NormalizedUsage>): NormalizedUsage => ({
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWrite5mTokens: 0,
+    cacheWrite1hTokens: 0,
+    outputTokens: 0,
+    seen: true,
+    ...over,
+  });
+  const oneM = usage({ inputTokens: 1_000_000, outputTokens: 1_000_000 });
+
+  it('prices every current Anthropic model, by API id and by Bedrock id', () => {
+    const current = [
+      'claude-fable-5-1',
+      'claude-mythos-5-1',
+      'claude-fable-5',
+      'claude-opus-5-5',
+      'claude-opus-5',
+      'claude-opus-4-8',
+      'claude-sonnet-5-5',
+      'claude-sonnet-5',
+      'claude-sonnet-4-6',
+      'claude-haiku-5-5',
+      'claude-haiku-4-5',
+    ];
+    for (const m of current) {
+      expect(computeCost('anthropic', m, oneM).priced, m).toBe(true);
+      expect(computeCost('anthropic', `${m}-20260401`, oneM).priced, `${m} dated`).toBe(true);
+      expect(
+        computeCost('bedrock', `us.anthropic.${m}-20260401-v1:0`, oneM).priced,
+        `${m} bedrock`,
+      ).toBe(true);
+    }
+  });
+
+  it('prices every current OpenAI model including embeddings', () => {
+    const current = [
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.5',
+      'gpt-5.4',
+      'gpt-5.4-mini',
+      'gpt-5.4-nano',
+      'gpt-5.2',
+      'gpt-5.1',
+      'gpt-5',
+      'gpt-5-mini',
+      'gpt-5-nano',
+      'gpt-4.1',
+      'gpt-4o',
+      'o3',
+      'o4-mini',
+      'text-embedding-3-small',
+      'text-embedding-3-large',
+    ];
+    for (const m of current) expect(computeCost('openai', m, oneM).priced, m).toBe(true);
+    const e = computeCost('openai', 'text-embedding-3-small', usage({ inputTokens: 1_000_000 }));
+    expect(e.totalUsd).toBeCloseTo(0.02, 6);
+  });
+
+  it('applies per-model cache-read multipliers', () => {
+    const read = usage({ cacheReadTokens: 1_000_000 });
+    expect(computeCost('anthropic', 'claude-opus-5-5', read).cacheReadUsd).toBeCloseTo(0.2, 6);
+    expect(computeCost('anthropic', 'claude-fable-5-1', read).cacheReadUsd).toBeCloseTo(0.25, 6);
+    expect(computeCost('anthropic', 'claude-sonnet-5-5', read).cacheReadUsd).toBeCloseTo(0.1, 6); // 0.05x on Sonnet 5.5
+    expect(computeCost('anthropic', 'claude-fable-5', read).cacheReadUsd).toBeCloseTo(1, 6);
+    expect(computeCost('openai', 'gpt-5', read).cacheReadUsd).toBeCloseTo(0.125, 6);
+    expect(computeCost('openai', 'gpt-4.1', read).cacheReadUsd).toBeCloseTo(0.5, 6);
+    expect(computeCost('openai', 'o3', read).cacheReadUsd).toBeCloseTo(0.5, 6);
+    expect(computeCost('openai', 'gpt-5-pro', read).cacheReadUsd).toBeCloseTo(15, 6);
+    // Cache writes keep the Anthropic provider default (1.25x / 2x) under a per-model read.
+    const write = usage({ cacheWrite5mTokens: 1_000_000, cacheWrite1hTokens: 1_000_000 });
+    expect(computeCost('anthropic', 'claude-opus-5-5', write).cacheWriteUsd).toBeCloseTo(13, 6);
+  });
+
+  it('bills Sonnet 5 at the $2/$10 list price (was seeded at $3/$15)', () => {
+    const c = computeCost('anthropic', 'claude-sonnet-5', oneM);
+    expect(c.inputUsd).toBeCloseTo(2, 6);
+    expect(c.outputUsd).toBeCloseTo(10, 6);
+  });
+
+  it('bills the whole request at the long-context tier past the threshold', () => {
+    // Haiku 5.5: $0.10/$0.50 up to 100K input, $0.50/$2.50 above.
+    const short = computeCost('anthropic', 'claude-haiku-5-5', usage({ inputTokens: 50_000 }));
+    expect(short.inputUsd).toBeCloseTo(0.005, 9);
+    const long = computeCost(
+      'anthropic',
+      'claude-haiku-5-5',
+      usage({ inputTokens: 150_000, outputTokens: 1_000 }),
+    );
+    expect(long.inputUsd).toBeCloseTo(0.075, 9);
+    expect(long.outputUsd).toBeCloseTo(0.0025, 9);
+    // Cache-read tokens count toward the threshold (total billable input).
+    const viaCache = computeCost(
+      'anthropic',
+      'claude-haiku-5-5',
+      usage({ inputTokens: 10_000, cacheReadTokens: 100_000 }),
+    );
+    expect(viaCache.inputUsd).toBeCloseTo(0.005, 9);
+    // gpt-5.6-sol: $4/$20 up to 272K input, $8/$30 above; cached input stays 0.1x.
+    const sol = computeCost(
+      'openai',
+      'gpt-5.6-sol',
+      usage({ inputTokens: 300_000, cacheReadTokens: 100_000, outputTokens: 1_000 }),
+    );
+    expect(sol.inputUsd).toBeCloseTo(2.4, 6);
+    expect(sol.cacheReadUsd).toBeCloseTo(0.08, 6);
+    expect(sol.outputUsd).toBeCloseTo(0.03, 6);
+  });
+});
+
+describe('long-context tier under a catalog override', () => {
+  it('applies the seed tier when the catalog resolves a flat rate for the same model', () => {
+    // models.dev carries no tier data, so a catalog row is flat; the provider still bills
+    // the whole request at the tier rate past the threshold.
+    const resolve = (provider: string, model: string) =>
+      provider === 'anthropic' && model === 'claude-haiku-5-5'
+        ? { input: 0.1, output: 0.5 }
+        : undefined;
+    const usage = {
+      inputTokens: 150_000,
+      cacheReadTokens: 0,
+      cacheWrite5mTokens: 0,
+      cacheWrite1hTokens: 0,
+      outputTokens: 1_000,
+      seen: true,
+    };
+    const c = computeCost('anthropic', 'claude-haiku-5-5', usage, resolve);
+    expect(c.priced).toBe(true);
+    expect(c.inputUsd).toBeCloseTo(0.075, 9); // 150K x $0.50/MTok, not $0.10
+    expect(c.outputUsd).toBeCloseTo(0.0025, 9); // 1K x $2.50/MTok, not $0.50
+    // Below the threshold the override's flat rate applies as-is.
+    const short = computeCost(
+      'anthropic',
+      'claude-haiku-5-5',
+      { ...usage, inputTokens: 50_000 },
+      resolve,
+    );
+    expect(short.inputUsd).toBeCloseTo(0.005, 9);
+  });
+});
+
+describe('long-context tier scaled to a divergent catalog base', () => {
+  const usage = (inputTokens: number) => ({
+    inputTokens,
+    cacheReadTokens: 0,
+    cacheWrite5mTokens: 0,
+    cacheWrite1hTokens: 0,
+    outputTokens: 1_000,
+    seen: true,
+  });
+
+  it('keeps the operator catalog price governing: the seed lends only the threshold and multiplier', () => {
+    // A negotiated Bedrock rate below list: Haiku 5.5 seed is $0.10/$0.50 with ×5 above
+    // 100K; the catalog says $0.08/$0.40 — so above 100K the request bills at $0.40/$2.00
+    // (the catalog base ×5), never at the seed's absolute $0.50/$2.50.
+    const below = (p: string, m: string) =>
+      p === 'bedrock' && m.includes('claude-haiku-5-5') ? { input: 0.08, output: 0.4 } : undefined;
+    const long = computeCost(
+      'bedrock',
+      'us.anthropic.claude-haiku-5-5-20251001-v1:0',
+      usage(150_000),
+      below,
+    );
+    expect(long.inputUsd).toBeCloseTo(0.06, 9);
+    expect(long.outputUsd).toBeCloseTo(0.002, 9);
+    const short = computeCost(
+      'bedrock',
+      'us.anthropic.claude-haiku-5-5-20251001-v1:0',
+      usage(99_000),
+      below,
+    );
+    expect(short.inputUsd).toBeCloseTo(0.00792, 9);
+    // A chargeback markup above list must not invert the tier (the per-token rate can
+    // never DROP past the threshold).
+    const above = () => ({ input: 0.6, output: 3 });
+    const marked = computeCost('anthropic', 'claude-haiku-5-5', usage(150_000), above);
+    expect(marked.inputUsd).toBeCloseTo(0.45, 9); // 150K × $3.00/MTok (0.6 × 5)
+    const markedShort = computeCost('anthropic', 'claude-haiku-5-5', usage(99_000), above);
+    expect(marked.inputUsd / 150_000).toBeGreaterThan(markedShort.inputUsd / 99_000);
+    // Azure reuses the OpenAI seed: a gpt-5.4 catalog row of $2/$12 bills $4/MTok input
+    // past 272K (seed ×2), not the OpenAI list $5.
+    const azure = computeCost('azure', 'gpt-5.4', usage(300_000), () => ({ input: 2, output: 12 }));
+    expect(azure.inputUsd).toBeCloseTo(1.2, 9);
   });
 });
